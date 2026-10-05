@@ -4,6 +4,7 @@ description = "Finding a peer on the same network, with no internet at all."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

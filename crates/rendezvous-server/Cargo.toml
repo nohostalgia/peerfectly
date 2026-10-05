@@ -4,6 +4,7 @@ description = "The rendezvous as a program: the library's service, over TLS, on 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [[bin]]

@@ -1,0 +1,10 @@
+# The one Rust every build uses: CI, releases and a local build alike, so that a
+# check does not change its answer because a newer compiler or linter came out.
+#
+# Bumped on purpose, together with the `rust:<version>-bookworm` images the
+# Docker builds start from: `crates/daemon/tests/toolchain.rs` keeps them in
+# step. `rust-version` in Cargo.toml stays the oldest Rust the code builds on.
+[toolchain]
+channel = "1.95"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,141 @@
+# A tag `v<version>` builds the packages and leaves them in a draft Release for
+# the maintainer to review and publish. Nothing is published unattended.
+#
+# Only the last job can write, and only to this repository: the Release, and the
+# provenance attestations. The packages are built by jobs that cannot.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# Two pushes of one tag never race to create the same Release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag names the version the programs report, or nothing is built.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "programs") | .version')
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::The tag is $TAG and the workspace version is $version. Tag v$version, or bump the version first."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows-package:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # No -Sign: there is no code-signing certificate yet, and the script says
+      # so on its last line.
+      - run: .\deploy\windows\package.ps1
+        shell: powershell
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows
+          path: target/dist/*.msi
+          if-no-files-found: error
+
+  linux-package:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The build runs in `deploy/linux/package.Dockerfile`, on the pinned Rust.
+      - run: deploy/linux/package.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [version, windows-package, linux-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      # Over the files this Release carries, and nothing else.
+      - working-directory: dist
+        run: |
+          sha256sum -- *.msi *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      # Says which workflow, commit and runner built each package. It is not a
+      # signature: Windows does not read it, and SmartScreen still warns.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.msi
+            dist/*.tar.gz
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          ## Install
+
+          - **Windows:** \`peerfectly-$VERSION-windows-x64.msi\`
+          - **Linux (x86_64, glibc 2.34 or later):** \`peerfectly-$VERSION-linux-x86_64.tar.gz\`, then \`sudo ./install.sh\` from the unpacked folder.
+
+          ## Check what you downloaded
+
+          Compare the file's digest with its line in \`SHA256SUMS\`:
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS --ignore-missing
+          \`\`\`
+
+          On Windows: \`(Get-FileHash peerfectly-$VERSION-windows-x64.msi).Hash\`, which prints the same digest in capitals.
+
+          To check that a package was built by this repository's release workflow from tag \`$TAG\`, and not on someone's machine, with the [GitHub CLI](https://cli.github.com/):
+
+          \`\`\`sh
+          gh attestation verify <file> --repo $REPO
+          \`\`\`
+
+          ## Not code-signed
+
+          The MSI and the programs in it carry no code signature yet. Windows SmartScreen will warn
+          that the publisher is unknown, and you have to choose *More info → Run anyway*. The
+          attestation above is how to check where the file came from; it is not a signature, and
+          Windows does not read it.
+          EOF
+          gh release create "$TAG" --repo "$REPO" --verify-tag --draft \
+            --title "peerfectly $VERSION" --notes-file notes.md \
+            dist/*.msi dist/*.tar.gz dist/SHA256SUMS
