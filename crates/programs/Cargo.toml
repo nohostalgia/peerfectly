@@ -1,0 +1,34 @@
+[package]
+name = "programs"
+description = "The two programs a person runs, `peerfectlyd` and `peerfectly`, on every desktop platform. Each hands over to its platform's crate at once."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Why a crate of its own: two packages in one workspace cannot both build a
+# binary called `peerfectlyd`. On Windows the second link fails outright, because both
+# write the same file; elsewhere Cargo warns that it will become an error. So the
+# names live here, once, and each platform's crate holds the bodies.
+[[bin]]
+name = "peerfectlyd"
+path = "src/bin/peerfectlyd.rs"
+
+[[bin]]
+name = "peerfectly"
+path = "src/bin/peerfectly.rs"
+
+# The tray, on Windows: a desktop program rather than a console one, so that
+# starting it never opens a console window. Elsewhere it says so and exits.
+[[bin]]
+name = "peerfectly-tray"
+path = "src/bin/peerfectly-tray.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-daemon = { path = "../windows-daemon" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-daemon = { path = "../linux-daemon" }
+
+[lints]
+workspace = true

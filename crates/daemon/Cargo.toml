@@ -1,0 +1,85 @@
+[package]
+name = "daemon"
+description = "The node as a program: what it decides, what it answers, and the loops that drive it. Portable — the calls that touch a machine are an edge crate's."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roster = { path = "../roster" }
+# The enrolment format and its rules: the joining payload, the confirmation code,
+# the proof of possession, and what a delivered roster must prove. Portable, so
+# a phone reuses it unchanged — the sockets and the terminal are this crate's.
+enrollment = { path = "../enrollment" }
+identity = { path = "../identity" }
+transport = { path = "../transport" }
+transport-iroh = { path = "../transport-iroh" }
+roster-sync = { path = "../roster-sync" }
+rendezvous = { path = "../rendezvous" }
+local-discovery = { path = "../local-discovery" }
+tunnel = { path = "../tunnel" }
+blake3.workspace = true
+async-trait.workspace = true
+# `io-util`: the control channel's framing reads and writes lines on a stream.
+tokio = { workspace = true, features = ["io-util", "net"] }
+# The control protocol between the CLI and the daemon. Local, unsigned, and not
+# part of any security boundary — unlike the roster it carries nothing that is
+# ever verified, so the canonical CBOR encoder is not the right tool and JSON
+# keeps the protocol readable when it misbehaves.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
+# Turns the PEM file a relay operator has into the DER the roster carries, for
+# `relay.rs`: every other crate deals in DER already.
+rustls-pki-types = { version = "1.15", features = ["std"] }
+# Fetching the certificate a relay presents, so nobody has to copy a file off a
+# server by hand. `ring` rather than the default provider because the default
+# builds `aws-lc-rs`, which needs a C toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The fingerprint is SHA-256 because that is what `openssl x509 -fingerprint
+# -sha256` prints on the relay host. A digest nobody can compare against
+# anything is not a check.
+sha2 = "0.11"
+# Splitting a relay URL into a host and a port. Hand-parsing this would get
+# IPv6 literals wrong, and getting them wrong means connecting somewhere else.
+url = "2.5"
+# DNS wire format. Parsing a query and building an answer by hand is a
+# well-known source of bugs, and this sits in the resolution path of every name
+# under the suffix. Not a cryptographic primitive, so no rule forbids a
+# dependency here, and writing our own would be the larger risk.
+hickory-proto = { version = "0.26.2", default-features = false }
+# Enumerating this machine's interfaces, so local discovery announces on the
+# local networks rather than on whichever adapter the routing table ranks first
+# — which is the tunnel this daemon creates. **Already in the tree**: `iroh`
+# reaches it through `netwatch`, so this promotes a transitive dependency to a
+# direct one and compiles nothing new. Preferred to calling
+# `GetAdaptersAddresses` ourselves, which would be a second `unsafe` module after
+# `route_table` for something a safe, cross-platform crate already does — and the
+# cross-platform part is not idle: `local-discovery` is in the portable core and
+# a Linux daemon needs the same answer.
+netdev = "0.45"
+# Rendering the joining payload as a scannable code. Default features off: the
+# image and SVG renderers would pull a decoder and a font stack for something a
+# terminal draws with two characters. The text form is authoritative and this is
+# a rendering of the same bytes.
+qrcode = { version = "0.14.1", default-features = false }
+# The service's log: what a person asked for, and what went wrong. Events only;
+# where they are written is each platform's. Already in the tree through iroh.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# The machine's time zone, so a time a person reads is their own and not seconds
+# since 1970. Already in the tree through `wmi`, with `iana-time-zone`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+# A certificate for the TLS server the fetch test talks to. Already built for
+# the workspace, and generating one is the only way to know what the fetch was
+# supposed to return.
+rcgen = "0.14"
+# A relay in the test process, for the enrolment that crosses one.
+iroh-relay = { version = "1.1", features = ["server", "test-utils"] }
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "test-util"] }
+
+[lints]
+workspace = true

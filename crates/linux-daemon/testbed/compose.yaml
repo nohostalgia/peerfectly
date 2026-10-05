@@ -1,0 +1,63 @@
+# The Linux daemon's testbed. From the repository root:
+#
+#   docker compose -f crates/linux-daemon/testbed/compose.yaml up -d --build
+#   docker compose -f crates/linux-daemon/testbed/compose.yaml exec a sudo -u alice peerfectly status
+#   docker compose -f crates/linux-daemon/testbed/compose.yaml run --rm tests
+#   docker compose -f crates/linux-daemon/testbed/compose.yaml down
+#
+# `a` and `b` each have a software TPM; `c` has none, so its keys are files
+# sealed with a passphrase. Each container is its own network namespace: the
+# interfaces, routes and firewall tables are the container's, and nothing here
+# touches the machine running Docker.
+
+name: peerfectly-testbed
+
+x-node: &node
+  build:
+    context: ../../..
+    dockerfile: crates/linux-daemon/testbed/Dockerfile
+    target: node
+  image: peerfectly-testbed-node
+  # What the daemon needs and nothing more: the TUN device, and the capability
+  # to configure interfaces, routes and the firewall inside the container.
+  cap_add: [NET_ADMIN]
+  devices: ["/dev/net/tun:/dev/net/tun"]
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "0"
+  init: false
+  restart: "no"
+
+services:
+  a:
+    <<: *node
+    hostname: a
+    environment:
+      TPM2TOOLS_TCTI: "swtpm:host=127.0.0.1,port=2321"
+  b:
+    <<: *node
+    hostname: b
+    environment:
+      TPM2TOOLS_TCTI: "swtpm:host=127.0.0.1,port=2321"
+  c:
+    <<: *node
+    hostname: c
+
+  # The `#[ignore]`d tests, which need a kernel, a TPM and root.
+  tests:
+    build:
+      context: ../../..
+      dockerfile: crates/linux-daemon/testbed/Dockerfile
+      target: tests
+    image: peerfectly-testbed-tests
+    profiles: [tests]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+    volumes:
+      - tests-target:/src/target
+      - tests-registry:/usr/local/cargo/registry
+
+volumes:
+  tests-target:
+  tests-registry:

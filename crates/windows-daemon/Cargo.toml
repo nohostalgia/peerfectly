@@ -1,0 +1,117 @@
+[package]
+name = "windows-daemon"
+description = "The node as a program on Windows: the packet device, the routes, the resolver, the CLI and the tray."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Every decision this crate makes real. The dependency runs one way and only one
+# way: nothing in `daemon` knows this crate exists.
+daemon = { path = "../daemon" }
+# The command line's logic, which this crate's `peerfectly` gives a pipe and the key store.
+cli = { path = "../cli" }
+# The types that cross the edge: what a packet device is, who a device is, what a
+# session is, and what the roster says. Named here rather than reached through
+# `daemon` so that a signature in `platform` reads as what it is.
+tunnel = { path = "../tunnel" }
+transport = { path = "../transport" }
+identity = { path = "../identity" }
+# What CNG signs is a hash, and ECDSA over P-256 fixes which one. The roster's
+# own hash is BLAKE3 everywhere else; this is the one place it is not, because
+# the curve says so. Already in the tree for the relay certificate's fingerprint.
+sha2 = "0.11"
+roster = { path = "../roster" }
+async-trait.workspace = true
+# `signal`: Ctrl+C on a waiting join abandons it in the daemon too.
+tokio = { workspace = true, features = ["signal"] }
+# The hash of the driver this daemon will load, checked before loading it.
+blake3.workspace = true
+# The transport a person's request starts. `daemon` says when; this says which.
+transport-iroh = { path = "../transport-iroh" }
+# The control protocol on the pipe, which is this crate's to carry.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json.workspace = true
+# The service's log: the daemon emits events, and this is where they are
+# written on Windows. Both already in the tree through iroh; the formatter only,
+# with no environment filter and no colours.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+# Registering, starting and stopping a Windows service. Preferred to calling the
+# service control manager ourselves for the same reason as `wintun`: it would
+# otherwise be another `unsafe` surface, and this one is entirely boilerplate —
+# and it is what lets the daemon register itself without an installer.
+windows-service = "0.8.1"
+# Safe bindings over Wintun.dll. Preferred to calling the DLL ourselves so the
+# adapter is not another `unsafe` surface.
+wintun = "0.5.1"
+# The NRPT rule is a registry value; this is a safe wrapper over the registry
+# API. `Add-DnsClientNrptRule` writes the same key.
+winreg = "0.56.0"
+# The IP Helper API for routes. The only place in this crate that is `unsafe`,
+# because no safe wrapper for it exists.
+windows-sys = { workspace = true, features = [
+    # CNG, for the signing key the TPM holds and never gives up.
+    "Win32_Security_Cryptography",
+    # The console window, which owns the key store's dialog so it opens in
+    # front of the command that asked rather than behind it.
+    "Win32_System_Console",
+    # The access control on the directory the machine keeps its networks in, and
+    # reading back the one it ended up with.
+    "Win32_Security_Authorization",
+    # Whether Windows vouches for the driver this daemon is about to load into
+    # the kernel. A digest says it is the file that was pinned; this says the
+    # file was worth pinning.
+    "Win32_Security_WinTrust",
+    # Who is at each end of the control channel: the caller's token, the account
+    # a process runs as, and whether a token holds administrators for real.
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_UI_WindowsAndMessaging",
+    # Who may start the service, set at install and read back (D4).
+    "Win32_System_Services",
+    # The tray: dark menus, looked up by ordinal (D2), and the elevation prompt
+    # for stopping the service (D3).
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+] }
+# The firewall, through the COM API its own tools use (F-11). Already in the
+# graph through iroh; this is a direct use with the features the firewall needs.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+tray-icon = "0.24.2"
+# Named pipes. Preferred to a local TCP port because §7.3 warns that any page in
+# a browser can reach 127.0.0.1, and a pipe is not reachable that way at all.
+interprocess = { version = "2.4.4", features = ["tokio"] }
+# The control channel's access control is written as SDDL, and what parses SDDL
+# takes a wide string. Already in the tree under `interprocess`, which is what
+# takes the parsed descriptor.
+widestring = "1.2.1"
+
+[dev-dependencies]
+# A certificate for the TLS server the fetch test talks to. Already built for
+# the workspace, and generating one is the only way to know what the fetch was
+# supposed to return.
+rcgen = "0.14"
+# A relay in the test process, for the enrolment that crosses one.
+iroh-relay = { version = "1.1", features = ["server", "test-utils"] }
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

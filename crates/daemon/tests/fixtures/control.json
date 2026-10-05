@@ -1,0 +1,899 @@
+{
+  "outcomes": [
+    {
+      "Reported": {
+        "admin_refusal": null,
+        "could_stop_the_daemon": false,
+        "elsewhere": 0,
+        "may_stop_the_daemon": true,
+        "networks": [
+          {
+            "accused": [
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": 41,
+                  "does": {
+                    "Admits": {
+                      "id": "1b2c-3d4e-5f6a-7b8c",
+                      "name": "laptop"
+                    }
+                  }
+                },
+                "pairs": 2,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Revokes": {
+                      "id": "1b2c-3d4e-5f6a-7b8c",
+                      "name": "laptop"
+                    }
+                  }
+                }
+              }
+            ],
+            "address": "fd00::4",
+            "admin": true,
+            "confirmation": null,
+            "custody": "KeyStore",
+            "id": "3d4e-5f6a-7b8c-9d0e",
+            "ipv4": {
+              "Held": "100.64.0.4"
+            },
+            "label": "home",
+            "name": "pixel.home.internal",
+            "owner_taken": false,
+            "peers": [
+              {
+                "address": "fd00::2",
+                "id": "0a1b-2c3d-4e5f-6a7b",
+                "ipv4": {
+                  "Held": "100.64.0.2"
+                },
+                "last_contact": {
+                  "Recorded": {
+                    "at": {
+                      "nanos_since_epoch": 0,
+                      "secs_since_epoch": 1757700000
+                    }
+                  }
+                },
+                "name": "nas.home.internal",
+                "path": "Relay",
+                "reachable": true,
+                "standing": "Current"
+              },
+              {
+                "address": "fd00::7",
+                "id": "1b2c-3d4e-5f6a-7b8c",
+                "ipv4": {
+                  "Withheld": {
+                    "address": "192.168.1.7",
+                    "with": "the local subnet 192.168.1.0/24"
+                  }
+                },
+                "last_contact": "NoneRecorded",
+                "name": "laptop.home.internal",
+                "path": null,
+                "reachable": false,
+                "standing": "Current"
+              }
+            ],
+            "problem": {
+              "at": {
+                "nanos_since_epoch": 0,
+                "secs_since_epoch": 1757000100
+              },
+              "cause": "certificate not trusted",
+              "subsystem": "relay"
+            },
+            "relay": "https://relay.example:443",
+            "relay_leaving": {
+              "relay": "https://old-relay.example:443",
+              "until": {
+                "nanos_since_epoch": 0,
+                "secs_since_epoch": 1758300000
+              }
+            },
+            "relay_pinned": true,
+            "rendezvous": "https://meet.example",
+            "revoked": [
+              {
+                "device": {
+                  "id": "2c3d-4e5f-6a7b-8c9d",
+                  "name": null
+                },
+                "last_contact": "NoneRecorded",
+                "revocations": [
+                  {
+                    "by": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    },
+                    "reason": "stolen on the train",
+                    "signer_clock": {
+                      "At": {
+                        "time": {
+                          "nanos_since_epoch": 0,
+                          "secs_since_epoch": 1757000000
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "by": {
+                      "id": "1b2c-3d4e-5f6a-7b8c",
+                      "name": "laptop"
+                    },
+                    "reason": "lost",
+                    "signer_clock": "NotRecorded"
+                  }
+                ]
+              }
+            ],
+            "standing": "Current",
+            "tunnel": "Up",
+            "waiting": [
+              {
+                "does": {
+                  "Revokes": {
+                    "id": "2c3d-4e5f-6a7b-8c9d",
+                    "name": null
+                  }
+                },
+                "owed": [
+                  {
+                    "connected": true,
+                    "device": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    },
+                    "last_contact": {
+                      "Recorded": {
+                        "at": {
+                          "nanos_since_epoch": 0,
+                          "secs_since_epoch": 1757700000
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "connected": false,
+                    "device": {
+                      "id": "1b2c-3d4e-5f6a-7b8c",
+                      "name": "laptop"
+                    },
+                    "last_contact": "NoneRecorded"
+                  }
+                ],
+                "signed_here": {
+                  "At": {
+                    "time": {
+                      "nanos_since_epoch": 0,
+                      "secs_since_epoch": 1757000060
+                    }
+                  }
+                }
+              },
+              {
+                "does": "Founds",
+                "owed": [],
+                "signed_here": "NotRecorded"
+              },
+              {
+                "does": {
+                  "Promotes": [
+                    {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    },
+                    true
+                  ]
+                },
+                "owed": [],
+                "signed_here": "NotRecorded"
+              },
+              {
+                "does": {
+                  "Demotes": {
+                    "id": "0a1b-2c3d-4e5f-6a7b",
+                    "name": "nas"
+                  }
+                },
+                "owed": [],
+                "signed_here": "NotRecorded"
+              },
+              {
+                "does": {
+                  "Renames": [
+                    {
+                      "id": "1b2c-3d4e-5f6a-7b8c",
+                      "name": "laptop"
+                    },
+                    "tablet"
+                  ]
+                },
+                "owed": [],
+                "signed_here": "NotRecorded"
+              },
+              {
+                "does": "SetsParameters",
+                "owed": [],
+                "signed_here": "NotRecorded"
+              }
+            ],
+            "waiting_unlisted": 3
+          },
+          {
+            "accused": [
+              {
+                "device": {
+                  "id": "5f6a-7b8c-9d0e-1f2a",
+                  "name": "build-box"
+                },
+                "first": {
+                  "depth": 41,
+                  "does": {
+                    "Admits": {
+                      "id": "6a7b-8c9d-0e1f-2a3b",
+                      "name": "tablet"
+                    }
+                  }
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": 41,
+                  "does": {
+                    "Admits": {
+                      "id": "7b8c-9d0e-1f2a-3b4c",
+                      "name": "tablet"
+                    }
+                  }
+                }
+              }
+            ],
+            "address": null,
+            "admin": false,
+            "confirmation": "Stale",
+            "custody": "KeyStore",
+            "id": "4e5f-6a7b-8c9d-0e1f",
+            "ipv4": null,
+            "label": "work",
+            "name": null,
+            "owner_taken": false,
+            "peers": [
+              {
+                "address": "fd01::2",
+                "id": "5f6a-7b8c-9d0e-1f2a",
+                "ipv4": {
+                  "Collides": {
+                    "id": "6a7b-8c9d-0e1f-2a3b",
+                    "name": "tablet"
+                  }
+                },
+                "last_contact": {
+                  "Recorded": {
+                    "at": {
+                      "nanos_since_epoch": 0,
+                      "secs_since_epoch": 1757600000
+                    }
+                  }
+                },
+                "name": "build-box.work.internal",
+                "path": "Direct",
+                "reachable": true,
+                "standing": {
+                  "LastKnown": {
+                    "at": {
+                      "nanos_since_epoch": 0,
+                      "secs_since_epoch": 1757600000
+                    }
+                  }
+                }
+              }
+            ],
+            "problem": null,
+            "relay": null,
+            "relay_leaving": null,
+            "relay_pinned": false,
+            "rendezvous": null,
+            "revoked": [],
+            "standing": {
+              "LastKnown": {
+                "at": {
+                  "nanos_since_epoch": 0,
+                  "secs_since_epoch": 1757600000
+                }
+              }
+            },
+            "tunnel": "Down",
+            "waiting": [],
+            "waiting_unlisted": 0
+          }
+        ],
+        "note": "the other machine confirmed the relay",
+        "unusable": [
+          {
+            "cause": "IdentityWillNotOpen",
+            "label": "old"
+          }
+        ]
+      }
+    },
+    {
+      "Reported": {
+        "admin_refusal": null,
+        "could_stop_the_daemon": false,
+        "elsewhere": 1,
+        "may_stop_the_daemon": false,
+        "networks": [],
+        "note": "one network on this machine belongs to somebody else, and none to you",
+        "unusable": []
+      }
+    },
+    "Done",
+    {
+      "Admitting": {
+        "accepted": true,
+        "code": "418209",
+        "fingerprint": "AB:CD",
+        "proposed_name": "tablet",
+        "taken": {
+          "id": "0b0b-0b0b-0b0b-0b0b",
+          "name": "tablet"
+        }
+      }
+    },
+    "Enrolling",
+    {
+      "Joining": {
+        "payload": "peerfectly-join:abc",
+        "scannable": "▀▄"
+      }
+    },
+    {
+      "Adopted": {
+        "carrying": false,
+        "devices": 3,
+        "relay_confirmed": true,
+        "suffix": "studio.internal"
+      }
+    },
+    {
+      "Pinning": {
+        "der_len": 812,
+        "fingerprint": "D4:1E",
+        "moving": "home",
+        "relay": "https://relay.example:443"
+      }
+    },
+    {
+      "Declined": {
+        "message": "nothing was signed: signing was declined"
+      }
+    },
+    {
+      "NeedsSignatures": {
+        "id": "18f3a-2",
+        "items": [
+          {
+            "kind": "Operation",
+            "message": [
+              1,
+              2,
+              3
+            ],
+            "payload": [
+              161,
+              4
+            ]
+          },
+          {
+            "kind": "Snapshot",
+            "message": [
+              5
+            ],
+            "payload": [
+              162
+            ]
+          }
+        ],
+        "key": "peerfectly.casa.signing",
+        "network": "casa"
+      }
+    },
+    {
+      "NeedsKey": {
+        "id": "k18f3a",
+        "name": "peerfectly.casa.signing",
+        "network": "casa"
+      }
+    },
+    {
+      "OnlyAdmin": {
+        "network": "casa"
+      }
+    },
+    {
+      "NotAllowed": {
+        "message": "`casa` belongs to somebody else on this machine, and you are not authorised. Nothing about it was changed."
+      }
+    },
+    {
+      "Exposed": {
+        "rules": [
+          {
+            "network": "casa",
+            "port": 8000,
+            "protocol": "Tcp"
+          }
+        ]
+      }
+    },
+    {
+      "Failed": {
+        "left_behind": [
+          "a route"
+        ],
+        "message": "the adapter would not come up"
+      }
+    }
+  ],
+  "shown": [
+    [
+      "a\u0000b",
+      "a\\u{0000}b"
+    ],
+    [
+      "a\u0001b",
+      "a\\u{0001}b"
+    ],
+    [
+      "a\u0002b",
+      "a\\u{0002}b"
+    ],
+    [
+      "a\u0003b",
+      "a\\u{0003}b"
+    ],
+    [
+      "a\u0004b",
+      "a\\u{0004}b"
+    ],
+    [
+      "a\u0005b",
+      "a\\u{0005}b"
+    ],
+    [
+      "a\u0006b",
+      "a\\u{0006}b"
+    ],
+    [
+      "a\u0007b",
+      "a\\u{0007}b"
+    ],
+    [
+      "a\bb",
+      "a\\u{0008}b"
+    ],
+    [
+      "a\tb",
+      "a\\u{0009}b"
+    ],
+    [
+      "a\nb",
+      "a\\u{000a}b"
+    ],
+    [
+      "a\u000bb",
+      "a\\u{000b}b"
+    ],
+    [
+      "a\fb",
+      "a\\u{000c}b"
+    ],
+    [
+      "a\rb",
+      "a\\u{000d}b"
+    ],
+    [
+      "a\u000eb",
+      "a\\u{000e}b"
+    ],
+    [
+      "a\u000fb",
+      "a\\u{000f}b"
+    ],
+    [
+      "a\u0010b",
+      "a\\u{0010}b"
+    ],
+    [
+      "a\u0011b",
+      "a\\u{0011}b"
+    ],
+    [
+      "a\u0012b",
+      "a\\u{0012}b"
+    ],
+    [
+      "a\u0013b",
+      "a\\u{0013}b"
+    ],
+    [
+      "a\u0014b",
+      "a\\u{0014}b"
+    ],
+    [
+      "a\u0015b",
+      "a\\u{0015}b"
+    ],
+    [
+      "a\u0016b",
+      "a\\u{0016}b"
+    ],
+    [
+      "a\u0017b",
+      "a\\u{0017}b"
+    ],
+    [
+      "a\u0018b",
+      "a\\u{0018}b"
+    ],
+    [
+      "a\u0019b",
+      "a\\u{0019}b"
+    ],
+    [
+      "a\u001ab",
+      "a\\u{001a}b"
+    ],
+    [
+      "a\u001bb",
+      "a\\u{001b}b"
+    ],
+    [
+      "a\u001cb",
+      "a\\u{001c}b"
+    ],
+    [
+      "a\u001db",
+      "a\\u{001d}b"
+    ],
+    [
+      "a\u001eb",
+      "a\\u{001e}b"
+    ],
+    [
+      "a\u001fb",
+      "a\\u{001f}b"
+    ],
+    [
+      "a b",
+      "a b"
+    ],
+    [
+      "a~b",
+      "a~b"
+    ],
+    [
+      "ab",
+      "a\\u{007f}b"
+    ],
+    [
+      "ab",
+      "a\\u{0080}b"
+    ],
+    [
+      "ab",
+      "a\\u{0081}b"
+    ],
+    [
+      "ab",
+      "a\\u{0082}b"
+    ],
+    [
+      "ab",
+      "a\\u{0083}b"
+    ],
+    [
+      "ab",
+      "a\\u{0084}b"
+    ],
+    [
+      "ab",
+      "a\\u{0085}b"
+    ],
+    [
+      "ab",
+      "a\\u{0086}b"
+    ],
+    [
+      "ab",
+      "a\\u{0087}b"
+    ],
+    [
+      "ab",
+      "a\\u{0088}b"
+    ],
+    [
+      "ab",
+      "a\\u{0089}b"
+    ],
+    [
+      "ab",
+      "a\\u{008a}b"
+    ],
+    [
+      "ab",
+      "a\\u{008b}b"
+    ],
+    [
+      "ab",
+      "a\\u{008c}b"
+    ],
+    [
+      "ab",
+      "a\\u{008d}b"
+    ],
+    [
+      "ab",
+      "a\\u{008e}b"
+    ],
+    [
+      "ab",
+      "a\\u{008f}b"
+    ],
+    [
+      "ab",
+      "a\\u{0090}b"
+    ],
+    [
+      "ab",
+      "a\\u{0091}b"
+    ],
+    [
+      "ab",
+      "a\\u{0092}b"
+    ],
+    [
+      "ab",
+      "a\\u{0093}b"
+    ],
+    [
+      "ab",
+      "a\\u{0094}b"
+    ],
+    [
+      "ab",
+      "a\\u{0095}b"
+    ],
+    [
+      "ab",
+      "a\\u{0096}b"
+    ],
+    [
+      "ab",
+      "a\\u{0097}b"
+    ],
+    [
+      "ab",
+      "a\\u{0098}b"
+    ],
+    [
+      "ab",
+      "a\\u{0099}b"
+    ],
+    [
+      "ab",
+      "a\\u{009a}b"
+    ],
+    [
+      "ab",
+      "a\\u{009b}b"
+    ],
+    [
+      "ab",
+      "a\\u{009c}b"
+    ],
+    [
+      "ab",
+      "a\\u{009d}b"
+    ],
+    [
+      "ab",
+      "a\\u{009e}b"
+    ],
+    [
+      "ab",
+      "a\\u{009f}b"
+    ],
+    [
+      "a b",
+      "a b"
+    ],
+    [
+      "a؛b",
+      "a؛b"
+    ],
+    [
+      "a؜b",
+      "a\\u{061c}b"
+    ],
+    [
+      "a؝b",
+      "a؝b"
+    ],
+    [
+      "a b",
+      "a b"
+    ],
+    [
+      "a​b",
+      "a\\u{200b}b"
+    ],
+    [
+      "a‌b",
+      "a\\u{200c}b"
+    ],
+    [
+      "a‍b",
+      "a\\u{200d}b"
+    ],
+    [
+      "a‎b",
+      "a\\u{200e}b"
+    ],
+    [
+      "a‏b",
+      "a\\u{200f}b"
+    ],
+    [
+      "a‐b",
+      "a‐b"
+    ],
+    [
+      "a b",
+      "a\\u{2029}b"
+    ],
+    [
+      "a‪b",
+      "a\\u{202a}b"
+    ],
+    [
+      "a‫b",
+      "a\\u{202b}b"
+    ],
+    [
+      "a‬b",
+      "a\\u{202c}b"
+    ],
+    [
+      "a‭b",
+      "a\\u{202d}b"
+    ],
+    [
+      "a‮b",
+      "a\\u{202e}b"
+    ],
+    [
+      "a b",
+      "a b"
+    ],
+    [
+      "a⁥b",
+      "a⁥b"
+    ],
+    [
+      "a⁦b",
+      "a\\u{2066}b"
+    ],
+    [
+      "a⁧b",
+      "a\\u{2067}b"
+    ],
+    [
+      "a⁨b",
+      "a\\u{2068}b"
+    ],
+    [
+      "a⁩b",
+      "a\\u{2069}b"
+    ],
+    [
+      "a⁪b",
+      "a⁪b"
+    ],
+    [
+      "a b",
+      "a b"
+    ],
+    [
+      "a⁠b",
+      "a\\u{2060}b"
+    ],
+    [
+      "a⁡b",
+      "a\\u{2061}b"
+    ],
+    [
+      "a⁢b",
+      "a\\u{2062}b"
+    ],
+    [
+      "a⁣b",
+      "a\\u{2063}b"
+    ],
+    [
+      "a⁤b",
+      "a\\u{2064}b"
+    ],
+    [
+      "a⁥b",
+      "a⁥b"
+    ],
+    [
+      "a﻾b",
+      "a﻾b"
+    ],
+    [
+      "a﻿b",
+      "a\\u{feff}b"
+    ],
+    [
+      "a＀b",
+      "a＀b"
+    ],
+    [
+      "a‧b",
+      "a‧b"
+    ],
+    [
+      "a b",
+      "a\\u{2028}b"
+    ],
+    [
+      "a b",
+      "a\\u{2029}b"
+    ],
+    [
+      "a‪b",
+      "a\\u{202a}b"
+    ],
+    [
+      "laptop",
+      "laptop"
+    ],
+    [
+      "città",
+      "città"
+    ],
+    [
+      "東京",
+      "東京"
+    ],
+    [
+      "back\\slash",
+      "back\\\\slash"
+    ],
+    [
+      "\\u{202e}",
+      "\\\\u{202e}"
+    ],
+    [
+      "emoji 🛰 ok",
+      "emoji 🛰 ok"
+    ],
+    [
+      "lаptop",
+      "lаptop"
+    ],
+    [
+      "‮pot‬",
+      "\\u{202e}pot\\u{202c}"
+    ]
+  ]
+}

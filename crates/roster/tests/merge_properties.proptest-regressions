@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b7874d79dc400ba95f02980c5dc5aeff92394de3bcdb56be47bdc80c8cf472a6 # shrinks to steps = [AddMember(2), AddMember(7), AddMember(4), AddMember(3), AddMember(2), Promote(3), Rename(4, 0), Promote(2)], branch_at = 0
+cc 84e3f754ea574c1288b9cfb0dff55e023f176355bccaf96354cdf001d0fc60a0 # shrinks to steps = [Rename(2, 0), AddMember(2), Rename(2, 0), AddMember(3), Rename(2, 0), Revoke(2), SetNetwork(0)], branch_at = 0, seed = 88320871742183016
+cc 40311271558825ce636606196a88930a5e214d3ea3cd45da7c55dd8cd265f68e # shrinks to steps = [Rename(2, 0), AddMember(5), Rename(2, 0), AddMember(4), Rename(2, 0), Demote(4), SetNetwork(0)], branch_at = 0
+cc 584ebb906f0a84886e0ecef565397c0cb5357f73059c3dd2c3843e9c6bbbd4e0 # shrinks to steps = [AddAdmin(3), Rename(2, 0), AddMember(3), AddMember(3), AddMember(3), AddMember(2), AddMember(5), Rename(5, 0), AddMember(2), AddMember(4)], branch_at = 5
+cc 0c224ad95693789b7ea2b12f7f730a864ed3ef8b016f5d72b1947c5c477135b5 # shrinks to steps = [AddMember(3), Rename(2, 0), AddMember(3), Rename(4, 0), Revoke(3), Demote(3), AddMember(2), AddMember(4)], branch_at = 1
+cc b22fe8cb2e83e746874f642900165d03dd9168cff3366d04adb9dc66245656d9 # shrinks to steps = [AddMember(2), AddMember(5), Rename(3, 0), AddMember(5), Revoke(5), Revoke(5), AddMember(2), AddMember(3)], branch_at = 2

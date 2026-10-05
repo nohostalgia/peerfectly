@@ -1,0 +1,46 @@
+[package]
+name = "rendezvous-server"
+description = "The rendezvous as a program: the library's service, over TLS, on an address it is given."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "peerfectly-rendezvous"
+path = "src/main.rs"
+
+[dependencies]
+# The service itself. This crate only puts it on a socket, so the library the
+# phone builds carries no server dependency.
+rendezvous = { path = "../rendezvous" }
+# The same HTTP stack the library's router is written for, now with the part
+# that serves it. Already in the lockfile.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# TLS, with `ring` as the rest of the workspace uses it; already in the lockfile
+# through iroh. No `aws-lc-rs`: it needs a C toolchain in the image.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# PEM to DER, as `daemon` reads a relay's certificate.
+rustls-pki-types = { version = "1.15", features = ["std"] }
+# Not used by this program. Here so that the image can build `iroh-relay`'s own
+# binary from **this workspace's lockfile** — `cargo install` would resolve its
+# dependencies afresh — with the `server` feature it needs, which Cargo only lets
+# a workspace member ask for. See `deploy/server/Dockerfile`.
+iroh-relay = { version = "=1.1.0", features = ["server"], optional = true }
+
+[features]
+relay-binary = ["dep:iroh-relay"]
+
+[dev-dependencies]
+# A certificate for the server under test, as `windows-daemon`'s TLS tests make one.
+rcgen = "0.14"
+identity = { path = "../identity" }
+roster = { path = "../roster" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

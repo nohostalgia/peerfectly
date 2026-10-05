@@ -1,0 +1,37 @@
+# The relay's configuration: a generic default, copied into the image as
+# /etc/peerfectly/relay.toml. Mount your own file there to replace it.
+#
+# The certificate's paths are placeholders. The entrypoint puts in PEERFECTLY_CERT and
+# PEERFECTLY_KEY, which the rendezvous reads as well, so both serve one certificate.
+# Keys are those of iroh-relay 1.1.0.
+
+enable_relay = true
+# QUIC address discovery: how a device learns the address the internet sees it
+# at, which is what lets two devices find a direct path. Asked on the relay's own
+# port, so it shares the HTTPS port.
+enable_quic_addr_discovery = true
+# Off: a metrics endpoint is one more listening port, and it names connections.
+enable_metrics = false
+# Plain HTTP only for captive-portal checks. Published as 80 on the host.
+http_bind_addr = "[::]:8080"
+
+# Who may use the relay. Open, stated rather than defaulted, and bounded below.
+# An allowlist is a later change.
+access = "everyone"
+
+[tls]
+https_bind_addr = "[::]:8443"
+quic_bind_addr = "[::]:8443"
+cert_mode = "Manual"
+manual_cert_path = "@PEERFECTLY_CERT@"
+manual_key_path = "@PEERFECTLY_KEY@"
+
+[limits]
+# New connections a second, and how many may arrive at once.
+accept_conn_limit = 5.0
+accept_conn_burst = 50
+
+[limits.client.rx]
+# Per client: about 20 Mbit/s sustained, with room for a burst.
+bytes_per_second = 2_500_000
+max_burst_bytes = 10_000_000

@@ -1,0 +1,20 @@
+[package]
+name = "enrollment"
+description = "How a device that belongs to no network becomes a member of one."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roster = { path = "../roster" }
+identity = { path = "../identity" }
+# The domain-separated derivations: the confirmation code, and the input the
+# joining device signs to prove it holds the key its identity comes from.
+blake3.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

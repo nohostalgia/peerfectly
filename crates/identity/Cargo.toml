@@ -1,0 +1,33 @@
+[package]
+name = "identity"
+description = "How a node obtains, holds and uses the keys that make it a device."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roster = { path = "../roster" }
+# The same curve implementation the roster verifies with, so a key store's
+# encodings are read here rather than by each platform; `pkcs8` is what reads
+# a SubjectPublicKeyInfo.
+p256 = { workspace = true, features = ["pkcs8"] }
+minicbor.workspace = true
+getrandom.workspace = true
+# A signing key sealed with a passphrase (`passphrase`): Argon2id stretches it,
+# ChaCha20-Poly1305 seals under the result. The cipher is already in the tree
+# through iroh; Argon2 is new, and only its raw derivation is used — no
+# password-hash strings.
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

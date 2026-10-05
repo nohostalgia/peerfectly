@@ -1,0 +1,4 @@
+# Shell scripts run inside Linux containers from a Windows checkout. A CR in a
+# shebang makes the interpreter "not found", which reports as exit code 127 and
+# looks nothing like a line-ending problem.
+*.sh text eol=lf

@@ -1,0 +1,23 @@
+[package]
+name = "cli"
+description = "The command line on any platform: every command's flow, and what is signed read off the bytes and checked. A platform gives it a channel and custody."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The protocol, the report's views, and the rules the command line reads.
+daemon = { path = "../daemon" }
+# Reading what is about to be signed off the bytes themselves.
+roster = { path = "../roster" }
+async-trait.workspace = true
+# `signal`: Ctrl+C on a waiting join abandons it in the daemon too.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+
+[dev-dependencies]
+# Operations to read, signed as a device would.
+identity = { path = "../identity" }
+
+[lints]
+workspace = true

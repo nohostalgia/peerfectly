@@ -1,0 +1,72 @@
+[package]
+name = "transport-iroh"
+description = "The iroh binding: what the transport interface looks like over a real network."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Lets a node accept a relay presenting a self-signed certificate. Exists only so
+# the tests can run a relay in-process; a build without this feature has no way
+# to reach the code at all, which is the point.
+insecure-test-relay = ["iroh/test-utils"]
+
+[dependencies]
+roster = { path = "../roster" }
+transport = { path = "../transport" }
+identity = { path = "../identity" }
+# `unstable-custom-transports` is what exposes the path selector. Choosing the
+# path is the only place a path can be refused: `iroh` enumerates the machine's
+# interfaces itself to find candidates, finds the tunnel adapter this session
+# carries among them, and its one address filter (`Builder::addr_filter`) applies
+# to address-lookup services this binding does not use.
+#
+# The feature is documented as outside semantic versioning and may change in any
+# release. Everything that names a type from behind it lives in `paths.rs` and
+# the line of the builder that installs it, so a release that withdraws it breaks
+# those and nothing else — and the per-path timeouts beside it are stable API and
+# keep bounding the damage on their own.
+iroh = { version = "1.1", features = ["unstable-custom-transports"] }
+# For `RelayQuicConfig`, which `iroh` does not re-export. Needed to set the
+# address-discovery port to match the relay's own, rather than the library
+# default of 7842 — see the note in `node.rs`.
+iroh-relay = "1.1"
+# For `CertificateDer`, the type a pinned relay certificate has to become. The
+# same crate `iroh-relay` builds its trust store from, so the version has to
+# track it.
+rustls-pki-types = "1.15"
+# The enrolment endpoint verifies a relay certificate the ordinary way first and
+# accepts one on sight only when that fails, which needs a verifier of our own.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The roots that "the ordinary way" means, so a relay with a publicly signed
+# certificate needs no ceremony from a person.
+webpki-roots = "1"
+# A relay's host, to choose its verifier by during a move. Already in the tree
+# under `iroh`, whose relay URLs are `url::Url` underneath.
+url = "2.5"
+async-trait.workspace = true
+tokio.workspace = true
+# The byte buffer a QUIC datagram is sent as.
+bytes = "1"
+
+[dev-dependencies]
+proptest.workspace = true
+# Depending on itself with the feature on is what makes `cargo test` enable it
+# without a flag, while an ordinary build still cannot see it.
+transport-iroh = { path = ".", features = ["insecure-test-relay"] }
+# The relay used by the tests runs in-process on localhost. A test that reached
+# a relay on the public internet would be reporting on somebody else's network.
+iroh = { version = "1.1", features = ["test-utils"] }
+# A relay configured here rather than by `iroh::test_utils`, which throws away
+# the certificate it generated. Pinning that certificate is the whole point of
+# the test that uses this.
+iroh-relay = { version = "1.1", features = ["server", "test-utils"] }
+# Two certificates for two relay hosts, to hold the by-host verifier to each
+# relay keeping its own rule. Already in the tree for the daemon's tests.
+rcgen = "0.14"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

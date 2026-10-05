@@ -1,0 +1,42 @@
+# The relay and the rendezvous, as two containers from one image.
+#
+#   docker compose -f deploy/server/compose.yaml up -d --build
+#
+# The certificate and key are read from PEERFECTLY_CERT_DIR on the host (default
+# /etc/peerfectly/certs), mounted read-only. Which files in it are used is one
+# setting for both services, PEERFECTLY_CERT and PEERFECTLY_KEY, defaulted in the image.
+
+x-hardened: &hardened
+  image: peerfectly-server
+  build:
+    context: ../..
+    dockerfile: deploy/server/Dockerfile
+  # User and group both: the key is readable by group 10001 and nobody else.
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:size=1m,mode=1777
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  environment:
+    # warn: at info and below the relay names connecting nodes.
+    RUST_LOG: warn
+  volumes:
+    - ${PEERFECTLY_CERT_DIR:-/etc/peerfectly/certs}:/etc/peerfectly/certs:ro
+
+services:
+  relay:
+    <<: *hardened
+    command: ["relay-entrypoint"]
+    ports:
+      - "80:8080/tcp"
+      - "443:8443/tcp"
+      - "443:8443/udp"
+
+  rendezvous:
+    <<: *hardened
+    command: ["peerfectly-rendezvous"]
+    ports:
+      - "8444:8444/tcp"

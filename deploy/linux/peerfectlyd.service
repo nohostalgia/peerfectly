@@ -1,0 +1,79 @@
+# The peerfectly daemon, as a systemd service.
+#
+# Installed by install.sh, which comes beside it in the archive package.sh
+# builds: it checks what the daemon needs, puts the programs in /usr/local/bin
+# and this file in /etc/systemd/system, and enables and starts it.
+#
+#   sudo ./install.sh
+#
+# Every setting below either gives the daemon something it needs, with the
+# reason beside it, or takes away something it does not. Drop-ins a machine adds
+# can change any of it: this is the default, not a guarantee.
+
+[Unit]
+Description=peerfectly daemon
+# Names are routed through systemd-resolved when it is there; the daemon comes
+# up without it, and says so.
+Wants=network-online.target
+After=network-online.target systemd-resolved.service
+
+[Service]
+# In the foreground: that is the only way it runs.
+ExecStart=/usr/local/bin/peerfectlyd
+Restart=on-failure
+# `systemctl stop` is a SIGTERM, and the daemon takes every network down before
+# it exits. Time enough for that, and no more.
+TimeoutStopSec=30
+
+# /var/lib/peerfectly, root's and closed: the networks, their keys, the record of
+# what is exposed. The daemon checks the mode itself and refuses a looser one.
+StateDirectory=peerfectly
+StateDirectoryMode=0700
+# /run/peerfectly: the control socket and the lock that makes this the only daemon.
+# Anybody may connect; what each may do is decided per command.
+RuntimeDirectory=peerfectly
+RuntimeDirectoryMode=0755
+
+# Root, with two capabilities and no others:
+#   CAP_NET_ADMIN         the TUN device, addresses and routes over netlink,
+#                         and the nftables table;
+#   CAP_NET_BIND_SERVICE  the resolver, on port 53 of this device's overlay
+#                         address.
+# Reading who is calling needs neither: /proc/<pid>/status is anybody's.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Nothing on the machine is written but the two directories above.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+# What it creates is its own: every file it writes sets its mode, and this is
+# the net under that.
+UMask=0077
+# No system-call filter: the TUN ioctl, netlink and flock are all in the usual
+# groups, but a filter that is one call short fails as a daemon that will not
+# bring a network up, and that is not a trade this default makes blind.
+# AF_UNIX: the control socket, and D-Bus for resolvectl. AF_INET and AF_INET6:
+# the transport and the resolver. AF_NETLINK: addresses, routes and nftables.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# The devices it opens, and no others: the TUN device, and the TPM, which it
+# asks at start whether it can hold keys and loads keys into to check them.
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+DeviceAllow=/dev/tpmrm0 rw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+# What the build does not need: build output, the phone, history, and anything
+# that could be a key.
+target
+android
+.git
+**/*.key
+**/*.pem
+**/*.p12

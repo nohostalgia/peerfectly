@@ -1,0 +1,50 @@
+[package]
+name = "linux-daemon"
+description = "The node as a program on Linux: the packet device, the routes, the names, the firewall, the control socket and the key store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Every decision this crate makes real, as for `windows-daemon`: nothing in
+# `daemon` knows this crate exists.
+daemon = { path = "../daemon" }
+# The command line's logic, which this crate's `peerfectly` gives a socket and custody.
+cli = { path = "../cli" }
+identity = { path = "../identity" }
+roster = { path = "../roster" }
+tunnel = { path = "../tunnel" }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "io-util", "time", "sync"] }
+serde_json.workspace = true
+# What the TPM signs is a SHA-256 digest, and the key's authorisation value is
+# one: ECDSA over P-256 fixes the hash. Already in the tree.
+sha2 = "0.11"
+# A passphrase is cleared from memory once used.
+zeroize.workspace = true
+# The daemon's log on standard error, where systemd puts it in the journal.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The TUN `ioctl`: the one call in this crate with no safe wrapper.
+libc = "0.2.189"
+# A passphrase read without echo, and the effective uid, with no `unsafe`.
+# Already in the tree.
+rustix = { version = "1.1.4", features = ["termios", "process", "fs"] }
+# Addresses, routes and the link. Already in the tree, through
+# `netdev` and `netwatch`: this is the newest set of the three that agree.
+netlink-packet-core = "0.9.0"
+netlink-packet-route = "0.33.0"
+netlink-sys = "0.9.0"
+# The TPM: the Parsec project's binding over the TCG's own ESAPI.
+# It links the system's `libtss2-esys`, so the Linux programs need it installed.
+tss-esapi = "7.7.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+
+[lints]
+workspace = true

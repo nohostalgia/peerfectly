@@ -1,0 +1,24 @@
+[package]
+name = "roster"
+description = "Signed operation log for the overlay network: canonical encoding, identifiers, and signature envelope."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+minicbor.workspace = true
+blake3.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+p256.workspace = true
+signature.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+

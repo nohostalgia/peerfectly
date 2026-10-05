@@ -1,0 +1,32 @@
+[package]
+name = "rendezvous"
+description = "Where a device says it can be reached: a signed record, a monotone sequence, and a service that authenticates nobody."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roster = { path = "../roster" }
+identity = { path = "../identity" }
+# Already in this workspace's lockfile, pulled in by iroh for the relay's own
+# HTTP server. Choosing anything else would add a second HTTP stack to a project
+# that already compiles this one.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+# Also already in the lockfile via iroh. rustls rather than the platform's TLS,
+# because the rest of the workspace already builds rustls and a second TLS stack
+# would be a second thing to keep current.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio.workspace = true
+# The seal (F-12): the same construction local discovery uses, under its own
+# context. All three are already in the workspace through local discovery.
+blake3.workspace = true
+chacha20poly1305 = "0.11"
+getrandom.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints]
+workspace = true

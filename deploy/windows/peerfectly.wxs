@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Windows installer: peerfectlyd.exe, peerfectly.exe, peerfectly-tray.exe and wintun.dll in
+  %ProgramFiles%\peerfectly, the service registered and started, `peerfectly` on the
+  system PATH, and the tray in the Start menu.
+
+  Built by package.ps1 beside this file, which passes:
+    Version  the workspace version
+    Stage    the folder holding the files to pack, already checked
+
+  Why the service is not a <ServiceInstall>: the daemon registers itself with
+  `peerfectlyd install`, which also sets who may start and stop it, and that is
+  tested where it is written (crates/windows-daemon/src/service.rs). A second
+  definition here would drift from it. So the installer runs the installed
+  program to register, and lets Windows stop and delete the entry on removal.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="peerfectly"
+           Manufacturer="peerfectly"
+           Version="$(Version)"
+           UpgradeCode="83ED9DA4-CE99-4BF8-9510-4DBF84425847"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <!-- A newer package removes the older one first: the service is stopped
+         and unregistered and the programs go, then the new ones are installed
+         and registered. The networks under %ProgramData%\peerfectly are not the
+         installer's and are never touched. The same version installs over
+         itself, so a rebuild can be tried without uninstalling. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer peerfectly is already installed. Uninstall it first to install this one." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- %ProgramFiles%: writable only by the system and administrators, which is
+         what lets the daemon start without the override. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="peerfectly" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <ComponentGroup Id="Programs" Directory="INSTALLFOLDER">
+      <Component Id="Daemon">
+        <File Id="peerfectlyd.exe" Source="$(Stage)\peerfectlyd.exe" KeyPath="yes" />
+        <!-- Stopped before its files are replaced or removed, started once it
+             is registered, and its entry deleted when the product goes.
+             Windows skips a stop or a delete for a service that is not there. -->
+        <ServiceControl Id="Service" Name="peerfectly" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+
+      <Component Id="CommandLine">
+        <File Id="peerfectly.exe" Source="$(Stage)\peerfectly.exe" KeyPath="yes" />
+        <!-- `peerfectly` from any console. Removed with the product. -->
+        <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" Permanent="no" />
+      </Component>
+
+      <!-- The tray: a desktop program, so no console opens with it. -->
+      <Component Id="Tray">
+        <File Id="peerfectly_tray.exe" Name="peerfectly-tray.exe" Source="$(Stage)\peerfectly-tray.exe" KeyPath="yes">
+          <!-- For every person on the machine. Its first start writes the
+               person's own entry to start it at login; the installer writes
+               nothing under any person's key. Advertised, which is the form
+               Windows Installer keeps with the program itself: a plain shortcut
+               in the Start menu is read as per-user data (ICE43, ICE57) even in
+               a per-machine package. -->
+          <Shortcut Id="Tray" Directory="ProgramMenuFolder" Name="peerfectly" Description="The peerfectly icon in the notification area"
+                    WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
+      </Component>
+
+      <!-- Loaded only from beside peerfectlyd.exe, and only if the daemon's pins and
+           the signature check accept it; package.ps1 asked that same check
+           before packing it. -->
+      <Component Id="Driver">
+        <File Id="wintun.dll" Source="$(Stage)\wintun.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="DriverLicence">
+        <File Id="wintun_LICENSE.txt" Name="wintun-LICENSE.txt" Source="$(Stage)\wintun-LICENSE.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="peerfectly" Level="1">
+      <ComponentGroupRef Id="Programs" />
+    </Feature>
+
+    <!-- Registering. Deferred and not impersonated, so it runs as the system,
+         after the files are in place and before Windows starts the service.
+
+         1. `peerfectlyd uninstall`, result ignored: removes a registration left from
+            a build directory, which `install` alone would keep pointing there.
+            With nothing registered it fails, harmlessly.
+         2. `peerfectlyd install`, result checked: a failure rolls the install back.
+            Its rollback partner, scheduled before it, unregisters again. -->
+    <SetProperty Id="UnregisterEarlier" Value="&quot;[#peerfectlyd.exe]&quot; uninstall" Before="UnregisterEarlier" Sequence="execute" />
+    <CustomAction Id="UnregisterEarlier" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <SetProperty Id="UnregisterOnRollback" Value="&quot;[#peerfectlyd.exe]&quot; uninstall" Before="UnregisterOnRollback" Sequence="execute" />
+    <CustomAction Id="UnregisterOnRollback" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+
+    <SetProperty Id="Register" Value="&quot;[#peerfectlyd.exe]&quot; install" Before="Register" Sequence="execute" />
+    <CustomAction Id="Register" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="UnregisterEarlier" After="InstallServices" Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="UnregisterOnRollback" After="UnregisterEarlier" Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="Register" After="UnregisterOnRollback" Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
+    </InstallExecuteSequence>
+
+    <!-- The dialogs: a notice, progress, and a last page offering to open the
+         tray. Opened through its Start-menu shortcut, which carries the `tray`
+         argument, from the dialog sequence, which runs as the person and not
+         elevated. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)notice.rtf" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open peerfectly in the notification area" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <SetProperty Id="WixShellExecTarget" Value="[ProgramMenuFolder]peerfectly.lnk" After="CostFinalize" Sequence="ui" />
+    <CustomAction Id="OpenTray" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="OpenTray"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+  </Package>
+</Wix>
