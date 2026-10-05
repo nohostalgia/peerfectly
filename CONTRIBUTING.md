@@ -22,18 +22,40 @@ protocol change, and two versions stop talking to each other.
 
 ## Building and testing
 
-You need Rust 1.91 or later. Before you push:
+You need [rustup](https://rustup.rs/). `rust-toolchain.toml` pins the Rust every build uses, and
+rustup installs it the first time you run `cargo` here. Before you push:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+On Linux, add `--exclude windows-daemon` to the last two, and install `libtss2-dev` and
+`pkg-config` first.
 
 Clippy runs with the workspace's lints, and a few of them deny rather than warn: no `unwrap`, no
 `panic!`, no unchecked indexing or arithmetic outside tests. The Linux daemon's tests that need a
 kernel, a TPM and root are `#[ignore]`d. They run in the Docker testbed under
 `crates/linux-daemon/testbed/`.
+
+## What CI checks
+
+Every pull request runs [`ci.yml`](.github/workflows/ci.yml), and its jobs are required: a pull
+request with one of them red isn't merged.
+
+| Job | What it runs |
+|---|---|
+| `fmt` | `cargo fmt --all --check` |
+| `windows` | clippy with warnings as errors, and the tests, the whole workspace |
+| `linux` | the same without `windows-daemon` |
+| `deny` | [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) against [`deny.toml`](deny.toml): licences, RustSec advisories, and crates.io as the only source |
+| `secrets` | [`gitleaks`](https://github.com/gitleaks/gitleaks) on the tree, and on every commit the pull request adds |
+
+A new dependency has to come from crates.io under a licence `deny.toml` allows. If it needs one that
+isn't there, say so in the pull request: the list is short on purpose, and every entry is compatible
+with the AGPL. A test string that looks like a secret and isn't takes an inline `gitleaks:allow`
+comment.
 
 ## What a good pull request looks like here
 

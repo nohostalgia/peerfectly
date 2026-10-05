@@ -4,6 +4,7 @@ description = "The interface a connectivity layer must satisfy, and what an auth
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

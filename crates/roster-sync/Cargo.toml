@@ -4,6 +4,7 @@ description = "How two nodes reconcile their rosters over an authenticated sessi
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

@@ -1,0 +1,62 @@
+# What every dependency must satisfy, checked by `cargo deny check` on every
+# pull request.
+
+[graph]
+# Every target the project builds for: Windows and Linux daemons share a tree,
+# and a dependency only one of them pulls in still ships.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# The RustSec database. A known vulnerability or unsoundness fails the check.
+# An advisory accepted on purpose goes in `ignore` with its id and the reason,
+# never silently.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Licences compatible with shipping the project under the AGPL-3.0-or-later,
+# and nothing that is not in the tree: a licence nobody uses is not on this list.
+# Most crates are dual-licensed, and one acceptable option is enough.
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # minicbor, the canonical CBOR encoder: a permissive licence.
+    "BlueOak-1.0.0",
+    "CC0-1.0",
+    # webpki-roots: the Mozilla root certificates, as data.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # attohttpc and option-ext: file-level copyleft, compatible with the AGPL.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Several versions of one crate come in through iroh. That costs build time,
+# not safety, so it warns.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own crates depend on each other by path, with no version. That
+# is allowed only because none of them is published (`publish = false`).
+allow-wildcard-paths = true
+
+[sources]
+# crates.io and nothing else: no other registry, and no git dependency.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,9 @@
+# The workflows pin every action by commit, so nothing moves on its own. This
+# proposes each update as a pull request, with the new commit and its version,
+# and CI runs on it like on any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

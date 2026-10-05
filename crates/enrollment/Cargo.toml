@@ -4,6 +4,7 @@ description = "How a device that belongs to no network becomes a member of one."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

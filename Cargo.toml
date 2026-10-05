@@ -25,6 +25,9 @@ members = [
 edition = "2024"
 version = "0.1.0"
 license = "AGPL-3.0-or-later"
+# Built and shipped from here, as programs and packages; none of the crates
+# goes to crates.io, and they depend on each other by path.
+publish = false
 # 1.91 because `iroh` 1.1 and its tree require it — `iroh-base`, `iroh-dns`,
 # `netwatch` and `portmapper` all declare it. The value here was 1.85 and was
 # simply untrue: it only ever showed up when building on a toolchain older than

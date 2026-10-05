@@ -4,6 +4,7 @@ description = "The node as a program: what it decides, what it answers, and the 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

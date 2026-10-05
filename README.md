@@ -68,15 +68,13 @@ The exact formats are written down next to the code that reads them: see the `FO
 
 ### Install
 
-Prebuilt packages will be published on the
-[Releases](https://github.com/nohostalgia/peerfectly/releases) page. Until then, build them
-yourself as below.
+Download the package for your machine from the
+[Releases](https://github.com/nohostalgia/peerfectly/releases) page, together with `SHA256SUMS`.
 
-**Windows.** Build the installer with `.\deploy\windows\package.ps1`, then run the `.msi` it writes
-to `target\dist\`. It isn't code-signed yet, so SmartScreen will warn: *More info → Run anyway*.
+**Windows.** Run the `.msi`. It isn't code-signed yet, so SmartScreen will warn that the publisher
+is unknown: *More info → Run anyway*.
 
-**Linux.** Build the archive with `deploy/linux/package.sh` (it needs Docker), copy it to the
-machine, check its SHA-256 against `target/dist/SHA256SUMS`, and run:
+**Linux.** Unpack the archive and run its install script:
 
 ```sh
 tar xzf peerfectly-0.1.0-linux-x86_64.tar.gz
@@ -85,6 +83,21 @@ sudo ./peerfectly-0.1.0-linux-x86_64/install.sh
 
 The script checks everything it needs before it writes anything, and tells you which packages are
 missing.
+
+**Checking what you downloaded.** Before you install, compare the file's digest with its line in
+`SHA256SUMS`: `sha256sum -c SHA256SUMS --ignore-missing` on Linux, or
+`(Get-FileHash <file>).Hash` on Windows, which prints the same digest in capitals.
+
+Every package also carries a provenance attestation: a record, signed by GitHub, of which workflow
+built it, from which commit, on which runner. To check that a file came out of this repository's
+release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify peerfectly-0.1.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+```
+
+That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
+it won't quiet SmartScreen.
 
 ### A network in four commands
 
@@ -124,7 +137,8 @@ machine need an elevated console. On Linux, anything that signs needs `sudo`.
 
 ## Building from source
 
-Rust 1.91 or later, then:
+With [rustup](https://rustup.rs/), which installs the Rust that `rust-toolchain.toml` pins, the
+one CI and the releases build with:
 
 ```sh
 cargo build --release -p programs
@@ -134,6 +148,10 @@ cargo test --workspace
 The programs are `peerfectlyd` (the daemon), `peerfectly` (the command line) and, on Windows,
 `peerfectly-tray`. On Linux the TPM support links the system's TSS: install `libtss2-dev` (Debian,
 Ubuntu) or `tpm2-tss-devel` (Fedora) to build, and `nftables` to run.
+
+The packages are built by the same scripts the release workflow runs:
+`.\deploy\windows\package.ps1` writes the `.msi` to `target\dist\`, and `deploy/linux/package.sh`
+(it needs Docker) writes the Linux archive there. Both add their line to `target/dist/SHA256SUMS`.
 
 ## Finding your way around
 
