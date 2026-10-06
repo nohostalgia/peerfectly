@@ -35,6 +35,18 @@ jobs:
       # rustup reads the version and components from `rust-toolchain.toml`.
       - run: rustup toolchain install
       - run: cargo fmt --all --check
+      # A script added from Windows lands in git without its executable bit, and
+      # then `./script.sh` fails on every Linux checkout, the release's included.
+      - name: Shell scripts are executable
+        run: |
+          status=0
+          while read -r mode _ _ path; do
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$path::$path is not executable in git: git update-index --chmod=+x $path"
+              status=1
+            fi
+          done < <(git ls-files -s -- '*.sh')
+          exit "$status"
 
   windows:
     runs-on: windows-latest
