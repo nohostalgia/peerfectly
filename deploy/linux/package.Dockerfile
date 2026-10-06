@@ -24,9 +24,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/peerfectlyd target/release/peerfectly /out/
 
 FROM build AS pack
+# The version is read with its CR removed: a Windows checkout has CRLF in
+# Cargo.toml, and a CR in the archive's name is a file Windows cannot write.
 RUN set -eu; \
     version=$(awk '/^\[workspace.package\]/ { inside = 1; next } /^\[/ { inside = 0 } \
-                   inside && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml); \
+                   inside && $1 == "version" { gsub(/["\r]/, "", $3); print $3; exit }' Cargo.toml); \
     floor=$(objdump -T /out/peerfectlyd /out/peerfectly | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' \
             | sort -uV | tail -n 1); \
     name="peerfectly-$version-linux-x86_64"; \
