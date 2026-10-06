@@ -1,1 +1,5 @@
 /target
+
+# A server operator's own settings, beside the compose file (deploy/server/README.md).
+/deploy/server/.env
+/deploy/server/*.local.*

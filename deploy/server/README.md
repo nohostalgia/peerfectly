@@ -1,133 +1,203 @@
-# The server: relay and rendezvous
+# The peerfectly server
 
-One image, two containers:
+Devices in a peerfectly network talk to each other directly whenever they can. This server is what
+they lean on when they can't. It's two small services, built into one image and run as two
+containers:
 
-- **`relay`** — `iroh-relay` 1.1.0, built from this workspace's lockfile. It carries traffic between devices that cannot reach each other directly, and tells each device the address the internet sees it at.
-- **`rendezvous`** — `peerfectly-rendezvous`. It holds each device's sealed, signed record of where it can be reached.
+- **`relay`**: [`iroh-relay`](https://github.com/n0-computer/iroh), the exact version the rest of
+  the workspace is tested against. It forwards traffic between devices that can't reach each other
+  directly, for example both behind strict NATs, and tells each device the address the internet sees
+  it at, which is what lets two devices find a direct path in the first place.
+- **`rendezvous`**: `peerfectly-rendezvous`. Each device leaves a sealed, signed note here saying
+  where it can be reached, and the other devices of its network pick it up.
 
-Neither can read a network's traffic or join one. What their operator sees is at the end.
+Neither can read what devices say to each other, and neither can let anyone into a network. What
+the operator does see is spelled out [at the end](#what-the-operator-sees).
 
-## What is where
+## What you need
 
-| File | What |
-|---|---|
-| `Dockerfile` | Builds both binaries and the runtime image. Built from the repository root. |
-| `Dockerfile.dockerignore` | Keeps build output, the phone, history and anything key-like out of the build. |
-| `compose.yaml` | The two services, their ports and their restrictions. |
-| `relay.toml` | The relay's default configuration, copied into the image. |
-| `relay-entrypoint.sh` | Puts the certificate's paths into the relay's configuration, then starts it. |
+- A Linux host with a public address, and Docker with the Compose plugin.
+- About 2 GB of memory to build the image there. On a smaller machine, build it somewhere else:
+  see [Building on another machine](#building-on-another-machine).
+- These ports open, both in the host's firewall and in your cloud provider's security rules:
 
-## Ports
+  | Port | Service | What for |
+  |---|---|---|
+  | 443/tcp | relay | the relay, over HTTPS |
+  | 443/udp | relay | QUIC, which devices use to learn their public address |
+  | 80/tcp | relay | captive-portal checks |
+  | 8444/tcp | rendezvous | the rendezvous, over HTTPS |
 
-| Host | Service | Why |
-|---|---|---|
-| 80/tcp | relay | captive-portal checks |
-| 443/tcp | relay | the relay, over HTTPS |
-| 443/udp | relay | QUIC address discovery, on the relay's own port |
-| 8444/tcp | rendezvous | the rendezvous, over HTTPS |
+Inside the containers the services listen on 8080, 8443 and 8444 as an unprivileged user, and
+Docker maps them to the ports above. They run with a read-only filesystem and no capabilities at
+all.
 
-Open exactly these in the host's firewall **and** in the cloud provider's security list, plus SSH restricted to where you administer from.
+## Running it
 
-Inside, the services listen on 8080, 8443 and 8444 as an unprivileged user, and Docker publishes them. That is why no capability is needed, not even the one for low ports.
+The example uses the address `203.0.113.10`. Replace it with your server's.
 
-## The certificate
+### 1. A certificate
 
-Both services serve **the same** certificate, so a network that pins it verifies both.
+Both services serve the same certificate. Devices **pin** it: they trust this certificate and
+nothing else, so it doesn't need to come from a public authority. A self-signed one works, and is
+the usual choice for a server on a bare IP address.
 
-**Where it is read from:**
-- by default `/etc/peerfectly/certs/relay.crt` and `relay.key` on the host;
-- `PEERFECTLY_CERT_DIR` moves the directory;
-- `PEERFECTLY_CERT` and `PEERFECTLY_KEY`, set in `compose.yaml`'s `environment`, name other files inside it (for example `fullchain.pem` and `privkey.pem`). Both services read them. Do not give either service a path of its own.
+On the server, with OpenSSL 3:
 
-The image never contains a certificate or a key.
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+  -keyout relay.key -out relay.crt -subj "/CN=203.0.113.10" \
+  -addext "subjectAltName=IP:203.0.113.10" \
+  -addext "basicConstraints=critical,CA:FALSE"
+```
 
-**Installing it on the host:**
+Three details matter:
+
+- **`subjectAltName`** has to name exactly what devices will connect to: `IP:` for an address,
+  `DNS:relay.example.org` for a name.
+- **`CA:FALSE`** is not optional. Without it, OpenSSL marks the certificate as an authority, and
+  devices refuse an authority as a server's own certificate.
+- **Ten years (`-days 3650`) is on purpose.** Replacing a pinned certificate means moving every
+  network that uses it (see [Replacing the certificate](#replacing-the-certificate)), so make it
+  long-lived.
+
+Put it where the containers read it, readable by the services' group (10001) and nobody else:
 
 ```sh
 sudo mkdir -p /etc/peerfectly/certs
-sudo cp relay.crt relay.key /etc/peerfectly/certs/
+sudo mv relay.crt relay.key /etc/peerfectly/certs/
 sudo chown root:10001 /etc/peerfectly/certs/relay.crt /etc/peerfectly/certs/relay.key
 sudo chmod 0644 /etc/peerfectly/certs/relay.crt
 sudo chmod 0640 /etc/peerfectly/certs/relay.key
 ```
 
-**Its expiry:**
+Note its fingerprint. You'll compare it on the first device:
 
 ```sh
-openssl x509 -in /etc/peerfectly/certs/relay.crt -noout -enddate -fingerprint -sha256
+openssl x509 -in /etc/peerfectly/certs/relay.crt -noout -fingerprint -sha256 -enddate
 ```
 
-Write the date down.
-
-**Replacing it.** A network that pins this certificate trusts it and nothing else. Replacing it with one that has a different key needs each such network moved with `peerfectly relay <address>` first, which pins the new one and keeps the old reachable for the transition. Swapping the file alone strands every device of those networks.
-
-## Build and start
-
-On the server, from a copy of the repository:
-
-```powershell
-# On your machine, from the repository root: the committed tree, nothing else.
-git archive --format=tar.gz -o peerfectly-src.tar.gz HEAD
-scp peerfectly-src.tar.gz <user>@<server>:
-```
+### 2. Start the services
 
 ```sh
-# On the server.
-mkdir -p ~/peerfectly && tar -xzf ~/peerfectly-src.tar.gz -C ~/peerfectly
-cd ~/peerfectly
+git clone https://github.com/nohostalgia/peerfectly.git
+cd peerfectly
+git checkout v0.1.0
 docker compose -f deploy/server/compose.yaml up -d --build
 docker compose -f deploy/server/compose.yaml ps
 ```
 
-Building on the server makes the image native to its architecture. Rust needs a couple of gigabytes of memory to build this. On a smaller machine, build on yours for the server's platform and load it there:
+The first build takes a while: it compiles both programs from source. Check out the release tag
+that matches the version your devices run.
 
-```powershell
+### 3. Point a network at it
+
+On the device that founds the network:
+
+```sh
+peerfectly found home --relay https://203.0.113.10 --rendezvous https://203.0.113.10:8444
+```
+
+It fetches the relay's certificate and shows its fingerprint: check it's the one from step 1 before
+you confirm. Because the rendezvous runs on the same host, the same pinned certificate covers it.
+Devices that join later get both addresses, and the pin, from the network itself.
+
+## Configuration
+
+The defaults work as they are. For anything else, keep your changes in files of your own next to
+`compose.yaml`, so that updating the checkout never overwrites them.
+
+**The certificate in another place, or under other names**, for example files from your own CA:
+
+```sh
+# deploy/server/.env: Compose reads it from the compose file's directory.
+PEERFECTLY_CERT_DIR=/srv/peerfectly/certs
+```
+
+```yaml
+# deploy/server/compose.local.yaml
+services:
+  relay:
+    environment:
+      PEERFECTLY_CERT: /etc/peerfectly/certs/fullchain.pem
+      PEERFECTLY_KEY: /etc/peerfectly/certs/privkey.pem
+  rendezvous:
+    environment:
+      PEERFECTLY_CERT: /etc/peerfectly/certs/fullchain.pem
+      PEERFECTLY_KEY: /etc/peerfectly/certs/privkey.pem
+```
+
+`PEERFECTLY_CERT_DIR` is the directory on the host. `PEERFECTLY_CERT` and `PEERFECTLY_KEY` are paths
+*inside* the container, under `/etc/peerfectly/certs`. Give both services the same two: they serve
+one certificate.
+
+**The relay's own settings.** The image carries [`relay.toml`](relay.toml), which lets anyone use
+the relay within limits: 5 new connections a second (bursts of 50), and about 20 Mbit/s per client.
+To change them, copy it to `deploy/server/relay.local.toml`, edit the copy, and mount it:
+
+```yaml
+# deploy/server/compose.local.yaml
+services:
+  relay:
+    volumes:
+      - ./relay.local.toml:/etc/peerfectly/relay.toml:ro
+```
+
+For example, to allow more bandwidth per client:
+
+```toml
+[limits.client.rx]
+bytes_per_second = 6_250_000   # about 50 Mbit/s
+max_burst_bytes = 25_000_000
+```
+
+Leave the `@PEERFECTLY_CERT@` and `@PEERFECTLY_KEY@` placeholders as they are: the container fills
+them in from the two settings above when it starts.
+
+With a `compose.local.yaml`, name both files in every command:
+
+```sh
+docker compose -f deploy/server/compose.yaml -f deploy/server/compose.local.yaml up -d --build
+```
+
+## Updating
+
+```sh
+cd peerfectly
+git fetch --tags
+git checkout v0.2.0
+docker compose -f deploy/server/compose.yaml up -d --build
+```
+
+The certificate stays where it is, so nothing changes on the devices.
+
+## Building on another machine
+
+On your own computer, from the repository, build for the server's architecture (`uname -m` on the
+server: `x86_64` is `linux/amd64`, `aarch64` is `linux/arm64`):
+
+```sh
 docker buildx build --platform linux/arm64 -f deploy/server/Dockerfile -t peerfectly-server --load .
 docker save peerfectly-server -o peerfectly-server.tar
-scp peerfectly-server.tar <user>@<server>:
+scp peerfectly-server.tar you@203.0.113.10:
 ```
+
+Then on the server, from the checkout, without `--build`:
 
 ```sh
 docker load -i peerfectly-server.tar
 docker compose -f deploy/server/compose.yaml up -d
 ```
 
-Use `linux/amd64` for an x86 server; `uname -m` on the server says which.
+## Replacing the certificate
 
-## Replacing a deployment from before the rename
+Every network that uses this server has its certificate signed into its configuration. Swapping the
+files on the server, with a new key, cuts all of them off.
 
-Before 2026-10-03 the product was called `mynet`, and its server ran from the image `mynet-server`
-with the certificate under `/etc/mynet/certs`. The rename changed the protocol too. The
-rendezvous's records are sealed under a context that has changed, so what the old rendezvous held is
-useless to the new devices, and nothing needs to be kept.
-
-**The relay's certificate can stay.** The relay speaks iroh's relay protocol, which carries no
-product name, so a new network can pin the same certificate. On the server:
-
-```sh
-# The old containers, from the old checkout.
-cd ~/mynet && docker compose -f deploy/server/compose.yaml down
-# The certificate, moved to where the new image looks for it.
-sudo mv /etc/mynet /etc/peerfectly
-```
-
-Then build and start as above, from a checkout of the new source. If an override of
-`compose.yaml` set `MYNET_CERT`, `MYNET_KEY` or `MYNET_CERT_DIR`, rename them to
-`PEERFECTLY_CERT`, `PEERFECTLY_KEY` and `PEERFECTLY_CERT_DIR`. Once the new containers answer, the old
-image and checkout can go:
-
-```sh
-docker image rm mynet-server
-rm -rf ~/mynet ~/mynet-src.tar.gz
-```
-
-## Rolling back
-
-```sh
-docker compose -f deploy/server/compose.yaml down
-```
-
-Then start whatever ran before. The certificate did not change, so nothing on the devices did.
+To move a network to a new certificate, generate it, serve it from a **second** address or port,
+and run `peerfectly relay <new address>` on the network's admin. That pins the new certificate and
+keeps the old one reachable while devices catch up. Retire the old one only once every network
+has moved.
 
 ## Logs
 
@@ -135,31 +205,37 @@ Then start whatever ran before. The certificate did not change, so nothing on th
 docker compose -f deploy/server/compose.yaml logs --tail 50
 ```
 
-- **The relay** runs at `RUST_LOG=warn`. At `info` and below it names connecting nodes.
+- **The relay** runs at `RUST_LOG=warn`. At `info` and below it names the devices that connect.
 - **The rendezvous** writes one line when it starts and nothing per request.
 
-Neither log should carry a node identity, a key or a published address. Raising the level to debug a problem changes that: lower it again afterwards.
-
-## Who may use the relay
-
-`relay.toml` says `access = "everyone"`, with limits on new connections a second and on each client's bandwidth. To change them, mount your own `relay.toml` at `/etc/peerfectly/relay.toml`, keeping `@PEERFECTLY_CERT@` and `@PEERFECTLY_KEY@` as the certificate's paths.
-
-An allowlist of your own devices is a later change.
+So by default neither log holds a device identity, a key or an address. Raising the level to chase a
+problem changes that: lower it again afterwards.
 
 ## What the operator sees
 
 **The relay:**
-- which node identities connect, and from which addresses;
-- when, and how much they send.
+- which device identities connect, and from which addresses;
+- when they connect, and how much they send.
 
-It carries traffic it cannot read: sessions are end-to-end encrypted between devices.
+It can't read the traffic: it's end-to-end encrypted between devices.
 
 **The rendezvous:**
-- the addresses that publish and fetch;
-- a pseudonym per record, and records sealed with a key derived from the network's identifier.
+- the addresses that publish and fetch notes;
+- one pseudonym per note, and the notes themselves, sealed with a key derived from the network's
+  identifier.
 
-It is never told a network's identifier, so it cannot read the addresses in a record. It cannot forge a record either: devices sign their own.
+It is never told a network's identifier, so it can't open the notes, and since devices sign their
+own, it can't forge one either.
 
-**Both:**
-- can refuse service, or delay it;
-- cannot admit anybody to a network, or read what devices say to each other.
+**Both** can refuse service, or delay it. Neither can admit anybody to a network or read what
+devices say to each other.
+
+## What's in this directory
+
+| File | What |
+|---|---|
+| `Dockerfile` | builds both programs and the runtime image, from the repository root |
+| `Dockerfile.dockerignore` | keeps build output, history and anything key-like out of the build |
+| `compose.yaml` | the two services, their ports and their restrictions |
+| `relay.toml` | the relay's default configuration, copied into the image |
+| `relay-entrypoint.sh` | puts the certificate's paths into the relay's configuration, then starts it |
