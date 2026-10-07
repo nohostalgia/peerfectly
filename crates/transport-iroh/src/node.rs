@@ -239,6 +239,14 @@ impl IrohTransport {
             // decide: the default policy takes any direct path the moment it
             // validates, and a path through our own tunnel validates.
             .path_selector(std::sync::Arc::new(crate::paths::Selector::new(avoided.clone())))
+            // The net report keeps its HTTPS latency probes, although a network
+            // has one relay and nothing to choose between. Without them, a
+            // network where QUIC to the relay gets no answer (one that blocks
+            // UDP) never picks a home relay, and the device is left with no
+            // relay at all where it needs one most. `NetReportConfig::minimal()`
+            // did that; the binding tests caught it, their relay answering QUIC
+            // on another port.
+            .net_report_config(iroh::endpoint::NetReportConfig::default())
             // And under that, a bound on every other way a path can fall
             // silent — a carrier that stops forwarding, a network that changes
             // under a session. The defaults are fifteen seconds of nothing
@@ -247,12 +255,6 @@ impl IrohTransport {
             // `iroh` chose for its own defaults. Both are clamped by `iroh` to
             // at most its 15s and 5s, so neither can be set past what it
             // allows.
-            // Only the QUIC address discovery a net report needs. Its HTTPS
-            // latency probes exist to choose the fastest of several relays, and a
-            // network has exactly one, signed in its roster; each was a TLS
-            // handshake with the relay every twenty-odd seconds, whether or not
-            // anything was being carried. The captive-portal check goes with them.
-            .net_report_config(iroh::endpoint::NetReportConfig::minimal())
             .transport_config(
                 iroh::endpoint::QuicTransportConfig::builder()
                     .default_path_max_idle_timeout(PATH_IDLE)

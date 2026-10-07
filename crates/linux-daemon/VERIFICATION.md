@@ -842,6 +842,12 @@ every 20 to 26 seconds, about 950 MB a month — and the relay ping every 15 sec
 interval is a constant in iroh 1.1 to 1.3; `NetReportConfig` (PR #4020) turns probes off, not the
 interval down.
 
+`minimal()` was withdrawn on the same day, before merging. Without the HTTPS probe, a device whose
+QUIC to the relay gets no answer, on a network that blocks UDP, never picks a home relay and is left
+with no relay at all. The binding tests caught it in CI, since their relay answers QUIC on another
+port. The probes' share, about 100 MB a month at rest, is left to the change that pauses the net
+report (`quiet-iroh`).
+
 **Does it grow with the network?** Three nodes, `b` measured at rest twelve minutes after the last
 session, with the same build (minimal net report), on 2026-10-07:
 
