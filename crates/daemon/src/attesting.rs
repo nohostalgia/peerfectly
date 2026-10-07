@@ -65,11 +65,20 @@ pub fn sign_over_heads(roster: &Roster, identity: &NodeIdentity) -> Result<Vec<u
         return Err("that roster has no heads, so there is nothing to attest to".to_owned());
     }
 
+    // Dated by the wall clock, which is what lets any member relay it: a
+    // receiver ages it by the time since this moment, so one passed on late reads
+    // as old as it is. A roster whose clock cannot say what time it is cannot
+    // date one, and signs none.
+    let Some(issued_at) = roster.unix_now() else {
+        return Err("this roster's clock cannot say what time it is, so it cannot date an                     attestation"
+            .to_owned());
+    };
     let body = Attestation::new(
         next_sequence(roster),
         heads,
         identity.attestation_key().public_key().key_id(),
         state.network,
+        issued_at,
     )
     .map_err(|cause| cause.to_string())?;
 
@@ -153,7 +162,7 @@ mod tests {
         )
         .expect("well-formed");
         let bytes = sign_operation(&core, founder.signer()).expect("signs");
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted());
         (roster, founder)
     }

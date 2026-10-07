@@ -37,7 +37,12 @@ const STREAM_OPENER: [u8; 4] = *b"MNT1";
 /// A dedicated identifier, so an unrelated application on the same connectivity
 /// layer cannot open a session here by accident, and so a future version of this
 /// protocol can be told apart from this one rather than being guessed at.
-pub const ALPN: &[u8] = b"peerfectly/transport/1";
+///
+/// `2` since sessions are opened on demand and reconciliation leads with a
+/// digest: a node of the first version cannot read the second's messages, so
+/// the two must not open a session at all. They fail at the handshake instead,
+/// which [`Error::IncompatibleVersion`] names.
+pub const ALPN: &[u8] = b"peerfectly/transport/2";
 
 /// How many peers direct addresses are remembered for.
 ///
@@ -50,21 +55,31 @@ const MAX_LEARNED_PEERS: usize = 64;
 ///
 /// The connectivity layer's own default is fifteen seconds, and a path that has
 /// gone silent holds the session for every one of them: fifteen seconds of a
-/// frozen tunnel, which is what this was measured at. Three seconds is three
+/// frozen tunnel, which is what this was first measured at. Nine seconds is three
 /// keep-alives below, the same ratio `iroh` chose for its defaults, and is
 /// clamped by it to at most its own fifteen.
+///
+/// It was three, from a keep-alive every second. Measured on 2026-10-07, that
+/// keep-alive was the larger part of what an idle device spent — a packet a
+/// second each way on every session, about 0.9 GB a month for one peer — and a
+/// session now exists only while something uses it, so the rate it pays is the
+/// rate of a session in use. Three seconds is what Tailscale keeps its active
+/// paths alive at. What it costs is a tunnel that can stall for up to about nine
+/// seconds instead of three when a path dies **silently**; a change of network
+/// the machine reports is acted on at once.
 ///
 /// This bounds what the path rule in `paths` cannot foresee — a carrier that
 /// stops forwarding, a network that changes under a session. Abandoning the dead
 /// path is also the event that asks the rule to choose again, so this is how
 /// long every wrong choice can last.
-const PATH_IDLE: core::time::Duration = core::time::Duration::from_secs(3);
+const PATH_IDLE: core::time::Duration = core::time::Duration::from_secs(9);
 
 /// How often a path with nothing to carry says something.
 ///
-/// One second, so [`PATH_IDLE`] is three missed beats rather than one. Clamped
-/// by `iroh` to at most its own five.
-const PATH_KEEP_ALIVE: core::time::Duration = core::time::Duration::from_secs(1);
+/// Three seconds, so [`PATH_IDLE`] is three missed beats rather than one. Clamped
+/// by `iroh` to at most its own five. See [`PATH_IDLE`] for why it is no longer
+/// one.
+const PATH_KEEP_ALIVE: core::time::Duration = core::time::Duration::from_secs(3);
 
 /// How many addresses are remembered per peer.
 ///
@@ -224,11 +239,19 @@ impl IrohTransport {
             // decide: the default policy takes any direct path the moment it
             // validates, and a path through our own tunnel validates.
             .path_selector(std::sync::Arc::new(crate::paths::Selector::new(avoided.clone())))
+            // The net report keeps its HTTPS latency probes, although a network
+            // has one relay and nothing to choose between. Without them, a
+            // network where QUIC to the relay gets no answer (one that blocks
+            // UDP) never picks a home relay, and the device is left with no
+            // relay at all where it needs one most. `NetReportConfig::minimal()`
+            // did that; the binding tests caught it, their relay answering QUIC
+            // on another port.
+            .net_report_config(iroh::endpoint::NetReportConfig::default())
             // And under that, a bound on every other way a path can fall
             // silent — a carrier that stops forwarding, a network that changes
             // under a session. The defaults are fifteen seconds of nothing
             // before a dead path is abandoned, which is fifteen seconds of a
-            // frozen tunnel; three keeps the ratio to the keep-alive that
+            // frozen tunnel; nine keeps the ratio to the keep-alive that
             // `iroh` chose for its own defaults. Both are clamped by `iroh` to
             // at most its 15s and 5s, so neither can be set past what it
             // allows.
@@ -467,11 +490,13 @@ impl Transport for IrohTransport {
         // says only that it failed, and the difference between a relay that is
         // down, a peer that is not there, and a protocol mismatch is exactly what
         // somebody needs at that moment.
-        let connection = self
-            .endpoint
-            .connect(address, ALPN)
-            .await
-            .map_err(|cause| Error::PeerUnreachable { cause: Some(cause.to_string()) })?;
+        let connection = self.endpoint.connect(address, ALPN).await.map_err(|cause| {
+            if offers_another_protocol(&cause) {
+                Error::IncompatibleVersion
+            } else {
+                Error::PeerUnreachable { cause: Some(cause.to_string()) }
+            }
+        })?;
         self.admit(connection).await
     }
 
@@ -498,6 +523,10 @@ impl Transport for IrohTransport {
     /// and the short path idle timeout means that is soon.
     fn avoid(&self, ranges: &[transport::Range]) {
         self.avoided.set(ranges);
+    }
+
+    fn own_ports(&self) -> Vec<u16> {
+        self.endpoint.bound_sockets().iter().map(std::net::SocketAddr::port).collect()
     }
 
     fn learned(&self, peer: &PublicKey, addresses: &[String]) {
@@ -554,5 +583,49 @@ fn is_private(ip: &std::net::IpAddr) -> bool {
                 || v6.is_unspecified()
                 || (v6.segments().first().unwrap_or(&0) & 0xfe00) == 0xfc00
         }
+    }
+}
+
+/// Whether a dial failed because the peer offered no protocol name in common.
+///
+/// TLS says so with alert 120, `no_application_protocol`, which QUIC carries
+/// as the crypto error of that number in the close it receives. Between two
+/// devices of one network that means one of them runs another version.
+fn offers_another_protocol(cause: &iroh::endpoint::ConnectError) -> bool {
+    use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
+    let no_application_protocol = TransportErrorCode::crypto(120);
+    let closed = match cause {
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        }
+        | ConnectError::Connection { source, .. } => source,
+        _ => return false,
+    };
+    match closed {
+        ConnectionError::ConnectionClosed(close) => close.error_code == no_application_protocol,
+        ConnectionError::TransportError(error) => error.code == no_application_protocol,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PATH_IDLE, PATH_KEEP_ALIVE};
+
+    /// The two numbers the `transport-iroh` capability states: a keep-alive
+    /// every three seconds while a session is open, and a silent path left in
+    /// under ten. Pinned because either drifting changes what an idle device
+    /// spends or how long a tunnel can stall, and neither shows in a test that
+    /// only checks a session works.
+    #[test]
+    fn a_path_is_kept_alive_every_three_seconds_and_left_within_ten() {
+        assert_eq!(PATH_KEEP_ALIVE.as_secs(), 3);
+        assert!(PATH_IDLE.as_secs() < 10, "a silent path is left in under ten seconds");
+        assert_eq!(
+            PATH_IDLE.as_secs(),
+            PATH_KEEP_ALIVE.as_secs().saturating_mul(3),
+            "three missed keep-alives, the ratio iroh uses for its own defaults"
+        );
     }
 }

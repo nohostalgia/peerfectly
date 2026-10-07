@@ -158,7 +158,7 @@ pub fn node_off(
     // Whatever is already on disk is replayed first, exactly as the daemon does
     // at start-up, so that assembling a second node over the same directory is a
     // restart rather than a fresh device that happens to share a folder.
-    let mut roster = Roster::new();
+    let mut roster = Roster::with_clock(Box::new(daemon::state::WallClock));
     for operation in &existing {
         roster.offer_bytes(operation);
     }

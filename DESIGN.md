@@ -151,6 +151,14 @@ punching: the session migrates when a direct path succeeds. Realistically some c
 the relay for good, since carrier-grade NAT is common on mobile and fixed-wireless networks. **The
 relay is permanent infrastructure, not an edge case.**
 
+**Sessions exist while something uses them.** The first packet for a member opens one, and what
+arrives while it opens waits rather than being dropped. A session that carries nothing for ten
+minutes is closed. While open, a path is kept alive every three seconds and left after about nine
+seconds of silence. Nobody is dialled for merely being in the roster.
+
+The cost is a pause of tens to hundreds of milliseconds before the first packet after ten idle
+minutes, and a `peers` report that looks when asked rather than remembering.
+
 ## 3. The product surface
 
 ### 3.1 First use
@@ -226,9 +234,23 @@ by default. What dates a roster is an *attestation*, which carries no state: see
 
 ### 4.7 Distribution
 
-No privileged channel. Whenever two nodes connect, they exchange the ids of the operations they know
-and pass each other what is missing. On a LAN that happens by itself. Elsewhere it happens through
-any peer, and a rendezvous could hold the roster without being able to alter it.
+No privileged channel. Whenever two nodes connect, they exchange a digest of the operations they
+hold, and only where the digests differ the ids, and they pass each other what is missing. On a LAN
+that happens by itself. Elsewhere it happens through any peer, and a rendezvous could hold the roster
+without being able to alter it.
+
+**Every operation is pushed the moment it is admitted**, to the open sessions and to the device's
+**neighbours**. These are three members chosen by rendezvous hashing over the ids of their admission
+operations, plus the members that chose this device, a claim the roster can check. Neighbours pass
+on what they receive, so an operation crosses a network of thousands in a handful of hops while no
+device contacts more than a few others in the background. A burst of operations is pushed once. A
+device that comes up, or changes network, reconciles with its neighbours straight away, and every
+hour as a safety net.
+
+Attestations travel the same way. Each carries the time its admin signed it, and freshness is
+measured from the earlier of that and its receipt, so an attestation relayed late reads as old as
+it is, and a signed time can make a roster read older but never fresher. An admin on a phone gives
+its attestation to its neighbours and need not meet every member.
 
 The effect: a node off for a month catches up at its first connection with anyone, and revocations
 spread by contagion.

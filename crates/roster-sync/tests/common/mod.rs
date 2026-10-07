@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use identity::NodeIdentity;
+use roster::attestation::{Attestation, sign_attestation};
 use roster::id::{DeviceId, NetworkId, OperationId};
 use roster::roster::Roster;
 use roster::sign::sign_operation;
@@ -123,6 +124,28 @@ impl Fixture {
             assert!(admission.is_accepted(), "fixture operation refused: {admission:?}");
         }
         node
+    }
+
+    /// An attestation over the current head, signed by `by`'s attestation key.
+    ///
+    /// Undated in effect: signed at a time no test clock reaches, so it is dated
+    /// from its receipt.
+    pub fn attestation_by(&self, by: &NodeIdentity, seq: u64) -> Vec<u8> {
+        let key = by.attestation_key();
+        let body = Attestation::new(
+            seq,
+            vec![self.head],
+            key.public_key().key_id(),
+            self.network,
+            u64::MAX,
+        )
+        .expect("well-formed");
+        sign_attestation(&body, key.signer()).expect("signs")
+    }
+
+    /// The founder's attestation over the current head.
+    pub fn attestation(&self, seq: u64) -> Vec<u8> {
+        self.attestation_by(&self.founder, seq)
     }
 
     /// A syncer over a roster holding every operation authored so far.

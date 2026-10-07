@@ -79,7 +79,7 @@ impl Fixture {
         .expect("well-formed");
         let add_bytes = sign_operation(&add, founder.signer()).expect("signs");
 
-        let mut node = Roster::new();
+        let mut node = Roster::with_clock(Box::new(daemon::state::WallClock));
         assert!(node.offer_bytes(&genesis_bytes).is_accepted());
         assert!(node.offer_bytes(&add_bytes).is_accepted());
 
@@ -95,7 +95,7 @@ impl Fixture {
 
     /// A roster holding what the network already agrees on.
     fn roster(&self) -> Roster {
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(daemon::state::WallClock));
         assert!(roster.offer_bytes(&self.genesis).is_accepted());
         assert!(roster.offer_bytes(&self.add).is_accepted());
         roster
@@ -118,6 +118,22 @@ impl Fixture {
         sign_operation(&core, self.founder.signer()).expect("signs")
     }
 
+    /// An operation admitting `device`, signed by the founder.
+    fn admit(&self, device: &NodeIdentity) -> Vec<u8> {
+        let core = OperationCore::new(
+            3,
+            self.founder.signing_key().algorithm(),
+            OperationBody::AddDevice(
+                device.device_spec("newcomer", Role::Member, false, vec![]).expect("spec"),
+            ),
+            self.roster().heads(),
+            self.founder.signing_key().key_id(),
+            self.network,
+        )
+        .expect("well-formed");
+        sign_operation(&core, self.founder.signer()).expect("signs")
+    }
+
     /// An operation revoking a device, signed by the founder.
     fn revoke(&self, device: roster::id::DeviceId) -> Vec<u8> {
         let core = OperationCore::new(
@@ -130,6 +146,32 @@ impl Fixture {
         )
         .expect("well-formed");
         sign_operation(&core, self.founder.signer()).expect("signs")
+    }
+
+    /// `count` renames of the joiner, each on the one before, as an admin's
+    /// daemon writes them. Concurrent ones by one author would be an
+    /// equivocation, which the roster rightly does not trust; and renames add no
+    /// member, so the network stays small enough that everyone is a neighbour.
+    fn a_chain_of_renames(&self, count: usize) -> Vec<Vec<u8>> {
+        let mut parents = self.roster().heads();
+        let mut out = Vec::new();
+        for index in 0..count {
+            let core = OperationCore::new(
+                u64::try_from(index).expect("small").saturating_add(4),
+                self.founder.signing_key().algorithm(),
+                OperationBody::Rename {
+                    device: self.joiner.device_id(),
+                    name: format!("laptop-{index}"),
+                },
+                parents.clone(),
+                self.founder.signing_key().key_id(),
+                self.network,
+            )
+            .expect("well-formed");
+            parents = vec![core.id()];
+            out.push(sign_operation(&core, self.founder.signer()).expect("signs"));
+        }
+        out
     }
 
     fn prefix(&self) -> Prefix {
@@ -282,7 +324,7 @@ async fn an_admission_while_up_makes_ipv4_routable_and_a_revocation_refuses_it()
         tokio::join!(founder_transport.connect(&key), joiner_transport.accept());
     let dialled: Arc<dyn Session> = Arc::from(dialled.expect("establishes"));
 
-    let mut genesis_only = Roster::new();
+    let mut genesis_only = Roster::with_clock(Box::new(daemon::state::WallClock));
     assert!(genesis_only.offer_bytes(&fixture.genesis).is_accepted());
     let founder = assemble_holding(
         &fixture,
@@ -608,12 +650,20 @@ async fn a_roster_change_reaches_the_other_node() {
     assert_eq!(after, before + 1, "the change propagated without a restart");
 }
 
-/// **A packet for a device that is not connected is an event, never a
-/// problem.** An application on the machine that keeps trying a device that is
-/// off would otherwise keep the network shown as wrong for as long as it tried.
+/// **A packet for a device that is switched off is an event, never a
+/// problem.** The packet opens a session; the device does not answer; what was
+/// waiting is dropped and that is recorded. An application on the machine that
+/// keeps trying a device that is off would otherwise keep the network shown as
+/// wrong for as long as it tried.
 #[tokio::test]
 async fn a_packet_for_a_device_not_connected_is_not_a_problem() {
-    let (fixture, founder, _joiner, _dialled, _accepted) = pair().await;
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
 
     let to_joiner = Tunnel::new(fixture.prefix(), fixture.founder.device_id())
         .address_of(&fixture.joiner.device_id());
@@ -622,9 +672,16 @@ async fn a_packet_for_a_device_not_connected_is_not_a_problem() {
     founder.machine.queue(packet(from_founder, to_joiner)).await;
     let _ = founder.node.carry_one().await;
 
-    let event = founder.node.event().await;
+    let mut event = None;
+    for _ in 0..100 {
+        event = founder.node.event().await;
+        if event.as_ref().is_some_and(|event| event.cause.contains("were dropped")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(
-        event.as_ref().is_some_and(|event| event.cause.contains("no session for")),
+        event.as_ref().is_some_and(|event| event.cause.contains("were dropped")),
         "it is logged: {event:?}"
     );
     assert_eq!(None, founder.node.fault().await, "and it is not the network's problem");
@@ -733,7 +790,7 @@ async fn the_roster_is_rebuilt_from_what_arrived() {
     log.append(&fixture.genesis).expect("appends");
     log.append(&fixture.add).expect("appends");
 
-    let mut rebuilt = Roster::new();
+    let mut rebuilt = Roster::with_clock(Box::new(daemon::state::WallClock));
     for operation in log.read().expect("reads") {
         assert!(rebuilt.offer_bytes(&operation).is_accepted(), "replay runs the same validation");
     }
@@ -813,5 +870,438 @@ async fn a_revocation_that_arrives_from_a_peer_also_closes_the_session() {
         joiner.node.session_count().await,
         0,
         "and dropped the session rather than keeping it open to a network it has left"
+    );
+}
+
+// ---- A session opened by the packet that needs it -----------------------------
+
+/// Two assembled nodes on one fabric with no session between them. The joiner
+/// is not accepting yet: a test starts it when it wants the session to open.
+async fn apart() -> (Fixture, Assembled, Assembled) {
+    let (fixture, founder, joiner, _fabric) = apart_on_fabric().await;
+    (fixture, founder, joiner)
+}
+
+/// As [`apart`], with the fabric, for a test that brings a third party onto it.
+async fn apart_on_fabric() -> (Fixture, Assembled, Assembled, MemoryFabric) {
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let joiner_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.joiner), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+    let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
+    // As an admin's daemon does on its way up: without it the founder has never
+    // dated its roster, and carries traffic only to administrators.
+    founder.node.attest_change().await;
+    (fixture, founder, joiner, fabric)
+}
+
+/// A packet from the founder's machine to the joiner's, marked so that a burst's
+/// order can be read back.
+fn marked(fixture: &Fixture, mark: u8) -> Vec<u8> {
+    let tunnel = Tunnel::new(fixture.prefix(), fixture.founder.device_id());
+    let mut out = packet(
+        tunnel.address_of(&fixture.founder.device_id()),
+        tunnel.address_of(&fixture.joiner.device_id()),
+    );
+    out.push(mark);
+    out
+}
+
+/// What the machine has been handed, once `count` have arrived or the bound
+/// has passed.
+async fn delivered(machine: &MemoryDevice, count: usize) -> Vec<Vec<u8>> {
+    for _ in 0..100 {
+        let got = machine.delivered().await;
+        if got.len() >= count {
+            return got;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    machine.delivered().await
+}
+
+#[tokio::test]
+async fn the_first_packet_opens_the_session_and_arrives() {
+    let (fixture, founder, joiner) = apart().await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+
+    let first = marked(&fixture, 1);
+    founder.machine.queue(first.clone()).await;
+    let departure = founder.node.carry_one().await.expect("takes");
+    assert!(matches!(departure, Departure::Unreachable { .. }), "no session yet: {departure:?}");
+
+    assert_eq!(delivered(&joiner.machine, 1).await, vec![first], "late, but not lost");
+}
+
+#[tokio::test]
+async fn a_burst_while_the_session_opens_arrives_in_order() {
+    let (fixture, founder, joiner) = apart().await;
+
+    let burst: Vec<Vec<u8>> = (1..=5).map(|mark| marked(&fixture, mark)).collect();
+    for packet in &burst {
+        founder.machine.queue(packet.clone()).await;
+        let _ = founder.node.carry_one().await.expect("takes");
+    }
+    // Only now does the other side answer: everything above waited.
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+
+    assert_eq!(delivered(&joiner.machine, burst.len()).await, burst);
+}
+
+#[tokio::test]
+async fn the_waiting_queue_is_bounded() {
+    let (fixture, founder, joiner) = apart().await;
+
+    let over = daemon::limits::MAX_WAITING_PACKETS + 8;
+    for mark in 0..over {
+        founder.machine.queue(marked(&fixture, u8::try_from(mark).expect("small"))).await;
+        let _ = founder.node.carry_one().await.expect("takes");
+    }
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+
+    let got = delivered(&joiner.machine, daemon::limits::MAX_WAITING_PACKETS).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        joiner.machine.delivered().await.len(),
+        daemon::limits::MAX_WAITING_PACKETS,
+        "the bound, and not one more: {}",
+        got.len()
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_member_costs_one_recorded_failure() {
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    // Only the founder is on the fabric: the joiner is switched off.
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+
+    founder.machine.queue(marked(&fixture, 1)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+
+    let mut said = None;
+    for _ in 0..100 {
+        said = founder.node.event().await;
+        if said.as_ref().is_some_and(|event| event.cause.contains("were dropped")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let said = said.expect("the failure is recorded");
+    assert!(said.cause.contains("1 packets"), "once, for the attempt: {}", said.cause);
+}
+
+// ---- An idle session is closed ---------------------------------------------------
+
+const IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+#[tokio::test(start_paused = true)]
+async fn an_unused_session_is_closed_without_a_fault() {
+    let (fixture, founder, _joiner, dialled, _accepted) = pair().await;
+    register(&founder, &dialled).await;
+    assert!(founder.node.has_session(&fixture.joiner.device_id()).await);
+
+    tokio::time::advance(IDLE + std::time::Duration::from_secs(1)).await;
+    founder.node.close_idle(IDLE).await;
+
+    assert!(!founder.node.has_session(&fixture.joiner.device_id()).await, "closed");
+    assert_eq!(None, founder.node.fault().await, "and nothing went wrong");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_in_use_is_kept() {
+    let (fixture, founder, joiner, dialled, accepted) = pair().await;
+    register(&founder, &dialled).await;
+    register(&joiner, &accepted).await;
+
+    // Halfway through the idle period, a packet crosses.
+    tokio::time::advance(IDLE / 2).await;
+    founder.machine.queue(marked(&fixture, 1)).await;
+    assert!(founder.node.carry_one().await.expect("takes").is_carried());
+
+    tokio::time::advance(IDLE / 2 + std::time::Duration::from_secs(1)).await;
+    founder.node.close_idle(IDLE).await;
+    assert!(
+        founder.node.has_session(&fixture.joiner.device_id()).await,
+        "used five minutes ago: still open"
+    );
+}
+
+#[tokio::test]
+async fn a_closed_session_reopens_on_the_next_packet() {
+    let (fixture, founder, joiner) = apart().await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+
+    founder.machine.queue(marked(&fixture, 1)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    assert_eq!(delivered(&joiner.machine, 1).await.len(), 1);
+
+    // Idle for "ever": closed at once.
+    founder.node.close_idle(std::time::Duration::ZERO).await;
+    assert!(!founder.node.has_session(&fixture.joiner.device_id()).await);
+
+    founder.machine.queue(marked(&fixture, 2)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    let got = delivered(&joiner.machine, 2).await;
+    assert_eq!(got.len(), 2, "the second packet opened it again");
+    assert_eq!(got.last(), Some(&marked(&fixture, 2)));
+}
+
+// ---- Every operation is pushed to the neighbours, a burst once ------------------
+
+/// How many devices a node's roster holds, once it holds at least `count`, or
+/// when the bound has passed.
+async fn devices_reach(node: &Arc<Node>, count: usize) -> usize {
+    for _ in 0..200 {
+        let held = node.state().await.map_or(0, |state| state.devices.len());
+        if held >= count {
+            return held;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    node.state().await.map_or(0, |state| state.devices.len())
+}
+
+/// Not only a revocation: an admission reaches a neighbour that has no session
+/// open, without waiting for any period.
+#[tokio::test]
+async fn any_operation_reaches_a_neighbour_with_no_open_session() {
+    let (fixture, founder, joiner) = apart().await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    tokio::spawn(Arc::clone(&founder.node).spread_forever());
+    let before = joiner.node.state().await.expect("derives").devices.len();
+
+    founder.node.admit_without_activating(&fixture.add_a_third()).await.expect("admits");
+
+    assert_eq!(devices_reach(&joiner.node, before + 1).await, before + 1, "it arrived");
+}
+
+/// An admin signing five acts at once makes one round of contact, not five.
+#[tokio::test]
+async fn a_burst_makes_one_contact_per_neighbour() {
+    let (fixture, founder, joiner) = apart().await;
+    let contacts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let joiner = Arc::clone(&joiner.node);
+        let contacts = Arc::clone(&contacts);
+        tokio::spawn(async move {
+            while joiner.accept().await.is_ok() {
+                contacts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+    tokio::spawn(Arc::clone(&founder.node).spread_forever());
+
+    for operation in fixture.a_chain_of_renames(5) {
+        founder.node.admit_without_activating(&operation).await.expect("admits");
+    }
+
+    let renamed = async || {
+        joiner.node.state().await.is_ok_and(|state| {
+            state
+                .devices
+                .get(&fixture.joiner.device_id())
+                .is_some_and(|record| record.name == "laptop-4")
+        })
+    };
+    let mut arrived = false;
+    for _ in 0..200 {
+        if renamed().await {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(arrived, "all five arrived: the last rename is in force");
+    // Long enough for any second round to have happened.
+    tokio::time::sleep(Node::SPREAD_PAUSE * 2).await;
+    assert_eq!(
+        contacts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one contact for the whole burst"
+    );
+}
+
+// ---- A device catches up when it comes back ---------------------------------------
+
+/// A device that was down while an operation was admitted holds it shortly
+/// after coming up, from the reconciliation it makes on the way up, without
+/// waiting for any period.
+#[tokio::test]
+async fn a_device_coming_up_learns_what_it_missed() {
+    let (fixture, founder, joiner) = apart().await;
+    // The joiner is down: nothing is pushed to it, and it reaches nobody.
+    let before = joiner.node.state().await.expect("derives").devices.len();
+    founder.node.admit_without_activating(&fixture.add_a_third()).await.expect("admits");
+    assert_eq!(joiner.node.state().await.expect("derives").devices.len(), before);
+
+    // It comes up: the founder answers, and the joiner runs what the service
+    // runs first on the way up.
+    tokio::spawn(Arc::clone(&founder.node).accept_forever());
+    joiner.node.reconcile_with_neighbours().await;
+
+    assert_eq!(devices_reach(&joiner.node, before + 1).await, before + 1, "caught up");
+}
+
+// ---- A newcomer is not left refused ------------------------------------------------
+
+/// A device admitted a moment ago reaches a member that has not heard of the
+/// admission yet. The member refuses, catches up from its neighbours, and
+/// accepts the newcomer when it tries again.
+#[tokio::test]
+async fn a_newcomer_is_accepted_on_retry_by_a_member_that_was_behind() {
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    let newcomer = Arc::new(NodeIdentity::generate().expect("generates"));
+    let admission = fixture.admit(&newcomer);
+
+    // The founder holds the admission; the joiner does not, yet.
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+    founder.node.attest_change().await;
+    founder.node.admit_without_activating(&admission).await.expect("admits");
+
+    let joiner_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.joiner), fixture.state.clone()).await,
+    );
+    let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
+
+    let mut held = fixture.roster();
+    assert!(held.offer_bytes(&admission).is_accepted());
+    let newcomer_state = held.state().expect("derives");
+    let newcomer_transport =
+        Arc::new(MemoryTransport::join(&fabric, Arc::clone(&newcomer), newcomer_state).await);
+    let arrived =
+        assemble_holding(&fixture, held, &newcomer, newcomer_transport as Arc<dyn Transport>).await;
+
+    tokio::spawn(Arc::clone(&founder.node).accept_forever());
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    tokio::spawn(Arc::clone(&arrived.node).accept_forever());
+
+    let joiner_key = fixture.joiner.transport_key().public_key();
+    let outcome = tokio::time::timeout(
+        Node::NEWCOMER_RETRY * u32::try_from(Node::NEWCOMER_ATTEMPTS + 1).expect("small"),
+        arrived.node.connect(&joiner_key),
+    )
+    .await
+    .expect("within the retries");
+    assert!(outcome.is_ok(), "accepted on a retry: {outcome:?}");
+}
+
+/// Refusing strangers in quick succession makes a member catch up once, not once
+/// for each.
+#[tokio::test]
+async fn a_burst_of_strangers_makes_one_catch_up() {
+    let (fixture, founder, joiner, fabric) = apart_on_fabric().await;
+    let contacts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let founder = Arc::clone(&founder.node);
+        let contacts = Arc::clone(&contacts);
+        tokio::spawn(async move {
+            while founder.accept().await.is_ok() {
+                contacts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+
+    let joiner_key = fixture.joiner.transport_key().public_key();
+    for _ in 0..5 {
+        let stranger = Arc::new(NodeIdentity::generate().expect("generates"));
+        let stranger_transport =
+            MemoryTransport::join(&fabric, stranger, fixture.state.clone()).await;
+        let refused = stranger_transport.connect(&joiner_key).await;
+        assert!(refused.is_err(), "a stranger is refused");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        contacts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one catch-up for five strangers"
+    );
+}
+
+// ---- Asking about members looks, rather than remembering -----------------------------
+
+/// A member that is up, with no session open, is found when a person asks.
+#[tokio::test]
+async fn asking_finds_a_member_that_is_up() {
+    let (fixture, founder, joiner) = apart().await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    assert!(!founder.node.has_session(&fixture.joiner.device_id()).await);
+
+    founder.node.probe(daemon::limits::PROBE_WITHIN, daemon::limits::PROBE_AT_MOST).await;
+
+    assert!(founder.node.has_session(&fixture.joiner.device_id()).await, "reachable now");
+}
+
+/// A member that does not answer costs the question no more than the bound,
+/// and is left to be reported by its last contact.
+#[tokio::test]
+async fn asking_about_a_member_that_is_off_waits_no_longer_than_the_bound() {
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+
+    let started = std::time::Instant::now();
+    founder.node.probe(daemon::limits::PROBE_WITHIN, daemon::limits::PROBE_AT_MOST).await;
+
+    assert!(started.elapsed() <= daemon::limits::PROBE_WITHIN + std::time::Duration::from_secs(1));
+    assert!(!founder.node.has_session(&fixture.joiner.device_id()).await);
+}
+
+// ---- A failed attempt is not repeated at once ------------------------------------------
+
+/// After a packet fails to reach a member, the next packets for it are dropped
+/// for a while rather than opening another attempt each time it fails.
+#[tokio::test]
+async fn a_member_a_packet_failed_to_reach_is_rested() {
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+
+    founder.machine.queue(marked(&fixture, 1)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    let mut first = None;
+    for _ in 0..100 {
+        first = founder.node.event().await;
+        if first.as_ref().is_some_and(|event| event.cause.contains("were dropped")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let first = first.expect("the first attempt failed and said so");
+
+    for mark in 2..6 {
+        founder.machine.queue(marked(&fixture, mark)).await;
+        let _ = founder.node.carry_one().await.expect("takes");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        founder.node.event().await.map(|event| event.at),
+        Some(first.at),
+        "no further attempt was made, so nothing further failed"
     );
 }

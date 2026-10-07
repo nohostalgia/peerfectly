@@ -24,20 +24,27 @@ fn right() -> DeviceId {
     DeviceId::from_bytes([0x0b; 32])
 }
 
-/// One full exchange, both sides offering and answering.
+/// One full exchange: both sides greet, and every reply is delivered until
+/// neither side has anything left to say.
 fn reconcile(a: &mut Syncer, b: &mut Syncer) {
-    let a_offer = a.greeting().encode();
-    let b_offer = b.greeting().encode();
-
-    let a_answer = a.receive(right(), &b_offer);
-    let b_answer = b.receive(left(), &a_offer);
-
-    for message in a_answer.replies {
-        b.receive(left(), &message.encode());
+    let mut to_a = vec![b.greeting()];
+    let mut to_b = vec![a.greeting()];
+    for _ in 0..8 {
+        if to_a.is_empty() && to_b.is_empty() {
+            return;
+        }
+        let mut next_a = Vec::new();
+        let mut next_b = Vec::new();
+        for message in to_a.drain(..) {
+            next_b.extend(a.receive(right(), &message.encode()).replies);
+        }
+        for message in to_b.drain(..) {
+            next_a.extend(b.receive(left(), &message.encode()).replies);
+        }
+        to_a = next_a;
+        to_b = next_b;
     }
-    for message in b_answer.replies {
-        a.receive(right(), &message.encode());
-    }
+    panic!("reconciliation did not settle");
 }
 
 /// Derived state, as bytes, for comparing two nodes exactly.

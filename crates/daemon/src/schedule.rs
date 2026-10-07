@@ -4,28 +4,36 @@
 //! no announcement schedule. Each of them said so plainly and deferred here. This
 //! is that decision, in one place, with the reasoning next to the numbers.
 //!
-//! # These are starting values, not findings
+//! # Some are findings now
 //!
-//! Every interval below was chosen by argument rather than measurement. None of
-//! them has been tested against a real node on a real network with a real number
-//! of peers, because until this change there was no such thing to measure.
+//! These were all chosen by argument at first, and written together so that the
+//! first measurement would have something specific to contradict. It did. On
+//! 2026-10-07 the testbed measured what an idle device spent: about 3.7 GB a
+//! month with one peer up, and between 2.8 and 11 GB with one switched off
+//! (`crates/linux-daemon/VERIFICATION.md`, step 32). The sixty-second sync, which
+//! dialled every member and offered it everything, and the five-second
+//! announcements were most of it. [`Schedule::sync`], [`Schedule::announce`],
+//! [`Schedule::press_longest`] and [`Schedule::idle`] are set from that
+//! measurement, and say so where they are defined.
 //!
-//! They are written here together, rather than scattered through the code that
-//! uses them, so the first measurement has something specific to contradict. If
-//! one of these is still unchanged after the daemon has run on a real machine for
-//! a week, that is a sign nobody looked — not a sign it was right.
+//! The others are still argued rather than measured: `publish`, `endpoint_cache`
+//! and `press`. If one of them is still unchanged after the daemon has run on a
+//! real machine for a week, that is a sign nobody looked — not a sign it was
+//! right.
 
 use core::time::Duration;
 
 /// The intervals the daemon runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Schedule {
-    /// How often to exchange roster heads with an established peer.
+    /// How often to reconcile with the neighbours and the open sessions.
     ///
-    /// Sync also runs on every session establishment, which is when it matters
-    /// most — a node that has been away catches up on contact rather than on a
-    /// timer. This tick is for the case where nothing changes: two nodes that
-    /// stay connected for hours and need to notice a revocation made elsewhere.
+    /// Sync also runs on every session establishment and whenever an operation is
+    /// admitted, which is how operations actually travel: each is pushed at once.
+    /// This tick is only the safety net for a push that was lost, so an hour, not
+    /// the minute it was: every minute, it cost every device a contact with every
+    /// member around the clock — the recurring traffic measured on 2026-10-07 at
+    /// gigabytes a month.
     pub sync: Duration,
 
     /// How often to publish to the rendezvous when nothing has changed.
@@ -35,12 +43,15 @@ pub struct Schedule {
     /// would otherwise look stale to a peer that has never seen this device.
     pub publish: Duration,
 
-    /// How often to announce on the local network.
+    /// How often to announce on the local network when nothing has changed.
     ///
-    /// Short, because `local-discovery` records that multicast on Wi-Fi is
-    /// filtered or delivered at low bitrates and unreliable enough that a single
-    /// announcement is not evidence of anything. An announcement is small and
-    /// stays on the local segment.
+    /// A minute. It was five seconds, which measured on 2026-10-07 as about
+    /// 0.35 GB a month of multicast on a quiet network. What the short interval
+    /// was for — `local-discovery` records that multicast on Wi-Fi is filtered or
+    /// delivered at low bitrates, so a single announcement is not evidence of
+    /// anything — matters when something has just changed, not every five seconds
+    /// for ever: a change of interfaces is announced at once and then
+    /// [`ANNOUNCE_REPEATS`] more times, [`crate::limits::INTERFACE_RECHECK`] apart.
     pub announce: Duration,
 
     /// How long a cached endpoint is worth trying before the rendezvous.
@@ -64,6 +75,25 @@ pub struct Schedule {
     /// [`Self::sync`] as attempts go unanswered. Short, because the attempts most
     /// likely to be answered are the ones just after the event.
     pub press: Duration,
+    /// The longest pressing ever waits.
+    ///
+    /// Pressing used to widen only to the ordinary tick, a minute, and stay
+    /// there: a device switched off for a week was dialled every minute for the
+    /// week, and each attempt retried a handshake on every path it knew for half
+    /// a minute. Six hours is a few attempts a day for a device that is simply
+    /// away, while one that comes back soon after the operation is still found
+    /// within seconds.
+    pub press_longest: Duration,
+    /// How long a session may carry nothing before it is closed.
+    ///
+    /// A session is opened by the first packet that needs it, so a closed one
+    /// costs the next packet a reopening: a handshake of a few kilobytes and a
+    /// pause of tens to hundreds of milliseconds. An open one costs a keep-alive
+    /// every three seconds each way, about 100 bytes a second, for as long as it
+    /// stays open. Ten minutes keeps a session through the ordinary pauses of
+    /// someone working — reading a page, thinking between commands — and closes it
+    /// once they have stopped.
+    pub idle: Duration,
 }
 
 impl Schedule {
@@ -71,11 +101,13 @@ impl Schedule {
     #[must_use]
     pub const fn provisional() -> Self {
         Self {
-            sync: Duration::from_secs(60),
+            sync: Duration::from_secs(60 * 60),
             publish: Duration::from_secs(15 * 60),
-            announce: Duration::from_secs(5),
+            announce: Duration::from_secs(60),
             endpoint_cache: Duration::from_secs(24 * 60 * 60),
             press: Duration::from_secs(2),
+            press_longest: Duration::from_secs(6 * 60 * 60),
+            idle: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -89,9 +121,9 @@ impl Schedule {
 /// The rule is that urgency decays. The attempts most likely to be answered are
 /// the ones immediately after an operation is signed — a device that is going to
 /// come back usually comes back soon — so pressing starts short and doubles until
-/// it is no more frequent than the ordinary tick. A device that has been off for
-/// a week is then dialled at the same rate as everything else, rather than every
-/// two seconds for a week.
+/// it reaches [`Schedule::press_longest`], six hours. A device that has been off
+/// for a week is then tried a few times a day, rather than every two seconds — or
+/// every minute — for a week.
 ///
 /// It starts short again when the amount owed **grows**, because that is a new
 /// event rather than a continuation of the old wait. A person who revokes a
@@ -129,11 +161,17 @@ impl Pressing {
         }
         self.owed = owed;
 
-        let waiting = self.interval.min(schedule.sync);
-        self.interval = self.interval.saturating_mul(2).min(schedule.sync);
+        let waiting = self.interval.min(schedule.press_longest);
+        self.interval = self.interval.saturating_mul(2).min(schedule.press_longest);
         waiting
     }
 }
+
+/// How many more times a change of interfaces is announced, after the first.
+///
+/// Three announcements in all, a few seconds apart, so that one lost to Wi-Fi
+/// multicast does not leave a device on the relay for the next minute.
+pub const ANNOUNCE_REPEATS: u8 = 2;
 
 impl Default for Schedule {
     fn default() -> Self {
@@ -315,8 +353,25 @@ mod tests {
     fn the_schedule_is_in_one_place() {
         let schedule = Schedule::provisional();
         assert!(schedule.announce < schedule.sync, "announcing is cheap and unreliable");
-        assert!(schedule.sync < schedule.publish, "syncing matters more often than publishing");
+        // Not ordered against publishing any more: a published record is a
+        // device's own address, refreshed on a period because nothing else
+        // refreshes it, while operations are pushed the moment they are admitted
+        // and the sync tick only catches a push that was lost.
+        assert!(schedule.sync >= Duration::from_secs(60 * 60), "a safety net, not the transport");
         assert!(schedule.publish < schedule.endpoint_cache, "a cached endpoint outlives a record");
+    }
+
+    /// A quiet network hears one announcement a minute, and a change a few in
+    /// quick succession: the cost at rest is the minute, and the burst is what
+    /// survives Wi-Fi dropping one.
+    #[test]
+    fn announcing_is_a_minute_at_rest_and_a_burst_on_change() {
+        let schedule = Schedule::provisional();
+        assert_eq!(schedule.announce, Duration::from_secs(60));
+        assert!((1..=3).contains(&ANNOUNCE_REPEATS), "a few repeats, not a stream");
+        let burst = crate::limits::INTERFACE_RECHECK
+            .saturating_mul(u32::from(ANNOUNCE_REPEATS).saturating_add(1));
+        assert!(burst < schedule.announce, "the burst is over well inside the minute");
     }
 
     /// The trigger that makes the difference a person notices: arriving home
@@ -395,23 +450,24 @@ mod tests {
     }
 
     /// And decays, so a device that has been switched off for a week is not
-    /// dialled every two seconds for a week.
+    /// dialled every two seconds — or every minute — for a week.
     #[test]
-    fn pressing_widens_toward_the_ordinary_tick() {
+    fn pressing_widens_to_hours() {
         let schedule = Schedule::provisional();
         let mut pressing = Pressing::new(schedule.press);
 
         let mut previous = pressing.next(1, &schedule);
         let mut widened = false;
-        for _ in 0..20u32 {
+        for _ in 0..30u32 {
             let waiting = pressing.next(1, &schedule);
             assert!(waiting >= previous, "the interval never narrows while the wait continues");
-            assert!(waiting <= schedule.sync, "and never exceeds the ordinary tick");
+            assert!(waiting <= schedule.press_longest, "and never exceeds six hours");
             widened |= waiting > previous;
             previous = waiting;
         }
         assert!(widened, "it widens rather than repeating");
-        assert_eq!(previous, schedule.sync, "settling at the ordinary tick");
+        assert!(previous > Duration::from_secs(60), "past a minute");
+        assert_eq!(previous, schedule.press_longest, "settling at six hours");
     }
 
     /// A second revocation is a new event, not a continuation of the first

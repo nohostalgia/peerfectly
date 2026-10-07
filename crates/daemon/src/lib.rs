@@ -77,6 +77,7 @@ pub mod limits;
 pub mod logging;
 pub mod machine;
 pub(crate) mod names;
+pub(crate) mod neighbours;
 pub mod networks;
 pub mod node;
 pub mod relay;

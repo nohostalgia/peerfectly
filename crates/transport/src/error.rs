@@ -81,6 +81,14 @@ pub enum Error {
     /// still cross, and tunnel traffic cannot. Its own outcome so the difference
     /// is said rather than seen as silent loss.
     PacketsNotAccepted,
+    /// The peer speaks another version of this protocol.
+    ///
+    /// The two ends offered no protocol name in common, which between two
+    /// devices of one network means one of them was not updated: the protocol
+    /// changes its name when it changes in a way the other version cannot read.
+    /// Said as such, because "could not be reached" sends a person looking at the
+    /// network when the answer is to update a device.
+    IncompatibleVersion,
     /// A roster check refused the value.
     Roster(roster::Error),
     /// An identity operation failed.
@@ -102,6 +110,7 @@ impl Error {
             Self::PayloadTooLarge { .. } => "payload_too_large",
             Self::PacketTooLarge { .. } => "packet_too_large",
             Self::PacketsNotAccepted => "packets_not_accepted",
+            Self::IncompatibleVersion => "incompatible_version",
             Self::Roster(_) => "roster",
             Self::Identity(_) => "identity",
         }
@@ -119,6 +128,7 @@ impl Error {
         "payload_too_large",
         "packet_too_large",
         "packets_not_accepted",
+        "incompatible_version",
         "roster",
         "identity",
     ];
@@ -179,6 +189,9 @@ impl fmt::Display for Error {
             Self::PacketsNotAccepted => {
                 f.write_str("the peer does not accept packets: it may be running an older build")
             }
+            Self::IncompatibleVersion => f.write_str(
+                "the peer runs another version of peerfectly: update both devices to the same                  release",
+            ),
             Self::Roster(inner) => write!(f, "roster: {inner}"),
             Self::Identity(inner) => write!(f, "identity: {inner}"),
         }
@@ -210,6 +223,7 @@ mod tests {
             Error::PayloadTooLarge { len: 2, limit: 1 },
             Error::PacketTooLarge { len: 2, limit: 1 },
             Error::PacketsNotAccepted,
+            Error::IncompatibleVersion,
             Error::Roster(roster::Error::InvalidKey),
             Error::Identity(identity::Error::KeyReuse),
         ];

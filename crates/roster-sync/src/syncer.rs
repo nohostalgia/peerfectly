@@ -24,7 +24,7 @@ use roster::sign::RawOperation;
 use roster::snapshot::RawSnapshot;
 
 use crate::error::{Error, Result};
-use crate::message::{Message, Offer};
+use crate::message::{Digest, Message, Offer};
 use crate::quota::Quota;
 
 /// Something a peer sent that was not acted on, and why.
@@ -67,11 +67,12 @@ pub struct Reception {
     /// an operation, a session that stays open and the absence of an error all
     /// look the same from this side whether or not the far end ever read it.
     pub held: Option<Held>,
-    /// A message to send to every *other* open session.
+    /// A message to send to every *other* open session, and to the neighbours.
     ///
-    /// Carries only operations newly accepted, so a cycle of nodes terminates:
-    /// an operation already held produces nothing to forward. It is never sent
-    /// back to the peer it arrived from.
+    /// Carries only what was newly accepted — operations, or an attestation newer
+    /// than the one held — so a cycle of nodes terminates: what is already held
+    /// produces nothing to forward. It is never sent back to the peer it arrived
+    /// from.
     pub forward: Option<Message>,
     /// What was refused, and why.
     pub refusals: Vec<Refusal>,
@@ -167,15 +168,25 @@ impl Syncer {
         }
     }
 
-    /// What to send when a session opens.
+    /// The digest of what this node holds, as it tells a peer first.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        let offer = self.offer();
+        Digest::of(&offer.ids, offer.snapshot)
+    }
+
+    /// What to send when a session opens, and on every periodic reconciliation.
     ///
     /// Both sides send this immediately, without waiting to be asked. There is
     /// no server: a node that has just joined and the node that founded the
     /// network run the same exchange. A protocol where one side asks and the
     /// other answers has a privileged role in it, and §4.7 says there is none.
+    ///
+    /// The digest, not the offer: where both sides hold the same operations,
+    /// which is almost always, that is the whole exchange.
     #[must_use]
     pub fn greeting(&self) -> Message {
-        Message::Offer(self.offer())
+        Message::Digest(self.digest())
     }
 
     /// Handles a payload from `peer`.
@@ -195,7 +206,37 @@ impl Syncer {
             Message::Transfer(operations) => self.take_operations(peer, &operations),
             Message::Snapshot(bytes) => self.take_snapshot(peer, &bytes),
             Message::Attestation(bytes) => self.take_attestation(peer, &bytes),
+            Message::Digest(digest) => self.answer_digest(peer, digest),
         }
+    }
+
+    /// Answers a peer's digest.
+    ///
+    /// Equal: the peer holds exactly what this node holds, and nothing is sent.
+    /// That is also evidence, as an offer naming every operation would be — the
+    /// peer's own digest commits to its set — so every operation held here is
+    /// reported as held by the peer.
+    ///
+    /// Different: this node's offer, so that the peer can send what this node
+    /// lacks. The peer, having seen this node's digest differ from its own, sends
+    /// its offer too, and each answers the other's as before.
+    fn answer_digest(&self, peer: DeviceId, digest: Digest) -> Reception {
+        let mut reception = Reception::default();
+        if digest == self.digest() {
+            reception.held = Some(Held {
+                peer,
+                ids: self
+                    .roster
+                    .dag()
+                    .operations()
+                    .iter()
+                    .map(roster::sign::VerifiedOperation::id)
+                    .collect(),
+            });
+        } else {
+            reception.replies.push(Message::Offer(self.offer()));
+        }
+        reception
     }
 
     /// Admits an operation authored on this node, and says what to forward.
@@ -379,10 +420,15 @@ impl Syncer {
 
     /// Takes an attestation a peer sent.
     ///
-    /// **Never forwarded.** An attestation says what its author knew at a moment;
-    /// a node passing on someone else's would be saying it about itself, and the
-    /// receiver would date its roster from a device it never heard from. Every
-    /// admin sends its own, to every session it has.
+    /// **Forwarded when accepted as newer, and only then.** An attestation says
+    /// what its author knew and when it signed it, so a node passing one on is
+    /// carrying the admin's word, dated, rather than saying anything itself: the
+    /// receiver ages it by the time since it was signed, however late it arrives.
+    /// That is what spares an admin on a phone meeting every member in person.
+    ///
+    /// One already held, one this roster refused, or one naming heads this node
+    /// does not hold is not forwarded: the first would echo round a cycle, and
+    /// the others are not this node's to vouch for having accepted.
     fn take_attestation(&mut self, peer: DeviceId, bytes: &[u8]) -> Reception {
         let mut reception = Reception::default();
 
@@ -393,6 +439,7 @@ impl Syncer {
                 // — and can restore it with the receipt time it had, which is
                 // what makes freshness outlive the process.
                 reception.attestation = Some(bytes.to_vec());
+                reception.forward = Some(Message::Attestation(bytes.to_vec()));
             }
             // The author knew more than this node does. Not a refusal: nobody
             // misbehaved, and the answer is to catch up, which reconciliation is

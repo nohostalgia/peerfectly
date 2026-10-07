@@ -38,6 +38,14 @@ pub struct Router {
     holdings: Ipv4Holdings,
     /// IPv4 address to device, for devices with a live session that hold one.
     live_v4: BTreeMap<Ipv4Addr, DeviceId>,
+    /// Address to device, for every member, session or not.
+    ///
+    /// What lets a packet for a member with no session open one: the router has
+    /// to know whose address it is before anyone can be asked to answer at it.
+    /// Derived from the roster's members, never supplied.
+    members: BTreeMap<Ipv6Addr, DeviceId>,
+    /// The same for IPv4, from the holdings.
+    members_v4: BTreeMap<Ipv4Addr, DeviceId>,
 }
 
 impl Router {
@@ -49,6 +57,33 @@ impl Router {
             live: BTreeMap::new(),
             holdings: Ipv4Holdings::default(),
             live_v4: BTreeMap::new(),
+            members: BTreeMap::new(),
+            members_v4: BTreeMap::new(),
+        }
+    }
+
+    /// Replaces the members a packet may open a session to.
+    ///
+    /// Each address is derived here from the device id, as [`Self::opened`]
+    /// derives a live one; the caller names devices, never addresses.
+    pub fn set_members(&mut self, devices: impl IntoIterator<Item = DeviceId>) {
+        self.members =
+            devices.into_iter().map(|device| (address_of(&device, &self.prefix), device)).collect();
+        self.members_v4 = self
+            .members
+            .values()
+            .filter_map(|device| self.holdings.of(device).map(|address| (address, *device)))
+            .collect();
+    }
+
+    /// The member whose address this is, whether or not a session to it is open.
+    ///
+    /// `None` for an address no member holds.
+    #[must_use]
+    pub fn member_at(&self, destination: impl Into<IpAddr>) -> Option<DeviceId> {
+        match destination.into() {
+            IpAddr::V6(address) => self.members.get(&address).copied(),
+            IpAddr::V4(address) => self.members_v4.get(&address).copied(),
         }
     }
 
@@ -78,6 +113,11 @@ impl Router {
     pub fn set_holdings(&mut self, holdings: Ipv4Holdings) {
         self.live_v4 = self
             .live
+            .values()
+            .filter_map(|device| holdings.of(device).map(|address| (address, *device)))
+            .collect();
+        self.members_v4 = self
+            .members
             .values()
             .filter_map(|device| holdings.of(device).map(|address| (address, *device)))
             .collect();

@@ -1,8 +1,8 @@
 //! What crosses a session, and how it is encoded.
 //!
-//! Three messages, each a canonical CBOR map behind a small envelope: an
-//! **offer** naming what the sender holds, a **transfer** carrying operations,
-//! and a **snapshot**.
+//! Five messages, each a canonical CBOR map behind a small envelope: a
+//! **digest** of what the sender holds, an **offer** naming it, a **transfer**
+//! carrying operations, a **snapshot** and an **attestation**.
 //!
 //! # These messages are not signed, deliberately
 //!
@@ -52,6 +52,9 @@ const SNAPSHOT: &[&str] = &["snap"];
 /// An attestation message's single field.
 const ATTESTATION: &[&str] = &["att"];
 
+/// A digest message's single field.
+const DIGEST: &[&str] = &["hash"];
+
 /// Which message an envelope carries.
 mod kind {
     /// An offer of what the sender holds.
@@ -62,6 +65,8 @@ mod kind {
     pub const SNAPSHOT: u64 = 3;
     /// A signed attestation.
     pub const ATTESTATION: u64 = 4;
+    /// A digest of what the sender holds.
+    pub const DIGEST: u64 = 5;
 }
 
 /// A message crossing a session.
@@ -76,10 +81,59 @@ pub enum Message {
     Snapshot(Vec<u8>),
     /// A signed attestation, as the exact bytes.
     ///
-    /// Sent by an admin's node when its heads change and otherwise on a period,
-    /// and never relayed: an attestation says what its author knew, and a node
-    /// passing on someone else's would be saying it about itself.
+    /// Produced by an admin's node when its heads change and otherwise on a
+    /// period, and relayed by any node whose roster accepted it as newer: it
+    /// carries the time its author signed it, so whoever delivers it, it reads as
+    /// old as it is.
     Attestation(Vec<u8>),
+    /// A digest of what the sender holds, sent first.
+    ///
+    /// Two nodes that agree — which is almost every time — learn it from 32 bytes
+    /// each and send nothing else. Only where the digests differ does each send
+    /// its [`Offer`], and the exchange carries on exactly as it did before there
+    /// was a digest: one payload each way, no resumption.
+    Digest(Digest),
+}
+
+/// A hash of the set of operations a node holds verified, and of the snapshot
+/// it holds.
+///
+/// Recomputed from the set rather than updated as operations arrive. A hash
+/// kept incrementally — a sum or exclusive-or of per-operation hashes — is
+/// linear, and a set of operations chosen to cancel out could make two
+/// different sets agree: two nodes, one of them missing a revocation, would each
+/// believe the other held everything. Hashing the sorted ids costs a few dozen
+/// microseconds for the largest roster there can be, once per contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Digest(pub [u8; 32]);
+
+impl Digest {
+    /// The digest of a set of operation ids and a snapshot sequence.
+    ///
+    /// The order the ids are given in does not matter: they are sorted first, so
+    /// two nodes that admitted the same operations in different orders agree.
+    #[must_use]
+    pub fn of(ids: &[OperationId], snapshot: Option<u64>) -> Self {
+        let mut sorted: Vec<&OperationId> = ids.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        sorted.dedup();
+        let mut hasher = blake3::Hasher::new_derive_key("peerfectly roster digest v1");
+        // The snapshot first, flagged, so "no snapshot" and "snapshot 0" differ.
+        match snapshot {
+            Some(seq) => {
+                hasher.update(&[1]);
+                hasher.update(&seq.to_be_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&(sorted.len() as u64).to_be_bytes());
+        for id in sorted {
+            hasher.update(id.as_bytes());
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
 }
 
 /// What a node holds, as it tells a peer.
@@ -120,6 +174,7 @@ impl Message {
             Self::Transfer(operations) => (kind::TRANSFER, encode_transfer(operations)),
             Self::Snapshot(bytes) => (kind::SNAPSHOT, encode_snapshot(bytes)),
             Self::Attestation(bytes) => (kind::ATTESTATION, encode_attestation(bytes)),
+            Self::Digest(digest) => (kind::DIGEST, encode_digest(digest)),
         };
         let mut writer = Writer::new();
         writer.map(2);
@@ -154,6 +209,7 @@ impl Message {
             kind::TRANSFER => decode_transfer(&body, available).map(Self::Transfer),
             kind::SNAPSHOT => decode_snapshot(&body).map(Self::Snapshot),
             kind::ATTESTATION => decode_attestation(&body).map(Self::Attestation),
+            kind::DIGEST => decode_digest(&body).map(Self::Digest),
             // An unknown kind is refused, never skipped. The message we cannot
             // parse might be the one carrying a revocation.
             _ => Err(Error::Malformed(roster::Error::InvalidValue("message kind"))),
@@ -225,6 +281,26 @@ fn decode_offer(body: &[u8], available: usize) -> Result<Offer> {
     }
 
     Ok(Offer { ids, snapshot: held.then_some(sequence) })
+}
+
+/// Encodes a digest.
+fn encode_digest(digest: &Digest) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.map(1);
+    writer.key("hash").bytes(&digest.0);
+    writer.finish()
+}
+
+/// Decodes a digest.
+fn decode_digest(body: &[u8]) -> Result<Digest> {
+    let mut reader = Reader::new(body);
+    let mut map = reader.map(DIGEST).map_err(Error::Malformed)?;
+    let raw = map.key("hash").and_then(|value| value.fixed_bytes(32)).map_err(Error::Malformed)?;
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(raw);
+    map.finish().map_err(Error::Malformed)?;
+    reader.finish().map_err(Error::Malformed)?;
+    Ok(Digest(hash))
 }
 
 /// Encodes a transfer.
@@ -343,7 +419,7 @@ mod tests {
     /// alphabetical, which is exactly the kind of thing that gets written wrong.
     #[test]
     fn every_schema_is_canonical() {
-        for schema in [ENVELOPE, OFFER, TRANSFER, SNAPSHOT] {
+        for schema in [ENVELOPE, OFFER, TRANSFER, SNAPSHOT, DIGEST] {
             assert!(is_canonical_schema(schema), "{schema:?} is not in canonical key order");
         }
     }
@@ -510,5 +586,48 @@ mod tests {
         for input in [b"".as_slice(), b"\x00".as_slice(), b"not cbor".as_slice()] {
             assert!(Message::decode(input).is_err(), "{input:?} decoded");
         }
+    }
+
+    fn id(tag: u8) -> OperationId {
+        OperationId::from_bytes([tag; 32])
+    }
+
+    #[test]
+    fn a_digest_does_not_depend_on_order() {
+        assert_eq!(
+            Digest::of(&[id(1), id(2), id(3)], Some(4)),
+            Digest::of(&[id(3), id(1), id(2)], Some(4))
+        );
+    }
+
+    #[test]
+    fn one_operation_more_changes_the_digest() {
+        assert_ne!(Digest::of(&[id(1), id(2)], None), Digest::of(&[id(1), id(2), id(3)], None));
+    }
+
+    #[test]
+    fn a_different_snapshot_changes_the_digest() {
+        let ids = [id(1), id(2)];
+        assert_ne!(Digest::of(&ids, Some(1)), Digest::of(&ids, Some(2)));
+        assert_ne!(Digest::of(&ids, None), Digest::of(&ids, Some(0)), "none is not zero");
+    }
+
+    #[test]
+    fn a_digest_round_trips() {
+        let digest = Digest::of(&[id(7)], Some(3));
+        assert_eq!(Message::decode(&Message::Digest(digest).encode()), Ok(Message::Digest(digest)));
+    }
+
+    #[test]
+    fn a_digest_of_the_wrong_width_is_refused() {
+        let mut writer = Writer::new();
+        writer.map(1);
+        writer.key("hash").bytes(&[0u8; 31]);
+        let body = writer.finish();
+        let mut envelope = Writer::new();
+        envelope.map(2);
+        envelope.key("body").bytes(&body);
+        envelope.key("kind").u64(kind::DIGEST);
+        assert!(Message::decode(&envelope.finish()).is_err());
     }
 }

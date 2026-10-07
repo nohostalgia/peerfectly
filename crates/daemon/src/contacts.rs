@@ -287,6 +287,7 @@ mod tests {
             ("logging.rs", include_str!("logging.rs")),
             ("machine.rs", include_str!("machine.rs")),
             ("names.rs", include_str!("names.rs")),
+            ("neighbours.rs", include_str!("neighbours.rs")),
             ("networks.rs", include_str!("networks.rs")),
             ("relay.rs", include_str!("relay.rs")),
             ("resolving.rs", include_str!("resolving.rs")),

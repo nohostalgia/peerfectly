@@ -194,20 +194,33 @@ impl Discovery {
     pub async fn announce_forever(self: Arc<Self>) {
         let mut announcing = Announcing::new();
         let interval = self.node.schedule().announce;
+        let check = crate::limits::INTERFACE_RECHECK;
+        // Due at once: the network has just come up.
+        let mut since = interval;
+        let mut repeats = 0u8;
 
         loop {
             let Some(state) = self.network().await else { return };
             let Some(transport) = self.node.transport().await else { return };
 
             let addresses = transport.addresses();
-            // `should_announce` compares against what it saw last time, so a
-            // changed address set goes out at once and an unchanged one waits
-            // for the tick. Moving from tethering to home Wi-Fi is the case
-            // that matters: waiting five seconds to notice the machine in the
-            // next room is the absurd failure `local-discovery` names.
-            if !announcing.should_announce(&addresses, true) || addresses.is_empty() {
-                tokio::time::sleep(interval).await;
+            // Looked at every few seconds, announced on a change and otherwise
+            // once a minute. `should_announce` compares against what it saw last
+            // time, so a changed address set goes out at once. Moving from
+            // tethering to home Wi-Fi is the case that matters: waiting a minute
+            // to notice the machine in the next room is the absurd failure
+            // `local-discovery` names.
+            let changed = announcing.would_change(&addresses);
+            let due = since >= interval || repeats > 0;
+            if !announcing.should_announce(&addresses, due) || addresses.is_empty() {
+                tokio::time::sleep(check).await;
+                since = since.saturating_add(check);
                 continue;
+            }
+            if changed {
+                repeats = crate::schedule::ANNOUNCE_REPEATS;
+            } else {
+                repeats = repeats.saturating_sub(1);
             }
 
             if let Err(cause) = self.announce_once(&state, &addresses).await {
@@ -216,7 +229,9 @@ impl Discovery {
                 // rather than deciding nothing has changed.
                 announcing.forget();
             }
-            tokio::time::sleep(interval).await;
+            since = core::time::Duration::ZERO;
+            tokio::time::sleep(check).await;
+            since = since.saturating_add(check);
         }
     }
 

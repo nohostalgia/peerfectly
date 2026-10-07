@@ -403,7 +403,7 @@ fn the_binding_keeps_no_membership_list_of_its_own() {
 /// same connectivity layer cannot open a session here by accident.
 #[test]
 fn the_protocol_has_its_own_alpn() {
-    assert_eq!(ALPN, b"peerfectly/transport/1");
+    assert_eq!(ALPN, b"peerfectly/transport/2");
     assert!(!ALPN.is_empty(), "an empty ALPN would accept anything");
 }
 
@@ -438,6 +438,51 @@ async fn a_peer_offering_a_different_alpn_is_not_accepted() {
             .await;
 
     assert!(!matches!(outcome, Ok(Ok(_))), "a different protocol must not open a session here");
+}
+
+/// A device of the first version offers `peerfectly/transport/1`. Reaching it is
+/// not "could not be reached" but "update one of them", because that is what a
+/// person has to do.
+#[tokio::test]
+async fn a_device_of_another_version_is_told_apart() {
+    let (map, url, _server) =
+        iroh::test_utils::run_relay_server().await.expect("a relay in this process");
+    let fixture = Fixture::found(Some(url.as_str()));
+    let dialler =
+        IrohTransport::bind_trusting_any_relay_certificate(&fixture.founder, fixture.state.clone())
+            .await
+            .expect("binds");
+
+    let first_version = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::endpoint::RelayMode::Custom(map))
+        .alpns(vec![b"peerfectly/transport/1".to_vec()])
+        .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
+        .bind()
+        .await
+        .expect("binds");
+    tokio::time::timeout(Duration::from_secs(30), first_version.online())
+        .await
+        .expect("reaches the relay");
+    let listening = first_version.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = listening.accept().await {
+            let _refused = incoming.await;
+        }
+    });
+
+    let key = roster::sign::PublicKey::new(
+        roster::types::Algorithm::Ed25519,
+        first_version.id().as_bytes().to_vec(),
+    )
+    .expect("an ed25519 key");
+    let outcome = tokio::time::timeout(Duration::from_secs(20), dialler.connect(&key))
+        .await
+        .expect("answers within the bound");
+    assert!(
+        matches!(outcome, Err(transport::Error::IncompatibleVersion)),
+        "a version mismatch is named as one: {:?}",
+        outcome.map(|_| ())
+    );
 }
 
 /// The suite this binding runs is the one the in-memory implementations run.

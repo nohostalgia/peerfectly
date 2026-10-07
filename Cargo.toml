@@ -73,3 +73,8 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# The neighbour simulation scores every pair of five thousand members, which is
+# seventy-five million hashes: minutes unoptimised, seconds optimised.
+[profile.dev.package.blake3]
+opt-level = 3
