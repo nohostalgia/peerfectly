@@ -233,7 +233,10 @@ fn entry_for(peer: &Peer) -> Block {
     let reached = match (peer.reachable, peer.path) {
         (true, Some(path)) => format!("yes, {path}"),
         (true, None) => "yes".to_owned(),
-        (false, _) => "no".to_owned(),
+        // Not "unreachable": a device does not dial members in the background,
+        // so this says only that it did not answer just now. The last contact,
+        // on the next line, is what is known.
+        (false, _) => "not reached just now".to_owned(),
     };
     // Whether that answer is live or remembered is the difference between a
     // device that is there and one that was.
@@ -597,7 +600,7 @@ mod tests {
     fn a_peer_that_is_not_reachable_is_not_given_a_path() {
         let report = two_networks();
         let drawn = report.peers(Some("lavoro")).to_string();
-        assert!(drawn.contains("no ("), "{drawn}");
+        assert!(drawn.contains("not reached just now ("), "{drawn}");
         assert!(!drawn.contains("via relay") && !drawn.contains("direct"), "no guess: {drawn}");
     }
 

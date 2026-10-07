@@ -435,6 +435,7 @@ async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
         Log::at(admin_paths.roster()),
         daemon::state::read_snapshot(&admin_paths),
         daemon::state::read_attestation(&admin_paths),
+        daemon::state::read_dating_attestation(&admin_paths),
     )
     .expect("loads")
     .expect("holds a network");

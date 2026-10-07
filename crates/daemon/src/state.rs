@@ -16,6 +16,7 @@
 //! validation the network path runs, which means a tampered file is refused
 //! rather than trusted for having been on the local disk.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -151,6 +152,31 @@ impl Paths {
     /// device off and on the way out of a stale roster.
     pub fn attestation_at(&self) -> PathBuf {
         self.root.join("attestation_at")
+    }
+
+    /// The last attestation that dated this device's roster, where it is not
+    /// the one above.
+    ///
+    /// They differ on an admin of a network with other admins, whose own
+    /// attestation is held — it is relayed, and its sequence is what the next one
+    /// follows — but does not keep its own roster fresh. Without this a restart
+    /// would forget the other admin's word that did.
+    pub fn attestation_dating(&self) -> PathBuf {
+        self.root.join("attestation_dating")
+    }
+
+    /// When that one counts as having arrived, as [`Self::attestation_at`].
+    pub fn attestation_dating_at(&self) -> PathBuf {
+        self.root.join("attestation_dating_at")
+    }
+
+    /// The members that chose this device as a neighbour, one id a line.
+    ///
+    /// Kept so that a restart still pushes to them: they are learned only when
+    /// they make contact, and a device that forgot them would leave out of every
+    /// push the devices nobody else chose.
+    pub fn neighbours_in(&self) -> PathBuf {
+        self.root.join("neighbours_in")
     }
 
     /// Who this network is for, as the platform names a person.
@@ -418,9 +444,53 @@ pub fn write_snapshot(paths: &Paths, bytes: &[u8], at: u64) -> Result<()> {
 /// dated from now, which is the restart hole this exists to close.
 #[must_use]
 pub fn read_attestation(paths: &Paths) -> Option<(Vec<u8>, u64)> {
-    let bytes = fs::read(paths.attestation()).ok()?;
-    let at = fs::read_to_string(paths.attestation_at()).ok()?.trim().parse::<u64>().ok()?;
+    read_dated(&paths.attestation(), &paths.attestation_at())
+}
+
+/// The last attestation that dated this roster, where it differs from the one
+/// held, as [`Paths::attestation_dating`] describes.
+#[must_use]
+pub fn read_dating_attestation(paths: &Paths) -> Option<(Vec<u8>, u64)> {
+    read_dated(&paths.attestation_dating(), &paths.attestation_dating_at())
+}
+
+/// Bytes and the time they are dated by, where both are readable.
+fn read_dated(bytes: &std::path::Path, at: &std::path::Path) -> Option<(Vec<u8>, u64)> {
+    let bytes = fs::read(bytes).ok()?;
+    let at = fs::read_to_string(at).ok()?.trim().parse::<u64>().ok()?;
     (!bytes.is_empty()).then_some((bytes, at))
+}
+
+/// The members that chose this device as a neighbour, where the record is
+/// readable. A missing or unreadable record is an empty one: those members are
+/// learned again the next time they make contact.
+#[must_use]
+pub fn read_in_neighbours(paths: &Paths) -> BTreeSet<roster::id::DeviceId> {
+    fs::read_to_string(paths.neighbours_in())
+        .map(|text| {
+            text.lines().filter_map(|line| roster::id::DeviceId::from_hex(line.trim())).collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Records the members that chose this device as a neighbour.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn write_in_neighbours(paths: &Paths, members: &BTreeSet<roster::id::DeviceId>) -> Result<()> {
+    let path = paths.neighbours_in();
+    let text: String = members
+        .iter()
+        .map(|id| {
+            format!(
+                "{}
+",
+                id.to_hex()
+            )
+        })
+        .collect();
+    fs::write(&path, text).map_err(|cause| Error::State { path, cause: cause.to_string() })
 }
 
 /// Who a network is for, if it says.
@@ -481,11 +551,25 @@ pub fn take_ownership(paths: &Paths, owner: &str) -> Result<()> {
 ///
 /// When either file cannot be written.
 pub fn write_attestation(paths: &Paths, bytes: &[u8], at: u64) -> Result<()> {
-    let path = paths.attestation();
-    fs::write(&path, bytes).map_err(|cause| Error::State { path, cause: cause.to_string() })?;
-    let path = paths.attestation_at();
-    fs::write(&path, at.to_string())
-        .map_err(|cause| Error::State { path, cause: cause.to_string() })
+    write_dated(paths.attestation(), paths.attestation_at(), bytes, at)
+}
+
+/// Keeps the attestation that dated this roster, as [`read_dating_attestation`]
+/// reads it back.
+///
+/// # Errors
+///
+/// When either file cannot be written.
+pub fn write_dating_attestation(paths: &Paths, bytes: &[u8], at: u64) -> Result<()> {
+    write_dated(paths.attestation_dating(), paths.attestation_dating_at(), bytes, at)
+}
+
+/// Writes bytes and the time they are dated by.
+fn write_dated(bytes_path: PathBuf, at_path: PathBuf, bytes: &[u8], at: u64) -> Result<()> {
+    fs::write(&bytes_path, bytes)
+        .map_err(|cause| Error::State { path: bytes_path, cause: cause.to_string() })?;
+    fs::write(&at_path, at.to_string())
+        .map_err(|cause| Error::State { path: at_path, cause: cause.to_string() })
 }
 
 /// This device's wall clock in whole seconds, which is the frame a stored
@@ -518,6 +602,12 @@ pub struct WallClock;
 impl roster::roster::Clock for WallClock {
     fn now_seconds(&self) -> u64 {
         wall_seconds()
+    }
+
+    /// The same reading: this clock is the wall clock, so it is also what an
+    /// attestation signed here is dated with, and what one received is aged by.
+    fn unix_seconds(&self) -> Option<u64> {
+        Some(wall_seconds())
     }
 }
 

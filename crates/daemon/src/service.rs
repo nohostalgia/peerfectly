@@ -693,6 +693,7 @@ impl Service {
             crate::state::Log::at(paths.roster()),
             crate::state::read_snapshot(&paths),
             crate::state::read_attestation(&paths),
+            crate::state::read_dating_attestation(&paths),
         ) {
             Ok(Some(node)) => Ok(Network::new(record, paths, node)),
             Ok(None) => Err((
@@ -945,20 +946,40 @@ impl Service {
         // written for exactly this and had no caller for as long as it existed —
         // it is `pub` in a library, so nothing warned.
         let schedule = node.schedule();
+        //
+        // Once on the way up, which is how a device that was off learns what it
+        // missed, and then every hour as the safety net for a push that was lost.
+        // Only neighbours and open sessions: a member is never dialled for being
+        // in the roster.
         let dialling = Arc::clone(&node);
         driving.push(tokio::spawn(async move {
             loop {
-                dialling.dial_missing().await;
-                dialling.offer_to_everyone().await;
+                dialling.reconcile_with_neighbours().await;
                 tokio::time::sleep(schedule.sync).await;
+            }
+        }));
+
+        // Every admission reaches the neighbours with no open session, a short
+        // pause after the first of a burst.
+        driving.push(tokio::spawn(Arc::clone(&node).spread_forever()));
+
+        // A session nothing uses is closed, so it stops costing a keep-alive
+        // every three seconds; the next packet that needs it opens it again.
+        // Checked every minute: the idle period is ten, so a session lives at
+        // most a minute past it.
+        let sweeping = Arc::clone(&node);
+        driving.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(core::time::Duration::from_secs(60)).await;
+                sweeping.close_idle(schedule.idle).await;
             }
         }));
 
         // Urgency sets its own pace. A revocation nobody has received yet is not
         // the same situation as an idle network, and until now both waited the
         // same minute. This presses only the members that are owed something and
-        // have no session, and widens back toward the ordinary tick as attempts
-        // go unanswered — so a laptop switched off for a week is not dialled every
+        // have no session, and widens to six hours as attempts go unanswered — so
+        // a laptop switched off for a week is tried a few times a day, not every
         // two seconds for a week.
         let pressing_node = Arc::clone(&node);
         driving.push(tokio::spawn(async move {
@@ -1301,7 +1322,16 @@ impl Service {
     /// to look at this device's interfaces: a machine that moves to another
     /// Wi-Fi may have a peer that did not conflict before and does now.
     pub async fn reconcile_forever(self: Arc<Self>) {
-        let mut seen = self.interfaces.list();
+        // In index order: the platform lists the same interfaces in a different
+        // order from one call to the next, and compared as listed they read as a
+        // change every few seconds — which, since a change of network makes a
+        // device catch up with its neighbours, kept every session busy for ever.
+        let listed = || {
+            let mut interfaces = self.interfaces.list();
+            interfaces.sort_by_key(|interface| interface.index);
+            interfaces
+        };
+        let mut seen = listed();
         loop {
             let woken = tokio::select! {
                 () = self.reconciling.notified() => true,
@@ -1312,11 +1342,22 @@ impl Service {
             // notices, within one interval of the end.
             self.follow_relays().await;
             if !woken {
-                let now = self.interfaces.list();
+                let now = listed();
                 if now == seen {
                     continue;
                 }
                 seen = now;
+                tracing::info!("the machine's interfaces changed");
+                // A device that moved network may have missed pushes while it
+                // moved: it catches up with its neighbours now, not at the next
+                // hour. Only networks that are up: one that is down reaches
+                // nothing, by design.
+                for network in self.all().await {
+                    let node = Arc::clone(network.node());
+                    if node.transport().await.is_some() {
+                        tokio::spawn(async move { node.reconcile_with_neighbours().await });
+                    }
+                }
             }
             self.reconcile().await;
         }
@@ -1370,6 +1411,23 @@ impl Service {
         let prefix = Prefix::from_parameter(&state.params.ula).ok()?;
         let me = node.identity().device_id();
         state.devices.contains_key(&me).then(|| tunnel::address_of(&me, &prefix))
+    }
+
+    /// Tries the members of the networks that are up and asked about, before a
+    /// report on them is built. See [`Node::probe`].
+    async fn probe(&self, label: Option<&Label>) {
+        let asking = self.asking.lock().await.clone();
+        for network in self.all().await {
+            if label.is_some_and(|wanted| wanted != network.label())
+                || !asking.is(crate::state::read_owner(&network.paths).as_deref())
+            {
+                continue;
+            }
+            let node = Arc::clone(network.node());
+            if node.transport().await.is_some() {
+                node.probe(crate::limits::PROBE_WITHIN, crate::limits::PROBE_AT_MOST).await;
+            }
+        }
     }
 
     /// How things stand, for every network this device holds.
@@ -2602,16 +2660,30 @@ impl Service {
             // reading about them all shows more than was asked for and changes
             // nothing, which is why `up` and `down` refuse there and these do
             // not.
-            Command::Peers { network } | Command::Address { network } => {
-                match Self::wanted(network) {
-                    Ok(Some(label)) => match self.named(&label).await {
-                        Ok(_) => Outcome::Reported(self.report().await),
-                        Err(refusal) => Self::said(Err(refusal)),
-                    },
-                    Ok(None) => Outcome::Reported(self.report().await),
-                    Err(cause) => Self::said(Err(cause)),
+            // `peers` looks before it answers: without background dialling a
+            // device does not know, unprompted, which members are up.
+            Command::Peers { network } => match Self::wanted(network) {
+                Ok(Some(label)) => match self.named(&label).await {
+                    Ok(_) => {
+                        self.probe(Some(&label)).await;
+                        Outcome::Reported(self.report().await)
+                    }
+                    Err(refusal) => Self::said(Err(refusal)),
+                },
+                Ok(None) => {
+                    self.probe(None).await;
+                    Outcome::Reported(self.report().await)
                 }
-            }
+                Err(cause) => Self::said(Err(cause)),
+            },
+            Command::Address { network } => match Self::wanted(network) {
+                Ok(Some(label)) => match self.named(&label).await {
+                    Ok(_) => Outcome::Reported(self.report().await),
+                    Err(refusal) => Self::said(Err(refusal)),
+                },
+                Ok(None) => Outcome::Reported(self.report().await),
+                Err(cause) => Self::said(Err(cause)),
+            },
             Command::Up { network } => match Self::wanted(network) {
                 Ok(label) => Self::said(self.bring_up(label.as_ref()).await),
                 Err(cause) => Self::said(Err(cause)),
@@ -3698,6 +3770,7 @@ impl Service {
             crate::state::Log::at(paths.roster()),
             crate::state::read_snapshot(&paths),
             crate::state::read_attestation(&paths),
+            crate::state::read_dating_attestation(&paths),
         )?
         .ok_or(Error::NoNetwork)?;
 
@@ -4578,7 +4651,7 @@ mod tests {
     fn the_recurring_reconciliation_is_actually_run() {
         let daemon = crate::code_of(include_str!("service.rs"));
         assert!(
-            daemon.contains("offer_to_everyone"),
+            daemon.contains("reconcile_with_neighbours"),
             "reconciliation must repeat on an open session, not only when one is established"
         );
         assert!(
@@ -4597,8 +4670,9 @@ mod tests {
         paths.create().expect("creates");
 
         let identity = Arc::new(crate::state::identity_of(&paths).expect("an identity"));
-        let node = Node::from_log(identity, crate::state::Log::at(paths.roster()), None, None)
-            .expect("an empty log is readable");
+        let node =
+            Node::from_log(identity, crate::state::Log::at(paths.roster()), None, None, None)
+                .expect("an empty log is readable");
         assert!(node.is_none(), "an empty log describes no network");
 
         let machine = Arc::new(Recording::new());
@@ -5818,7 +5892,8 @@ mod tests {
         paths.create().expect("creates");
         let identity = Arc::new(crate::state::identity_of(&paths).expect("an identity"));
 
-        let outcome = Node::from_log(identity, crate::state::Log::at(paths.roster()), None, None);
+        let outcome =
+            Node::from_log(identity, crate::state::Log::at(paths.roster()), None, None, None);
 
         assert!(
             matches!(outcome, Ok(None)),
@@ -5874,7 +5949,7 @@ mod tests {
         let log = crate::state::Log::at(paths.roster());
         log.append(&tampered).expect("writes");
 
-        match Node::from_log(identity, log, None, None) {
+        match Node::from_log(identity, log, None, None, None) {
             Err(crate::error::Error::Parameters { cause }) => {
                 assert!(
                     cause.contains("suffix not under a private namespace"),
@@ -5912,7 +5987,7 @@ mod tests {
         .expect("well-formed");
         let bytes = sign_operation(&genesis, founder.signer()).expect("signs");
 
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted());
         let state = roster.state().expect("derives");
 
@@ -6001,7 +6076,7 @@ mod tests {
             let log = Log::at(paths.roster());
             log.append(&bytes).expect("writes");
 
-            let mut roster = Roster::new();
+            let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
             assert!(roster.offer_bytes(&bytes).is_accepted());
             let state = roster.state().expect("derives");
             let prefix = Prefix::from_parameter(&state.params.ula).expect("usable");
@@ -6608,7 +6683,7 @@ mod tests {
         );
 
         let log = Log::at(paths.roster());
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         for bytes in [&genesis_bytes, &added_bytes, &revoked_bytes] {
             log.append(bytes).expect("writes");
             assert!(roster.offer_bytes(bytes).is_accepted());
@@ -10237,7 +10312,7 @@ mod driven {
         let add_bytes = sign_operation(&add, founder.signer()).expect("signs");
 
         let roster_of = || {
-            let mut roster = Roster::new();
+            let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
             assert!(roster.offer_bytes(&genesis_bytes).is_accepted());
             assert!(roster.offer_bytes(&add_bytes).is_accepted());
             roster

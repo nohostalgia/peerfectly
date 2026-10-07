@@ -57,6 +57,12 @@ impl Clock for TestClock {
     fn now_seconds(&self) -> u64 {
         self.seconds.load(Ordering::SeqCst)
     }
+
+    /// The same reading, taken as Unix time, so that a test can sign an
+    /// attestation at a chosen time and see it aged on arrival.
+    fn unix_seconds(&self) -> Option<u64> {
+        Some(self.now_seconds())
+    }
 }
 
 /// A handle sharing one test clock between a roster and its test.
@@ -91,7 +97,19 @@ impl Clock for SharedClock {
     fn now_seconds(&self) -> u64 {
         self.0.now_seconds()
     }
+
+    fn unix_seconds(&self) -> Option<u64> {
+        self.0.unix_seconds()
+    }
 }
+
+/// A signed time no test clock reaches.
+///
+/// An attestation carrying it has no age on arrival, so it is dated from its
+/// receipt — exactly as every test written before attestations carried a time
+/// expects. Tests about the signed time choose one with
+/// [`History::attestation_issued`].
+pub const UNDATED: u64 = u64::MAX;
 
 /// A deterministic signer for a device.
 #[must_use]
@@ -405,9 +423,33 @@ impl History {
     /// For the cases where the point is that the wrong key signed it.
     #[must_use]
     pub fn attestation_signed_by(&self, seq: u64, key_seed: u8, head_labels: &[&str]) -> Vec<u8> {
+        self.attestation_signed_at(seq, key_seed, head_labels, UNDATED)
+    }
+
+    /// An attestation by the device with `seed`, signed at `issued_at`.
+    #[must_use]
+    pub fn attestation_issued(
+        &self,
+        seq: u64,
+        seed: u8,
+        head_labels: &[&str],
+        issued_at: u64,
+    ) -> Vec<u8> {
+        self.attestation_signed_at(seq, seed.wrapping_add(200), head_labels, issued_at)
+    }
+
+    /// The general form: any key, any signed time.
+    fn attestation_signed_at(
+        &self,
+        seq: u64,
+        key_seed: u8,
+        head_labels: &[&str],
+        issued_at: u64,
+    ) -> Vec<u8> {
         let heads: Vec<_> = head_labels.iter().map(|label| self.id(label)).collect();
-        let body = Attestation::new(seq, heads, signer(key_seed).key_id(), self.network())
-            .expect("well-formed attestation");
+        let body =
+            Attestation::new(seq, heads, signer(key_seed).key_id(), self.network(), issued_at)
+                .expect("well-formed attestation");
         sign_attestation(&body, &signer(key_seed)).expect("signs")
     }
 
@@ -416,9 +458,14 @@ impl History {
     pub fn attestation_over_unknown_heads(&self, seq: u64, seed: u8) -> Vec<u8> {
         let key_seed = seed.wrapping_add(200);
         let elsewhere = OperationId::from_bytes([0xee; 32]);
-        let body =
-            Attestation::new(seq, vec![elsewhere], signer(key_seed).key_id(), self.network())
-                .expect("well-formed attestation");
+        let body = Attestation::new(
+            seq,
+            vec![elsewhere],
+            signer(key_seed).key_id(),
+            self.network(),
+            UNDATED,
+        )
+        .expect("well-formed attestation");
         sign_attestation(&body, &signer(key_seed)).expect("signs")
     }
 

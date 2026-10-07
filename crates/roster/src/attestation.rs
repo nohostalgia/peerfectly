@@ -3,8 +3,8 @@
 //!
 //! # What it deliberately cannot say
 //!
-//! An attestation carries the network, the heads, a sequence number and the id
-//! of the key that signed — and **no roster state**. That absence is the whole
+//! An attestation carries the network, the heads, a sequence number, the time it
+//! was signed and the id of the key that signed — and **no roster state**. That absence is the whole
 //! of its security argument, and it is structural rather than procedural:
 //!
 //! - it cannot be **adopted**, because there is no state in it to adopt;
@@ -31,12 +31,25 @@
 //!
 //! ```text
 //! Attestation = { "seq": uint, "heads": [ bstr(32) ... ],
-//!                 "author": bstr(32), "network": bstr(32) }
+//!                 "author": bstr(32), "network": bstr(32), "issued_at": uint }
 //! ```
 //!
 //! No `state`, and no `depths` — depths exist in a snapshot because a node that
 //! compacted has to resolve last-writer-wins without the history, and an
 //! attestation resolves nothing.
+//!
+//! # Why it says when
+//!
+//! `issued_at` is what lets any member pass an attestation on. Dated only by when
+//! a node received it, an attestation relayed a week late would read as new, so
+//! attestations could only travel from an admin to the devices it met directly —
+//! which on a phone admin means contact with every member, all the time. With the
+//! time it was signed, it says when it was made whoever delivers it.
+//!
+//! A signer chooses that time, so what it may decide is bounded where freshness
+//! is measured ([`crate::roster::Roster::freshness`]): from the earlier of
+//! `issued_at` and local receipt. It can make a roster read older, never fresher,
+//! and a stolen attestation key writing a far-future time gains nothing by it.
 //!
 //! # A separate signing tag
 //!
@@ -54,10 +67,15 @@ use crate::sign::{PublicKey, Signer};
 ///
 /// Distinct from the operation and snapshot tags so that no kind of signature
 /// can be made to verify as another.
-pub const ATTESTATION_DOMAIN_TAG: &str = "roster-attestation/v1";
+///
+/// `v2` since attestations carry `issued_at`: the body is not the one `v1`
+/// signed, and a node of the earlier protocol refuses it rather than misreading it.
+pub const ATTESTATION_DOMAIN_TAG: &str = "roster-attestation/v2";
 
 /// The field names of an attestation body, in canonical order.
-const ATTESTATION_SCHEMA: &[&str] = &["seq", "heads", "author", "network"];
+///
+/// Canonical order is length-first, so `issued_at` comes last.
+const ATTESTATION_SCHEMA: &[&str] = &["seq", "heads", "author", "network", "issued_at"];
 
 /// The field names of a signed attestation.
 const SIGNED_ATTESTATION_SCHEMA: &[&str] = &["sig", "body"];
@@ -100,6 +118,10 @@ pub struct Attestation {
     pub heads: Vec<OperationId>,
     /// The network this attestation belongs to.
     pub network: NetworkId,
+    /// When its author signed it, in seconds since the Unix epoch on the author's
+    /// clock. Freshness is measured from the earlier of this and local receipt,
+    /// so it can only age a roster, never refresh one.
+    pub issued_at: u64,
 }
 
 impl Attestation {
@@ -113,6 +135,7 @@ impl Attestation {
         heads: Vec<OperationId>,
         author: KeyId,
         network: NetworkId,
+        issued_at: u64,
     ) -> Result<Self> {
         if heads.is_empty() {
             // An attestation covering nothing dates nothing.
@@ -121,14 +144,14 @@ impl Attestation {
         if heads.len() > limits::MAX_SNAPSHOT_HEADS {
             return Err(Error::LimitExceeded("attestation heads"));
         }
-        Ok(Self { seq, author, heads, network })
+        Ok(Self { seq, author, heads, network, issued_at })
     }
 
     /// The canonical bytes of this body.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.map(4);
+        writer.map(5);
         writer.key("seq").u64(self.seq);
         writer.key("heads").array(self.heads.len() as u64);
         for head in &self.heads {
@@ -136,6 +159,7 @@ impl Attestation {
         }
         writer.key("author").bytes(self.author.as_bytes());
         writer.key("network").bytes(self.network.as_bytes());
+        writer.key("issued_at").u64(self.issued_at);
         writer.finish()
     }
 
@@ -154,10 +178,11 @@ impl Attestation {
 
         let author = KeyId::decode(map.key("author")?)?;
         let network = NetworkId::decode(map.key("network")?)?;
+        let issued_at = map.key("issued_at")?.u64()?;
         map.finish()?;
         reader.finish()?;
 
-        Self::new(seq, heads, author, network)
+        Self::new(seq, heads, author, network, issued_at)
     }
 }
 
@@ -294,7 +319,8 @@ mod tests {
     }
 
     fn body(seq: u64, signer: &Ed25519Signer) -> Attestation {
-        Attestation::new(seq, vec![head(1), head(2)], signer.key_id(), network()).expect("bounded")
+        Attestation::new(seq, vec![head(1), head(2)], signer.key_id(), network(), 1_000)
+            .expect("bounded")
     }
 
     #[test]
@@ -314,14 +340,47 @@ mod tests {
         let text = String::from_utf8_lossy(&encoded);
         assert!(!text.contains("state"), "an attestation must carry no roster state");
         assert!(!text.contains("depths"), "and nothing that resolves an ordering");
-        assert_eq!(ATTESTATION_SCHEMA, &["seq", "heads", "author", "network"]);
+        assert_eq!(ATTESTATION_SCHEMA, &["seq", "heads", "author", "network", "issued_at"]);
+    }
+
+    /// The time is signed, not decoration: a relayed attestation whose time was
+    /// moved by whoever relayed it must not verify.
+    #[test]
+    fn an_altered_time_does_not_verify() {
+        let key = signer(11);
+        let original = body(1, &key);
+        let bytes = sign_attestation(&original, &key).expect("signs");
+        let raw = RawAttestation::decode(&bytes).expect("decodes");
+        let signature: [u8; limits::SIGNATURE_LEN] = raw.signature;
+
+        let mut moved = original.clone();
+        moved.issued_at = original.issued_at.saturating_add(7 * 24 * 60 * 60);
+        let forged = encode_signed(&signature, &moved.encode());
+        let raw_forged = RawAttestation::decode(&forged).expect("decodes");
+        assert_eq!(raw_forged.verify(&key.public_key()).map(|_| ()), Err(Error::SignatureInvalid));
+    }
+
+    /// An attestation of the earlier protocol, without a time, is refused at
+    /// decoding rather than read as one dated zero.
+    #[test]
+    fn an_attestation_without_a_time_is_refused() {
+        let key = signer(12);
+        let mut writer = Writer::new();
+        writer.map(4);
+        writer.key("seq").u64(1);
+        writer.key("heads").array(1);
+        writer.bytes(head(1).as_bytes());
+        writer.key("author").bytes(key.key_id().as_bytes());
+        writer.key("network").bytes(network().as_bytes());
+        let v1_body = writer.finish();
+        assert!(Attestation::decode(&v1_body).is_err());
     }
 
     #[test]
     fn an_attestation_with_no_heads_is_refused() {
         let key = signer(3);
         assert_eq!(
-            Attestation::new(1, vec![], key.key_id(), network()).map(|_| ()),
+            Attestation::new(1, vec![], key.key_id(), network(), 1_000).map(|_| ()),
             Err(Error::MissingField)
         );
     }
@@ -396,9 +455,14 @@ mod tests {
 
         // The same body, claiming another network: the signature covers the
         // network id, so it cannot be moved.
-        let elsewhere =
-            Attestation::new(1, here.heads.clone(), key.key_id(), NetworkId::from_bytes([8; 32]))
-                .expect("bounded");
+        let elsewhere = Attestation::new(
+            1,
+            here.heads.clone(),
+            key.key_id(),
+            NetworkId::from_bytes([8; 32]),
+            here.issued_at,
+        )
+        .expect("bounded");
         let signature: [u8; limits::SIGNATURE_LEN] = key
             .sign(&attestation_signing_input(&network(), &here.encode()))
             .expect("signs")
@@ -425,7 +489,7 @@ mod tests {
         let key = signer(10);
         let heads = vec![head(1); limits::MAX_SNAPSHOT_HEADS.saturating_add(1)];
         assert_eq!(
-            Attestation::new(1, heads, key.key_id(), network()).map(|_| ()),
+            Attestation::new(1, heads, key.key_id(), network(), 1_000).map(|_| ()),
             Err(Error::LimitExceeded("attestation heads"))
         );
     }

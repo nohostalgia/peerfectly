@@ -349,7 +349,7 @@ mod tests {
         .expect("well-formed");
         let bytes = founder.sign_operation(&genesis).expect("signs");
 
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted(), "the genesis is accepted");
         (roster, founder, bytes)
     }
@@ -513,7 +513,7 @@ mod tests {
             .expect("previews")
             .expect("nothing is held, so one is due");
 
-        let mut signed = Roster::new();
+        let mut signed = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(signed.offer_bytes(&genesis).is_accepted());
         let added = founder.sign_operation(&add).expect("signs");
         assert!(signed.offer_bytes(&added).is_accepted());
@@ -749,7 +749,7 @@ mod tests {
     /// never joined one refuse peers it does not have.
     #[test]
     fn a_device_holding_no_network_is_not_cautious() {
-        let mut nothing = Roster::new();
+        let mut nothing = Roster::with_clock(Box::new(crate::state::WallClock));
 
         assert_eq!(None, cautious(&mut nothing), "there is no roster to be old");
     }
@@ -887,7 +887,7 @@ mod tests {
     /// snapshot over an empty set that no verifier would accept.
     #[test]
     fn an_empty_roster_attests_to_nothing() {
-        let roster = Roster::new();
+        let roster = Roster::with_clock(Box::new(crate::state::WallClock));
         let identity = NodeIdentity::generate().expect("generates");
 
         assert!(sign_over_heads(&roster, &identity).is_err(), "there is nothing to attest to");

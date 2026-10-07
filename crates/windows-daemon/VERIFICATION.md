@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 55 of 87. Every other result reads `not run`. That is the honest
+**Run so far**: 56 of 88. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2414,3 +2414,28 @@ peerfectly status
 **Result**: run, 2026-10-05, passed (reported by the person who ran it).
 
 - `casa` was founded again with `peerfectly found casa --relay https://203.0.113.10`, pinning the same relay certificate after its fingerprint was confirmed. The phone then joined it (Android property 31).
+
+## 88. Sessions on demand, with the phone
+
+The PC and the phone updated together to the build of `on-demand-sessions`: the protocol changed
+(`peerfectly/transport/2`), so one of each version cannot talk.
+
+```powershell
+.\deploy\windows\package.ps1
+msiexec /i .\target\dist\peerfectly-0.1.0-windows-x64.msi
+peerfectly status
+peerfectly peers casa
+```
+
+Then, after eleven minutes with nothing carried to the phone:
+
+```powershell
+ping -n 4 <the phone's IPv4 address>
+```
+
+**Expect**:
+- `casa` up, and `never attested` at most for the moments before this device attests;
+- the phone reported reachable now by `peers`, with no session open beforehand;
+- four replies to `ping`, the first one slower while the session opens again.
+
+**Result**: run, 2026-10-07, passed (reported by the person who ran it).

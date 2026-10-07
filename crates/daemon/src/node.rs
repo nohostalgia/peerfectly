@@ -216,6 +216,61 @@ pub struct Node {
     contacts: Mutex<LastContacts>,
     /// Where that is kept between runs.
     contact_record: ContactRecord,
+    /// The members that chose this device as a neighbour and said so, checked
+    /// against the roster. Pushed to as the device's own choices are.
+    in_neighbours: Mutex<BTreeSet<DeviceId>>,
+    /// Packets waiting for a member whose session is being opened.
+    ///
+    /// A session is opened by the first packet that needs it. What arrives while
+    /// it opens waits here, in order, up to [`crate::limits::MAX_WAITING_PACKETS`],
+    /// and is sent once it is open — by whichever side opened it.
+    waiting: Mutex<BTreeMap<DeviceId, Waiting>>,
+    /// When each open session last carried something — a packet or a roster
+    /// message, in either direction.
+    ///
+    /// Keep-alives do not count: they are what an idle session costs, not use of
+    /// it. A plain lock, because it is touched for every packet, and an
+    /// asynchronous one there would be paid on the path that carries everything.
+    activity: std::sync::Mutex<BTreeMap<DeviceId, tokio::time::Instant>>,
+    /// Neighbours that did not answer, and until when each is left alone.
+    unanswered: std::sync::Mutex<BTreeMap<DeviceId, Rest>>,
+    /// Members a packet failed to open a session to, and until when packets for
+    /// them are dropped rather than opening another attempt.
+    ///
+    /// Without it, something that keeps sending to a member that is switched off
+    /// opens an attempt the moment the last one fails, for as long as it keeps
+    /// sending, and each attempt retries a handshake on every path for half a
+    /// minute.
+    unreached: std::sync::Mutex<BTreeMap<DeviceId, Rest>>,
+    /// Raised when something new was admitted that the neighbours should have.
+    ///
+    /// One permit, however often it is raised: [`Self::spread_forever`] waits
+    /// out a short pause and then makes one round of contact for everything
+    /// admitted meanwhile, so an admin signing five acts at once costs one round.
+    spreading: tokio::sync::Notify,
+    /// When this node last caught up with its neighbours because a session was
+    /// refused for want of a member it may simply not have heard of yet.
+    caught_up: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+/// How long a neighbour that did not answer is left alone.
+#[derive(Debug, Clone, Copy)]
+struct Rest {
+    /// The next wait, doubled at every failure.
+    interval: std::time::Duration,
+    /// Not tried before this.
+    until: tokio::time::Instant,
+}
+
+/// Packets waiting for one member's session.
+#[derive(Debug, Default)]
+struct Waiting {
+    /// In the order they arrived.
+    packets: std::collections::VecDeque<Vec<u8>>,
+    /// Their total size, for the byte bound.
+    bytes: usize,
+    /// How many arrived beyond the bound and were dropped.
+    dropped: usize,
 }
 
 impl Node {
@@ -248,6 +303,17 @@ impl Node {
         let contact_record = ContactRecord::beside(log.path());
         let (contacts, lost) = contact_record.load();
 
+        // The members that chose this one, kept beside the log. A record that
+        // cannot be read is an empty one: they are learned again on contact.
+        let in_neighbours = match log.path().parent() {
+            Some(directory) => {
+                crate::state::read_in_neighbours(&crate::state::Paths::under(directory))
+            }
+            // A log with no directory keeps nothing beside it: there is nothing
+            // to have lost.
+            None => BTreeSet::new(),
+        };
+
         // Every network's directory is named after its label, and the log sits
         // in it. Read off the path rather than passed in, so that naming a node
         // for the log is not another argument every caller has to get right.
@@ -277,6 +343,9 @@ impl Node {
             .map_or_else(|_| Ipv4Holdings::default(), |state| Ipv4Holdings::of_state(&state));
         let mut router = router;
         router.set_holdings(holdings.clone());
+        if let Ok(state) = syncer.roster().state() {
+            router.set_members(others(&state, &identity.device_id()));
+        }
         gateway.set_holdings(holdings.clone());
 
         Self {
@@ -300,6 +369,80 @@ impl Node {
             confirmations,
             contacts: Mutex::new(contacts),
             contact_record,
+            in_neighbours: Mutex::new(in_neighbours),
+            waiting: Mutex::new(BTreeMap::new()),
+            activity: std::sync::Mutex::new(BTreeMap::new()),
+            unanswered: std::sync::Mutex::new(BTreeMap::new()),
+            unreached: std::sync::Mutex::new(BTreeMap::new()),
+            spreading: tokio::sync::Notify::new(),
+            caught_up: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// How long a device refused as not a member waits before trying again.
+    pub const NEWCOMER_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How many times it tries again before giving up on this attempt.
+    pub const NEWCOMER_ATTEMPTS: usize = 3;
+
+    /// The least time between two catch-ups caused by refusals.
+    pub const CATCH_UP_AT_MOST: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Reconciles with the neighbours because a refusal suggests this roster
+    /// is behind — at most once every [`Self::CATCH_UP_AT_MOST`].
+    ///
+    /// The refusal may be right: a stranger is a stranger. It may also be a
+    /// device admitted moments ago whose admission has not reached this one yet,
+    /// and the neighbours are where it would come from. Bounded, so that a stream
+    /// of strangers costs at most one round of contact a minute; and nothing is
+    /// accepted from the refused device, which gets nothing it could not get by
+    /// waiting.
+    fn catch_up(self: &Arc<Self>) {
+        let now = tokio::time::Instant::now();
+        let due = self.caught_up.lock().is_ok_and(|mut last| {
+            let due =
+                last.is_none_or(|at| now.saturating_duration_since(at) >= Self::CATCH_UP_AT_MOST);
+            if due {
+                *last = Some(now);
+            }
+            due
+        });
+        if due {
+            let node = Arc::clone(self);
+            tokio::spawn(async move { node.reconcile_with_neighbours().await });
+        }
+    }
+
+    /// Notes that a session carried something now.
+    fn active(&self, peer: DeviceId) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.insert(peer, tokio::time::Instant::now());
+        }
+    }
+
+    /// Closes every session that has carried nothing for `idle`.
+    ///
+    /// Not a fault and not recorded: it is the ordinary end of a session nothing
+    /// is using, and the next packet that needs one opens it again.
+    pub async fn close_idle(&self, idle: std::time::Duration) {
+        let now = tokio::time::Instant::now();
+        let stale: Vec<DeviceId> = self.activity.lock().map_or_else(
+            |_| Vec::new(),
+            |activity| {
+                activity
+                    .iter()
+                    .filter(|(_, last)| now.saturating_duration_since(**last) >= idle)
+                    .map(|(peer, _)| *peer)
+                    .collect()
+            },
+        );
+        for peer in stale {
+            tracing::info!(network = %self.called, ?peer, "closing a session nothing used");
+            let session = self.sessions.lock().await.get(&peer).map(Arc::clone);
+            self.closed(&peer).await;
+            if let Some(session) = session {
+                let _closing = session.close().await;
+            }
         }
     }
 
@@ -331,10 +474,14 @@ impl Node {
         log: crate::state::Log,
         restored: Option<(Vec<u8>, u64)>,
         attested: Option<(Vec<u8>, u64)>,
+        dating: Option<(Vec<u8>, u64)>,
     ) -> crate::Result<Option<Arc<Self>>> {
         // On the wall clock, not the roster's default: freshness has to outlive
         // this process, and the default counts from the moment it started.
         let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
+        // So that, with other admins in the network, this device's own
+        // attestations do not keep its own roster fresh.
+        roster.set_own_device(identity.device_id());
         let held = log.read()?;
         // Why the first operation this build refuses was refused. A log written
         // by a build whose rules were looser — before network suffixes and
@@ -356,6 +503,15 @@ impl Node {
         // roster it has not yet decided whether to trust.
         if let Some((bytes, received_at)) = restored {
             let _restored = roster.restore_snapshot(&bytes, received_at);
+        }
+        // The one that dated this roster first, then the one held: the held one
+        // has the higher sequence, and where it is this device's own it is
+        // relayed and continued but dates nothing, which leaves the first's date
+        // standing.
+        if let Some((bytes, received_at)) = &dating
+            && attested.as_ref().is_none_or(|(held, _)| held != bytes)
+        {
+            let _restored = roster.restore_attestation(bytes, *received_at);
         }
         if let Some((bytes, received_at)) = attested {
             let _restored = roster.restore_attestation(&bytes, received_at);
@@ -743,14 +899,17 @@ impl Node {
         self.keep_attestation(&bytes).await;
         self.reconsider_carrying().await;
 
-        // To every session, and to every session's own copy: an attestation says
-        // what *this* node knew, so each admin sends its own rather than passing
-        // on another's.
+        // To every session. The members that receive it relay it onward: it
+        // carries the time it was signed, so it reads as old as it is wherever
+        // it arrives.
         let message = roster_sync::message::Message::Attestation(bytes);
         let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
         for peer in peers {
             self.send_to(peer, Channel::Roster, &message.encode()).await;
         }
+        // An admin on a phone gives it to its neighbours, and they relay it: it
+        // never has to meet every member.
+        self.spread_soon();
     }
 
     /// Keeps an attestation beside the log, with the moment it arrived.
@@ -759,10 +918,26 @@ impl Node {
     /// is not an operation and is not in the log, so a node that replayed its log
     /// would hold none — and one that re-accepted its own on start would date it
     /// from the start, which would make restarting the way out of a stale roster.
+    ///
+    /// Dated as the roster dated it — its receipt, moved back by the age it
+    /// already had — and not by the clock at the moment of writing, which would
+    /// make one relayed a week late look new again after a restart.
     pub(crate) async fn keep_attestation(&self, bytes: &[u8]) {
         let Some(paths) = self.paths() else { return };
-        if let Err(cause) =
-            crate::state::write_attestation(&paths, bytes, crate::state::wall_seconds())
+        let (dated, since) = {
+            let syncer = self.syncer.lock().await;
+            (syncer.roster().attestation_received_at(), syncer.roster().freshness_since())
+        };
+        let at = dated.unwrap_or_else(crate::state::wall_seconds);
+        if let Err(cause) = crate::state::write_attestation(&paths, bytes, at) {
+            self.record(Severity::Problem, "state", cause).await;
+        }
+        // Where this one is also what freshness is now measured from, it is kept
+        // a second time as the one that dates the roster, so that holding this
+        // device's own attestation later does not lose it across a restart.
+        if since.is_some()
+            && since == dated
+            && let Err(cause) = crate::state::write_dating_attestation(&paths, bytes, at)
         {
             self.record(Severity::Problem, "state", cause).await;
         }
@@ -917,6 +1092,7 @@ impl Node {
 
         self.router.lock().await.opened(peer);
         self.sessions.lock().await.insert(peer, Arc::clone(&session));
+        self.active(peer);
         self.note_contact(peer).await;
         self.date_for(peer).await;
 
@@ -1008,8 +1184,25 @@ impl Node {
     /// offer arrives and is answered with everything that offer did not name,
     /// which includes whatever was authored while the tunnel was down.
     pub async fn greet(&self, peer: DeviceId) {
-        let greeting = self.syncer.lock().await.greeting().encode();
+        let (greeting, neighbour) = {
+            let syncer = self.syncer.lock().await;
+            let neighbour = syncer.roster().state().is_ok_and(|state| {
+                let members = crate::neighbours::members_of(&state);
+                crate::neighbours::claim_holds(
+                    &state.network,
+                    &self.identity.device_id(),
+                    &peer,
+                    &members,
+                )
+            });
+            (syncer.greeting().encode(), neighbour)
+        };
         self.send_to(peer, Channel::Roster, &greeting).await;
+        // Where this device could have chosen the peer, it says so, so that the
+        // peer pushes to it too. The peer checks the same rule before believing it.
+        if neighbour {
+            self.claim_neighbour(peer).await;
+        }
     }
 
     /// Serves one session until it ends.
@@ -1021,6 +1214,10 @@ impl Node {
     pub async fn serve(self: Arc<Self>, session: Box<dyn Session>) {
         let session = self.opened(session).await;
         let peer = session.peer();
+
+        // What waited for this session is sent first, in the order it arrived,
+        // whichever side opened it.
+        self.release_waiting(peer).await;
 
         // Greeting runs beside the reading, never before it. A node that writes
         // before it reads deadlocks against a peer doing the same, and both
@@ -1050,7 +1247,7 @@ impl Node {
                     // node that quietly stops hearing from everyone looks
                     // healthy.
                     self.record(Severity::Event, "session", format!("{peer:?}: {cause}")).await;
-                    self.closed(&peer).await;
+                    self.ended(&session).await;
                     packets.abort();
                     return;
                 }
@@ -1074,9 +1271,25 @@ impl Node {
                 Ok(session) => {
                     tokio::spawn(Arc::clone(&self).serve(session));
                 }
+                // A device this roster does not name. Possibly a newcomer this
+                // node has not heard of yet, so it catches up; never a reason to
+                // stop accepting everyone else.
+                Err(transport::Error::NotAMember) => {
+                    self.record(
+                        Severity::Event,
+                        "transport",
+                        "a session from a device this roster does not name was refused",
+                    )
+                    .await;
+                    self.catch_up();
+                }
+                // One connection that failed. It used to end this loop, and with it
+                // every session this device would accept until it restarted: one
+                // stranger, or one handshake that did not finish, was enough. The
+                // loop ends only when the transport is taken away, above.
                 Err(cause) => {
-                    self.record(Severity::Problem, "transport", cause).await;
-                    return;
+                    self.record(Severity::Event, "transport", cause).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }
@@ -1097,13 +1310,165 @@ impl Node {
         }
     }
 
-    /// Opens a session with every roster peer this node has none with.
+    /// The neighbours this device chooses now, skipping those that have not
+    /// answered and are not yet due to be tried again.
+    async fn chosen_neighbours(&self) -> Vec<DeviceId> {
+        let Ok(state) = self.state().await else { return Vec::new() };
+        let members = crate::neighbours::members_of(&state);
+        let me = self.identity.device_id();
+        let Some(mine) = members.iter().find(|member| member.device == me).copied() else {
+            return Vec::new();
+        };
+        let now = tokio::time::Instant::now();
+        let resting: BTreeSet<DeviceId> = self.unanswered.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |unanswered| {
+                unanswered
+                    .iter()
+                    .filter(|(_, rest)| rest.until > now)
+                    .map(|(device, _)| *device)
+                    .collect()
+            },
+        );
+        crate::neighbours::choose(&state.network, &mine, &members, &|device| {
+            resting.contains(device)
+        })
+    }
+
+    /// Tries the members this device holds no session with, because a person
+    /// asked about them.
     ///
-    /// Dialling by transport key alone: the relay is a signed network parameter,
-    /// so every device already knows where every other device's relay is, and no
-    /// directory has to be asked where a peer is.
-    pub async fn dial_missing(self: &Arc<Self>) {
-        self.dial(&|_| true).await;
+    /// In parallel, at most `at_most` of them, each given `within` to answer. A
+    /// member that answers has a session afterwards, and is reported reachable
+    /// with the path it used; one that does not is reported by its last contact.
+    pub async fn probe(self: &Arc<Self>, within: std::time::Duration, at_most: usize) {
+        let Ok(state) = self.state().await else { return };
+        let me = self.identity.device_id();
+        let mut keys = Vec::new();
+        for record in state.devices.values() {
+            if keys.len() >= at_most {
+                break;
+            }
+            if record.id == me
+                || state.revoked.contains(&record.id)
+                || self.has_session(&record.id).await
+            {
+                continue;
+            }
+            if let Some(key) = transport_key_of(record) {
+                keys.push((record.id, key));
+            }
+        }
+        let attempts: Vec<_> = keys
+            .into_iter()
+            .map(|(device, key)| {
+                let node = Arc::clone(self);
+                tokio::spawn(async move {
+                    // A session that opened registers on its own task; it is
+                    // waited for here, within the same bound, so the report
+                    // built next sees it.
+                    let _answered = tokio::time::timeout(within, async {
+                        if node.connect(&key).await.is_ok() {
+                            while !node.has_session(&device).await {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        }
+                    })
+                    .await;
+                })
+            })
+            .collect();
+        for attempt in attempts {
+            let _finished = attempt.await;
+        }
+    }
+
+    /// The periodic safety net, and the contact a device makes on its way up.
+    ///
+    /// Every open session, and every neighbour this device chose, is sent the
+    /// digest of what it holds; a neighbour with no open session is contacted for
+    /// it. Where the digests agree that is the whole exchange. A neighbour that
+    /// does not answer is rested — a minute, then twice as long each time, up to
+    /// six hours — and its slot moves to the next member meanwhile.
+    ///
+    /// Nobody else is contacted: a member that is merely in the roster is never
+    /// dialled for being there.
+    pub async fn reconcile_with_neighbours(self: &Arc<Self>) {
+        tracing::info!(network = %self.called, "reconciling with the neighbours");
+        self.offer_to_everyone().await;
+        // Only the neighbours this device chose: those that chose it run the same
+        // check toward it.
+        self.contact_neighbours(false).await;
+    }
+
+    /// How long to wait after an admission before contacting the neighbours, so
+    /// that a burst of admissions makes one round of contact.
+    pub const SPREAD_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Says that something new was admitted and the neighbours should have it.
+    fn spread_soon(&self) {
+        self.spreading.notify_one();
+    }
+
+    /// Contacts the neighbours after every admission, a short pause after the
+    /// first of a burst, for as long as the node runs.
+    ///
+    /// Contact is all a push to a neighbour with no open session needs: the
+    /// session greets with a digest on opening, and whatever the neighbour lacks
+    /// follows. Neighbours with a session open were sent the operation already.
+    pub async fn spread_forever(self: Arc<Self>) {
+        loop {
+            self.spreading.notified().await;
+            tokio::time::sleep(Self::SPREAD_PAUSE).await;
+            tracing::info!(network = %self.called, "spreading to the neighbours");
+            self.contact_neighbours(true).await;
+        }
+    }
+
+    /// Opens contact with every neighbour that has no session: the three this
+    /// device chose and, where `mutual`, those that chose it.
+    async fn contact_neighbours(self: &Arc<Self>, mutual: bool) {
+        // A roster that derives nothing has no members to be neighbours with, and
+        // saying why is the business of whatever asks for the state to show it.
+        let Ok(state) = self.state().await else { return };
+        let mut neighbours: BTreeSet<DeviceId> =
+            self.chosen_neighbours().await.into_iter().collect();
+        if mutual {
+            neighbours.extend(self.in_neighbours().await);
+        }
+        for device in neighbours {
+            if self.has_session(&device).await || state.revoked.contains(&device) {
+                continue;
+            }
+            let Some(key) = state.devices.get(&device).and_then(transport_key_of) else {
+                continue;
+            };
+            // The session greets on opening, and says it comes from a neighbour.
+            match self.connect(&key).await {
+                Ok(()) => {
+                    if let Ok(mut unanswered) = self.unanswered.lock() {
+                        unanswered.remove(&device);
+                    }
+                }
+                Err(cause) => {
+                    self.rest(device);
+                    self.record(Severity::Event, "neighbours", format!("{device:?}: {cause}"))
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Rests a neighbour that did not answer: twice as long as last time, from a
+    /// minute up to six hours.
+    fn rest(&self, device: DeviceId) {
+        const FIRST: std::time::Duration = std::time::Duration::from_secs(60);
+        const LONGEST: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        let Ok(mut unanswered) = self.unanswered.lock() else { return };
+        let now = tokio::time::Instant::now();
+        let entry = unanswered.entry(device).or_insert(Rest { interval: FIRST, until: now });
+        entry.until = now.checked_add(entry.interval).unwrap_or(now);
+        entry.interval = entry.interval.saturating_mul(2).min(LONGEST);
     }
 
     /// Opens a session with every roster peer matching `wanted` that has none.
@@ -1149,6 +1514,44 @@ struct Refusing {
     /// what signs the attestation that ends the condition, so traffic to one
     /// keeps flowing.
     admins: std::collections::BTreeSet<DeviceId>,
+}
+
+/// The UDP source port of an IPv4 or IPv6 packet, where it is one.
+///
+/// IPv6 extension headers are not walked: a packet carrying them is not UDP as
+/// far as this is concerned, and is treated as the machine's own traffic, which
+/// is the direction that costs nothing but an attempt.
+fn udp_source_port(packet: &[u8]) -> Option<u16> {
+    const UDP: u8 = 17;
+    let version = packet.first()? >> 4;
+    let offset = match version {
+        4 => {
+            if *packet.get(9)? != UDP {
+                return None;
+            }
+            usize::from(packet.first()? & 0x0f).checked_mul(4)?
+        }
+        6 => {
+            if *packet.get(6)? != UDP {
+                return None;
+            }
+            40
+        }
+        _ => return None,
+    };
+    let high = *packet.get(offset)?;
+    let low = *packet.get(offset.checked_add(1)?)?;
+    Some(u16::from_be_bytes([high, low]))
+}
+
+/// Every member but this device, as the router needs them.
+fn others(state: &roster::state::RosterState, me: &DeviceId) -> Vec<DeviceId> {
+    state
+        .devices
+        .keys()
+        .filter(|device| *device != me && !state.revoked.contains(device))
+        .copied()
+        .collect()
 }
 
 /// A device's transport key, as the roster declares it.
@@ -1226,7 +1629,11 @@ impl Node {
         // a device revoked stops being so, rather than at the next restart.
         let holdings = Ipv4Holdings::of_state(&state);
         self.gateway.set_holdings(holdings.clone());
-        self.router.lock().await.set_holdings(holdings.clone());
+        {
+            let mut router = self.router.lock().await;
+            router.set_holdings(holdings.clone());
+            router.set_members(others(&state, &self.identity.device_id()));
+        }
         self.holdings.send_if_modified(|current| {
             if **current == holdings {
                 false
@@ -1303,10 +1710,28 @@ impl Node {
         }
     }
 
-    /// Forgets a session that has ended.
+    /// Forgets a session that has ended — only if it is still the one held.
+    ///
+    /// A session closed for being idle ends on its own task a moment later. By
+    /// then the next packet may have opened a new one to the same device, and
+    /// forgetting by device would forget the new one in its place. Sessions are
+    /// opened on demand, so that is the ordinary sequence, not a corner case.
+    async fn ended(&self, session: &Arc<dyn Session>) {
+        let peer = session.peer();
+        let current =
+            self.sessions.lock().await.get(&peer).is_some_and(|held| Arc::ptr_eq(held, session));
+        if current {
+            self.closed(&peer).await;
+        }
+    }
+
+    /// Forgets the session held with a device, whichever one it is.
     pub async fn closed(&self, peer: &DeviceId) {
         self.router.lock().await.closed(peer);
         self.sessions.lock().await.remove(peer);
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.remove(peer);
+        }
         self.refusing_packets.lock().await.remove(peer);
     }
 
@@ -1340,6 +1765,7 @@ impl Node {
     /// The dispatch point for both protocols. A payload whose channel this build
     /// does not know is recorded and dropped, never guessed at.
     pub async fn received(&self, peer: DeviceId, payload: &[u8]) {
+        self.active(peer);
         let Some((channel, body)) = unframe(payload) else {
             self.record(
                 Severity::Event,
@@ -1352,6 +1778,59 @@ impl Node {
 
         match channel {
             Channel::Roster => self.received_roster(peer, body).await,
+            Channel::Neighbour => self.received_neighbour_claim(peer).await,
+        }
+    }
+
+    /// The members that chose this device as a neighbour, as far as it knows.
+    pub async fn in_neighbours(&self) -> BTreeSet<DeviceId> {
+        self.in_neighbours.lock().await.clone()
+    }
+
+    /// Tells a peer this device contacted it as one of its neighbours.
+    pub async fn claim_neighbour(&self, peer: DeviceId) {
+        self.send_to(peer, Channel::Neighbour, &[]).await;
+    }
+
+    /// A peer says it chose this device as a neighbour.
+    ///
+    /// Believed only where the roster says it could have: anyone could claim it,
+    /// and a member believed on its word alone could make itself everybody's
+    /// neighbour. Kept beside the log once believed, so a restart still pushes
+    /// to it.
+    async fn received_neighbour_claim(&self, peer: DeviceId) {
+        let holds = {
+            let syncer = self.syncer.lock().await;
+            syncer.roster().state().is_ok_and(|state| {
+                let members = crate::neighbours::members_of(&state);
+                crate::neighbours::claim_holds(
+                    &state.network,
+                    &peer,
+                    &self.identity.device_id(),
+                    &members,
+                )
+            })
+        };
+        if !holds {
+            self.record(
+                Severity::Event,
+                "neighbours",
+                format!("{peer:?} claimed to be a neighbour, and the roster says it could not be"),
+            )
+            .await;
+            return;
+        }
+        let snapshot = {
+            let mut held = self.in_neighbours.lock().await;
+            if !held.insert(peer) {
+                return;
+            }
+            held.clone()
+        };
+        if let Some(paths) = self.paths()
+            && let Err(cause) = crate::state::write_in_neighbours(&paths, &snapshot)
+        {
+            self.record(Severity::Problem, "state", cause).await;
         }
     }
 
@@ -1419,6 +1898,7 @@ impl Node {
         }
         if let Some(forward) = reception.forward {
             self.send_to_others(peer, Channel::Roster, &forward.encode()).await;
+            self.spread_soon();
         }
 
         // A revocation that arrived from a peer takes effect here, on the
@@ -1428,6 +1908,7 @@ impl Node {
 
     /// A packet from a peer, as the session's packet channel delivered it.
     pub async fn received_packet(&self, peer: DeviceId, body: &[u8]) {
+        self.active(peer);
         if let Some(refusal) = self.refuses_traffic_with(&peer) {
             self.record(Severity::Event, "tunnel", refusal).await;
             return;
@@ -1458,12 +1939,24 @@ impl Node {
     /// # Errors
     ///
     /// When the device cannot be read.
-    pub async fn carry_one(&self) -> crate::Result<Departure> {
+    pub async fn carry_one(self: &Arc<Self>) -> crate::Result<Departure> {
         // The packet first, holding nothing. Waiting for the machine to send
         // something takes as long as it takes, and a lock held across that wait
         // is held for the same time — which deadlocked every new session against
         // an idle read.
         let packet = self.gateway.take().await?;
+
+        // The transport's own probe of an address a member advertised inside its
+        // tunnel. Never carried, session or not: through a session it would keep
+        // that session busy for ever, so it would never close for being idle, and
+        // without one it would open one. The path selector refuses such a path
+        // anyway.
+        if self.is_own_transports(&packet).await {
+            return Ok(Departure::Refused(tunnel::Outbound::DestinationOffNetwork {
+                destination: tunnel::destination_of(&packet)
+                    .unwrap_or(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+            }));
+        }
 
         let departure = {
             let router = self.router.lock().await;
@@ -1481,8 +1974,28 @@ impl Node {
             | Departure::Refused(tunnel::Outbound::UnknownVersion { .. }) => {}
             Departure::Refused(refusal) => self.record(Severity::Event, "tunnel", refusal).await,
             Departure::Unreachable { destination } => {
-                self.record(Severity::Event, "tunnel", format!("no session for {destination}"))
-                    .await;
+                // A member with no session: the packet waits, and the first one
+                // to wait opens the session. An address no member holds has
+                // nowhere to go.
+                let member = self.router.lock().await.member_at(*destination);
+                match member {
+                    // A member a packet failed to reach moments ago: dropped
+                    // until the rest is over, not another attempt.
+                    Some(device) if self.resting_after_failure(&device) => {}
+                    Some(device) => {
+                        if self.hold_for(device, packet.clone()).await {
+                            tokio::spawn(Arc::clone(self).open_for_waiting(device));
+                        }
+                    }
+                    None => {
+                        self.record(
+                            Severity::Event,
+                            "tunnel",
+                            format!("no member at {destination}"),
+                        )
+                        .await;
+                    }
+                }
             }
             Departure::TooLarge { len, limit } => {
                 self.record(
@@ -1494,6 +2007,114 @@ impl Node {
             }
         }
         Ok(departure)
+    }
+
+    /// Puts a packet in a member's waiting queue, and says whether it is the
+    /// first, so that the caller opens the session exactly once.
+    ///
+    /// Beyond the bound the packet is dropped and counted, never queued: a member
+    /// that does not answer holds no more than the bound however much is sent.
+    async fn hold_for(&self, device: DeviceId, packet: Vec<u8>) -> bool {
+        let mut waiting = self.waiting.lock().await;
+        let first = !waiting.contains_key(&device);
+        let queue = waiting.entry(device).or_default();
+        let fits = queue.packets.len() < crate::limits::MAX_WAITING_PACKETS
+            && queue.bytes.saturating_add(packet.len()) <= crate::limits::MAX_WAITING_BYTES;
+        if fits {
+            queue.bytes = queue.bytes.saturating_add(packet.len());
+            queue.packets.push_back(packet);
+        } else {
+            queue.dropped = queue.dropped.saturating_add(1);
+        }
+        first
+    }
+
+    /// Opens a session for the packets waiting for `device`.
+    ///
+    /// The session, once open, sends them itself (see [`Self::serve`]). A dial
+    /// that fails drops them, and the failure is recorded once for the attempt,
+    /// not once for every packet that was waiting.
+    async fn open_for_waiting(self: Arc<Self>, device: DeviceId) {
+        let key = {
+            let syncer = self.syncer.lock().await;
+            syncer
+                .roster()
+                .state()
+                .ok()
+                .and_then(|state| state.devices.get(&device).and_then(transport_key_of))
+        };
+        let outcome = match key {
+            Some(key) => self.connect(&key).await,
+            None => Err(crate::Error::Unreachable {
+                cause: "the roster declares no transport key for it".to_owned(),
+            }),
+        };
+        if let Err(cause) = outcome {
+            self.rest_after_failure(device);
+            let dropped = self.waiting.lock().await.remove(&device);
+            let count =
+                dropped.map_or(0, |queue| queue.packets.len().saturating_add(queue.dropped));
+            self.record(
+                Severity::Event,
+                "tunnel",
+                format!("{count} packets for {device:?} were dropped: {cause}"),
+            )
+            .await;
+        }
+    }
+
+    /// Whether a packet is the transport's own: UDP from a port it sends from.
+    async fn is_own_transports(&self, packet: &[u8]) -> bool {
+        let Some(source) = udp_source_port(packet) else { return false };
+        let Some(transport) = self.transport().await else { return false };
+        transport.own_ports().contains(&source)
+    }
+
+    /// Whether packets for `device` are being dropped after a failed attempt.
+    fn resting_after_failure(&self, device: &DeviceId) -> bool {
+        let now = tokio::time::Instant::now();
+        self.unreached
+            .lock()
+            .is_ok_and(|unreached| unreached.get(device).is_some_and(|rest| rest.until > now))
+    }
+
+    /// The first rest after a failed on-demand attempt, and the longest.
+    pub const UNREACHED_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+    /// See [`Self::UNREACHED_FIRST`].
+    pub const UNREACHED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    /// Rests a member a packet failed to reach: half a minute, then twice as long
+    /// each time, up to ten minutes. A session opening ends it.
+    fn rest_after_failure(&self, device: DeviceId) {
+        let Ok(mut unreached) = self.unreached.lock() else { return };
+        let now = tokio::time::Instant::now();
+        let entry =
+            unreached.entry(device).or_insert(Rest { interval: Self::UNREACHED_FIRST, until: now });
+        entry.until = now.checked_add(entry.interval).unwrap_or(now);
+        entry.interval = entry.interval.saturating_mul(2).min(Self::UNREACHED_LONGEST);
+    }
+
+    /// Sends what waited for a session that has just opened, in order.
+    async fn release_waiting(&self, peer: DeviceId) {
+        // Reached: whatever rest it was on is over.
+        if let Ok(mut unreached) = self.unreached.lock() {
+            unreached.remove(&peer);
+        }
+        let Some(queue) = self.waiting.lock().await.remove(&peer) else { return };
+        for packet in queue.packets {
+            self.send_packet_to(peer, &packet).await;
+        }
+        if queue.dropped > 0 {
+            self.record(
+                Severity::Event,
+                "tunnel",
+                format!(
+                    "{} packets for {peer:?} arrived while its session opened and did not fit",
+                    queue.dropped
+                ),
+            )
+            .await;
+        }
     }
 
     /// Admits an operation authored here, and spreads it.
@@ -1524,6 +2145,10 @@ impl Node {
             for peer in peers {
                 self.send_to(peer, Channel::Roster, &encoded).await;
             }
+            // And the neighbours with no session, which is every operation and
+            // not only a revocation: one is rare, so pushing it costs something
+            // only when it happens.
+            self.spread_soon();
         }
 
         // Including a revocation authored here: it must stop the session it
@@ -1734,10 +2359,11 @@ impl Node {
         }
     }
 
-    /// Offers this node's heads to every peer.
+    /// Sends this node's digest to every open session.
     ///
-    /// The tick behind reconciliation-on-contact: two nodes that stay connected
-    /// for hours still notice a revocation made elsewhere.
+    /// Part of [`Self::reconcile_with_neighbours`]: two nodes that stay connected
+    /// for hours still notice a revocation made elsewhere, at the cost of a few
+    /// dozen bytes each way when they already agree.
     pub async fn offer_to_everyone(&self) {
         let offer = self.syncer.lock().await.greeting().encode();
         let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
@@ -1753,8 +2379,9 @@ impl Node {
             self.record(Severity::Event, "session", format!("no session for {peer:?}")).await;
             return;
         };
-        if let Err(cause) = session.send(&frame(channel, payload)).await {
-            self.record(Severity::Event, "session", cause).await;
+        match session.send(&frame(channel, payload)).await {
+            Ok(()) => self.active(peer),
+            Err(cause) => self.record(Severity::Event, "session", cause).await,
         }
     }
 
@@ -1772,7 +2399,7 @@ impl Node {
             return;
         };
         match session.send_packet(packet).await {
-            Ok(()) => {}
+            Ok(()) => self.active(peer),
             // Once per session: a peer on an older build refuses every packet,
             // and a line per packet would bury everything else.
             Err(transport::Error::PacketsNotAccepted) => {
@@ -1803,16 +2430,43 @@ impl Node {
     /// # Errors
     ///
     /// When the peer cannot be reached, or the roster does not name it.
+    ///
+    /// Refused as not a member — this device may have been admitted moments ago,
+    /// and the peer not have heard yet — it tries again after
+    /// [`Self::NEWCOMER_RETRY`], up to [`Self::NEWCOMER_ATTEMPTS`] times, while
+    /// the peer catches up with its own neighbours. Over a real connection the
+    /// refusal can arrive as the peer closing it, so that is retried the same way.
     pub async fn connect(self: &Arc<Self>, peer: &roster::sign::PublicKey) -> crate::Result<()> {
-        let transport = self.transport.lock().await.clone().ok_or(crate::Error::NotUp)?;
-
-        let session = transport
-            .connect(peer)
-            .await
-            .map_err(|cause| crate::Error::Unreachable { cause: cause.to_string() })?;
-
-        tokio::spawn(Arc::clone(self).serve(session));
-        Ok(())
+        // Retried only toward a device this roster names: then a refusal means
+        // the other side is the one behind. A device this side does not know
+        // either is a stranger to both, and insisting would only delay saying so.
+        let known = self.state().await.is_ok_and(|state| {
+            state.devices.values().any(|record| {
+                transport_key_of(record).is_some_and(|key| key.key_id() == peer.key_id())
+                    && !state.revoked.contains(&record.id)
+            })
+        });
+        let mut attempt = 0usize;
+        loop {
+            let transport = self.transport.lock().await.clone().ok_or(crate::Error::NotUp)?;
+            match transport.connect(peer).await {
+                Ok(session) => {
+                    tokio::spawn(Arc::clone(self).serve(session));
+                    return Ok(());
+                }
+                Err(refusal @ (transport::Error::NotAMember | transport::Error::ClosedByPeer))
+                    if known && attempt < Self::NEWCOMER_ATTEMPTS =>
+                {
+                    // It may be this side that is behind, about the peer.
+                    if matches!(refusal, transport::Error::NotAMember) {
+                        self.catch_up();
+                    }
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(Self::NEWCOMER_RETRY).await;
+                }
+                Err(cause) => return Err(crate::Error::Unreachable { cause: cause.to_string() }),
+            }
+        }
     }
 
     /// Waits for a peer to open a session with this node.
@@ -1848,6 +2502,59 @@ mod tests {
         assert!(fault.current(at + Duration::from_secs(9 * 60)), "nine minutes on, still current");
         assert!(!fault.current(at + Duration::from_secs(11 * 60)), "eleven on, it has aged out");
         assert!(fault.current(at - Duration::from_secs(60)), "a clock gone backwards shows it");
+    }
+
+    /// **Nobody is dialled for being in the roster.** A session is opened for
+    /// one of four reasons, and each is a function here: a packet that needs one,
+    /// a neighbour, an operation still owed to a member, a person asking about a
+    /// member. A fifth caller of `connect` is a fifth reason, and has to be added
+    /// here on purpose — which is the point: the minute-by-minute dialling of
+    /// every member was one line in a loop, and it cost gigabytes a month.
+    #[test]
+    fn only_four_reasons_open_a_session() {
+        const REASONS: &[&str] = &["open_for_waiting", "contact_neighbours", "dial", "probe"];
+        let code = crate::code_of(include_str!("node.rs"));
+        let mut callers = std::collections::BTreeSet::new();
+        for (at, _) in code.match_indices("self.connect(&") {
+            let before = code.get(..at).unwrap_or_default();
+            let start = before.rfind("fn ").expect("inside a function");
+            let name: String = code
+                .get(start + 3..)
+                .unwrap_or_default()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            callers.insert(name);
+        }
+        for caller in &callers {
+            assert!(
+                REASONS.contains(&caller.as_str()),
+                "`{caller}` opens sessions, and is not one of the reasons a session is opened"
+            );
+        }
+        assert!(!code.contains("fn dial_missing"), "dialling every member is gone");
+    }
+
+    /// The UDP source port is read from both families, and nothing else is
+    /// taken for UDP.
+    #[test]
+    fn a_packets_udp_source_port_is_read() {
+        let mut v4 = vec![0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0];
+        v4.extend_from_slice(&[100, 64, 0, 1, 100, 64, 0, 2]);
+        v4.extend_from_slice(&[0xda, 0x8c, 0, 53, 0, 8, 0, 0]);
+        assert_eq!(super::udp_source_port(&v4), Some(0xda8c));
+
+        let mut v6 = vec![0x60, 0, 0, 0, 0, 8, 17, 64];
+        v6.extend_from_slice(&[0u8; 32]);
+        v6.extend_from_slice(&[0x12, 0x34, 0, 53, 0, 8, 0, 0]);
+        assert_eq!(super::udp_source_port(&v6), Some(0x1234));
+
+        let mut tcp = v4.clone();
+        if let Some(protocol) = tcp.get_mut(9) {
+            *protocol = 6;
+        }
+        assert_eq!(super::udp_source_port(&tcp), None, "TCP is not UDP");
+        assert_eq!(super::udp_source_port(&[]), None);
     }
 
     /// §2.6c by construction: with the tunnel down there is no transport, so
@@ -1962,7 +2669,7 @@ mod borrowing {
         )
         .unwrap();
         let network = NetworkId::from_bytes(*genesis.id().as_bytes());
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(
             roster.offer_bytes(&sign_operation(&genesis, founder.signer()).unwrap()).is_accepted()
         );
@@ -2084,6 +2791,74 @@ mod borrowing {
             }
         }
     }
+    /// A node of a large network, founded by `founder`, with its log in `dir`.
+    fn a_node_of(
+        founder: &Arc<NodeIdentity>,
+        dir: &std::path::Path,
+    ) -> (Node, roster::state::RosterState) {
+        let roster = a_history(founder);
+        let state = roster.state().unwrap();
+        let prefix = Prefix::from_parameter(&state.params.ula).unwrap();
+        let node = Node::new(
+            Arc::clone(founder),
+            Syncer::new(roster),
+            Arc::new(Gateway::new(Rules::new(prefix, founder.device_id()))),
+            Router::new(prefix),
+            Log::at(dir.join("roster.log")),
+            Schedule::provisional(),
+        );
+        (node, state)
+    }
+
+    /// A member's claim to have chosen this device as a neighbour, where the
+    /// roster says it could have, is kept — and kept across a restart, so the
+    /// device still pushes to it.
+    #[tokio::test]
+    async fn a_valid_neighbour_claim_is_kept_across_a_restart() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let scratch = tempfile::tempdir().unwrap();
+        let (node, state) = a_node_of(&founder, scratch.path());
+        let members = crate::neighbours::members_of(&state);
+        let me = founder.device_id();
+        let claimant = members
+            .iter()
+            .map(|member| member.device)
+            .find(|device| {
+                *device != me
+                    && crate::neighbours::claim_holds(&state.network, device, &me, &members)
+            })
+            .expect("some member could have chosen the founder");
+
+        node.received(claimant, &crate::channel::frame(crate::channel::Channel::Neighbour, &[]))
+            .await;
+        assert!(node.in_neighbours().await.contains(&claimant));
+
+        drop(node);
+        let (restarted, _) = a_node_of(&founder, scratch.path());
+        assert!(restarted.in_neighbours().await.contains(&claimant), "kept beside the log");
+    }
+
+    /// A claim the roster says could not be true is ignored: otherwise any member
+    /// could make itself everybody's neighbour.
+    #[tokio::test]
+    async fn a_false_neighbour_claim_is_ignored() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let scratch = tempfile::tempdir().unwrap();
+        let (node, state) = a_node_of(&founder, scratch.path());
+        let members = crate::neighbours::members_of(&state);
+        let me = founder.device_id();
+        let liar = members
+            .iter()
+            .map(|member| member.device)
+            .find(|device| {
+                *device != me
+                    && !crate::neighbours::claim_holds(&state.network, device, &me, &members)
+            })
+            .expect("most members could not have chosen the founder");
+
+        node.received(liar, &crate::channel::frame(crate::channel::Channel::Neighbour, &[])).await;
+        assert!(!node.in_neighbours().await.contains(&liar));
+    }
 }
 
 #[cfg(test)]
@@ -2144,7 +2919,7 @@ mod replacing {
             NetworkId::from_bytes([0; 32]),
         )
         .unwrap();
-        let mut roster = Roster::new();
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(
             roster.offer_bytes(&sign_operation(&genesis, founder.signer()).unwrap()).is_accepted()
         );

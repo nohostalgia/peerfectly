@@ -86,6 +86,30 @@ pub const MTU: usize = 1_280;
 /// whole is how a truncated packet becomes a plausible-looking lie.
 pub const MAX_PACKET: usize = MTU;
 
+/// How many packets wait for a member while its session opens.
+///
+/// A session is opened by the first packet that needs it, and what arrives in
+/// the meantime waits rather than being dropped: dropping the opening segment of
+/// a TCP connection costs it a second before the sender tries again. Enough for
+/// a burst of opening packets; a member that does not answer holds no more than
+/// this.
+pub const MAX_WAITING_PACKETS: usize = 32;
+
+/// The same bound in bytes, whichever is reached first.
+pub const MAX_WAITING_BYTES: usize = 64 * 1_024;
+
+/// How long `peers` waits for a member with no session to answer.
+///
+/// A device no longer dials every member in the background, so it does not
+/// know, unprompted, who is up. Asking is the moment to find out, and the cost
+/// is paid when a person asks: a few seconds on the command, not traffic every
+/// minute.
+pub const PROBE_WITHIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How many members `peers` tries at once, at most. The others are reported by
+/// their last contact.
+pub const PROBE_AT_MOST: usize = 32;
+
 /// The port the resolver listens on.
 ///
 /// The standard port, but bound on the device's own overlay address rather than

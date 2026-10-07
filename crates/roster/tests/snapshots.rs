@@ -11,7 +11,7 @@ mod support;
 
 use roster::Error;
 use roster::dag::Dag;
-use roster::roster::{AttestationAdmission, Freshness, Roster, SnapshotAdmission};
+use roster::roster::{AttestationAdmission, Clock as _, Freshness, Roster, SnapshotAdmission};
 use roster::sign::{RawOperation, Signer, sign_operation};
 use roster::snapshot::{
     RawSnapshot, SNAPSHOT_DOMAIN_TAG, Snapshot, assemble_snapshot, sign_snapshot,
@@ -1240,4 +1240,160 @@ fn a_revocation_settles_the_question_and_releases_the_evidence() {
         roster.equivocations().is_empty(),
         "once a signed operation has settled it, the accusation has nothing left to add"
     );
+}
+
+// ---- An attestation's signed time -------------------------------------------
+//
+// The test clock answers its own reading as Unix time, so an attestation signed
+// "at day 0" and offered "at day 6" arrives six days old.
+
+const DAY: u64 = 24 * 60 * 60;
+
+/// A far-future signed time gives no age: the attestation is dated from its
+/// receipt, exactly as one was before attestations carried a time. A stolen
+/// attestation key gains nothing by writing one.
+#[test]
+fn a_far_future_signed_time_is_dated_from_receipt() {
+    let history = linear(3);
+    let (mut roster, clock) = on_clock(&history, 64);
+    clock.advance(DAY);
+    let far = u64::MAX / 2;
+    assert!(
+        roster.offer_attestation(&history.attestation_issued(1, 1, &["n2"], far)).is_accepted()
+    );
+
+    clock.advance(params().snapshot_window.saturating_sub(1));
+    assert_eq!(roster.freshness(), Freshness::Fresh, "dated from its receipt");
+    clock.advance(2);
+    assert_eq!(roster.freshness(), Freshness::Stale, "and no later than a window after it");
+}
+
+/// Relayed six days late, an attestation is six days old on arrival: it buys one
+/// more day, not seven.
+#[test]
+fn an_old_attestation_relayed_late_is_dated_from_when_it_was_signed() {
+    let history = linear(3);
+    let (mut roster, clock) = on_clock(&history, 64);
+    let signed_at = clock.0.now_seconds();
+    clock.advance(6 * DAY);
+    assert!(
+        roster
+            .offer_attestation(&history.attestation_issued(1, 1, &["n2"], signed_at))
+            .is_accepted()
+    );
+    assert_eq!(roster.attestation_received_at(), Some(signed_at), "moved back by its age");
+
+    assert_eq!(roster.freshness(), Freshness::Fresh);
+    clock.advance(params().snapshot_window.saturating_sub(6 * DAY).saturating_add(1));
+    assert_eq!(roster.freshness(), Freshness::Stale, "one day bought, not seven");
+}
+
+/// One signed longer ago than the window is accepted — it is a valid attestation —
+/// and dates nothing: the roster is already stale on its word.
+#[test]
+fn an_attestation_older_than_the_window_refreshes_nothing() {
+    let history = linear(3);
+    let (mut roster, clock) = on_clock(&history, 64);
+    let signed_at = clock.0.now_seconds();
+    clock.advance(params().snapshot_window.saturating_add(DAY));
+    assert!(
+        roster
+            .offer_attestation(&history.attestation_issued(1, 1, &["n2"], signed_at))
+            .is_accepted()
+    );
+    assert_eq!(roster.freshness(), Freshness::Stale);
+}
+
+/// What is kept beside the log is the dating it was given, age included, and a
+/// restart neither ages it twice nor makes it young again.
+#[test]
+fn a_restored_attestation_keeps_the_age_it_arrived_with() {
+    let history = linear(3);
+    let (mut roster, clock) = on_clock(&history, 64);
+    let signed_at = clock.0.now_seconds();
+    clock.advance(6 * DAY);
+    let bytes = history.attestation_issued(1, 1, &["n2"], signed_at);
+    assert!(roster.offer_attestation(&bytes).is_accepted());
+    let kept = roster.attestation_received_at().expect("dated");
+
+    let restarted_clock = clock.clone();
+    let mut restarted = Roster::with_staleness_and_clock(64, Box::new(restarted_clock));
+    load(&mut restarted, &history);
+    assert!(restarted.restore_attestation(&bytes, kept).is_accepted());
+    assert_eq!(restarted.attestation_received_at(), Some(kept), "not aged a second time");
+
+    assert_eq!(restarted.freshness(), Freshness::Fresh);
+    clock.advance(params().snapshot_window.saturating_sub(6 * DAY).saturating_add(1));
+    assert_eq!(restarted.freshness(), Freshness::Stale);
+}
+
+// ---- An admin's own word ------------------------------------------------------
+
+/// A network with two admins: the founder (seed 1) and seed 2.
+fn two_admins() -> History {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
+    history
+}
+
+/// An admin cut off from every other device keeps signing attestations, and with
+/// another admin in the network they do not keep it fresh: that other admin could
+/// have revoked something it has not heard about.
+#[test]
+fn an_isolated_admin_goes_stale_where_there_are_other_admins() {
+    let history = two_admins();
+    let (mut roster, clock) = on_clock(&history, 64);
+    roster.set_own_device(device_id(2));
+
+    let mut seq = 1;
+    let mut elapsed = 0;
+    while elapsed <= params().snapshot_window {
+        let now = clock.0.now_seconds();
+        assert!(
+            roster
+                .offer_attestation(&history.attestation_issued(seq, 2, &["a"], now))
+                .is_accepted()
+        );
+        seq += 1;
+        clock.advance(DAY / 2);
+        elapsed += DAY / 2;
+    }
+    assert_ne!(roster.freshness(), Freshness::Fresh, "its own word does not date it");
+}
+
+/// The other admin's attestation still dates it, and so does its own once it is
+/// relayed onward: only freshness skips it.
+#[test]
+fn another_admins_attestation_still_dates_an_admin() {
+    let history = two_admins();
+    let (mut roster, clock) = on_clock(&history, 64);
+    roster.set_own_device(device_id(2));
+    let now = clock.0.now_seconds();
+    assert!(roster.offer_attestation(&history.attestation_issued(1, 1, &["a"], now)).is_accepted());
+    assert_eq!(roster.freshness(), Freshness::Fresh);
+}
+
+/// With a single admin there is nobody else who could revoke anything, and its own
+/// attestation is the only one there is.
+#[test]
+fn a_sole_admin_is_kept_fresh_by_its_own_attestation() {
+    let history = linear(3);
+    let (mut roster, clock) = on_clock(&history, 64);
+    roster.set_own_device(device_id(1));
+
+    let mut seq = 1;
+    let mut elapsed = 0;
+    while elapsed <= params().snapshot_window {
+        let now = clock.0.now_seconds();
+        assert!(
+            roster
+                .offer_attestation(&history.attestation_issued(seq, 1, &["n2"], now))
+                .is_accepted()
+        );
+        seq += 1;
+        clock.advance(DAY / 2);
+        elapsed += DAY / 2;
+    }
+    assert_eq!(roster.freshness(), Freshness::Fresh);
 }

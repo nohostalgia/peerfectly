@@ -135,6 +135,10 @@ peerfectly peers
 `peerfectly` with no arguments lists every command. On Windows the commands that change the
 machine need an elevated console. On Linux, anything that signs needs `sudo`.
 
+A device talks to another only while something is going between them, so the network costs next to
+nothing when you're not using it. The trade is a short pause, usually well under a second, on the
+first packet after ten minutes of quiet, while the session opens again.
+
 ## Building from source
 
 With [rustup](https://rustup.rs/), which installs the Rust that `rust-toolchain.toml` pins, the

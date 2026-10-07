@@ -13,26 +13,36 @@ use roster::id::DeviceId;
 use roster_sync::message::Message;
 use roster_sync::syncer::{Reception, Syncer};
 
-/// One full exchange: both sides offer, both sides answer.
+/// One full exchange: both sides greet, and every reply is delivered until
+/// neither side has anything left to say.
 ///
 /// Symmetric by construction — neither call is privileged, and swapping the two
-/// lines changes nothing.
+/// lines changes nothing. The greeting is a digest; where the digests differ,
+/// the offers and transfers follow, as they do on a real session.
 fn reconcile(a: (&mut Syncer, DeviceId), b: (&mut Syncer, DeviceId)) {
     let (left, left_id) = a;
     let (right, right_id) = b;
 
-    let left_offer = left.greeting().encode();
-    let right_offer = right.greeting().encode();
-
-    let left_answer = left.receive(right_id, &right_offer);
-    let right_answer = right.receive(left_id, &left_offer);
-
-    for message in left_answer.replies {
-        right.receive(left_id, &message.encode());
+    let mut to_left = vec![right.greeting()];
+    let mut to_right = vec![left.greeting()];
+    // Bounded: a reconciliation that has not settled in a handful of rounds is
+    // a bug this loop must not hide by spinning.
+    for _ in 0..8 {
+        if to_left.is_empty() && to_right.is_empty() {
+            return;
+        }
+        let mut next_left = Vec::new();
+        let mut next_right = Vec::new();
+        for message in to_left.drain(..) {
+            next_right.extend(left.receive(right_id, &message.encode()).replies);
+        }
+        for message in to_right.drain(..) {
+            next_left.extend(right.receive(left_id, &message.encode()).replies);
+        }
+        to_left = next_left;
+        to_right = next_right;
     }
-    for message in right_answer.replies {
-        left.receive(right_id, &message.encode());
-    }
+    panic!("reconciliation did not settle");
 }
 
 fn ids() -> (DeviceId, DeviceId) {
@@ -70,7 +80,7 @@ fn a_node_ahead_teaches_without_being_asked() {
 
     // The answer to the behind node's offer carries the operations, with no
     // request of any kind in between.
-    let answer = ahead.receive(behind_id, &behind.greeting().encode());
+    let answer = ahead.receive(behind_id, &Message::Offer(behind.offer()).encode());
     let _ = ahead_id;
 
     let transferred: usize = answer
@@ -164,7 +174,7 @@ fn a_snapshot_is_sent_before_the_operations_that_build_on_it() {
     let behind = fixture.syncer_through(1);
     let (_, behind_id) = ids();
 
-    let answer = ahead.receive(behind_id, &behind.greeting().encode());
+    let answer = ahead.receive(behind_id, &Message::Offer(behind.offer()).encode());
     let kinds: Vec<&str> = answer.replies.iter().map(kind_of).collect();
 
     assert_eq!(
@@ -206,7 +216,7 @@ fn no_snapshot_is_transferred_when_the_peer_is_already_ahead() {
 
     // Seen in the offer alone: the peer's sequence is higher, so this node's
     // snapshot would regress it. No snapshot bytes are sent for it.
-    let answer = behind.receive(peer, &ahead.greeting().encode());
+    let answer = behind.receive(peer, &Message::Offer(ahead.offer()).encode());
 
     assert!(
         !answer.replies.iter().any(|message| matches!(message, Message::Snapshot(_))),
@@ -271,6 +281,7 @@ fn kind_of(message: &Message) -> &'static str {
         Message::Transfer(_) => "transfer",
         Message::Offer(_) => "offer",
         Message::Attestation(_) => "attestation",
+        Message::Digest(_) => "digest",
     }
 }
 
@@ -496,7 +507,7 @@ fn an_interrupted_reconciliation_loses_nothing() {
 
     // The session dies after the offers cross but before the answer is
     // delivered: the answer is computed and thrown away.
-    let _abandoned = ahead.receive(behind_id, &behind.greeting().encode());
+    let _abandoned = ahead.receive(behind_id, &Message::Offer(behind.offer()).encode());
     assert_eq!(held(behind.roster()), before, "nothing was lost");
 
     // Reconciling again completes what was left.
@@ -577,7 +588,7 @@ fn a_reception_names_what_the_peer_already_had() {
     let behind = fixture.syncer_through(3);
     let (_, behind_id) = ids();
 
-    let reception = ahead.receive(behind_id, &behind.greeting().encode());
+    let reception = ahead.receive(behind_id, &Message::Offer(behind.offer()).encode());
 
     let held = reception.held.expect("an offer reports what the peer holds");
     assert_eq!(held.peer, behind_id, "attributed to the peer that offered");
@@ -605,11 +616,11 @@ fn what_one_peer_holds_is_not_attributed_to_another() {
     let (informed_id, ignorant_id) = ids();
 
     let from_informed = ahead
-        .receive(informed_id, &informed.greeting().encode())
+        .receive(informed_id, &Message::Offer(informed.offer()).encode())
         .held
         .expect("an offer reports what the peer holds");
     let from_ignorant = ahead
-        .receive(ignorant_id, &ignorant.greeting().encode())
+        .receive(ignorant_id, &Message::Offer(ignorant.offer()).encode())
         .held
         .expect("an offer reports what the peer holds");
 
@@ -635,7 +646,7 @@ fn sending_is_not_evidence_of_holding() {
     // The operations the peer lacks are handed over — the send half of the
     // exchange, from this side indistinguishable from one the far end read.
     let behind = fixture.syncer_through(1);
-    let first = ahead.receive(behind_id, &behind.greeting().encode());
+    let first = ahead.receive(behind_id, &Message::Offer(behind.offer()).encode());
     assert!(
         first.replies.iter().any(|message| matches!(message, Message::Transfer(_))),
         "what the peer lacked was sent"
@@ -643,7 +654,7 @@ fn sending_is_not_evidence_of_holding() {
 
     // The peer's next offer still does not name them: it never read what was
     // sent, or read it and discarded it. Either way nothing is evidence yet.
-    let second = ahead.receive(behind_id, &behind.greeting().encode());
+    let second = ahead.receive(behind_id, &Message::Offer(behind.offer()).encode());
     let held = second.held.expect("an offer reports what the peer holds");
     for index in 1..fixture.operations.len() {
         assert!(
@@ -651,4 +662,105 @@ fn sending_is_not_evidence_of_holding() {
             "an operation that was transmitted but never named is still not held"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The digest leads
+// ---------------------------------------------------------------------------
+
+/// Equal digests are the whole exchange, and they are evidence: the peer's digest
+/// commits to its set, so every operation held here is reported as held there.
+#[test]
+fn agreeing_digests_end_the_exchange_and_confirm_everything() {
+    let mut fixture = Fixture::found();
+    fixture.extend(6);
+    let mut left = fixture.syncer();
+    let right = fixture.syncer();
+    let (_, right_id) = ids();
+
+    let answer = left.receive(right_id, &right.greeting().encode());
+    assert!(answer.replies.is_empty());
+    let held = answer.held.expect("equal digests are evidence");
+    assert_eq!(held.peer, right_id);
+    assert_eq!(held.ids.len(), left.offer().ids.len(), "every operation, confirmed");
+}
+
+/// Different digests are answered with the offer, so the peer can send what is
+/// missing here — and nothing is confirmed on a digest that did not match.
+#[test]
+fn differing_digests_are_answered_with_the_offer() {
+    let mut fixture = Fixture::found();
+    fixture.extend(6);
+    let mut behind = fixture.syncer_through(2);
+    let ahead = fixture.syncer();
+    let (_, ahead_id) = ids();
+
+    let answer = behind.receive(ahead_id, &ahead.greeting().encode());
+    assert!(answer.held.is_none(), "a digest that differs confirms nothing");
+    assert_eq!(answer.replies.len(), 1);
+    assert!(matches!(answer.replies.first(), Some(Message::Offer(_))));
+}
+
+/// Two nodes that agree send each other their digests and nothing else: counted
+/// over a whole exchange.
+#[test]
+fn agreeing_nodes_exchange_only_digests() {
+    let mut fixture = Fixture::found();
+    fixture.extend(6);
+    let mut left = fixture.syncer();
+    let mut right = fixture.syncer();
+    let (left_id, right_id) = ids();
+
+    let from_right = left.receive(right_id, &right.greeting().encode());
+    let from_left = right.receive(left_id, &left.greeting().encode());
+    assert!(from_right.replies.is_empty() && from_left.replies.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Attestations are relayed
+// ---------------------------------------------------------------------------
+
+/// Accepted as newer, an attestation is passed on: a member that never meets the
+/// admin is dated through one that did.
+#[test]
+fn an_accepted_attestation_is_relayed() {
+    let mut fixture = Fixture::found();
+    fixture.extend(2);
+    let mut node = fixture.syncer();
+    let (peer, _) = ids();
+
+    let bytes = fixture.attestation(1);
+    let outcome = node.receive(peer, &Message::Attestation(bytes.clone()).encode());
+    assert!(outcome.is_clean());
+    assert_eq!(outcome.forward, Some(Message::Attestation(bytes)), "relayed onward");
+}
+
+/// The same one again is not relayed a second time, so relaying converges.
+#[test]
+fn an_attestation_already_held_is_not_relayed() {
+    let mut fixture = Fixture::found();
+    fixture.extend(2);
+    let mut node = fixture.syncer();
+    let (peer, _) = ids();
+
+    let message = Message::Attestation(fixture.attestation(1)).encode();
+    let _first = node.receive(peer, &message);
+    let second = node.receive(peer, &message);
+    assert!(second.forward.is_none(), "held already: nothing to pass on");
+}
+
+/// One the roster refuses — here, signed by a member — is not this node's to
+/// pass on.
+#[test]
+fn a_refused_attestation_is_not_relayed() {
+    let mut fixture = Fixture::found();
+    let member = fixture.add_member("phone");
+    fixture.extend(1);
+    let mut node = fixture.syncer();
+    let (peer, _) = ids();
+
+    let outcome =
+        node.receive(peer, &Message::Attestation(fixture.attestation_by(&member, 1)).encode());
+    assert!(!outcome.is_clean(), "a member's attestation is refused");
+    assert!(outcome.forward.is_none(), "and not relayed");
 }

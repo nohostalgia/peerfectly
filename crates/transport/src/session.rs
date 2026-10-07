@@ -121,6 +121,22 @@ pub trait Transport: Send + Sync {
     /// refuses nothing on this ground.
     fn avoid(&self, _ranges: &[Range]) {}
 
+    /// The local UDP ports this transport sends from.
+    ///
+    /// So the tunnel can tell this transport's own traffic from the machine's.
+    /// A connectivity layer probes every address a peer advertises, and a peer
+    /// advertises its tunnel's addresses too: those probes enter this device's
+    /// own tunnel, addressed to a member. Mistaken for the machine's traffic, each
+    /// would open a session to that member — whose attempt probes the same
+    /// address again. Measured in the testbed on 2026-10-07 as tens of gigabytes
+    /// a month toward a peer that was switched off.
+    ///
+    /// Empty by default: a transport that sends nothing through the tunnel has
+    /// nothing to tell apart.
+    fn own_ports(&self) -> Vec<u16> {
+        Vec::new()
+    }
+
     /// Whether the session with `peer` is carried on a direct path or through a
     /// relay, as the connection stands now.
     ///

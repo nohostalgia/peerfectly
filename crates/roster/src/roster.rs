@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use crate::attestation::{RawAttestation, SignedAttestation};
 use crate::dag::Dag;
 use crate::error::{Error, Result};
+use crate::id::DeviceId;
 use crate::id::KeyId;
 use crate::id::OperationId;
 use crate::limits;
@@ -56,6 +57,18 @@ pub trait Clock: core::fmt::Debug + Send + Sync {
     /// does not matter. A monotonic source is preferred; where only a wall
     /// clock is available a backwards jump is reported rather than absorbed.
     fn now_seconds(&self) -> u64;
+
+    /// Seconds since the Unix epoch, where this clock knows them.
+    ///
+    /// The one absolute reading a roster needs. An attestation says when its
+    /// author signed it on that scale, so a roster can only age a received
+    /// attestation by the time it already had, or date one it signs, where its
+    /// clock can say what time it is. `None` — the default, and what a clock of
+    /// elapsed time answers — dates a received attestation from its receipt, as
+    /// before attestations carried a time, and signs none.
+    fn unix_seconds(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The clock a daemon uses: elapsed time since process start.
@@ -185,6 +198,11 @@ impl SnapshotAdmission {
 /// snapshot — worse than having no window, because it would still look like a
 /// protection. It would also break the rule that timestamps never influence
 /// validity.
+///
+/// The one signed time it uses is an attestation's `issued_at`, and only to move
+/// the receipt **back** by the age the attestation already had — so that one
+/// relayed late reads as old as it is. It can never move the receipt forward,
+/// which is the direction the paragraph above forbids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
     /// A snapshot was accepted within the network's window.
@@ -292,12 +310,23 @@ pub struct Roster {
     snapshot_received_at: Option<u64>,
     /// The accepted attestation, if any.
     attestation: Option<SignedAttestation>,
-    /// Local time at which that attestation was accepted.
+    /// Local time at which that attestation counts as having arrived: its
+    /// receipt, moved back by the age it already had when it arrived.
     ///
-    /// This is what freshness is measured from. A snapshot carries state and is
-    /// delivered where a device needs state; dating a roster is a different job,
-    /// done by an object that can say nothing else.
+    /// A snapshot carries state and is delivered where a device needs state;
+    /// dating a roster is a different job, done by an object that can say nothing
+    /// else.
     attestation_received_at: Option<u64>,
+    /// What freshness is measured from: the dating of the last attestation that
+    /// counts for this node.
+    ///
+    /// Usually the held attestation's. It differs where the network has more
+    /// than one admin and the held attestation is this node's own: an admin's
+    /// word about itself does not keep it fresh while there are others who could
+    /// have revoked something it has not heard about.
+    freshness_since: Option<u64>,
+    /// This node's own device, where the caller has said which it is.
+    own_device: Option<DeviceId>,
     /// The highest attestation sequence accepted, which never decreases.
     attestation_seq: Option<u64>,
     /// The highest sequence number accepted, which never decreases.
@@ -393,6 +422,8 @@ impl Roster {
             snapshot_received_at: None,
             attestation: None,
             attestation_received_at: None,
+            freshness_since: None,
+            own_device: None,
             attestation_seq: None,
             highest_seq: None,
             conflicting_seqs: Vec::new(),
@@ -780,10 +811,39 @@ impl Roster {
         self.attestation_received_at
     }
 
-    /// Offers an attestation, dated as arriving now.
+    /// When freshness is measured from, on this roster's own clock.
+    ///
+    /// The same as [`Self::attestation_received_at`] except where the held
+    /// attestation is this node's own and the network has other admins. A caller
+    /// that keeps attestations beside the log keeps the one this dates too, so
+    /// that a restart does not lose it.
+    #[must_use]
+    pub const fn freshness_since(&self) -> Option<u64> {
+        self.freshness_since
+    }
+
+    /// Says which device this node is.
+    ///
+    /// Only freshness uses it: an attestation this device signed does not keep
+    /// its own roster fresh where the network has more than one admin.
+    pub fn set_own_device(&mut self, device: DeviceId) {
+        self.own_device = Some(device);
+    }
+
+    /// The time since the Unix epoch, where this roster's clock knows it.
+    ///
+    /// What an attestation signed here is dated with. See
+    /// [`Clock::unix_seconds`].
+    #[must_use]
+    pub fn unix_now(&self) -> Option<u64> {
+        self.clock.unix_seconds()
+    }
+
+    /// Offers an attestation, dated as arriving now — less the age it already
+    /// had, where this roster's clock can tell.
     pub fn offer_attestation(&mut self, bytes: &[u8]) -> AttestationAdmission {
         let now = self.observe_clock();
-        self.take_attestation(bytes, now)
+        self.take_attestation(bytes, now, true)
     }
 
     /// Restores an attestation accepted earlier, with the receipt time it had.
@@ -796,11 +856,25 @@ impl Roster {
         // The reading is still taken, so a clock that has moved backwards since
         // is caught on the next question rather than the one after.
         let _now = self.observe_clock();
-        self.take_attestation(bytes, received_at)
+        // What was stored is already the dating it was given on arrival, its age
+        // included, so it is not aged a second time.
+        self.take_attestation(bytes, received_at, false)
     }
 
     /// Accepts an attestation as having arrived at `received_at`.
-    fn take_attestation(&mut self, bytes: &[u8], received_at: u64) -> AttestationAdmission {
+    ///
+    /// With `age` set, the arrival is moved back by the age the attestation
+    /// already had: the time between its author signing it and now, on the
+    /// Unix clock. Measuring from the earlier of the two is what makes a
+    /// signer-chosen time safe — it can only move the start back. A time in the
+    /// future gives no age, and the attestation is dated from its receipt, as one
+    /// was before attestations carried a time.
+    fn take_attestation(
+        &mut self,
+        bytes: &[u8],
+        received_at: u64,
+        age: bool,
+    ) -> AttestationAdmission {
         let raw = match RawAttestation::decode(bytes) {
             Ok(raw) => raw,
             Err(reason) => return AttestationAdmission::Refused { reason },
@@ -847,21 +921,45 @@ impl Roster {
             return AttestationAdmission::HeadsNotHeld { seq };
         }
 
+        let dated = if age {
+            let already = self
+                .clock
+                .unix_seconds()
+                .map_or(0, |unix| unix.saturating_sub(signed.body().issued_at));
+            received_at.saturating_sub(already)
+        } else {
+            received_at
+        };
+
+        // An admin's own word dates its roster only where nobody else could have
+        // revoked anything: with other admins, an admin isolated from all of them
+        // would otherwise stay fresh for ever and honour a device they expelled.
+        let own = self.own_device.is_some_and(|own| own == record.id);
+        let admins = state
+            .devices
+            .values()
+            .filter(|device| device.role == Role::Admin && !state.revoked.contains(&device.id))
+            .count();
+        if !own || admins <= 1 {
+            self.freshness_since = Some(dated);
+        }
+
         self.attestation = Some(signed);
-        self.attestation_received_at = Some(received_at);
+        self.attestation_received_at = Some(dated);
         self.attestation_seq = Some(seq);
         AttestationAdmission::Accepted { seq }
     }
 
     /// How current this node believes its roster to be.
     ///
-    /// Measured from local receipt, never from a timestamp in the data. A
-    /// signer-chosen expiry would let a compromised admin set a far-future
-    /// value and leave the revocation window unbounded on every node that
-    /// accepted it — worse than no window, because it would look like a
-    /// protection.
+    /// Measured from the earlier of local receipt and the attestation's signed
+    /// time, never from a timestamp that could move it later. A signer-chosen
+    /// expiry would let a compromised admin set a far-future value and leave the
+    /// revocation window unbounded on every node that accepted it — worse than no
+    /// window, because it would look like a protection. A signed time that can
+    /// only make a roster older cannot do that.
     pub fn freshness(&mut self) -> Freshness {
-        let Some(received_at) = self.attestation_received_at else {
+        let Some(received_at) = self.freshness_since else {
             return Freshness::Unknown;
         };
         let previous = self.last_reading;

@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 31 of 31. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
+**Run so far**: 32 of 33; step 32 is run and its budget not yet met, for want of an iroh change. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
 through a pseudo-terminal; steps 18–25 were run by hand, with the Windows PC, the phone and WSL2,
 and reported as passed. Step 28 was run in plain containers and one running systemd; step 29 was
 run by hand on WSL2 and reported as passed. Steps 30 and 31, for the rename, were run by hand on WSL2 and reported as passed.
@@ -766,3 +766,121 @@ ip -br link | grep peer
 - `sudo nft list table inet peerfectly` answering.
 
 **Result**: run, 2026-10-05, passed (reported by the person who ran it).
+
+# Part F — what a device spends at rest, for `on-demand-sessions`
+
+## 32. Traffic at rest, counted on the real interface
+
+In the testbed, `a` founds `prova` with the relay `https://204.216.216.139`, `b` joins (step 14), and
+both are up. Nothing is sent through the tunnel. Then, from the repository root:
+
+```bash
+crates/linux-daemon/testbed/measure-idle.sh b a 204.216.216.139 300
+docker compose -f crates/linux-daemon/testbed/compose.yaml exec a sudo -u alice peerfectly down prova
+crates/linux-daemon/testbed/measure-idle.sh b a 204.216.216.139 300
+```
+
+The script counts `b`'s bytes on `eth0` by destination for five minutes and extrapolates them to a
+month (see its header). The first run has the peer up; the second has it switched off.
+
+**Expect**, after `on-demand-sessions`, in each configuration: under **100 MB a month** in total,
+and under **15 MB a month** without the relay connection.
+
+**Before** (the build of 0.1.0), three runs:
+
+| Date | Peer | Total / month | Relay | Not relay |
+|---|---|---|---|---|
+| 2026-10-07, by hand | up | ~3.7 GB | ~2.5 GB | ~1.2 GB |
+| 2026-10-07, by hand | switched off | ~11 GB | ~6.3 GB | ~4.6 GB |
+| 2026-10-07, script, first version | up | 3.9 GB | 2.4 GB | 1.5 GB |
+| 2026-10-07, script, first version | switched off | 5.6 GB | 3.3 GB | 2.2 GB |
+| 2026-10-07, script | up | 5.0 GB | 2.7 GB | 2.2 GB |
+| 2026-10-07, script | switched off | 2.8 GB | 1.5 GB | 1.3 GB |
+
+The first version of the script counted a peer's multicast announcements twice, so its split is off
+while its totals are right. With the peer switched off the figure varies by a factor of four between
+runs, from 2.8 to 11 GB. It depends on how the dial attempts fall in the five minutes: one every
+minute, each lasting thirty seconds and retrying the handshake on every path. Every run is gigabytes.
+
+With the peer up, the direct traffic is the session's keep-alive, a packet a second each way. The
+relay traffic is the same session's relayed path kept alive alongside it, plus the relay
+connection itself. With the peer switched off, it is QUIC Initial packets of 1228 bytes to the peer's
+addresses, answered by the peer's kernel with ICMP: the peer's daemon sends nothing, as §2.6c
+requires.
+
+**After** (the build of `on-demand-sessions`), 2026-10-07, measured twelve minutes after the join so
+that the session had closed for being idle:
+
+| Peer | Total / month | Relay | Peer, direct | Multicast (LAN) |
+|---|---|---|---|---|
+| up, idle | 2.3 GB | 2.25 GB | 0 | 53 MB |
+| switched off | 1.16 GB | 1.11 GB | 0 | 43 MB |
+
+**Result**: **the budget is not met.** Toward the peer the device now sends nothing at rest, in
+both configurations; before, that was 1.2 to 4.6 GB a month. What remains is iroh's own traffic to the
+relay: a net report every 20 to 26 seconds (`new_re_stun_timer`), which opens a fresh QUIC connection
+to the relay for address discovery, and a ping every 15 seconds. Both are constants inside iroh 1.1,
+not settings, and the task stops here for that decision, as the design says it should.
+
+Three defects were found on the way and fixed, each with a test (design D14):
+- **the transport's own probes looped through the tunnel.** iroh probes the tunnel addresses a peer
+  advertises, those packets entered this device's tunnel, and each opened a session that probed again:
+  31 GB a month toward a switched-off peer on the first run;
+- **a failed on-demand attempt was retried at once,** with no rest;
+- **the interface list was compared in the order the platform returned it,** which changes from one
+  call to the next, so every five seconds read as a change of network, made the device reconcile with
+  its neighbours, and kept every session busy so that none ever closed for being idle.
+
+The multicast left is local-discovery announcements, on the LAN only; it is over the 15 MB line for
+traffic other than the relay, and it costs no data plan.
+
+Then with iroh's optional net-report probes off (`NetReportConfig::minimal()`: no HTTPS latency
+probe, no captive-portal check; a network has one relay, so there is nothing to choose between), peer
+switched off: **1.06 GB a month**, of which 1.02 GB to the relay. The probes were not the bulk. What
+remains is the QUIC address discovery each net report makes — a fresh QUIC connection to the relay
+every 20 to 26 seconds, about 950 MB a month — and the relay ping every 15 seconds, about 60 MB. The
+interval is a constant in iroh 1.1 to 1.3; `NetReportConfig` (PR #4020) turns probes off, not the
+interval down.
+
+**Does it grow with the network?** Three nodes, `b` measured at rest twelve minutes after the last
+session, with the same build (minimal net report), on 2026-10-07:
+
+| Peers up | Relay | Direct to peers | Multicast (LAN) | Total / month |
+|---|---|---|---|---|
+| 2 | 996 MB | 0 | 65 MB | 1.06 GB |
+| 1 | 997 MB | 0 | 53 MB | 1.05 GB |
+| 0 | 1007 MB | 0 | 41 MB | 1.05 GB |
+
+No. What a device spends at rest is the same whether two peers, one or none are up: the relay share is
+iroh's net report and ping, once per device, and nothing goes to the peers. Only the multicast grows,
+by the announcements of each peer on the same LAN, about 12 MB a month each, and on the LAN only.
+
+## 33. Three devices, sessions on demand
+
+`a` founds `prova`, `b` and `c` join (step 14's commands, `c` with a sealed key). Then:
+
+1. `b` is taken down, `c` is admitted, `b` comes back up, and `c` pings `b`'s address.
+2. Nothing is carried for eleven minutes, then `peerfectly peers prova` on `a`.
+3. `b` is taken down, `a` signs `peerfectly rendezvous https://<relay>:8444 --network prova`, `b`
+   stays down for ten minutes and comes back up; `status` on `b` 45 seconds later.
+4. `a` revokes `c`; `status` and `peers` on `b` 20 seconds later.
+
+Throughout, `b`'s log is read for what made it contact anyone (`reconciling with the neighbours`,
+`spreading to the neighbours`).
+
+**Expect**:
+- `c` reaches `b`, though `b` never heard of `c` before it refused it once;
+- both members reported reachable now, with their paths, although no session was open;
+- `b` holds the new rendezvous within a minute of coming back;
+- `b` reads `2 devices, 1 revoked` within seconds of the revocation;
+- no contact logged on `b` but on its way up and after receiving something.
+
+**Result**: run, 2026-10-07, passed, after one false start: the first run's prompt driver read
+*"Nothing is signed without it"* as the end of the command, so the two signing steps signed nothing,
+and they were run again.
+- `ping -6` from `c` to `b`: 4 of 4.
+- `peers` on `a`: `c` `reachable yes, direct (now)`, `b` `reachable yes, via relay (now)`.
+- `b`, 45 s after coming back: `meet https://…:8444`.
+- `b`, 20 s after the revocation: `2 devices, 1 revoked`.
+- `b`'s log: `reconciling with the neighbours` when its network came up, and `spreading to the
+  neighbours` after the parameter change and the revocation reached it. Nothing in between.
