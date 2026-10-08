@@ -17,3 +17,9 @@ updates:
     groups:
       compatible:
         update-types: [minor, patch]
+    ignore:
+      # Kept at the version iroh's `netwatch` builds on Windows, so that the
+      # daemon compiles no second copy there (crates/daemon/Cargo.toml). Lift
+      # this when netwatch moves Windows to the version proposed.
+      - dependency-name: netdev
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
