@@ -82,7 +82,7 @@ openssl x509 -in /etc/peerfectly/certs/relay.crt -noout -fingerprint -sha256 -en
 ```sh
 git clone https://github.com/nohostalgia/peerfectly.git
 cd peerfectly
-git checkout v0.1.0
+git checkout v0.2.0
 docker compose -f deploy/server/compose.yaml up -d --build
 docker compose -f deploy/server/compose.yaml ps
 ```
@@ -133,6 +133,9 @@ one certificate.
 
 **The relay's own settings.** The image carries [`relay.toml`](relay.toml), which lets anyone use
 the relay within limits: 5 new connections a second (bursts of 50), and about 20 Mbit/s per client.
+It also pings a quiet device once a minute (`ping_interval_secs = 60`), which is how often devices
+ping the relay. Keep the two the same: a relay that pings more often makes every device at rest pay
+for it.
 To change them, copy it to `deploy/server/relay.local.toml`, edit the copy, and mount it:
 
 ```yaml

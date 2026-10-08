@@ -412,6 +412,71 @@ async fn register(assembled: &Assembled, session: &Arc<dyn Session>) {
     assembled.node.opened(Box::new(Shared(Arc::clone(session)))).await;
 }
 
+/// A session that says whether it was closed, and carries nothing.
+struct Watched {
+    peer: roster::id::DeviceId,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl Watched {
+    fn to(peer: roster::id::DeviceId) -> Arc<Self> {
+        Arc::new(Self { peer, closed: std::sync::atomic::AtomicBool::new(false) })
+    }
+
+    fn closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A handle on a `Watched`, which the node can own while the test keeps watching.
+struct WatchedHandle(Arc<Watched>);
+
+#[async_trait::async_trait]
+impl Session for WatchedHandle {
+    fn peer(&self) -> roster::id::DeviceId {
+        self.0.peer
+    }
+    async fn send(&self, _payload: &[u8]) -> transport::Result<()> {
+        Ok(())
+    }
+    async fn recv(&self) -> transport::Result<Vec<u8>> {
+        std::future::pending().await
+    }
+    async fn send_packet(&self, _packet: &[u8]) -> transport::Result<()> {
+        Ok(())
+    }
+    async fn recv_packet(&self) -> transport::Result<Vec<u8>> {
+        std::future::pending().await
+    }
+    async fn close(&self) -> transport::Result<()> {
+        self.0.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A session that replaces another to the same device closes the one it replaces.
+///
+/// Two devices that dial each other at the same moment open two connections, and
+/// each side keeps whichever it registered last. Where both kept the same one, the
+/// other was dropped from both tables and closed by neither: its own reader kept it
+/// alive in the transport, both paths and the net report with it, at rest and for
+/// good. Found in the testbed, in two runs out of six (Linux `VERIFICATION.md`,
+/// step 35).
+#[tokio::test]
+async fn a_session_replaced_by_another_to_the_same_device_is_closed() {
+    let (_fixture, founder, _joiner, dialled, _accepted) = pair().await;
+    let peer = dialled.peer();
+    let first = Watched::to(peer);
+    let second = Watched::to(peer);
+
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&first)))).await;
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&second)))).await;
+
+    assert!(first.closed(), "the session replaced is closed");
+    assert!(!second.closed(), "the session that replaced it is kept");
+    assert_eq!(founder.node.session_count().await, 1);
+}
+
 /// A device is dated the moment it can talk to an admin, which is what makes it
 /// right that the admission does not carry an attestation.
 ///

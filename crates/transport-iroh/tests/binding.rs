@@ -99,6 +99,32 @@ async fn the_endpoint_identity_is_the_devices_transport_key() {
     assert_eq!(dialler.transport_key().algorithm(), Algorithm::Ed25519);
 }
 
+/// A node on a quiet relay connection pings its relay once a minute, not every
+/// fifteen seconds: what it spends at rest is set here, not left to iroh.
+#[tokio::test]
+async fn a_quiet_node_does_not_ping_its_relay_every_fifteen_seconds() {
+    let (_map, url, server) =
+        iroh::test_utils::run_relay_server().await.expect("a relay in this process");
+    let fixture = Fixture::found(Some(url.as_str()));
+    let node =
+        IrohTransport::bind_trusting_any_relay_certificate(&fixture.founder, fixture.state.clone())
+            .await
+            .expect("binds");
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint().online())
+        .await
+        .expect("reaches the relay");
+
+    // The first ping goes out as the connection opens, whatever the interval.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = server.metrics().server.got_ping.get();
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    assert_eq!(
+        server.metrics().server.got_ping.get(),
+        before,
+        "no ping within sixteen seconds: iroh's default would have sent one"
+    );
+}
+
 /// A key this layer cannot represent must fail when the endpoint is built, not
 /// silently at the first connection — which would be diagnosed on a bad day, far
 /// from the misconfiguration that caused it.

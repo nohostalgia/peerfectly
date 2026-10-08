@@ -282,9 +282,101 @@ impl Announcing {
     }
 }
 
+/// Decides when a change in this device's interfaces is one to act on.
+///
+/// Acted on once it has held for [`Settling::STEADY`] checks in a row, and only
+/// if it differs from what was last acted on. Measured on 2026-10-08: a Windows
+/// PC's list changed and changed back five seconds later every eight to twenty
+/// minutes, with nothing moving. Each change made it catch up with its
+/// neighbours, which opened a session with the phone and kept it ten minutes,
+/// so the phone at rest spent about 800 MB a month on keep-alives (Android
+/// `VERIFICATION.md`, step 33). A change that undoes itself loses no push, so
+/// there is nothing to catch up on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settling<T> {
+    /// What was last acted on: the list as the daemon started, at first.
+    acted_on: T,
+    /// A different list, and how many checks in a row it has held.
+    pending: Option<(T, u32)>,
+}
+
+impl<T: PartialEq + Clone> Settling<T> {
+    /// How many checks in a row a new list must hold, at
+    /// [`crate::limits::INTERFACE_RECHECK`] each: thirty seconds. Late enough to
+    /// let a flicker pass, early enough that a device that really moved catches
+    /// up within a minute.
+    pub const STEADY: u32 = 6;
+
+    /// Starting from what is there now, which is not a change.
+    pub const fn new(current: T) -> Self {
+        Self { acted_on: current, pending: None }
+    }
+
+    /// One check: whether the list has now settled on something new.
+    pub fn observe(&mut self, now: T) -> bool {
+        if now == self.acted_on {
+            self.pending = None;
+            return false;
+        }
+        let held = match self.pending.take() {
+            Some((list, count)) if list == now => count.saturating_add(1),
+            _ => 1,
+        };
+        if held >= Self::STEADY {
+            self.acted_on = now;
+            true
+        } else {
+            self.pending = Some((now, held));
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list that changes and changes back is never acted on.
+    #[test]
+    fn a_change_that_undoes_itself_is_not_acted_on() {
+        let mut settling = Settling::new("wifi");
+        assert!(!settling.observe("wifi, flicker"));
+        assert!(!settling.observe("wifi"));
+        for _ in 0..20 {
+            assert!(!settling.observe("wifi"));
+        }
+    }
+
+    /// A list that holds is acted on once, after it has held, and not again.
+    #[test]
+    fn a_change_that_holds_is_acted_on_once() {
+        let mut settling = Settling::new("home");
+        for _ in 1..Settling::<&str>::STEADY {
+            assert!(!settling.observe("hotel"));
+        }
+        assert!(settling.observe("hotel"), "acted on at the last of its steady checks");
+        for _ in 0..20 {
+            assert!(!settling.observe("hotel"), "and not again while it holds");
+        }
+        for _ in 1..Settling::<&str>::STEADY {
+            assert!(!settling.observe("home"));
+        }
+        assert!(settling.observe("home"), "going back is a change too, once it holds");
+    }
+
+    /// A list that keeps changing is not acted on until one of them holds.
+    #[test]
+    fn a_list_that_keeps_changing_waits_for_one_to_hold() {
+        let mut settling = Settling::new(0_u32);
+        for step in 1..=20 {
+            assert!(!settling.observe(step), "nothing holds while every check differs");
+        }
+        // The last of them has held once already.
+        for _ in 2..Settling::<u32>::STEADY {
+            assert!(!settling.observe(20));
+        }
+        assert!(settling.observe(20));
+    }
 
     fn addresses(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()

@@ -159,6 +159,15 @@ seconds of silence. Nobody is dialled for merely being in the roster.
 The cost is a pause of tens to hundreds of milliseconds before the first packet after ten idle
 minutes, and a `peers` report that looks when asked rather than remembering.
 
+**With no session open, the transport sends one thing: the relay keep-alive, once a minute,** with
+the relay set to match. Finding this device's public address pauses until a session opens, and runs
+alongside its handshake. iroh's defaults spend about a gigabyte a month on those two things, an
+address probe every twenty-odd seconds and a ping every fifteen, whatever the network's size.
+Neither could be configured up to iroh 1.3, so they come from the project's fork of iroh until a
+release carries them (`deny.toml` names it and its exit condition). The cost is a dead relay
+connection noticed within a minute instead of fifteen seconds, and a direct path found a moment
+later after a rest.
+
 ## 3. The product surface
 
 ### 3.1 First use

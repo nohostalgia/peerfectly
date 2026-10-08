@@ -110,7 +110,7 @@ impl Waiting {
             relay.parse().map_err(|_| BuildError::UnusableRelay { address: relay.to_owned() })?;
 
         let seen = Arc::new(Mutex::new(None));
-        let endpoint = Endpoint::builder(presets::Minimal)
+        let endpoint = crate::relays::quiet_at_rest(Endpoint::builder(presets::Minimal))
             .secret_key(secret)
             .alpns(vec![ENROLMENT_ALPN.to_vec()])
             .relay_mode(relay_mode(Some(url)))
@@ -207,7 +207,7 @@ impl Admitting {
         let relays = crate::relays::relays_at(&state.params, now)?;
         let home = crate::relays::home_at(&state.params, now)?;
 
-        let mut builder = Endpoint::builder(presets::Minimal)
+        let mut builder = crate::relays::quiet_at_rest(Endpoint::builder(presets::Minimal))
             .secret_key(secret)
             // Deliberately no `alpns`: an endpoint that offers no protocol
             // accepts nothing, whatever anybody sends it.

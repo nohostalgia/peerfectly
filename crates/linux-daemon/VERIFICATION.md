@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 32 of 33; step 32 is run and its budget not yet met, for want of an iroh change. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
+**Run so far**: 36 of 36. Step 32's budget, not met for want of an iroh change, is met in step 35 on the project's fork of iroh; step 34 is iroh 1.3.0 unpatched, the figure the patch is measured against. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
 through a pseudo-terminal; steps 18–25 were run by hand, with the Windows PC, the phone and WSL2,
 and reported as passed. Step 28 was run in plain containers and one running systemd; step 29 was
 run by hand on WSL2 and reported as passed. Steps 30 and 31, for the rename, were run by hand on WSL2 and reported as passed.
@@ -890,3 +890,113 @@ and they were run again.
 - `b`, 20 s after the revocation: `2 devices, 1 revoked`.
 - `b`'s log: `reconciling with the neighbours` when its network came up, and `spreading to the
   neighbours` after the parameter change and the revocation reached it. Nothing in between.
+
+Run again on iroh 1.3.0 (`quiet-iroh`, before its patch), 2026-10-07: passed, the same four.
+- `ping -6` from `c` to `b`: 4 of 4.
+- `peers` on `a`: `b` and `c` both `reachable yes, direct (now)`.
+- `b`, 45 s after coming back: `meet https://…:8444`.
+- `b`, 20 s after the revocation: `2 devices, 1 revoked`.
+- `b`'s log: contact on its way up and after receiving something, and nothing in between.
+
+## 34. Traffic at rest on iroh 1.3.0, before the patch
+
+The same as step 32, on the build of `quiet-iroh` before its patch: iroh 1.3.0 from crates.io. The
+network has a rendezvous now, so its publishes are counted, and the script counts it apart: the
+rendezvous (TCP 8444 to the relay's host), `relay-quic` (UDP to the relay's host: the net report's
+address discovery) and `relay` (the rest: the relay connection, TCP). Thirty minutes, not five, so
+that a publish every fifteen minutes falls inside:
+
+```bash
+crates/linux-daemon/testbed/measure-idle.sh b a 204.216.216.139 1800
+```
+
+with `a` up, then with `a` switched off, each twelve minutes after the join.
+
+**Expect**: the floor of step 32, about a gigabyte a month, the same whether `a` is up or not, and
+nothing to `a`.
+
+**Result**: run, 2026-10-07.
+
+| Build | Peer | relay-quic | relay | rendezvous | peer | multicast | Total / month |
+|---|---|---|---|---|---|---|---|
+| 0.1, iroh 1.1, no rendezvous (before `quiet-iroh`'s script) | up | 933 MB | 109 MB | — | 0 | 54 MB | 1.10 GB |
+| iroh 1.3, unpatched | up | 1067 MB | 270 MB | 11 MB | **190 MB** | 68 MB | 1.61 GB |
+| iroh 1.3, unpatched | switched off | 923 MB | 102 MB | 11 MB | 0 | 41 MB | 1.08 GB |
+
+The floor is iroh 1.3's as it was 1.1's: the net report's address discovery, about 930 MB a month,
+a new QUIC connection to the relay every 20 to 26 seconds, and the relay connection's pings and the
+net report's HTTPS probes, about 100 MB. The rendezvous costs about 11 MB a month at a publish every
+fifteen minutes.
+
+**One run is not explained.** With `a` up, `b` sent and received 831 packets directly to `a` in the
+thirty minutes, 190 MB a month, and twice its usual traffic to the relay: a session, open for part
+of the window, that nothing logged at `info` accounts for. None of the other three runs with `a`
+up showed it: thirty minutes on 1.1 before, and afterwards five minutes sampled every second and
+thirty sampled every five seconds on the same 1.3 build, with nothing from `a` but its
+announcements. It is recorded rather than averaged away, and watched for in the runs after the
+patch.
+
+## 35. Traffic at rest on the patched iroh
+
+As step 34, on the build of `quiet-iroh` with its patch: iroh from the project's fork
+(`nohostalgia/iroh`, `peerfectly/1.3`, `2fc2b89a97`), the net report paused while no connection is
+open, and the relay pinged once a minute. The relay on the VPS updated to the image built from the
+same commit, with `ping_interval_secs = 60` in its `relay.toml`.
+
+**Expect** (`transport-iroh` spec, *An endpoint with no connection spends almost nothing*): nothing
+to `relay-quic`, the relay share under 20 MB a month, and nothing to `a`.
+
+**Result**: run, 2026-10-08, **passed**, after two findings that each had to be fixed first.
+
+| Build | Peer | relay-quic | relay | rendezvous | peer | multicast | Total / month |
+|---|---|---|---|---|---|---|---|
+| fork, relay not yet updated | up | 0 | 57.8 MB | 11.4 MB | 0 | 35.0 MB | 104 MB |
+| fork, relay not yet updated | switched off | 0 | 45.6 MB | 11.4 MB | 0 | 23.3 MB | 80 MB |
+| fork, relay updated | switched off | 0 | 13.7 MB | 11.3 MB | 0 | 23.3 MB | **48 MB** |
+| fork, relay updated | up | 320 packets | 510 MB | 11.3 MB | **392 MB** | 53.2 MB | 1.13 GB |
+| fork, relay updated, replaced sessions closed | up | 0 | 13.1 MB | 11.6 MB | 0 | 35.2 MB | **60 MB** |
+| the same, again | up | 0 | 14.3 MB | 11.3 MB | 0 | 35.7 MB | **61 MB** |
+
+**The address discovery is gone at rest**: no UDP to the relay in any run but the one with a session
+left open, against about 930 MB a month before.
+
+**The relay set the pace until it was updated.** Timed at rest before, `b` exchanged three packets in
+and two out with the relay every sixteen seconds: the relay's fifteen and jitter, which reset the
+device's minute each time. The redeploy on the VPS had not taken (`docker compose` was run from the
+wrong directory). Run again from the checkout, the exchange came once a minute, and the relay's share
+fell to about 14 MB.
+
+**A replaced session was never closed.** The fourth run is the unexplained run of step 34 again: a
+session open the whole window, its paths kept alive every three seconds and the net report running
+because iroh saw a connection. When `a` and `b` dial each other at the same moment, two connections
+open; each node keeps the one it registered last, and dropped the other from its table without
+closing it. Where both kept the same one, the other stayed open in the transport for good. It is
+closed now when it is replaced (`Node::opened`, the test
+`a_session_replaced_by_another_to_the_same_device_is_closed`), and the two runs after it are clean.
+
+Within the budget with the peer up or switched off: under 20 MB to the relay, nothing to `a` at rest,
+and the total under 100 MB, of which the LAN's multicast is 23 to 36 MB.
+
+## 36. A session after a rest, and the address discovery while one is open
+
+In the testbed on the same build, `a` and `b` in a network, nothing carried for eleven minutes, then
+from `b`:
+
+```bash
+ping -6 -c 5 -W 5 <a's address>
+ping -6 -i 1 -c 300 -q <a's address>
+```
+
+with UDP to the relay's host counted on `b` during the second, and again for the twelve idle minutes
+after it.
+
+**Expect**: the first packet answered; while the session is open, one QUIC connection kept for address
+discovery, not a new one for each report.
+
+**Result**: run, 2026-10-08, passed.
+- After eleven idle minutes, 5 of 5 answered, the first in 9 ms against about 1 ms for the others:
+  the session opening again.
+- Five minutes of a session in use: 38 packets, 18 KB, to the relay over UDP, against about 120 KB in
+  five minutes on 1.3 unpatched, where every report opened a connection of its own (step 34).
+- The twelve minutes after it, most of them with the session still open until it closed for being
+  idle: 97 packets, 38 KB.

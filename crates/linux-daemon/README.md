@@ -90,9 +90,9 @@ unit, `install.sh` and their digests.
 the script is about to run as root. Then:
 
 ```text
-sha256sum peerfectly-0.1.0-linux-x86_64.tar.gz
-tar xzf peerfectly-0.1.0-linux-x86_64.tar.gz
-sudo ./peerfectly-0.1.0-linux-x86_64/install.sh
+sha256sum peerfectly-0.2.0-linux-x86_64.tar.gz
+tar xzf peerfectly-0.2.0-linux-x86_64.tar.gz
+sudo ./peerfectly-0.2.0-linux-x86_64/install.sh
 ```
 
 The script **checks everything before it writes anything**, and reports every missing piece at once
@@ -123,7 +123,7 @@ programs, and the networks that were up come back up.
 **Uninstalling:**
 
 ```text
-sudo ./peerfectly-0.1.0-linux-x86_64/install.sh --uninstall
+sudo ./peerfectly-0.2.0-linux-x86_64/install.sh --uninstall
 ```
 
 It stops and disables the service and removes the unit and both programs. **It keeps

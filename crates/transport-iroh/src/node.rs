@@ -231,7 +231,7 @@ impl IrohTransport {
         // are, so both hold the same handle and an empty one refuses nothing.
         let avoided = crate::paths::Avoided::new();
 
-        let mut builder = Endpoint::builder(presets::Minimal)
+        let mut builder = crate::relays::quiet_at_rest(Endpoint::builder(presets::Minimal))
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(relay_mode)
@@ -239,14 +239,6 @@ impl IrohTransport {
             // decide: the default policy takes any direct path the moment it
             // validates, and a path through our own tunnel validates.
             .path_selector(std::sync::Arc::new(crate::paths::Selector::new(avoided.clone())))
-            // The net report keeps its HTTPS latency probes, although a network
-            // has one relay and nothing to choose between. Without them, a
-            // network where QUIC to the relay gets no answer (one that blocks
-            // UDP) never picks a home relay, and the device is left with no
-            // relay at all where it needs one most. `NetReportConfig::minimal()`
-            // did that; the binding tests caught it, their relay answering QUIC
-            // on another port.
-            .net_report_config(iroh::endpoint::NetReportConfig::default())
             // And under that, a bound on every other way a path can fall
             // silent — a carrier that stops forwarding, a network that changes
             // under a session. The defaults are fifteen seconds of nothing

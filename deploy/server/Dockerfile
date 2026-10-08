@@ -9,7 +9,7 @@ FROM rust:1.95-bookworm AS builder
 WORKDIR /src
 COPY . .
 # Both binaries from this workspace's lockfile, so the relay is the exact
-# iroh-relay the workspace is tested against (1.1.0), with the versions of its
+# iroh-relay the workspace is tested against (1.3.0), with the versions of its
 # dependencies the workspace resolved. `relay-binary` is how a workspace member
 # asks for the `server` feature iroh-relay's own binary needs.
 RUN cargo build --release --locked \

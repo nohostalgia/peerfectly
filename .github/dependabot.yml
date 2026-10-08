@@ -1,9 +1,19 @@
-# The workflows pin every action by commit, so nothing moves on its own. This
-# proposes each update as a pull request, with the new commit and its version,
-# and CI runs on it like on any other change.
+# The workflows pin every action by commit, and `Cargo.lock` every crate, so
+# nothing moves on its own. This proposes each update as a pull request, and CI
+# runs on it like on any other change. Cargo is here because a pin that falls
+# behind is otherwise found by accident: iroh stayed on 1.1.0 for two releases.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+  # One pull request a week for every compatible update, rather than one per
+  # crate in a tree of four hundred; a new major version still comes alone.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      compatible:
+        update-types: [minor, patch]
