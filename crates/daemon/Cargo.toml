@@ -60,7 +60,7 @@ hickory-proto = { version = "0.26.2", default-features = false, features = ["std
 # `route_table` for something a safe, cross-platform crate already does — and the
 # cross-platform part is not idle: `local-discovery` is in the portable core and
 # a Linux daemon needs the same answer.
-netdev = "0.45"
+netdev = "0.46"
 # Rendering the joining payload as a scannable code. Default features off: the
 # image and SVG renderers would pull a decoder and a font stack for something a
 # terminal draws with two characters. The text form is authoritative and this is
