@@ -94,7 +94,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
 ] }
-tray-icon = "0.24.2"
+tray-icon = "0.26.0"
 # Named pipes. Preferred to a local TCP port because §7.3 warns that any page in
 # a browser can reach 127.0.0.1, and a pipe is not reachable that way at all.
 interprocess = { version = "2.4.4", features = ["tokio"] }
