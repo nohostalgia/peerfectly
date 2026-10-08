@@ -1332,6 +1332,7 @@ impl Service {
             interfaces
         };
         let mut seen = listed();
+        let mut settling = crate::schedule::Settling::new(seen.clone());
         loop {
             let woken = tokio::select! {
                 () = self.reconciling.notified() => true,
@@ -1343,23 +1344,37 @@ impl Service {
             self.follow_relays().await;
             if !woken {
                 let now = listed();
+                // Catching up waits for a change that holds; reconciling below
+                // follows every change at once, since it contacts nobody.
+                if settling.observe(now.clone()) {
+                    self.catch_up_after_moving().await;
+                }
                 if now == seen {
                     continue;
                 }
                 seen = now;
-                tracing::info!("the machine's interfaces changed");
-                // A device that moved network may have missed pushes while it
-                // moved: it catches up with its neighbours now, not at the next
-                // hour. Only networks that are up: one that is down reaches
-                // nothing, by design.
-                for network in self.all().await {
-                    let node = Arc::clone(network.node());
-                    if node.transport().await.is_some() {
-                        tokio::spawn(async move { node.reconcile_with_neighbours().await });
-                    }
-                }
             }
             self.reconcile().await;
+        }
+    }
+
+    /// Catches up with the neighbours of every network that is up, once a change
+    /// in this device's interfaces has held.
+    ///
+    /// A device that moved network may have missed pushes while it moved: it
+    /// catches up now, not at the next hour. Not on a change that undoes itself
+    /// within seconds, which lost no push: catching up on those opened a session
+    /// with every neighbour, kept for ten minutes each time ([`Settling`]).
+    /// Only networks that are up: one that is down reaches nothing, by design.
+    ///
+    /// [`Settling`]: crate::schedule::Settling
+    async fn catch_up_after_moving(&self) {
+        tracing::info!("the machine's interfaces changed");
+        for network in self.all().await {
+            let node = Arc::clone(network.node());
+            if node.transport().await.is_some() {
+                tokio::spawn(async move { node.reconcile_with_neighbours().await });
+            }
         }
     }
 

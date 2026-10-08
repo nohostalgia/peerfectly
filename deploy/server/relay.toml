@@ -3,7 +3,8 @@
 #
 # The certificate's paths are placeholders. The entrypoint puts in PEERFECTLY_CERT and
 # PEERFECTLY_KEY, which the rendezvous reads as well, so both serve one certificate.
-# Keys are those of iroh-relay 1.1.0.
+# Keys are those of iroh-relay 1.3.0, as the project's fork builds it
+# (`ping_interval_secs` is the fork's).
 
 enable_relay = true
 # QUIC address discovery: how a device learns the address the internet sees it
@@ -14,6 +15,12 @@ enable_quic_addr_discovery = true
 enable_metrics = false
 # Plain HTTP only for captive-portal checks. Published as 80 on the host.
 http_bind_addr = "[::]:8080"
+
+# How often, in seconds, the relay pings a device whose connection is quiet.
+# peerfectly's devices ping once a minute, so the relay does too: at iroh's
+# fifteen seconds its own pings would set the pace, and a device at rest would
+# spend four times what it needs to keep its relay connection open.
+ping_interval_secs = 60
 
 # Who may use the relay. Open, stated rather than defaulted, and bounded below.
 # An allowlist is a later change.

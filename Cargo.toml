@@ -23,12 +23,12 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 license = "AGPL-3.0-or-later"
 # Built and shipped from here, as programs and packages; none of the crates
 # goes to crates.io, and they depend on each other by path.
 publish = false
-# 1.91 because `iroh` 1.1 and its tree require it — `iroh-base`, `iroh-dns`,
+# 1.91 because `iroh` 1.3 and its tree require it — `iroh-base`, `iroh-dns`,
 # `netwatch` and `portmapper` all declare it. The value here was 1.85 and was
 # simply untrue: it only ever showed up when building on a toolchain older than
 # the one this machine happens to have, which is exactly when a declared minimum
@@ -78,3 +78,14 @@ opt-level = 3
 # seventy-five million hashes: minutes unoptimised, seconds optimised.
 [profile.dev.package.blake3]
 opt-level = 3
+
+# iroh 1.3.0 with three fixes that no release carries yet, from the project's
+# fork (`nohostalgia/iroh`, branch `peerfectly/1.3`), pinned by commit. Up to
+# 1.3, an idle device spent about a gigabyte a month on iroh's own traffic to
+# the relay (crates/linux-daemon/VERIFICATION.md, steps 32 and 34). Each fix is
+# one commit on the tag, and `deny.toml` says which upstream issue each waits
+# on. `iroh-base` and `iroh-dns` follow from the fork too, unchanged: iroh takes
+# them by path inside its own repository.
+[patch.crates-io]
+iroh = { git = "https://github.com/nohostalgia/iroh", rev = "2fc2b89a97ce79c8faa2516d59ff3e08faa670e6" }
+iroh-relay = { git = "https://github.com/nohostalgia/iroh", rev = "2fc2b89a97ce79c8faa2516d59ff3e08faa670e6" }

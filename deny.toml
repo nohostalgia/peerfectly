@@ -55,8 +55,23 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 [sources]
-# crates.io and nothing else: no other registry, and no git dependency.
+# crates.io and nothing else: no other registry, and one git dependency.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# The exception: the project's fork of iroh, which the workspace takes through
+# `[patch.crates-io]`, pinned by commit. It is iroh's tag `v1.3.0` plus one commit
+# per fix, and each fix goes when an iroh release carries it:
+#
+# - "fix(iroh): seed the kept QAD connection with its first report":
+#   n0-computer/iroh#4523. Upstream means to rework the net report as a stream
+#   (#4400) rather than take a small fix.
+# - "feat(iroh): NetReportConfig::pause_when_idle": n0-computer/iroh#4589.
+#   Upstream agrees on the aim and leans towards several modes.
+# - "feat(iroh, iroh-relay): configurable relay ping interval":
+#   n0-computer/iroh#4590. Upstream agrees the ping is too frequent and would
+#   rather fix the default than add a setting; a quieter default is as good.
+#
+# When the last one goes, so do the fork, this entry and the `[patch]` sections.
+# A fix iroh turns down is decided again here, not kept quietly.
+allow-git = ["https://github.com/nohostalgia/iroh"]

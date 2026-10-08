@@ -109,7 +109,7 @@ widestring = "1.2.1"
 # supposed to return.
 rcgen = "0.14"
 # A relay in the test process, for the enrolment that crosses one.
-iroh-relay = { version = "1.1", features = ["server", "test-utils"] }
+iroh-relay = { version = "1.3", features = ["server", "test-utils"] }
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

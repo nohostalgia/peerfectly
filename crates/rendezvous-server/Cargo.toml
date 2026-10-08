@@ -29,7 +29,7 @@ rustls-pki-types = { version = "1.15", features = ["std"] }
 # binary from **this workspace's lockfile** — `cargo install` would resolve its
 # dependencies afresh — with the `server` feature it needs, which Cargo only lets
 # a workspace member ask for. See `deploy/server/Dockerfile`.
-iroh-relay = { version = "=1.1.0", features = ["server"], optional = true }
+iroh-relay = { version = "=1.3.0", features = ["server"], optional = true }
 
 [features]
 relay-binary = ["dep:iroh-relay"]

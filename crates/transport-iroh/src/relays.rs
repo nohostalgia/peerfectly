@@ -19,6 +19,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iroh::RelayUrl;
 use iroh::tls::CaTlsConfig;
@@ -99,6 +100,41 @@ pub(crate) fn relay_mode(home: Option<&Relay>) -> iroh::endpoint::RelayMode {
             )))
         }
     }
+}
+
+/// How often an endpoint pings its relay while the connection is quiet.
+///
+/// A minute rather than iroh's fifteen seconds. The ping keeps the relay
+/// connection open through NATs, and that connection is how a device nobody has
+/// dialled is reached; it also notices one that died without a word. At fifteen
+/// seconds it cost every device about 60 MB a month at rest, measured on
+/// 2026-10-07; a minute is about 15. The connection is TCP, which carriers keep
+/// for minutes at the least, and a minute is what Tailscale's relay keeps its
+/// connections alive at. What it costs is a dead relay connection noticed within
+/// about a minute rather than fifteen seconds; a change of network is acted on at
+/// once, as before.
+///
+/// The relay pings on its own schedule too, and `deploy/server/relay.toml` sets
+/// it to the same minute: at its default, the relay's pings would set the pace.
+pub(crate) const RELAY_PING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What an endpoint spends at rest. Every endpoint this crate builds starts here.
+///
+/// The net report pauses while no connection is open: it learns this device's
+/// public address and keeps its NAT mapping warm for a connection to use, and
+/// with none open each run was a round trip to the relay every twenty-odd
+/// seconds, about 950 MB a month (2026-10-07). It runs again when a connection is
+/// dialled or accepted, and on a change of network.
+///
+/// It keeps its HTTPS latency probes, although a network has one relay and
+/// nothing to choose between. Without them, a network where QUIC to the relay
+/// gets no answer (one that blocks UDP) never picks a home relay, and the device
+/// is left with no relay at all where it needs one most. `minimal()` did that;
+/// the binding tests caught it, their relay answering QUIC on another port.
+pub(crate) fn quiet_at_rest(builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+    let mut net_report = iroh::endpoint::NetReportConfig::default();
+    net_report.pause_when_idle = true;
+    builder.net_report_config(net_report).relay_ping_interval(RELAY_PING_INTERVAL)
 }
 
 /// Now, in milliseconds since the epoch — the clock a move's end is dated by.
@@ -270,6 +306,29 @@ impl ServerCertVerifier for ByHost {
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
     use super::*;
+
+    /// Every endpoint this crate builds goes through `quiet_at_rest`: one that did
+    /// not would keep iroh's defaults, about a gigabyte a month at rest.
+    #[test]
+    fn every_endpoint_is_quiet_at_rest() {
+        for (file, source) in
+            [("node.rs", include_str!("node.rs")), ("enrolment.rs", include_str!("enrolment.rs"))]
+        {
+            let built = source.matches("Endpoint::builder(").count();
+            let quiet = source.matches("quiet_at_rest(Endpoint::builder(").count();
+            assert!(built > 0, "{file} builds an endpoint");
+            assert_eq!(built, quiet, "every endpoint {file} builds is quiet at rest");
+        }
+    }
+
+    /// The relay's own pings follow the devices': at iroh's default they would
+    /// set the pace, and a device's minute would save nothing.
+    #[test]
+    fn the_relay_pings_as_seldom_as_the_devices() {
+        let config = include_str!("../../../deploy/server/relay.toml");
+        let line = format!("ping_interval_secs = {}", RELAY_PING_INTERVAL.as_secs());
+        assert!(config.lines().any(|l| l.trim() == line), "deploy/server/relay.toml says `{line}`");
+    }
 
     const ISSUED: u64 = 1_000;
     const WINDOW_S: u64 = 604_800;

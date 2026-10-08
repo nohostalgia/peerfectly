@@ -1091,7 +1091,16 @@ impl Node {
         let peer = session.peer();
 
         self.router.lock().await.opened(peer);
-        self.sessions.lock().await.insert(peer, Arc::clone(&session));
+        let replaced = self.sessions.lock().await.insert(peer, Arc::clone(&session));
+        // Two sessions to one device: the newer is kept, and the one it replaces
+        // is closed, not merely dropped from the table. Dropped, it stayed open in
+        // the transport, since its own reader holds it, and kept both its paths
+        // and the net report alive at rest for good. Two devices that dial each
+        // other at the same moment is how it happens (Linux `VERIFICATION.md`,
+        // step 35).
+        if let Some(old) = replaced.filter(|old| !Arc::ptr_eq(old, &session)) {
+            let _closing = old.close().await;
+        }
         self.active(peer);
         self.note_contact(peer).await;
         self.date_for(peer).await;
