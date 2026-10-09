@@ -82,7 +82,7 @@ openssl x509 -in /etc/peerfectly/certs/relay.crt -noout -fingerprint -sha256 -en
 ```sh
 git clone https://github.com/nohostalgia/peerfectly.git
 cd peerfectly
-git checkout v0.2.0
+git checkout v0.3.0
 docker compose -f deploy/server/compose.yaml up -d --build
 docker compose -f deploy/server/compose.yaml ps
 ```
@@ -168,7 +168,7 @@ docker compose -f deploy/server/compose.yaml -f deploy/server/compose.local.yaml
 ```sh
 cd peerfectly
 git fetch --tags
-git checkout v0.2.0
+git checkout v0.3.0
 docker compose -f deploy/server/compose.yaml up -d --build
 ```
 

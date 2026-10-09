@@ -23,7 +23,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.2.0"
+version = "0.3.0"
 license = "AGPL-3.0-or-later"
 # Built and shipped from here, as programs and packages; none of the crates
 # goes to crates.io, and they depend on each other by path.
