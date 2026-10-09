@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 56 of 88. Every other result reads `not run`. That is the honest
+**Run so far**: 57 of 89. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2439,3 +2439,33 @@ ping -n 4 <the phone's IPv4 address>
 - four replies to `ping`, the first one slower while the session opens again.
 
 **Result**: run, 2026-10-07, passed (reported by the person who ran it).
+
+## 89. The PC's name, renamed to one the phone can look up
+
+This PC joined `casa` as `DESKTOP-RJUUBB3`, a name in upper case that the phone could not reach by.
+On the package built from this change, from an elevated console:
+
+```powershell
+peerfectly status casa
+peerfectly rename --id <this device's id> pc --network casa
+```
+
+Then, from the phone over wireless debugging: `ping` of the new and the old name, and a page served
+on this PC's port 8000 (which `expose` opens) fetched by name with `nc`.
+
+**Expect**: Windows Hello asked once; `status` naming this device `pc.casa.internal`; on the phone,
+`pc.casa.internal` resolving to this PC and the old name no longer; the page fetched by name.
+
+**Result**: run, 2026-10-09, passed.
+- `status`: `this device pc.casa.internal [b477-30e2-0f86-8b53], admin`, and the rename waiting for
+  `w2` only, switched off for four days: *"renaming of [b477-30e2-0f86-8b53] to pc"*.
+- On the phone, a few seconds after the rename: `pc.casa.internal` resolved to `100.95.229.148` and
+  `fd3e:487:33d9:4fb0:afa9:806c:121b:a7b4`, and `desktop-rjuubb3.casa.internal` was an unknown host.
+  A first lookup made within seconds of signing still had the old name, as the phone had not yet
+  received the rename.
+- The page on port 8000 came back by name: `ciao da pc`, logged here from `100.102.49.135`, the
+  phone's address in `casa`.
+- `ping` from the phone to this PC got no answer, by name or by address, while this PC's `ping` to
+  the phone got 3 of 3. Windows puts the `peerfectly casa` interface in the *Public* profile, and no
+  rule there lets an echo request in. That is Windows' default and not the name: the page on port 8000
+  is what reaches.

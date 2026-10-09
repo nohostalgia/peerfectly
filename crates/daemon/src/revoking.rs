@@ -73,9 +73,56 @@ pub fn resolve(
             .to_owned());
     }
 
+    let found = find(state, target, CHOOSE)?;
+
+    if found.id == identity.device_id() {
+        return Err(format!(
+            "{} is this device. Revoking it here would expel this machine from a \
+             network it would go on holding a roster for; to leave, remove its state \
+             instead.",
+            asked_for(target)
+        ));
+    }
+
+    Ok(Expulsion { device: found.id, name: found.name.clone(), reason: reason.trim().to_owned() })
+}
+
+/// What a person who named one of several devices is told to do instead.
+const CHOOSE: &str = "Revoking is irreversible, so this will not choose. Name the one you mean by \
+                      its id:\n  peerfectly revoke --id <id> <reason>";
+
+/// How a target is quoted back to the person who typed it.
+fn asked_for(target: &Target) -> String {
+    match target {
+        Target::Name(name) => format!("{name:?}"),
+        Target::Id(typed) => {
+            read_short_id(typed).map_or_else(|| format!("{typed:?}"), |id| format!("the id {id}"))
+        }
+    }
+}
+
+/// Finds the one device a person named, by name (case aside) or by its short id.
+///
+/// Shared by revoking and renaming, which name a device the same way: exactly,
+/// never by prefix or position, and never one of several. `choose` is what the
+/// person is told when more than one answers.
+///
+/// # Errors
+///
+/// When no member matches, when more than one does, or when an id is not all
+/// sixteen digits or names a device already revoked.
+pub(crate) fn find<'a>(
+    state: &'a RosterState,
+    target: &Target,
+    choose: &str,
+) -> Result<&'a DeviceRecord, String> {
     let (matches, asked): (Vec<&DeviceRecord>, String) = match target {
         Target::Name(name) => (
-            state.devices.values().filter(|record| record.name == *name).collect(),
+            state
+                .devices
+                .values()
+                .filter(|record| record.name.eq_ignore_ascii_case(name))
+                .collect(),
             format!("{name:?}"),
         ),
         Target::Id(typed) => {
@@ -97,34 +144,23 @@ pub fn resolve(
         }
     };
 
-    let found = match matches.as_slice() {
-        [] => return Err(format!("no device in this network answers to {asked}")),
-        [one] => *one,
+    match matches.as_slice() {
+        [] => Err(format!("no device in this network answers to {asked}")),
+        [one] => Ok(*one),
         several => {
             let listed = several
                 .iter()
                 .map(|record| format!("  {} [{}]", shown(&record.name), short_id(&record.id)))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Err(format!(
+            Err(format!(
                 "{} devices in this network answer to {asked}, and nothing was signed:\n\
                  {listed}\n\
-                 Revoking is irreversible, so this will not choose. Name the one you mean by \
-                 its id:\n  peerfectly revoke --id <id> <reason>",
+                 {choose}",
                 several.len()
-            ));
+            ))
         }
-    };
-
-    if found.id == identity.device_id() {
-        return Err(format!(
-            "{asked} is this device. Revoking it here would expel this machine from a \
-             network it would go on holding a roster for; to leave, remove its state \
-             instead."
-        ));
     }
-
-    Ok(Expulsion { device: found.id, name: found.name.clone(), reason: reason.trim().to_owned() })
 }
 
 /// Builds the revocation, up to but not including its signature.
@@ -247,11 +283,22 @@ mod tests {
     #[test]
     fn a_name_that_only_nearly_matches_is_refused() {
         let (state, founder, _joiner) = network();
-        for near in ["lap", "laptops", "Laptop", "laptop "] {
+        for near in ["lap", "laptops", "laptop "] {
             let refusal = resolve(&state, &founder, &Target::Name(near.to_owned()), "a reason")
                 .expect_err("only an exact name resolves");
             assert!(refusal.contains("answers to"), "{refusal}");
         }
+    }
+
+    /// Case aside: DNS does not tell `Laptop` from `laptop`, so neither does a
+    /// person naming the device to expel.
+    #[test]
+    fn a_name_is_found_without_regard_to_case() {
+        let (state, founder, joiner) = network();
+        let expulsion = resolve(&state, &founder, &Target::Name("Laptop".to_owned()), "a reason")
+            .expect("the same name, case aside");
+        assert_eq!(expulsion.device, joiner.device_id());
+        assert_eq!(expulsion.name, "laptop", "reported as the roster names it");
     }
 
     #[test]

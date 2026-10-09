@@ -326,6 +326,12 @@ impl fmt::Display for Act {
                 write!(f, "promotion of {device} to admin and founder")
             }
             Self::Demotes(device) => write!(f, "demotion of {device} to member"),
+            // Once the rename is in force here, the name the device goes by
+            // is the new one: by id alone then, not "renaming of studio to
+            // studio".
+            Self::Renames(device, to) if device.name.as_ref() == Some(to) => {
+                write!(f, "renaming of [{}] to {}", device.id, shown(to))
+            }
             Self::Renames(device, to) => write!(f, "renaming of {device} to {}", shown(to)),
             Self::SetsParameters => f.write_str("a change to the network's parameters"),
         }
@@ -395,11 +401,22 @@ impl fmt::Display for Path {
     }
 }
 
+/// What a report from before [`Peer::name_resolves`] is read as.
+const fn name_resolves_by_default() -> bool {
+    true
+}
+
 /// One other device, as the daemon can describe it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     /// Its name under the network's suffix.
     pub name: String,
+    /// Whether that name can be looked up. A name admitted before names were
+    /// held to a DNS label may hold a space, an apostrophe or a dot, and then
+    /// nobody reaches the device by it until an admin renames it. Absent from an
+    /// older daemon's report, where it reads as `true`.
+    #[serde(default = "name_resolves_by_default")]
+    pub name_resolves: bool,
     /// Its short id.
     pub id: String,
     /// Its overlay address.
@@ -1196,6 +1213,7 @@ impl Command {
             | Self::Down { network }
             | Self::Admit { network, .. }
             | Self::Revoke { network, .. }
+            | Self::Rename { network, .. }
             | Self::ChangeRelay { network, .. }
             | Self::ChangeRendezvous { network, .. } => Needs::TheOwnerOf(network.clone()),
             Self::Expose { network, .. } | Self::Unexpose { network, .. } => {
@@ -1404,6 +1422,20 @@ pub enum Command {
         reason: String,
     },
 
+    /// Give a device a new name.
+    ///
+    /// Named as [`Command::Revoke`] names it, exactly, by name or by id. The new
+    /// name is checked by the daemon, which lowers it and refuses one a resolver
+    /// could not answer.
+    Rename {
+        /// Which network the device is in, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The device, by the name it answers to or by its id.
+        target: Target,
+        /// The name it is to answer to, as the person typed it.
+        name: String,
+    },
+
     /// The signature a previous answer asked for.
     ///
     /// Not a command a person types. It continues an act the daemon began and
@@ -1557,6 +1589,11 @@ impl Command {
     /// them: it takes arguments, and `ALL` is the ones that are a single word.
     pub const REVOKE_USAGE: &'static str = "peerfectly revoke <name> <reason...> [--network N]\n       \
                                              peerfectly revoke --id <id> <reason...> [--network N]";
+
+    /// The usage line for renaming, listed with the commands for the same reason
+    /// as revoking: it takes arguments.
+    pub const RENAME_USAGE: &'static str = "peerfectly rename <name> <new name> [--network N]\n       \
+                                             peerfectly rename --id <id> <new name> [--network N]";
 
     /// The usage line for moving a network to another relay.
     pub const RELAY_USAGE: &'static str =
@@ -1736,6 +1773,45 @@ impl Command {
         Ok(Self::Revoke { network, target, reason })
     }
 
+    /// Reads a renaming from the words after `rename`.
+    ///
+    /// The new name is passed on as typed: whether it can be a device's name is
+    /// the daemon's to say, so the phone hears the same answer.
+    ///
+    /// # Errors
+    ///
+    /// When no device is named, when `--id` is given nothing, or when there is no
+    /// new name, or more than one word for it.
+    pub fn renaming(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::RENAME_USAGE);
+        let (target, after) = match words.first().map(String::as_str) {
+            Some("--id") => {
+                let id = words.get(1).ok_or_else(usage)?;
+                (Target::Id(id.clone()), 2)
+            }
+            Some(name) => (Target::Name(name.to_owned()), 1),
+            None => return Err(usage()),
+        };
+        let given: Vec<&String> = words
+            .get(after..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|word| !word.starts_with("--"))
+            .collect();
+        let [name] = given.as_slice() else {
+            return Err(format!(
+                "a device's new name is one word: letters, digits and hyphens.\n{}",
+                usage()
+            ));
+        };
+        let network = words
+            .iter()
+            .position(|word| word == "--network")
+            .and_then(|at| words.get(at.checked_add(1)?))
+            .cloned();
+        Ok(Self::Rename { network, target, name: (*name).clone() })
+    }
+
     /// Reads a command name.
     ///
     /// # Errors
@@ -1785,6 +1861,7 @@ impl Command {
             Self::Up { .. }
                 | Self::Down { .. }
                 | Self::Revoke { .. }
+                | Self::Rename { .. }
                 | Self::Found { .. }
                 | Self::Join { .. }
                 // The two that are the machine's rather than a network's.
@@ -1855,6 +1932,7 @@ impl Command {
             Self::Forget { label, .. } => ("forget", Some(label.as_str())),
             Self::Found { label, .. } => ("found", Some(label.as_str())),
             Self::Revoke { network, .. } => ("revoke", network.as_deref()),
+            Self::Rename { network, .. } => ("rename", network.as_deref()),
             Self::Signed { .. } => ("signed", None),
             Self::TakeOwnership { network } => ("takeownership", network.as_deref()),
             Self::ChangeRelay { network, .. } => ("relay", network.as_deref()),
@@ -2251,6 +2329,7 @@ mod tests {
             accused: Vec::new(),
             peers: vec![Peer {
                 name: "nas.example.internal".to_owned(),
+                name_resolves: true,
                 id: "0a0a-0a0a-0a0a-0a0a".to_owned(),
                 address: Ipv6Addr::LOCALHOST,
                 ipv4: Some(Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2))),
@@ -3279,6 +3358,64 @@ mod tests {
         for wrong in ["", "--now", "https://a https://b", "https://a --frobnicate"] {
             assert!(Command::relay_change(&words(wrong)).is_err(), "`{wrong}` is not a change");
         }
+    }
+
+    #[test]
+    fn a_renaming_is_read_by_name_or_by_id() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+
+        assert_eq!(
+            Command::renaming(&words("desktop-rjuubb3 studio --network casa")).unwrap(),
+            Command::Rename {
+                network: Some("casa".to_owned()),
+                target: Target::Name("desktop-rjuubb3".to_owned()),
+                name: "studio".to_owned(),
+            }
+        );
+        assert_eq!(
+            Command::renaming(&words("--id 0a1b-2c3d-4e5f-6a7b Studio")).unwrap(),
+            Command::Rename {
+                network: None,
+                target: Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()),
+                name: "Studio".to_owned(),
+            },
+            "the name is passed on as typed, for the daemon to check"
+        );
+
+        assert!(Command::renaming(&words("laptop")).is_err(), "no new name");
+        assert!(Command::renaming(&words("laptop my laptop")).is_err(), "a name of two words");
+        assert!(Command::renaming(&words("--id")).is_err(), "an id flag with nothing after it");
+        assert!(Command::renaming(&[]).is_err());
+    }
+
+    /// A rename waiting to reach every device is listed after it is in force
+    /// here, when the device already goes by the new name: by id then, not
+    /// "renaming of studio to studio".
+    #[test]
+    fn a_rename_in_force_names_its_device_once() {
+        let pending = Act::Renames(named("laptop", 1), "studio".to_owned());
+        assert!(pending.to_string().starts_with("renaming of laptop ["), "{pending}");
+        let in_force = Act::Renames(named("studio", 1), "studio".to_owned());
+        assert!(in_force.to_string().starts_with("renaming of ["), "{in_force}");
+        assert!(in_force.to_string().ends_with("to studio"), "{in_force}");
+    }
+
+    /// Renaming acts on a roster, so it is the network owner's, and it signs, so
+    /// it is asked from an elevated console as revoking is.
+    #[test]
+    fn renaming_needs_what_revoking_needs() {
+        let rename = Command::Rename {
+            network: Some("casa".to_owned()),
+            target: Target::Name("laptop".to_owned()),
+            name: "studio".to_owned(),
+        };
+        let revoke = Command::Revoke {
+            network: Some("casa".to_owned()),
+            target: Target::Name("laptop".to_owned()),
+            reason: "lost".to_owned(),
+        };
+        assert_eq!(rename.needs(), revoke.needs());
+        assert_eq!(rename.needs_administrator(), revoke.needs_administrator());
     }
 
     #[test]

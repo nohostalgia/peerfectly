@@ -66,6 +66,9 @@ pub struct Pending {
     /// Set by the task reading the channel, read by whatever asks this side's
     /// person. Nothing is signed while it is false.
     accepted: Arc<AtomicBool>,
+    /// The name the joining device will be admitted under: the one it proposed,
+    /// made usable (`admitted_name`).
+    name: String,
     /// The device already answering to the name this one proposes, if there is
     /// one.
     ///
@@ -90,10 +93,11 @@ pub struct Taken {
 }
 
 impl Pending {
-    /// The name the joining device proposed for itself.
+    /// The name the joining device proposed for itself, made usable: what the
+    /// admin is shown, before anything is signed, and what it is admitted under.
     #[must_use]
     pub fn proposed_name(&self) -> &str {
-        &self.payload.name
+        &self.name
     }
 
     /// The device already answering to that name, if there is one.
@@ -176,7 +180,7 @@ pub async fn open(
     // Every refusal from here on closes the endpoint it leaves behind. Dropped
     // instead, its socket stayed bound — found on a phone that, with every network
     // off, kept receiving into a queue nobody read.
-    let payload_name = payload.name.clone();
+    let payload_name = admitted_name(&payload.name);
     match exchange(&endpoint, &payload, identity).await {
         Ok((channel, code, expires)) => {
             let pending = Pending {
@@ -187,6 +191,7 @@ pub async fn open(
                 expires,
                 accepted: Arc::new(AtomicBool::new(false)),
                 taken: holder_of(&payload_name, state),
+                name: payload_name,
             };
             // Listening starts here rather than being left to the caller: the
             // device being enrolled may accept while a person on this side is
@@ -542,18 +547,36 @@ fn identity_spec(
     // device leaves the membership entirely — so the name *is* free. But the
     // `state` this reads was gathered before any of that, and altering the name
     // against it would quietly undo what the person asked for.
-    let name =
-        if keeping_the_name { payload.name.clone() } else { unused_name(&payload.name, state) };
+    let proposed = admitted_name(&payload.name);
+    let name = if keeping_the_name { proposed } else { unused_name(&proposed, state) };
     roster::types::DeviceSpec::new(keys, name, Role::Member, false, vec![])
         .map_err(|cause| cause.to_string())
 }
 
+/// The name a joining device is admitted under: the one it proposed, made one a
+/// resolver can answer.
+///
+/// Lowered when that is all it needs. An older client may propose anything its
+/// person typed, and nobody on this side can be asked to retype it, so a name
+/// that is not a label is made into the nearest one, and the admin is shown that
+/// before signing. A name with nothing usable in it becomes `device`, made unique
+/// like any other.
+fn admitted_name(proposed: &str) -> String {
+    crate::names::usable(proposed)
+        .ok()
+        .or_else(|| crate::names::made_usable(proposed))
+        .unwrap_or_else(|| "device".to_owned())
+}
+
 /// The device already answering to a name, if one does.
+///
+/// Without regard to case: the resolver answers `Laptop` and `laptop` alike, so
+/// two devices with those names are one name nobody can look up.
 fn holder_of(name: &str, state: &RosterState) -> Option<Taken> {
     state
         .devices
         .values()
-        .find(|record| record.name == name)
+        .find(|record| record.name.eq_ignore_ascii_case(name))
         .map(|record| Taken { name: record.name.clone(), device: record.id })
 }
 
@@ -562,7 +585,9 @@ fn holder_of(name: &str, state: &RosterState) -> Option<Taken> {
 /// Two devices with one name would make a name ambiguous, and a name is what a
 /// person types. The proposal is kept where it can be.
 fn unused_name(proposed: &str, state: &RosterState) -> String {
-    let taken = |candidate: &str| state.devices.values().any(|record| record.name == candidate);
+    let taken = |candidate: &str| {
+        state.devices.values().any(|record| record.name.eq_ignore_ascii_case(candidate))
+    };
     if !taken(proposed) {
         return proposed.to_owned();
     }
@@ -777,6 +802,23 @@ mod tests {
         assert_eq!(spec.name, "laptop");
     }
 
+    /// An older client may propose a name a resolver cannot answer; it is
+    /// admitted under the nearest one, which is what the admin is shown.
+    #[test]
+    fn an_unusable_proposed_name_is_made_usable() {
+        let state = state_with(&[]);
+        let joining = NodeIdentity::generate().expect("generates");
+        for (proposed, admitted) in
+            [("Mario's phone", "mario-s-phone"), ("Laptop", "laptop"), ("___", "device")]
+        {
+            let payload =
+                Joining::of(&joining, proposed, "https://relay.example:443").expect("valid");
+            let spec = identity_spec(&payload, &state, false).expect("builds");
+            assert_eq!(spec.name, admitted, "{proposed:?}");
+            assert_eq!(admitted_name(proposed), admitted, "and the admin is shown the same");
+        }
+    }
+
     /// A name is what a person types, so two devices must not share one.
     #[test]
     fn a_proposed_name_already_taken_is_made_unique() {
@@ -818,6 +860,17 @@ mod tests {
         assert_eq!("laptop", found.name);
         assert_eq!(held.id, found.device, "and the identity the decision falls on");
         assert_eq!(None, holder_of("telefono", &state), "a free name reports nothing");
+    }
+
+    /// `Laptop` and `laptop` are one name to the resolver, so one name here.
+    #[test]
+    fn a_name_that_differs_only_in_case_is_in_use() {
+        let state = state_with(&["laptop"]);
+
+        let found = holder_of("Laptop", &state).expect("the same name, case aside");
+
+        assert_eq!("laptop", found.name);
+        assert_eq!("Laptop-2", unused_name("Laptop", &state), "not a second `laptop`");
     }
 
     /// Declining to replace admits under a name no device holds — today's

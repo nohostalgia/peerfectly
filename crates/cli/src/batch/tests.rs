@@ -296,6 +296,52 @@ fn a_revocation_must_carry_the_reason_typed() {
     assert!(!matches_what_was_asked(&other, &revoke));
 }
 
+/// A founding typed with `--name Laptop` is signed as `laptop`, which is the
+/// founding asked for. Before the CLI compared names as the daemon keeps them,
+/// it refused its own founding.
+#[test]
+fn a_founding_typed_in_upper_case_is_the_one_asked_for() {
+    let admin = Admin::new();
+    let founder = admin.identity.device_spec("laptop", Role::Admin, true, Vec::new()).unwrap();
+    let founding =
+        admin.core(OperationBody::CreateNetwork { device: founder, params: params() }, Vec::new());
+    let asked = |name: &str| Command::Found {
+        label: "casa".to_owned(),
+        name: name.to_owned(),
+        suffix: "home.internal".to_owned(),
+        relay: None,
+        rendezvous: None,
+        certificate: daemon::control::Certificate::None,
+        ipv4_range: None,
+    };
+    assert!(matches_what_was_asked(&asked("Laptop"), &founding));
+    assert!(matches_what_was_asked(&asked("laptop"), &founding));
+    assert!(!matches_what_was_asked(&asked("desktop"), &founding));
+}
+
+/// A name is compared as the daemon keeps it: in lower case, so `Laptop` typed
+/// is `laptop` signed, and any other name is refused.
+#[test]
+fn a_rename_must_carry_the_name_typed_in_lower_case() {
+    let admin = Admin::new();
+    let rename = admin.core(
+        OperationBody::Rename {
+            device: DeviceId::from_bytes([0x11; 32]),
+            name: "studio".to_owned(),
+        },
+        Vec::new(),
+    );
+    let asked = |name: &str| Command::Rename {
+        network: None,
+        target: Target::Name("laptop".to_owned()),
+        name: name.to_owned(),
+    };
+    assert!(matches_what_was_asked(&asked("studio"), &rename));
+    assert!(matches_what_was_asked(&asked("Studio"), &rename));
+    assert!(!matches_what_was_asked(&asked("office"), &rename));
+    assert!(!matches_what_was_asked(&asked("stu dio"), &rename), "no name matches nothing");
+}
+
 // ---- what a person is told -------------------------------------------------
 
 fn said(item: &Read, asked: &Command) -> String {
@@ -335,6 +381,18 @@ fn every_kind_says_what_it_does_and_what_follows() {
     let rename = admin.core(OperationBody::Rename { device, name: "desk".to_owned() }, Vec::new());
     let text = said(&Read::Operation(Box::new(rename)), &Command::Confirm);
     assert!(text.contains("rename") && text.contains("`desk`"), "{text}");
+    let asked = Command::Rename {
+        network: None,
+        target: Target::Name("laptop".to_owned()),
+        name: "desk".to_owned(),
+    };
+    let text = said(
+        &Read::Operation(Box::new(
+            admin.core(OperationBody::Rename { device, name: "desk".to_owned() }, Vec::new()),
+        )),
+        &asked,
+    );
+    assert!(text.contains("rename `laptop` (") && text.contains("to `desk`"), "{text}");
 
     let body = admin.snapshot_over(vec![OperationId::from_bytes([3; 32])]);
     let text = said(&Read::Snapshot(body), &Command::Confirm);

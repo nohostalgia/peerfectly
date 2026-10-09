@@ -62,6 +62,7 @@
                   }
                 },
                 "name": "nas.home.internal",
+                "name_resolves": true,
                 "path": "Relay",
                 "reachable": true,
                 "standing": "Current"
@@ -77,6 +78,7 @@
                 },
                 "last_contact": "NoneRecorded",
                 "name": "laptop.home.internal",
+                "name_resolves": true,
                 "path": null,
                 "reachable": false,
                 "standing": "Current"
@@ -283,6 +285,7 @@
                   }
                 },
                 "name": "build-box.work.internal",
+                "name_resolves": true,
                 "path": "Direct",
                 "reachable": true,
                 "standing": {

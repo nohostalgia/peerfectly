@@ -252,6 +252,132 @@ fn is_within(name: &str, suffix: &str) -> bool {
 ///
 /// Not used to resolve anything — [`answer`] reads the roster each time — but a
 /// person asking what exists deserves a list.
+/// The most a device's name may be: one DNS label.
+pub const MAX_NAME: usize = 63;
+
+/// Why a name a person gave cannot be a device's name, and what could be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unusable {
+    /// The rule the name broke.
+    pub broken: Broken,
+    /// The nearest usable name, where there is one.
+    pub suggestion: Option<String>,
+}
+
+/// The rule a name broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Broken {
+    /// There is no name at all.
+    Empty,
+    /// A character other than a letter from a to z, a digit or a hyphen.
+    Character(char),
+    /// A hyphen at the start or the end.
+    EdgeHyphen,
+    /// Longer than [`MAX_NAME`] characters.
+    TooLong(usize),
+}
+
+impl std::fmt::Display for Unusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.broken {
+            Broken::Empty => f.write_str("a device needs a name")?,
+            Broken::Character(found) => write!(
+                f,
+                "a device's name may hold only letters from a to z, digits and hyphens, and {found:?} is none of them"
+            )?,
+            Broken::EdgeHyphen => {
+                f.write_str("a device's name cannot begin or end with a hyphen")?
+            }
+            Broken::TooLong(length) => {
+                write!(
+                    f,
+                    "a device's name is at most {MAX_NAME} characters, and this one is {length}"
+                )?;
+            }
+        }
+        if let Some(suggestion) = &self.suggestion {
+            write!(f, "; `{suggestion}` would do")?;
+        }
+        Ok(())
+    }
+}
+
+/// A name a person gave, made lower case, or why it cannot be a device's name.
+///
+/// A device's name is what a person types to reach it, `<name>.<suffix>`, so it
+/// is held to what a resolver can answer: one DNS label of letters, digits and
+/// hyphens. **Upper case is lowered rather than refused.** DNS does not tell
+/// `Laptop` from `laptop`, so neither does a network: the name is kept in lower
+/// case, and two that differ only in case are the same name. Anything else that
+/// is not a label is refused, with the nearest name that is, because a name
+/// that cannot be looked up is a device nobody can reach by name.
+///
+/// # Errors
+///
+/// [`Unusable`], saying which rule the name broke and suggesting one that
+/// keeps to it.
+pub fn usable(given: &str) -> Result<String, Unusable> {
+    let lowered = given.to_ascii_lowercase();
+    let refused = |broken| Err(Unusable { broken, suggestion: made_usable(given) });
+    if lowered.is_empty() {
+        return refused(Broken::Empty);
+    }
+    if let Some(found) = lowered.chars().find(|c| !label_character(*c)) {
+        return refused(Broken::Character(found));
+    }
+    if lowered.starts_with('-') || lowered.ends_with('-') {
+        return refused(Broken::EdgeHyphen);
+    }
+    if lowered.len() > MAX_NAME {
+        return refused(Broken::TooLong(lowered.len()));
+    }
+    Ok(lowered)
+}
+
+/// Any text made into a usable name, or `None` when nothing usable is left.
+///
+/// For a name nobody typed, which there is no one to ask about: a machine's
+/// hostname, or what an older client proposed. Upper case is lowered, every run
+/// of anything else becomes one hyphen, hyphens are trimmed from both ends, and
+/// what is left is cut to [`MAX_NAME`]. `DESKTOP_RJUUBB3` becomes
+/// `desktop-rjuubb3`, and `Mario's phone` becomes `mario-s-phone`.
+#[must_use]
+pub fn made_usable(raw: &str) -> Option<String> {
+    let mut made = String::new();
+    let mut apart = false;
+    for character in raw.chars().map(|c| c.to_ascii_lowercase()) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            if apart && !made.is_empty() {
+                made.push('-');
+            }
+            apart = false;
+            made.push(character);
+        } else {
+            apart = true;
+        }
+    }
+    made.truncate(MAX_NAME);
+    while made.ends_with('-') {
+        made.pop();
+    }
+    (!made.is_empty()).then_some(made)
+}
+
+/// Whether a name already in a roster can be looked up.
+///
+/// Mixed case can: resolution compares without regard to case. A space, an
+/// apostrophe or a dot cannot, which is what names admitted before the rule
+/// above may hold.
+#[must_use]
+pub fn resolvable(name: &str) -> bool {
+    usable(name).is_ok()
+}
+
+/// Whether a character belongs in a label as it is kept: lower case.
+const fn label_character(character: char) -> bool {
+    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+}
+
 #[must_use]
 /// **Only its own tests call this.** It was public while every module in this
 /// crate was, so nothing said so; narrowing the surface is what made it visible.
@@ -563,5 +689,74 @@ mod tests {
         for forbidden in ["forward", "upstream", "fallback_resolver"] {
             assert!(!code.contains(forbidden), "`{forbidden}` would make this a forwarder");
         }
+    }
+}
+
+#[cfg(test)]
+mod naming {
+    use super::{Broken, MAX_NAME, made_usable, resolvable, usable};
+
+    #[test]
+    fn upper_case_is_lowered() {
+        assert_eq!(usable("Laptop"), Ok("laptop".to_owned()));
+        assert_eq!(usable("DESKTOP-RJUUBB3"), Ok("desktop-rjuubb3".to_owned()));
+    }
+
+    #[test]
+    fn a_space_is_refused_with_the_nearest_name() {
+        let refused = usable("PC di Giovanni").expect_err("a space is not in a label");
+        assert_eq!(refused.broken, Broken::Character(' '));
+        assert_eq!(refused.suggestion.as_deref(), Some("pc-di-giovanni"));
+        assert!(refused.to_string().contains("`pc-di-giovanni`"), "{refused}");
+    }
+
+    #[test]
+    fn a_dot_is_refused() {
+        let refused = usable("nas.casa").expect_err("a dot would make two labels");
+        assert_eq!(refused.broken, Broken::Character('.'));
+        assert_eq!(refused.suggestion.as_deref(), Some("nas-casa"));
+    }
+
+    #[test]
+    fn a_hyphen_at_either_end_and_the_empty_name_are_refused() {
+        assert_eq!(usable("-x").map_err(|e| e.broken), Err(Broken::EdgeHyphen));
+        assert_eq!(usable("x-").map_err(|e| e.broken), Err(Broken::EdgeHyphen));
+        assert_eq!(usable("").map_err(|e| e.broken), Err(Broken::Empty));
+    }
+
+    #[test]
+    fn a_label_is_at_most_sixty_three_characters() {
+        let longest = "a".repeat(MAX_NAME);
+        assert_eq!(usable(&longest), Ok(longest.clone()));
+        let refused = usable(&format!("{longest}a")).expect_err("one past the limit");
+        assert_eq!(refused.broken, Broken::TooLong(64));
+        assert_eq!(refused.suggestion, Some(longest), "the suggestion is cut to fit");
+    }
+
+    #[test]
+    fn a_letter_outside_a_to_z_is_refused() {
+        let refused = usable("caffè").expect_err("not ASCII");
+        assert_eq!(refused.broken, Broken::Character('è'));
+        assert_eq!(refused.suggestion.as_deref(), Some("caff"));
+    }
+
+    #[test]
+    fn a_hostname_is_made_usable() {
+        assert_eq!(made_usable("DESKTOP_RJUUBB3").as_deref(), Some("desktop-rjuubb3"));
+        assert_eq!(made_usable("Mario's phone").as_deref(), Some("mario-s-phone"));
+        assert_eq!(made_usable("  --lab..box--  ").as_deref(), Some("lab-box"));
+    }
+
+    #[test]
+    fn nothing_usable_is_none() {
+        assert_eq!(made_usable("___"), None);
+        assert_eq!(made_usable(""), None);
+        assert_eq!(made_usable("ààà"), None);
+    }
+
+    #[test]
+    fn a_mixed_case_name_resolves_and_a_spaced_one_does_not() {
+        assert!(resolvable("Laptop"));
+        assert!(!resolvable("PC di Giovanni"));
     }
 }

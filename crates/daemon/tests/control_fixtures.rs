@@ -65,6 +65,7 @@ fn report() -> Report {
         peers: vec![
             Peer {
                 name: "nas.home.internal".to_owned(),
+                name_resolves: true,
                 id: nas.id.clone(),
                 address: "fd00::2".parse().unwrap(),
                 ipv4: Some(Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2))),
@@ -75,6 +76,7 @@ fn report() -> Report {
             },
             Peer {
                 name: "laptop.home.internal".to_owned(),
+                name_resolves: true,
                 id: laptop.id.clone(),
                 address: "fd00::7".parse().unwrap(),
                 ipv4: Some(Ipv4State::Withheld {
@@ -182,6 +184,7 @@ fn report() -> Report {
         // Reachable when last known: an off network must still not draw it as now.
         peers: vec![Peer {
             name: "build-box.work.internal".to_owned(),
+            name_resolves: true,
             id: "5f6a-7b8c-9d0e-1f2a".to_owned(),
             address: "fd01::2".parse().unwrap(),
             ipv4: Some(Ipv4State::Collides(named(Some("tablet"), "6a7b-8c9d-0e1f-2a3b"))),
