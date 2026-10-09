@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 56 of 88. Every other result reads `not run`. That is the honest
+**Run so far**: 57 of 89. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 

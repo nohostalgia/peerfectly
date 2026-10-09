@@ -2,10 +2,11 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 36 of 36. Step 32's budget, not met for want of an iroh change, is met in step 35 on the project's fork of iroh; step 34 is iroh 1.3.0 unpatched, the figure the patch is measured against. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
+**Run so far**: 37 of 37. Step 32's budget, not met for want of an iroh change, is met in step 35 on the project's fork of iroh; step 34 is iroh 1.3.0 unpatched, the figure the patch is measured against. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
 through a pseudo-terminal; steps 18–25 were run by hand, with the Windows PC, the phone and WSL2,
 and reported as passed. Step 28 was run in plain containers and one running systemd; step 29 was
-run by hand on WSL2 and reported as passed. Steps 30 and 31, for the rename, were run by hand on WSL2 and reported as passed.
+run by hand on WSL2 and reported as passed. Steps 30 and 31, for the rename, were run by hand on WSL2 and reported as passed. Step 37, device
+names and `rename`, was run in the testbed through a pseudo-terminal.
 
 **On 2026-10-03 the product was renamed from `mynet` to `peerfectly`** (`rename-to-peerfectly`),
 protocol included: nothing before that date speaks to anything after it. Commands and **Expect**
