@@ -119,6 +119,13 @@ enum Resume {
         /// Where its roster stood when the batch was built.
         prepared_against: crate::signing::Moment,
     },
+    /// A device of the network this device calls `label` is being renamed.
+    Renaming {
+        /// Which network.
+        label: Label,
+        /// Where its roster stood when the batch was built.
+        prepared_against: crate::signing::Moment,
+    },
     /// The network this device calls `label` is changing its parameters: its
     /// relay, or its rendezvous. Resumed the same way for either.
     ChangingParameters {
@@ -1590,6 +1597,7 @@ impl Service {
             }
             peers.push(Peer {
                 name: format!("{}.{}", record.name, state.params.suffix),
+                name_resolves: crate::names::resolvable(&record.name),
                 id: membership.directory.named(&record.id).id,
                 address: Prefix::from_parameter(&state.params.ula)
                     .map_or(Ipv6Addr::UNSPECIFIED, |prefix| {
@@ -1747,6 +1755,9 @@ impl Service {
         match resume {
             Resume::Revoking { label, prepared_against } => {
                 self.revocation_signed(&label, &prepared_against, &requests, signatures).await
+            }
+            Resume::Renaming { label, prepared_against } => {
+                self.rename_signed(&label, &prepared_against, &requests, signatures).await
             }
             Resume::ChangingParameters { label, prepared_against } => {
                 self.relay_change_signed(&label, &prepared_against, &requests, signatures).await
@@ -2751,6 +2762,12 @@ impl Service {
                     Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
                 }
             },
+            Command::Rename { network, target, name } => match Self::wanted(network) {
+                Ok(label) => self.rename(label.as_ref(), &target, &name).await,
+                Err(cause) => {
+                    Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                }
+            },
             Command::TakeOwnership { network } => match Self::wanted(network) {
                 Ok(label) => self.take_ownership(label.as_ref()).await,
                 Err(cause) => {
@@ -2789,11 +2806,27 @@ impl Service {
                 self.tidy_after(ended.into_iter().collect()).await;
                 Outcome::Done
             }
-            Command::Join { relay, name } => self.begin_joining(&relay, &name).await,
+            // A name is checked where it enters: refused before anything is made or
+            // sent when it is not one a resolver can answer, and lowered when it is.
+            Command::Join { relay, name } => match crate::names::usable(&name) {
+                Ok(name) => self.begin_joining(&relay, &name).await,
+                Err(unusable) => {
+                    Outcome::Failed { message: unusable.to_string(), left_behind: Vec::new() }
+                }
+            },
             Command::Replace => self.confirm_replacing().await,
             Command::Forget { label, last_admin } => self.forget(&label, last_admin).await,
             Command::Waiting => self.waiting_on().await,
             Command::Found { label, name, suffix, relay, rendezvous, certificate, ipv4_range } => {
+                let name = match crate::names::usable(&name) {
+                    Ok(name) => name,
+                    Err(unusable) => {
+                        return Outcome::Failed {
+                            message: unusable.to_string(),
+                            left_behind: Vec::new(),
+                        };
+                    }
+                };
                 let fetch = certificate == crate::control::Certificate::FromTheRelay;
                 // Before anything else, and before any certificate is fetched: a
                 // range that is not allowed is refused with nothing signed.
@@ -2927,6 +2960,116 @@ impl Service {
                 message: format!(
                     "the revocation is signed and held, but the network would not come \
                      up to carry it: {cause}"
+                ),
+                left_behind: Vec::new(),
+            },
+        }
+    }
+
+    /// Gives a device of a network a new name.
+    ///
+    /// `revoke`'s path, step for step: the same lookup, the same refusal where
+    /// the platform cannot hold an admin's key, the same split between signing
+    /// here and handing the bytes to whoever holds the key. Who may rename is the
+    /// roster's to say, and a member's attempt is refused in its words.
+    async fn rename(
+        &self,
+        which: Option<&Label>,
+        target: &crate::control::Target,
+        given: &str,
+    ) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let node = Arc::clone(network.node());
+        let state = match node.state().await {
+            Ok(state) => state,
+            Err(cause) => {
+                return Outcome::Failed {
+                    message: format!("there is no network on this device: {cause}"),
+                    left_behind: Vec::new(),
+                };
+            }
+        };
+        let renaming = match crate::renaming::resolve(&state, target, given) {
+            Ok(renaming) => renaming,
+            Err(refusal) => return Outcome::Failed { message: refusal, left_behind: Vec::new() },
+        };
+
+        let identity = node.identity();
+        let prepared_against = node.moment().await;
+        let heads = prepared_against.heads.clone();
+
+        if let Some(refusal) = self.keys.admin_refusal() {
+            return Outcome::refused(format!(
+                "this network makes this device an admin, and {refusal}. Nothing was signed."
+            ));
+        }
+
+        if !identity.signing_key().answers_here() {
+            let core = match crate::renaming::core(&renaming, identity, &state, heads) {
+                Ok(core) => core,
+                Err(refusal) => {
+                    return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                }
+            };
+            let requests = Self::with_owed_snapshot(&node, core::slice::from_ref(&core)).await;
+            let label = network.label().clone();
+            let resume = Resume::Renaming { label: label.clone(), prepared_against };
+            return self.wants_signatures(requests, identity, &label, resume).await;
+        }
+
+        let signed = match crate::renaming::sign(&renaming, identity, &state, heads) {
+            Ok(signed) => signed,
+            Err(cause) => {
+                return Outcome::refused(format!("the rename could not be signed: {cause}"));
+            }
+        };
+        self.carry_rename(&network, signed).await
+    }
+
+    /// Finishes a rename whose signature was made elsewhere.
+    async fn rename_signed(
+        &self,
+        label: &Label,
+        prepared_against: &crate::signing::Moment,
+        requests: &[identity::detached::SigningRequest],
+        signatures: &[Vec<u8>],
+    ) -> Outcome {
+        let network = match self.named(label).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let artifacts =
+            match self.verified_batch(&network, prepared_against, requests, signatures).await {
+                Ok(artifacts) => artifacts,
+                Err(refused) => return refused,
+            };
+        let mut artifacts = artifacts.into_iter();
+        let Some(signed) = artifacts.next() else {
+            return Outcome::refused("the batch held no rename".to_owned());
+        };
+        let carried = self.carry_rename(&network, signed).await;
+        self.with_the_snapshot(&network, carried, artifacts.next()).await
+    }
+
+    /// Puts a signed rename into the roster, bringing the network up to carry
+    /// it, as every administrative act does.
+    async fn carry_rename(&self, network: &Arc<Network>, signed: Vec<u8>) -> Outcome {
+        match self.admit_to(network, &signed).await {
+            Ok(false) => Outcome::Reported(self.report().await),
+            Ok(true) => Outcome::Reported(
+                self.report().await.with_note("the network was brought up to carry it"),
+            ),
+            Err(cause) => Outcome::Failed {
+                message: format!(
+                    "the rename is signed and held, but the network would not come up to \
+                     carry it: {cause}"
                 ),
                 left_behind: Vec::new(),
             },
@@ -4850,6 +4993,83 @@ mod tests {
 
         service.bring_up(None).await.expect("and the tunnel comes up, with no restart");
         assert!(!machine.installed().adapters.is_empty());
+    }
+
+    /// A device's name is kept in lower case: `NAS` founds a network whose first
+    /// device is `nas`, which is what a resolver answers anyway.
+    #[tokio::test]
+    async fn founding_lowers_the_device_name() {
+        let (service, _machine, _scratch) = unjoined().await;
+
+        let outcome = service
+            .handle(Command::Found {
+                label: "test".to_owned(),
+                name: "NAS".to_owned(),
+                suffix: "example.internal".to_owned(),
+                relay: None,
+                rendezvous: None,
+                certificate: crate::control::Certificate::None,
+                ipv4_range: None,
+            })
+            .await;
+        assert!(matches!(outcome, Outcome::Reported(_)), "{outcome:?}");
+
+        let node = service.node().await.expect("a network");
+        let state = node.state().await.expect("a roster");
+        let names: Vec<&str> = state.devices.values().map(|record| record.name.as_str()).collect();
+        assert_eq!(names, ["nas"]);
+    }
+
+    /// A name a resolver cannot answer founds nothing, and the refusal says
+    /// what would do.
+    #[tokio::test]
+    async fn founding_under_an_unusable_name_founds_nothing() {
+        let (service, _machine, _scratch) = unjoined().await;
+
+        let outcome = service
+            .handle(Command::Found {
+                label: "test".to_owned(),
+                name: "PC di Giovanni".to_owned(),
+                suffix: "example.internal".to_owned(),
+                relay: None,
+                rendezvous: None,
+                certificate: crate::control::Certificate::None,
+                ipv4_range: None,
+            })
+            .await;
+
+        match outcome {
+            Outcome::Failed { message, .. } => {
+                assert!(message.contains("`pc-di-giovanni`"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!service.has_network().await, "nothing was founded");
+    }
+
+    /// A join under a name a resolver cannot answer sends nothing and leaves
+    /// nothing waiting.
+    #[tokio::test]
+    async fn joining_under_an_unusable_name_sends_nothing() {
+        let (service, _machine, _scratch) = unjoined().await;
+
+        let outcome = service
+            .handle(Command::Join {
+                relay: "https://127.0.0.1:1".to_owned(),
+                name: "nas.casa".to_owned(),
+            })
+            .await;
+
+        match outcome {
+            Outcome::Failed { message, .. } => {
+                assert!(message.contains("`nas-casa`"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            matches!(service.handle(Command::Waiting).await, Outcome::Done),
+            "nothing is waiting to be confirmed"
+        );
     }
 
     /// Founding twice is refused, through the new path as through the old.
@@ -8734,6 +8954,69 @@ mod tests {
 
         let node = service.node().await.expect("the fixture holds a network");
         assert!(node.state().await.expect("derives").revoked.is_empty(), "and nothing was");
+    }
+
+    /// A rename takes effect here at once: the new name resolves on this device
+    /// and the old one no longer does, with nothing restarted.
+    #[tokio::test]
+    async fn renaming_a_device_takes_effect_here_at_once() {
+        let fixture = fixture(None).await;
+        let founder = Arc::clone(
+            fixture.service.node().await.expect("the fixture holds a network").identity(),
+        );
+        let laptop = add_a_device(&fixture.service, &founder).await;
+        fixture.service.admit(&laptop).await.expect("admits");
+
+        let outcome = fixture
+            .service
+            .handle(Command::Rename {
+                network: None,
+                target: crate::control::Target::Name("laptop".to_owned()),
+                name: "Studio".to_owned(),
+            })
+            .await;
+        assert!(matches!(outcome, Outcome::Reported(_)), "{outcome:?}");
+
+        let node = fixture.service.node().await.expect("the fixture holds a network");
+        let state = node.state().await.expect("derives");
+        let view = crate::names::Ipv4View::default();
+        assert!(
+            !crate::names::answer(&state, &view, "studio.example.internal.").is_non_existent(),
+            "the new name resolves, in lower case"
+        );
+        assert!(
+            crate::names::answer(&state, &view, "laptop.example.internal.").is_non_existent(),
+            "and the old one no longer does"
+        );
+    }
+
+    /// A machine that cannot hold an admin's key renames nothing, as it revokes
+    /// nothing.
+    #[tokio::test]
+    async fn a_machine_that_cannot_be_an_admin_renames_nothing() {
+        let fixture = fixture(None).await;
+        let founder = Arc::clone(
+            fixture.service.node().await.expect("the fixture holds a network").identity(),
+        );
+        let laptop = add_a_device(&fixture.service, &founder).await;
+        fixture.service.admit(&laptop).await.expect("admits");
+        let service = fixture.service.with_keys(Arc::new(MemberOnly));
+
+        let outcome = service
+            .handle(Command::Rename {
+                network: None,
+                target: crate::control::Target::Name("laptop".to_owned()),
+                name: "studio".to_owned(),
+            })
+            .await;
+        let Outcome::Failed { message, .. } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(message.contains("Nothing was signed"), "{message}");
+
+        let node = service.node().await.expect("the fixture holds a network");
+        let state = node.state().await.expect("derives");
+        assert!(state.devices.values().any(|record| record.name == "laptop"), "still `laptop`");
     }
 
     /// Being a member is untouched by any of this.

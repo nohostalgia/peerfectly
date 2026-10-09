@@ -363,6 +363,15 @@ impl Cli<'_> {
                     return ExitCode::FAILURE;
                 }
             }
+        } else if word == "rename" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match daemon::control::Command::renaming(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
         } else {
             // A second word, where the command takes one, is the network it acts on.
             // A person holding one network types neither it nor anything in its
@@ -1191,7 +1200,7 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         .filter(|word| !word.starts_with("--"))
         .ok_or_else(|| format!("usage: {FOUND_USAGE}"))?
         .clone();
-    let name = option(rest, "--name").unwrap_or_else(default_name);
+    let name = device_name(rest)?;
 
     let relay_address = option(rest, "--relay");
 
@@ -1320,10 +1329,7 @@ fn joining_from(rest: &[String]) -> Result<daemon::control::Command, String> {
     let relay = option(rest, "--relay")
         .or_else(|| rest.first().filter(|word| !word.starts_with("--")).cloned())
         .ok_or_else(|| format!("usage: {JOIN_USAGE}"))?;
-    Ok(daemon::control::Command::Join {
-        relay,
-        name: option(rest, "--name").unwrap_or_else(default_name),
-    })
+    Ok(daemon::control::Command::Join { relay, name: device_name(rest)? })
 }
 
 /// Shows a relay's certificate and asks whether to pin it.
@@ -1385,11 +1391,38 @@ const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] [-
      [--rendezvous URL] \
                            [--relay-cert FILE | --no-relay-cert] [--ipv4-range A.B.C.D/N]";
 
-/// The name a device proposes when a person did not choose one.
+/// This device's name: the one a person gave, or one made from the machine's.
 ///
-/// The machine's own name, because that is what a person will look for in a list
-/// and what they would have typed. The admin can choose another.
-fn default_name() -> String {
+/// A name given is passed on as typed, for the daemon to check, which it does
+/// for the phone as well; only that it will be kept in lower case is said here,
+/// before anything is asked of a person. A name nobody gave is the machine's own,
+/// because that is what a person will look for in a list, made into one a
+/// resolver can answer, since there is nobody to ask about it.
+///
+/// # Errors
+///
+/// When no name is given and the machine's has nothing a name can use.
+fn device_name(rest: &[String]) -> Result<String, String> {
+    if let Some(given) = option(rest, "--name") {
+        if let Ok(lowered) = daemon::usable(&given)
+            && lowered != given
+        {
+            println!("this device is named `{lowered}`: a device's name is kept in lower case.");
+        }
+        return Ok(given);
+    }
+    named_after(machine_name().as_deref()).ok_or_else(|| {
+        "this machine's name has nothing a device's name can use: give one with --name".to_owned()
+    })
+}
+
+/// A device's name made from the machine's, when it has anything usable.
+fn named_after(machine: Option<&str>) -> Option<String> {
+    machine.and_then(daemon::made_usable)
+}
+
+/// The machine's own name, as the system has it.
+fn machine_name() -> Option<String> {
     // Windows says it in `COMPUTERNAME`; elsewhere a shell may export
     // `HOSTNAME`, and the machine keeps it in `/etc/hostname`.
     ["COMPUTERNAME", "HOSTNAME"]
@@ -1398,7 +1431,6 @@ fn default_name() -> String {
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
         .map(|name| name.trim().to_owned())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "device".to_owned())
 }
 
 /// How `join` is spelled, in one place so the usage and the refusal agree.
@@ -1408,6 +1440,9 @@ const JOIN_USAGE: &str = "peerfectly join --relay URL [--name NAME]";
 const ADMIT_USAGE: &str = "peerfectly admit <the payload the joining device printed>";
 
 const REVOKE_USAGE: &str = daemon::control::Command::REVOKE_USAGE;
+
+/// How `rename` is spelled, from the daemon's control module like `revoke`'s.
+const RENAME_USAGE: &str = daemon::control::Command::RENAME_USAGE;
 
 /// How `forget` is spelled, in one place so the usage and the refusal agree.
 const FORGET_USAGE: &str = daemon::control::Command::FORGET_USAGE;
@@ -1443,6 +1478,10 @@ fn usage(privileged: &str) -> String {
 "
     ));
     out.push_str(&format!(
+        "  {RENAME_USAGE}{needs}
+"
+    ));
+    out.push_str(&format!(
         "  {FORGET_USAGE}
 "
     ));
@@ -1458,6 +1497,23 @@ fn usage(privileged: &str) -> String {
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
     use daemon::control::Command;
+
+    use super::named_after;
+
+    /// A name nobody gave is the machine's, made into one a resolver answers.
+    #[test]
+    fn a_machine_name_is_made_into_a_device_name() {
+        assert_eq!(named_after(Some("DESKTOP_RJUUBB3")).as_deref(), Some("desktop-rjuubb3"));
+        assert_eq!(named_after(Some("Mario's PC")).as_deref(), Some("mario-s-pc"));
+    }
+
+    /// A machine whose name has nothing usable gives no name, and the command
+    /// asks for `--name` rather than inventing one.
+    #[test]
+    fn a_machine_name_with_nothing_usable_gives_none() {
+        assert_eq!(named_after(Some("___")), None);
+        assert_eq!(named_after(None), None);
+    }
 
     use super::founding_from;
 

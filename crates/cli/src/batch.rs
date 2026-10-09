@@ -84,6 +84,7 @@ fn typed_label(asked: &Command) -> Option<&str> {
         Command::Revoke { network, .. }
         | Command::ChangeRelay { network, .. }
         | Command::ChangeRendezvous { network, .. }
+        | Command::Rename { network, .. }
         | Command::Admit { network, .. } => network.as_deref(),
         _ => None,
     }
@@ -98,9 +99,11 @@ fn typed_label(asked: &Command) -> Option<&str> {
 /// knows what they typed is this one.
 ///
 /// **Down to the values typed**, where the bytes carry them: the reason a
-/// revocation gives, the name a founding gives this device, the rendezvous or
-/// relay a settings change moves to. A daemon that kept the act and changed the
-/// address would otherwise have it signed.
+/// revocation gives, the name a founding gives this device or a rename gives a
+/// device, the rendezvous or relay a settings change moves to. A daemon that
+/// kept the act and changed the address would otherwise have it signed. A name
+/// is compared as the daemon keeps it, in lower case: `Laptop` typed is
+/// `laptop` signed, and a name that is no name matches nothing.
 ///
 /// A command that is not one of the acts below imposes no expectation: an
 /// admission is confirmed rather than named, and there is nothing to compare.
@@ -112,7 +115,11 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
         ),
         Command::Found { name, .. } => matches!(
             &core.body,
-            OperationBody::CreateNetwork { device, .. } if device.name == *name
+            OperationBody::CreateNetwork { device, .. } if is_named(&device.name, name)
+        ),
+        Command::Rename { name, .. } => matches!(
+            &core.body,
+            OperationBody::Rename { name: signed, .. } if is_named(signed, name)
         ),
         Command::ChangeRendezvous { rendezvous, .. } => matches!(
             &core.body,
@@ -125,6 +132,11 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
         ),
         _ => true,
     }
+}
+
+/// Whether a signed name is the one typed, as the daemon keeps names.
+fn is_named(signed: &str, typed: &str) -> bool {
+    daemon::usable(typed).is_ok_and(|kept| kept == signed)
 }
 
 /// Whether the batch is one act this command signs, and the items read.
@@ -311,10 +323,24 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
             act: format!("make {} a member", short(device)),
             consequence: "it will no longer be able to admit or revoke devices".to_owned(),
         },
-        OperationBody::Rename { device, name } => Described {
-            act: format!("rename {} to `{}`", short(device), daemon::control::shown(name)),
-            consequence: "the name every device uses for it changes".to_owned(),
-        },
+        OperationBody::Rename { device, name } => {
+            // The name the person typed, as with a revocation: the bytes carry
+            // the device's id and the new name, not the old one.
+            let named = match asked {
+                Command::Rename { target: daemon::control::Target::Name(old), .. } => {
+                    format!("`{}` ", daemon::control::shown(old))
+                }
+                _ => String::new(),
+            };
+            Described {
+                act: format!(
+                    "rename {named}({}) to `{}`",
+                    short(device),
+                    daemon::control::shown(name)
+                ),
+                consequence: "the name every device uses for it changes".to_owned(),
+            }
+        }
         OperationBody::SetNetwork(params) => Described {
             act: format!("change {network}'s settings to: {}", settings(params)),
             consequence: format!("every device in {network} follows this"),

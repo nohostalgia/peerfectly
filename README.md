@@ -132,6 +132,12 @@ peerfectly up home
 peerfectly peers
 ```
 
+A device's name is how the others reach it, as `laptop.home.internal`, so it is a DNS label:
+lower-case letters, digits and hyphens, at most 63 of them, with no hyphen at either end. Upper case
+is lowered, so `Laptop` and `laptop` are the same name. Anything else is refused with a name that
+would do. Without `--name`, the machine's name is used, made to fit. An admin renames a device with
+`peerfectly rename laptop studio`.
+
 `peerfectly` with no arguments lists every command. On Windows the commands that change the
 machine need an elevated console. On Linux, anything that signs needs `sudo`.
 

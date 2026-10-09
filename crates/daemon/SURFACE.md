@@ -92,6 +92,14 @@ every name.
 name can belong to a current one. A row that shows a name and no id is a row on
 which a person can revoke the wrong device.
 
+### A name that cannot be looked up is said so
+
+`Peer::name_resolves` is `false` for a device whose name is not a DNS label: one
+admitted before names were held to the rule, with a space, an apostrophe or a dot
+in it. Nobody reaches that device by name. A renderer says so beside the device,
+and says that an admin fixes it with `rename`, rather than leaving a person to
+find out from a browser that cannot find it.
+
 ### Times are claims unless they are this device's own
 
 | field | whose clock | how to say it |

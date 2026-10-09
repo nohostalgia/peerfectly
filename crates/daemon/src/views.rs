@@ -242,6 +242,16 @@ fn entry_for(peer: &Peer) -> Block {
     // device that is there and one that was.
     block.line("reachable", format!("{reached} ({})", peer.standing));
     block.line("contact", contact_of(&peer.last_contact));
+    if !peer.name_resolves {
+        block.line(
+            "name",
+            format!(
+                "cannot be looked up: it is not a DNS name. An admin fixes it with\n  \
+                 peerfectly rename --id {} <new name>",
+                peer.id
+            ),
+        );
+    }
     block
 }
 
@@ -457,6 +467,7 @@ mod tests {
     fn peer(name: &str, id: &str, reachable: bool) -> Peer {
         Peer {
             name: name.to_owned(),
+            name_resolves: true,
             id: id.to_owned(),
             address: Ipv6Addr::LOCALHOST,
             ipv4: Some(Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2))),
@@ -567,6 +578,23 @@ mod tests {
         let mut without = two_networks();
         without.networks[0].relay = None;
         assert!(said(&without.to_string()).contains("no relay"), "{without}");
+    }
+
+    /// A name admitted before the rule, which nobody can look up, is said so,
+    /// with the command that fixes it; a usable one is not.
+    #[test]
+    fn a_name_that_cannot_be_looked_up_is_said_so() {
+        let mut report = two_networks();
+        let casa = report.networks.first_mut().expect("casa");
+        let mut spaced = peer("PC di Giovanni.casa.internal", "0d0d-0d0d-0d0d-0d0d", true);
+        spaced.name_resolves = false;
+        casa.peers = vec![spaced, peer("Laptop.casa.internal", "0e0e-0e0e-0e0e-0e0e", true)];
+
+        let drawn = report.peers(Some("casa")).to_string();
+        let flagged = said(&drawn);
+        assert!(flagged.contains("cannot be looked up"), "{drawn}");
+        assert!(flagged.contains("peerfectly rename --id 0d0d-0d0d-0d0d-0d0d"), "{drawn}");
+        assert_eq!(drawn.matches("cannot be looked up").count(), 1, "only the one: {drawn}");
     }
 
     /// Peers is about devices, one entry each.

@@ -1000,3 +1000,44 @@ discovery, not a new one for each report.
   five minutes on 1.3 unpatched, where every report opened a connection of its own (step 34).
 - The twelve minutes after it, most of them with the session still open until it closed for being
   idle: 97 packets, 38 KB.
+
+## 37. Names are DNS labels, and a device is renamed
+
+In the testbed, with step 14's commands:
+
+1. `a` founds `prova` with `--name Laptop`.
+2. `b` joins with `--name "PC di Giovanni"`.
+3. `b` joins with `--name b`, and `a` admits it.
+4. On `a`: `sudo peerfectly rename b Studio --network prova`.
+5. On both, ten seconds later, each node's resolver asked for `studio`, `b` and `laptop` under
+   `.prova.internal`, as in step 14.
+
+**Expect**:
+- the founding to say the name is kept in lower case, and `status` to show `laptop.prova.internal`;
+- the second join refused before anything is made, with `pc-di-giovanni` offered, and `b` holding no
+  network;
+- the rename confirmed as ``rename … to `studio` ``, in lower case, and signed with the passphrase;
+- `studio` answering on both nodes with `b`'s address, `b` answering on neither, and `b` calling
+  itself `studio.prova.internal`.
+
+**Result**: run, 2026-10-09, passed after one fix.
+- **The founding was refused by the command line itself:** *"the act to be signed is not the act
+  that was asked for. Nothing was signed."* The command line checks the act it signs against what
+  was typed, and compared the typed `Laptop` with the daemon's `laptop`. A signature asked here, as
+  on Linux, goes through that check; one made inside the daemon, as on Windows, does not, which is
+  why the daemon's tests did not show it. Names are now compared as the daemon keeps them, a
+  rename's new name is checked the same way (it was not checked at all), and the tests
+  `a_founding_typed_in_upper_case_is_the_one_asked_for` and
+  `a_rename_must_carry_the_name_typed_in_lower_case` cover both.
+- After it: ``this device is named `laptop`: a device's name is kept in lower case.``, and `status`
+  on `a` read `laptop.prova.internal`.
+- The second join: *"a device's name may hold only letters from a to z, digits and hyphens, and ' '
+  is none of them; `pc-di-giovanni` would do"*, with no passphrase asked, and `b` holding no network.
+- The rename: confirmed as ``rename ab0e-11c5-aa66-0e24 to `studio` ``, signed, exit 0.
+- On `a` and on `b`: `studio` answered `fdff:5685:d06e:3380:fc17:ab8e:ec24:d5e4`, `b` answered
+  nothing, `laptop` answered `a`'s address. `status` on `b`: `studio.prova.internal`.
+
+Two things read badly in that run and were changed after it, with tests rather than another run:
+the waiting line read *"renaming of studio [ab0e…] to studio"*, as the device already went by the new
+name, and now reads *"renaming of [ab0e…] to studio"*; and the confirmation named the device by id
+alone, and now names it as typed, as a revocation's does: ``rename `b` (ab0e…) to `studio` ``.

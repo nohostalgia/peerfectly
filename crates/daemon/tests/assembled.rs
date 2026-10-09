@@ -1197,6 +1197,60 @@ async fn a_burst_makes_one_contact_per_neighbour() {
     );
 }
 
+/// A rename is in force where it was signed at once, and reaches the device it
+/// renames: the old name is gone on both, and the new one is what both hold.
+#[tokio::test]
+async fn a_rename_is_in_force_on_both_members() {
+    let (fixture, founder, joiner) = apart().await;
+    {
+        let joiner = Arc::clone(&joiner.node);
+        tokio::spawn(async move { while joiner.accept().await.is_ok() {} });
+    }
+    tokio::spawn(Arc::clone(&founder.node).spread_forever());
+
+    let rename = OperationCore::new(
+        4,
+        fixture.founder.signing_key().algorithm(),
+        OperationBody::Rename { device: fixture.joiner.device_id(), name: "studio".to_owned() },
+        fixture.roster().heads(),
+        fixture.founder.signing_key().key_id(),
+        fixture.network,
+    )
+    .expect("well-formed");
+    let signed = sign_operation(&rename, fixture.founder.signer()).expect("signs");
+    let before = joiner.node.state().await.expect("derives");
+    assert_eq!(
+        before.devices.get(&fixture.joiner.device_id()).map(|record| record.name.as_str()),
+        Some("joiner"),
+        "named `joiner` before"
+    );
+    founder.node.admit_without_activating(&signed).await.expect("admits");
+
+    let name_on = async |node: &Arc<Node>| {
+        node.state().await.ok().and_then(|state| {
+            state.devices.get(&fixture.joiner.device_id()).map(|record| record.name.clone())
+        })
+    };
+    assert_eq!(name_on(&founder.node).await.as_deref(), Some("studio"), "at once, where signed");
+
+    let mut arrived = false;
+    for _ in 0..200 {
+        if name_on(&joiner.node).await.as_deref() == Some("studio") {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(arrived, "and on the device it renamed");
+    for node in [&founder.node, &joiner.node] {
+        let state = node.state().await.expect("derives");
+        assert!(
+            !state.devices.values().any(|record| record.name == "joiner"),
+            "the old name is gone"
+        );
+    }
+}
+
 // ---- A device catches up when it comes back ---------------------------------------
 
 /// A device that was down while an operation was admitted holds it shortly

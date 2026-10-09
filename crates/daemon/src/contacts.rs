@@ -291,6 +291,7 @@ mod tests {
             ("networks.rs", include_str!("networks.rs")),
             ("relay.rs", include_str!("relay.rs")),
             ("resolving.rs", include_str!("resolving.rs")),
+            ("renaming.rs", include_str!("renaming.rs")),
             ("revoking.rs", include_str!("revoking.rs")),
             ("router.rs", include_str!("router.rs")),
             ("routes.rs", include_str!("routes.rs")),
