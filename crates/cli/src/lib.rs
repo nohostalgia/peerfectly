@@ -1190,7 +1190,6 @@ impl Cli<'_> {
 /// talking to the relay about the same thing.
 fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
     use daemon::control::{Certificate, Command};
-    use daemon::relay;
 
     // The network's name, which is this machine's own name for it. The device's
     // own name is separate and has a sensible default; the network's does not,
@@ -1204,73 +1203,19 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
 
     let relay_address = option(rest, "--relay");
 
-    // The relay's certificate is fetched **by default** where there is a relay to
-    // fetch it from.
-    //
-    // # Why this is not a flag a person has to know about
-    //
-    // An admitting side pins the relay's certificate only where the network does:
-    // `transport-iroh`'s enrolment endpoint adds `ca_tls_config` under `if let
-    // Some(certificate) = state.params.relay_cert`, and otherwise verifies against
-    // the system's roots. So a network founded against a relay whose certificate
-    // no public authority vouches for — a self-signed one on a bare address is the
-    // ordinary case — and **not** pinned can never admit anybody: the admitting
-    // side cannot reach the relay at all.
-    //
-    // The joining side has no such trouble. It accepts on sight when ordinary
-    // verification fails, registers, and shows its payload exactly as it should,
-    // then waits out its ten minutes. So the failure appears on the machine that
-    // is working, and nothing anywhere mentions a certificate. That cost an
-    // evening of two-machine testing; it is written down in `VERIFICATION.md` §29.
-    //
-    // Nothing about the pause changes. The fingerprint is still shown and still
-    // confirmed before anything is signed — what changes is which way round the
-    // question is put, and which answer a person gets by not thinking about it.
-    let declining = rest.iter().any(|word| word == "--no-relay-cert");
-    let given = option(rest, "--relay-cert");
-    if given.is_some() && declining {
-        return Err("--relay-cert and --no-relay-cert disagree; use one or the other".to_owned());
+    // On this branch a relay is `key@host:port`, trusted by the key it carries:
+    // there is no certificate to fetch, give or decline, and a flag about one is
+    // a mistake said here rather than a choice made quietly. The daemon checks
+    // the relay itself, so the Android app is held to the same.
+    if rest.iter().any(|word| word == "--relay-cert" || word == "--no-relay-cert") {
+        return Err(format!(
+            "this build speaks convesso, whose relays carry their key in their address: no \
+             certificate is given or pinned. A relay is written {}.\nusage: {FOUND_USAGE}",
+            daemon::relay::FORM
+        ));
     }
-    let certificate = match given {
-        Some(path) => {
-            let certificate = relay::read_certificate(&path)?;
-            // A file may legitimately be a certificate authority's certificate
-            // that signs the one the relay presents, and this cannot tell the two
-            // apart — so this is said and not enforced. The fetch, which knows it
-            // holds the relay's own certificate, does enforce it.
-            if let Some(address) = relay_address.as_deref() {
-                let (host, _) = relay::host_and_port(address)?;
-                if let Err(reason) = relay::usable_as_a_server_certificate(&certificate, &host) {
-                    println!("warning: {address} cannot present this certificate itself:");
-                    println!("{reason}");
-                    println!(
-                        "pinning it anyway — right only if it signs the one the relay serves."
-                    );
-                    println!();
-                }
-            }
-            Certificate::Given(certificate)
-        }
-        // A relay and no objection: fetch it, show the fingerprint, and pin it
-        // only once a person says it matches.
-        None if !declining && relay_address.is_some() => Certificate::FromTheRelay,
-        // No relay to fetch from, or a person who said not to — and who is
-        // told what that costs before the founding is signed.
-        None => {
-            if declining && relay_address.is_some() {
-                println!();
-                println!("Founding without pinning that relay's certificate.");
-                println!();
-                println!("If it presents one no public authority vouches for, this network will");
-                println!("never be able to admit another device: admitting verifies against the");
-                println!("system's roots when the network pins nothing, and cannot reach the");
-                println!("relay at all. The device trying to join will wait and time out, and");
-                println!("nothing will mention a certificate.");
-                println!();
-            }
-            Certificate::None
-        }
-    };
+    let certificate = Certificate::None;
+    let _ = &relay_address;
 
     // Read here as well as in the daemon, so a range that is not allowed is
     // refused before the daemon is asked anything, and a range that is allowed
@@ -1387,9 +1332,8 @@ fn option(rest: &[String], flag: &str) -> Option<String> {
 }
 
 /// How `found` is spelled, in one place so the usage and the refusal agree.
-const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] [--relay URL] \
-     [--rendezvous URL] \
-                           [--relay-cert FILE | --no-relay-cert] [--ipv4-range A.B.C.D/N]";
+const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] \
+                           [--relay KEY@HOST:PORT] [--rendezvous URL] [--ipv4-range A.B.C.D/N]";
 
 /// This device's name: the one a person gave, or one made from the machine's.
 ///
@@ -1434,7 +1378,7 @@ fn machine_name() -> Option<String> {
 }
 
 /// How `join` is spelled, in one place so the usage and the refusal agree.
-const JOIN_USAGE: &str = "peerfectly join --relay URL [--name NAME]";
+const JOIN_USAGE: &str = "peerfectly join --relay KEY@HOST:PORT [--name NAME]";
 
 /// How `admit` is spelled, in one place so the usage and the refusal agree.
 const ADMIT_USAGE: &str = "peerfectly admit <the payload the joining device printed>";
@@ -1581,51 +1525,33 @@ mod tests {
         }
     }
 
-    /// A relay and no argument about it: the certificate is fetched.
-    ///
-    /// The other way round produces a network that can never admit anybody —
-    /// admitting verifies against the system's roots when the network pins
-    /// nothing, and cannot reach a relay whose certificate they refuse. A person
-    /// who has not thought about it must not land there by default.
+    /// A relay is trusted by the key in its address: nothing is fetched, with
+    /// or without a relay.
     #[test]
-    fn a_relay_has_its_certificate_fetched_without_being_asked_for() {
-        let command = founding_from(&words("casa --relay https://relay.example:443")).unwrap();
-        assert_eq!(daemon::control::Certificate::FromTheRelay, certificate_of(&command));
-    }
-
-    /// And without a relay there is nothing to fetch, so nothing is asked for.
-    #[test]
-    fn no_relay_fetches_nothing() {
+    fn no_certificate_is_ever_asked_for() {
+        let relay = "0".repeat(64) + "@relay.example:7400";
+        let command = founding_from(&words(&format!("casa --relay {relay}"))).unwrap();
+        assert_eq!(daemon::control::Certificate::None, certificate_of(&command));
         let command = founding_from(&words("casa")).unwrap();
         assert_eq!(daemon::control::Certificate::None, certificate_of(&command));
     }
 
-    /// A person can still say no, and it takes saying so.
+    /// A certificate flag is iroh's, and refused here, showing the form.
     #[test]
-    fn declining_is_possible_and_explicit() {
-        let command =
-            founding_from(&words("casa --relay https://relay.example:443 --no-relay-cert"))
-                .unwrap();
-        assert_eq!(daemon::control::Certificate::None, certificate_of(&command));
-    }
-
-    /// Naming a certificate and refusing one at the same time is a mistake, not
-    /// a precedence puzzle to resolve quietly.
-    #[test]
-    fn a_certificate_and_a_refusal_together_are_refused() {
-        let refusal =
-            founding_from(&words("casa --relay https://r:443 --relay-cert c.pem --no-relay-cert"))
-                .unwrap_err();
-        assert!(refusal.contains("one or the other"), "{refusal}");
+    fn a_certificate_flag_is_refused() {
+        for flags in ["--relay-cert c.pem", "--no-relay-cert"] {
+            let refusal =
+                founding_from(&words(&format!("casa --relay r:7400 {flags}"))).unwrap_err();
+            assert!(refusal.contains("convesso"), "{refusal}");
+            assert!(refusal.contains("@host:port"), "{refusal}");
+        }
     }
 
     #[test]
-    fn the_usage_names_the_way_to_decline() {
-        assert!(super::FOUND_USAGE.contains("--no-relay-cert"));
-        assert!(
-            !super::FOUND_USAGE.contains("--fetch-relay-cert"),
-            "fetching is no longer something to ask for"
-        );
+    fn the_usage_shows_the_form_of_a_relay() {
+        assert!(super::FOUND_USAGE.contains("KEY@HOST:PORT"));
+        assert!(super::JOIN_USAGE.contains("KEY@HOST:PORT"));
+        assert!(!super::FOUND_USAGE.contains("--relay-cert"), "no certificate to give");
     }
 }
 

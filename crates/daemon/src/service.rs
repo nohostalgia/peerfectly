@@ -444,6 +444,9 @@ pub struct Service {
     /// Woken when IPv4 routes may need to change: a roster change on a network
     /// that is up. Networks coming up or down reconcile directly.
     reconciling: Arc<tokio::sync::Notify>,
+    /// Woken when the platform says the device's network may have changed, so
+    /// the interfaces are read at once rather than at the next check.
+    interfaces_moved: Arc<tokio::sync::Notify>,
 }
 
 /// An act held while a signing key is made where a person can be asked.
@@ -639,6 +642,7 @@ impl Service {
             unkeyed: Mutex::new(None),
             stopping: Mutex::new(false),
             reconciling: Arc::new(tokio::sync::Notify::new()),
+            interfaces_moved: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -1343,7 +1347,9 @@ impl Service {
         loop {
             let woken = tokio::select! {
                 () = self.reconciling.notified() => true,
-                () = tokio::time::sleep(crate::limits::INTERFACE_RECHECK) => false,
+                // A check, as the timer's: the interfaces are read now.
+                () = self.interfaces_moved.notified() => false,
+                () = tokio::time::sleep(crate::limits::NETWORK_CHECK) => false,
             };
             // Every wake, notified or not: a roster change can move a relay, and
             // a move ends with nothing arriving to say so — this tick is what
@@ -1359,9 +1365,42 @@ impl Service {
                 if now == seen {
                     continue;
                 }
+                // At once, not once it has settled: a device that changed
+                // network is unreachable until its connectivity layer stops
+                // waiting on the one it left. A change that undoes itself costs
+                // a relay link replaced, a few hundred bytes.
+                //
+                // Not while there is no network at all. A phone leaving Wi-Fi
+                // lists nothing for a moment before its mobile network appears,
+                // 155 ms later on 2026-10-19 (Android `VERIFICATION.md`, C3); a
+                // relay link tried then has nothing to carry it. The next
+                // change, to a network that is there, is told instead.
+                if carries_traffic(&now) {
+                    self.network_changed().await;
+                }
                 seen = now;
             }
             self.reconcile().await;
+        }
+    }
+
+    /// Says the device's network may have changed: the interfaces are read at
+    /// once, and a change is passed on to every network's connectivity layer.
+    ///
+    /// For a platform that is told by the system, as Android is, so that a phone
+    /// leaving Wi-Fi is not left waiting for the next check. Nothing happens if
+    /// the interfaces turn out the same.
+    pub fn interfaces_may_have_changed(&self) {
+        self.interfaces_moved.notify_one();
+    }
+
+    /// Tells the connectivity layer of every network that is up that this
+    /// machine's network changed.
+    async fn network_changed(&self) {
+        for network in self.all().await {
+            if let Some(transport) = network.node().transport().await {
+                transport.network_changed().await;
+            }
         }
     }
 
@@ -1631,7 +1670,15 @@ impl Service {
                 .is_some_and(|record| record.role == roster::types::Role::Admin),
             relay: state.params.relay.clone(),
             rendezvous: state.params.rendezvous.clone(),
-            relay_pinned: state.params.relay_cert.is_some(),
+            // A convesso relay carries its key in its address, and that key is
+            // its pin: what a renderer warns about when nothing is pinned is
+            // settled by it.
+            relay_pinned: state.params.relay_cert.is_some()
+                || state
+                    .params
+                    .relay
+                    .as_deref()
+                    .is_some_and(|relay| transport_convesso::relay::parse(relay).is_ok()),
             relay_leaving: state.params.leaving_at(crate::clock::now_ms()).map(|leaving| {
                 crate::control::RelayLeaving {
                     relay: leaving.relay.clone(),
@@ -2788,9 +2835,16 @@ impl Service {
                 Ok(label) => self.exposed(label.as_ref()).await,
                 Err(cause) => Self::said(Err(cause)),
             },
-            Command::ChangeRelay { network, relay, pin, immediately } => {
+            // On this branch a relay carries its key in its address, so there is
+            // no certificate to fetch or pin: `pin` is set aside.
+            Command::ChangeRelay { network, relay, pin: _, immediately } => {
+                if let Err(refusal) = convesso_relay(&relay) {
+                    return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                }
                 match Self::wanted(network) {
-                    Ok(label) => self.change_relay(label.as_ref(), &relay, pin, immediately).await,
+                    Ok(label) => {
+                        self.change_relay(label.as_ref(), &relay, false, immediately).await
+                    }
                     Err(cause) => Self::said(Err(cause)),
                 }
             }
@@ -2809,6 +2863,10 @@ impl Service {
             // A name is checked where it enters: refused before anything is made or
             // sent when it is not one a resolver can answer, and lowered when it is.
             Command::Join { relay, name } => match crate::names::usable(&name) {
+                Ok(_) if convesso_relay(&relay).is_err() => Outcome::Failed {
+                    message: convesso_relay(&relay).err().unwrap_or_default(),
+                    left_behind: Vec::new(),
+                },
                 Ok(name) => self.begin_joining(&relay, &name).await,
                 Err(unusable) => {
                     Outcome::Failed { message: unusable.to_string(), left_behind: Vec::new() }
@@ -2827,7 +2885,24 @@ impl Service {
                         };
                     }
                 };
-                let fetch = certificate == crate::control::Certificate::FromTheRelay;
+                // A relay is `key@host:port` on this branch: trusted by the key
+                // in it, with no certificate given, fetched or pinned.
+                if let Some(relay) = relay.as_deref()
+                    && let Err(refusal) = convesso_relay(relay)
+                {
+                    return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                }
+                if certificate != crate::control::Certificate::None && relay.is_some() {
+                    return Outcome::Failed {
+                        message: format!(
+                            "this build speaks convesso, whose relays carry their key in their \
+                             address: no certificate is given or pinned. A relay is written {}",
+                            transport_convesso::relay::FORM
+                        ),
+                        left_behind: Vec::new(),
+                    };
+                }
+                let fetch = false;
                 // Before anything else, and before any certificate is fetched: a
                 // range that is not allowed is refused with nothing signed.
                 let ipv4_range = match crate::founding::ipv4_range(ipv4_range.as_deref()) {
@@ -4571,6 +4646,20 @@ impl Service {
     }
 }
 
+/// Whether any interface in `listed` can carry traffic: up, running, and not
+/// the loopback.
+fn carries_traffic(listed: &[crate::connectivity::LocalInterface]) -> bool {
+    listed.iter().any(|interface| interface.up && interface.running && !interface.loopback)
+}
+
+/// A relay as this branch writes it, `key@host:port`, or why not.
+///
+/// Checked where a relay enters, by `found`, `join` and `relay`, whoever asks:
+/// the command line and the Android app alike.
+fn convesso_relay(relay: &str) -> core::result::Result<(), String> {
+    transport_convesso::relay::parse(relay).map(|_| ()).map_err(|refusal| refusal.to_string())
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
@@ -4995,6 +5084,71 @@ mod tests {
         assert!(!machine.installed().adapters.is_empty());
     }
 
+    /// A relay of the other kind, or a certificate, founds nothing on this
+    /// branch, and the refusal shows the form a relay takes.
+    #[tokio::test]
+    async fn founding_on_a_relay_written_for_iroh_founds_nothing() {
+        let (service, _machine, _scratch) = unjoined().await;
+        let founding = |relay: &str, certificate| Command::Found {
+            label: "test".to_owned(),
+            name: "nas".to_owned(),
+            suffix: "example.internal".to_owned(),
+            relay: Some(relay.to_owned()),
+            rendezvous: None,
+            certificate,
+            ipv4_range: None,
+        };
+
+        for refused in [
+            founding("https://relay.example:443", crate::control::Certificate::None),
+            founding(&at("relay.example:7400"), crate::control::Certificate::FromTheRelay),
+            founding(&at("relay.example:7400"), crate::control::Certificate::Given(vec![0x30])),
+        ] {
+            let Outcome::Failed { message, .. } = service.handle(refused).await else {
+                panic!("a relay of the other kind must be refused");
+            };
+            assert!(message.contains("convesso"), "{message}");
+            assert!(service.node().await.is_none(), "nothing was founded");
+        }
+
+        let founded = service
+            .handle(founding(&at("relay.example:7400"), crate::control::Certificate::None))
+            .await;
+        assert!(matches!(founded, Outcome::Reported(_)), "{founded:?}");
+        let node = service.node().await.expect("a network");
+        let params = node.state().await.expect("a roster").params;
+        assert_eq!(params.relay, Some(at("relay.example:7400")), "the string, as written");
+        assert_eq!(params.relay_cert, None, "and no certificate");
+    }
+
+    /// A join at a relay of the other kind sends nothing.
+    #[tokio::test]
+    async fn joining_at_a_relay_written_for_iroh_sends_nothing() {
+        let (service, _machine, _scratch) = unjoined().await;
+        let outcome = service
+            .handle(Command::Join {
+                relay: "https://relay.example:443".to_owned(),
+                name: "laptop".to_owned(),
+            })
+            .await;
+        let Outcome::Failed { message, .. } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(message.contains("convesso"), "{message}");
+    }
+
+    /// A relay change to a string that is not a relay signs nothing.
+    #[tokio::test]
+    async fn a_relay_change_to_something_else_is_refused() {
+        let fixture = fixture(None).await;
+        let before = params_of(&fixture).await;
+        for refused in ["https://relay.example:443", "relay.example:7400"] {
+            let answered = fixture.service.handle(change(refused, false, false)).await;
+            assert!(matches!(answered, Outcome::Failed { .. }), "{answered:?}");
+        }
+        assert_eq!(before, params_of(&fixture).await, "nothing changed");
+    }
+
     /// A device's name is kept in lower case: `NAS` founds a network whose first
     /// device is `nas`, which is what a resolver answers anyway.
     #[tokio::test]
@@ -5054,10 +5208,7 @@ mod tests {
         let (service, _machine, _scratch) = unjoined().await;
 
         let outcome = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "nas.casa".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "nas.casa".to_owned() })
             .await;
 
         match outcome {
@@ -5105,6 +5256,7 @@ mod tests {
     /// have answered — so the fingerprint goes to a person first. Against a real
     /// TLS server, because a fetch that returned anything other than the bytes
     /// presented would pin a certificate nobody has.
+    #[ignore = "convesso-live: a relay carries its key in its address; no certificate is fetched"]
     #[tokio::test]
     async fn a_fetched_certificate_is_confirmed_before_anything_is_signed() {
         let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
@@ -5185,10 +5337,7 @@ mod tests {
         // A relay nobody is listening on: the join gets no further than trying,
         // which is all this needs — what is asserted is what abandoning leaves.
         let outcome = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "laptop".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
         assert!(
             matches!(outcome, Outcome::Failed { .. } | Outcome::Joining { .. }),
@@ -6053,10 +6202,7 @@ mod tests {
         });
 
         let outcome = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "laptop".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
 
         match outcome {
@@ -6473,6 +6619,124 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    /// Interfaces a test can change while the daemon watches them.
+    struct Moving(std::sync::Mutex<Vec<crate::connectivity::LocalInterface>>);
+
+    impl crate::connectivity::Interfaces for Moving {
+        fn list(&self) -> Vec<crate::connectivity::LocalInterface> {
+            self.0.lock().expect("not poisoned").clone()
+        }
+    }
+
+    fn wifi(index: u32, address: [u8; 4]) -> crate::connectivity::LocalInterface {
+        crate::connectivity::LocalInterface {
+            index,
+            ipv4: vec![std::net::Ipv4Addr::from(address)],
+            subnets: Vec::new(),
+            gateways: Vec::new(),
+            resolvers: Vec::new(),
+            up: true,
+            running: true,
+            multicast: true,
+            loopback: false,
+        }
+    }
+
+    /// **A change of network reaches the connectivity layer at once**, before it
+    /// has settled: a device that left Wi-Fi is unreachable until its layer
+    /// stops waiting on the network it left (Android `VERIFICATION.md`, C3).
+    #[tokio::test]
+    async fn a_change_of_network_is_told_to_the_transport_at_once() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let handed = watching.handed();
+        let casa = handed.first().expect("a transport");
+        assert_eq!(casa.moved(), 0, "nothing moved yet");
+
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wi-Fi gone, mobile data in its place.
+        *interfaces.0.lock().expect("not poisoned") = vec![wifi(7, [10, 64, 3, 9])];
+        let within = crate::limits::NETWORK_CHECK + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + within;
+        while casa.moved() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        running.abort();
+        assert_eq!(casa.moved(), 1, "told once, within one check, not after it settled");
+    }
+
+    /// **A moment with no network at all is not told**: told then, the layer
+    /// tries what cannot work and backs off. The next change, to a network that
+    /// is there, is.
+    #[tokio::test]
+    async fn a_moment_with_no_network_is_not_told_and_the_next_is() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let casa = watching.handed().into_iter().next().expect("a transport");
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Wi-Fi gone, and nothing yet in its place.
+        *interfaces.0.lock().expect("not poisoned") = Vec::new();
+        service.interfaces_may_have_changed();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(casa.moved(), 0, "nothing to carry traffic: not told");
+
+        // The mobile network appears.
+        *interfaces.0.lock().expect("not poisoned") = vec![wifi(7, [10, 64, 3, 9])];
+        service.interfaces_may_have_changed();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while casa.moved() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert_eq!(casa.moved(), 1, "told once, when there was a network to move to");
+    }
+
+    /// **Told by the platform, the change is seen at once**, not at the next
+    /// check: Android says when its network changes.
+    #[tokio::test]
+    async fn a_change_the_platform_reports_is_told_at_once() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let casa = watching.handed().into_iter().next().expect("a transport");
+
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        // Just after a check, so the next one is a whole interval away.
+        tokio::time::sleep(crate::limits::NETWORK_CHECK + std::time::Duration::from_millis(50))
+            .await;
+        *interfaces.0.lock().expect("not poisoned") = vec![wifi(7, [10, 64, 3, 9])];
+        service.interfaces_may_have_changed();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while casa.moved() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert_eq!(casa.moved(), 1, "told within 300 ms of the platform saying so");
     }
 
     /// A path through any tunnel of this device is the machine's own traffic
@@ -8163,6 +8427,13 @@ mod tests {
         (port, presented)
     }
 
+    /// A relay as this branch writes it, `key@host:port`, with one fixed key.
+    fn at(host: &str) -> String {
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[7; 32])
+            .expect("a seed is an identity");
+        transport_convesso::relay::written(key.address().as_bytes(), host, false)
+    }
+
     fn change(relay: &str, pin: bool, immediately: bool) -> Command {
         Command::ChangeRelay { network: None, relay: relay.to_owned(), pin, immediately }
     }
@@ -8175,11 +8446,11 @@ mod tests {
     #[tokio::test]
     async fn a_network_with_no_relay_is_given_one() {
         let fixture = fixture(None).await;
-        let done = fixture.service.handle(change("https://a.example:443", false, false)).await;
+        let done = fixture.service.handle(change(&at("a.example:443"), false, false)).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
 
         let params = params_of(&fixture).await;
-        assert_eq!(Some("https://a.example:443"), params.relay.as_deref());
+        assert_eq!(Some(at("a.example:443").as_str()), params.relay.as_deref());
         assert!(params.leaving.is_none(), "there was nothing to leave");
     }
 
@@ -8187,14 +8458,14 @@ mod tests {
     #[tokio::test]
     async fn a_change_of_relay_is_a_move_that_leaves_the_old_one() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
-        let done = fixture.service.handle(change("https://b.example:443", false, false)).await;
+        fixture.service.handle(change(&at("a.example:443"), false, false)).await;
+        let done = fixture.service.handle(change(&at("b.example:443"), false, false)).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
 
         let params = params_of(&fixture).await;
-        assert_eq!(Some("https://b.example:443"), params.relay.as_deref());
+        assert_eq!(Some(at("b.example:443").as_str()), params.relay.as_deref());
         let leaving = params.leaving.expect("leaving the one it was on");
-        assert_eq!("https://a.example:443", leaving.relay);
+        assert_eq!(at("a.example:443"), leaving.relay);
         assert!(leaving.until > crate::clock::now_ms(), "for a while yet");
     }
 
@@ -8202,11 +8473,11 @@ mod tests {
     #[tokio::test]
     async fn an_immediate_change_leaves_nothing_behind() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
-        fixture.service.handle(change("https://b.example:443", false, true)).await;
+        fixture.service.handle(change(&at("a.example:443"), false, false)).await;
+        fixture.service.handle(change(&at("b.example:443"), false, true)).await;
 
         let params = params_of(&fixture).await;
-        assert_eq!(Some("https://b.example:443"), params.relay.as_deref());
+        assert_eq!(Some(at("b.example:443").as_str()), params.relay.as_deref());
         assert!(params.leaving.is_none(), "nobody waits on the old one");
     }
 
@@ -8214,10 +8485,10 @@ mod tests {
     #[tokio::test]
     async fn the_same_relay_is_not_a_move() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
+        fixture.service.handle(change(&at("a.example:443"), false, false)).await;
         let before = params_of(&fixture).await;
 
-        let refused = fixture.service.handle(change("https://A.example", false, false)).await;
+        let refused = fixture.service.handle(change(&at("A.example:443"), false, false)).await;
         assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
         assert_eq!(before, params_of(&fixture).await, "nothing changed");
     }
@@ -8231,13 +8502,13 @@ mod tests {
     #[tokio::test]
     async fn a_rendezvous_is_set_and_removed() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
+        fixture.service.handle(change(&at("a.example:443"), false, false)).await;
 
         let set = fixture.service.handle(meeting(Some("https://a.example:8444"))).await;
         assert!(matches!(set, Outcome::Reported(_)), "{set:?}");
         let params = params_of(&fixture).await;
         assert_eq!(Some("https://a.example:8444"), params.rendezvous.as_deref());
-        assert_eq!(Some("https://a.example:443"), params.relay.as_deref(), "the relay stays");
+        assert_eq!(Some(at("a.example:443").as_str()), params.relay.as_deref(), "the relay stays");
 
         let removed = fixture.service.handle(meeting(None)).await;
         assert!(matches!(removed, Outcome::Reported(_)), "{removed:?}");
@@ -8281,6 +8552,7 @@ mod tests {
 
     /// **Nothing is signed before the certificate is confirmed, and a declined
     /// one changes nothing.**
+    #[ignore = "convesso-live: a relay carries its key in its address; no certificate is fetched"]
     #[tokio::test]
     async fn nothing_is_signed_before_the_certificate_is_confirmed() {
         let fixture = fixture(None).await;
@@ -9384,10 +9656,7 @@ mod tests {
         let service = service.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
 
         let asked = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "laptop".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
         let Outcome::NeedsKey(wanted) = asked else {
             panic!("it must stop and ask for a key: {asked:?}");

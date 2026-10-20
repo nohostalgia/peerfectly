@@ -122,12 +122,16 @@ pub fn host_and_port(relay: &str) -> Result<(String, u16), Refusal> {
     Ok((host, port))
 }
 
+/// The form a relay is written in on this branch, for a person reading a
+/// refusal.
+pub const FORM: &str = transport_convesso::relay::FORM;
+
 /// Whether two relay addresses name the same relay.
 ///
-/// Compared on scheme, host and port: the scheme and a host name case-folded, a
-/// trailing dot dropped, an IPv6 address without its brackets, and the port made
-/// explicit where the scheme implies one. The path plays no part — a relay is
-/// reached by its host.
+/// A relay is `key@host:port`, or `tls://key@host:port` (on this branch, the
+/// convesso binding's form): the same relay when the keys, the hosts compared
+/// without regard to case or a trailing dot, the ports and the use of TLS all
+/// agree. `transport_convesso::relay::same` decides.
 ///
 /// **Nothing is resolved.** An address and a name that resolves to it are two
 /// relays here: resolving to compare would be the contact this exists to
@@ -136,10 +140,7 @@ pub fn host_and_port(relay: &str) -> Result<(String, u16), Refusal> {
 /// An address that does not parse is the same as nothing, including itself.
 #[must_use]
 pub fn same_relay(one: &str, other: &str) -> bool {
-    match (identity_of(one), identity_of(other)) {
-        (Some(one), Some(other)) => one == other,
-        _ => false,
-    }
+    transport_convesso::relay::same(one, other)
 }
 
 /// Whether two URLs name the same host, whatever their scheme and port.
@@ -166,15 +167,6 @@ fn host_of(address: &str) -> Option<url::Host<String>> {
         url::Host::Ipv4(address) => Some(url::Host::Ipv4(address)),
         url::Host::Ipv6(address) => Some(url::Host::Ipv6(address)),
     }
-}
-
-/// What a relay address names, as [`same_relay`] compares it.
-fn identity_of(relay: &str) -> Option<(String, String, u16)> {
-    let scheme = url::Url::parse(relay).ok()?.scheme().to_ascii_lowercase();
-    let (host, port) = host_and_port(relay).ok()?;
-    let host = host.to_ascii_lowercase();
-    let host = host.strip_suffix('.').map_or(host.clone(), str::to_owned);
-    Some((scheme, host, port))
 }
 
 /// The first certificate the server at `host:port` presents.
@@ -374,36 +366,40 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnything {
 mod tests {
     use super::*;
 
-    /// One relay, however it is written.
+    /// A relay written as the convesso binding writes it, with the key of `seed`.
+    fn relay(seed: u8, host: &str, tls: bool) -> String {
+        let identity = convesso_core::identity::Identity::from_ed25519_seed(&[seed; 32])
+            .expect("a seed is an identity");
+        transport_convesso::relay::written(identity.address().as_bytes(), host, tls)
+    }
+
+    /// One relay, however its host is written.
     #[test]
     fn one_relay_written_differently_is_one_relay() {
-        let ours = "https://relay.example:443";
-        for spelled in [
-            "https://relay.example",
-            "https://RELAY.Example:443",
-            "HTTPS://relay.example:443",
-            "https://relay.example.:443",
-            "https://relay.example:443/",
-            "https://relay.example:443/some/path",
-        ] {
-            assert!(same_relay(ours, spelled), "`{spelled}` is `{ours}`");
+        let ours = relay(1, "relay.example:7400", false);
+        for spelled in ["RELAY.Example:7400", "relay.example.:7400"] {
+            assert!(same_relay(&ours, &relay(1, spelled, false)), "`{spelled}` is `{ours}`");
         }
-        assert!(same_relay("https://[2001:db8::1]:443", "https://[2001:DB8::1]"));
+        assert!(same_relay(
+            &relay(1, "[2001:db8::1]:7400", false),
+            &relay(1, "[2001:DB8::1]:7400", false)
+        ));
     }
 
     /// Different relays, including the ones that look close.
     #[test]
     fn a_different_relay_is_different() {
-        let ours = "https://relay.example:443";
+        let ours = relay(1, "relay.example:7400", false);
         for other in [
-            "https://relay.example:8443",
-            "http://relay.example:443",
-            "https://relay.example.net:443",
-            "https://evil.example:443",
-            "not a url",
-            "",
+            relay(2, "relay.example:7400", false),
+            relay(1, "relay.example:7401", false),
+            relay(1, "relay.example:7400", true),
+            relay(1, "relay.example.net:7400", false),
+            "https://relay.example:443".to_owned(),
+            "not a relay".to_owned(),
+            String::new(),
         ] {
-            assert!(!same_relay(ours, other), "`{other}` is not `{ours}`");
+            assert!(!same_relay(&ours, &other), "`{other}` is not `{ours}`");
         }
     }
 
@@ -411,12 +407,16 @@ mod tests {
     /// would be contacting the host the comparison exists to keep away from.
     #[test]
     fn an_address_is_not_the_name_that_resolves_to_it() {
-        assert!(!same_relay("https://localhost:443", "https://127.0.0.1:443"));
-        let code = crate::code_of(include_str!("relay.rs"));
+        assert!(!same_relay(
+            &relay(1, "localhost:7400", false),
+            &relay(1, "127.0.0.1:7400", false)
+        ));
+        // The comparison is the binding's: read where it is written.
+        let code = crate::code_of(include_str!("../../transport-convesso/src/relay.rs"));
         let comparing = code
-            .split("pub fn same_relay")
+            .split("pub fn same")
             .nth(1)
-            .and_then(|rest| rest.split("pub fn presented_certificate").next())
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
             .expect("it is declared");
         for resolving in ["to_socket_addrs", "lookup_host", "resolve", "dns"] {
             assert!(!comparing.contains(resolving), "`{resolving}` would contact what it compares");

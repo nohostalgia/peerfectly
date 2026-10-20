@@ -279,6 +279,11 @@ fn counted(network: &Network) -> String {
 /// two-machine testing once.
 fn infrastructure(network: &Network) -> String {
     let relay = match (&network.relay, network.relay_pinned) {
+        // A convesso relay carries its key in its address: that key is what is
+        // trusted, and there is no certificate to pin or to miss.
+        (Some(relay), _) if transport_convesso::relay::parse(relay).is_ok() => {
+            format!("relay {} (trusted by its key)", shown(relay))
+        }
         (Some(relay), true) => format!("relay {} (certificate pinned)", shown(relay)),
         (Some(relay), false) => format!("relay {} (no certificate pinned)", shown(relay)),
         (None, _) => "no relay — direct paths only".to_owned(),

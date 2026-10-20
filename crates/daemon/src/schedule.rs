@@ -302,10 +302,10 @@ pub struct Settling<T> {
 
 impl<T: PartialEq + Clone> Settling<T> {
     /// How many checks in a row a new list must hold, at
-    /// [`crate::limits::INTERFACE_RECHECK`] each: thirty seconds. Late enough to
-    /// let a flicker pass, early enough that a device that really moved catches
-    /// up within a minute.
-    pub const STEADY: u32 = 6;
+    /// [`crate::limits::NETWORK_CHECK`] each: thirty seconds. Late enough to let
+    /// a flicker pass, early enough that a device that really moved catches up
+    /// within a minute.
+    pub const STEADY: u32 = 30;
 
     /// Starting from what is there now, which is not a change.
     pub const fn new(current: T) -> Self {

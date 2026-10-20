@@ -32,7 +32,7 @@ use enrollment::exchange::{Message, Possession};
 use enrollment::payload::Joining;
 use enrollment::{adopt, limits};
 use identity::NodeIdentity;
-use transport_iroh::enrolment::{Channel, Waiting};
+use transport_convesso::enrolment::{Channel, Waiting};
 
 use crate::state::{Log, Paths};
 

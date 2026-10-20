@@ -137,6 +137,23 @@ pub trait Transport: Send + Sync {
         Vec::new()
     }
 
+    /// Says that this machine's network changed: an interface came or went, or
+    /// one of its addresses moved.
+    ///
+    /// Called by the daemon the moment it sees the change, not once it has
+    /// settled: a phone that left Wi-Fi for mobile data is unreachable until its
+    /// connectivity layer stops waiting on a network that is gone. Measured on
+    /// the convesso branch on 2026-10-19: told nothing, the phone answered
+    /// nothing for 92 seconds after its Wi-Fi went off, and a TCP connection
+    /// across the change was given up by the far end (Android
+    /// `VERIFICATION.md`, C3).
+    ///
+    /// A hint, as [`Self::learned`] is: the layer decides what to do with it,
+    /// and one that watches the network itself may ignore it. The default does
+    /// nothing, which is right for the in-memory implementations and for one that
+    /// notices on its own.
+    async fn network_changed(&self) {}
+
     /// Whether the session with `peer` is carried on a direct path or through a
     /// relay, as the connection stands now.
     ///

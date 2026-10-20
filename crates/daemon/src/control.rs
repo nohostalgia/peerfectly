@@ -608,7 +608,8 @@ pub struct Network {
     pub relay: Option<String>,
     /// The rendezvous it uses, as its roster names it.
     pub rendezvous: Option<String>,
-    /// Whether that roster pins the relay's certificate.
+    /// Whether that roster pins the relay's certificate, or, on the branch
+    /// `convesso-transport`, names a relay by its key, which is its pin.
     ///
     /// Without a pin a relay presenting a self-signed certificate is refused, no
     /// device registers a home relay, and every peer reads `not reachable` with
@@ -1596,8 +1597,7 @@ impl Command {
                                              peerfectly rename --id <id> <new name> [--network N]";
 
     /// The usage line for moving a network to another relay.
-    pub const RELAY_USAGE: &'static str =
-        "peerfectly relay <address> [--network N] [--no-relay-cert] [--now]";
+    pub const RELAY_USAGE: &'static str = "peerfectly relay <KEY@HOST:PORT> [--network N] [--now]";
 
     /// The usage line for setting or removing a network's rendezvous.
     pub const RENDEZVOUS_USAGE: &'static str =
@@ -2502,6 +2502,18 @@ mod tests {
         let mut unpinned = report(Standing::Current, Vec::new());
         the_one(&mut unpinned).relay_pinned = false;
         assert!(unpinned.to_string().contains("(no certificate pinned)"), "{unpinned}");
+
+        let mut convesso = report(Standing::Current, Vec::new());
+        the_one(&mut convesso).relay = Some(format!("{}@relay.example:7400", "0".repeat(64)));
+        the_one(&mut convesso).relay_pinned = false;
+        assert!(convesso.to_string().contains("(no certificate pinned)"), "not a key: {convesso}");
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[5; 32]).unwrap();
+        the_one(&mut convesso).relay = Some(transport_convesso::relay::written(
+            key.address().as_bytes(),
+            "relay.example:7400",
+            false,
+        ));
+        assert!(convesso.to_string().contains("(trusted by its key)"), "{convesso}");
 
         let mut none = report(Standing::Current, Vec::new());
         the_one(&mut none).relay = None;

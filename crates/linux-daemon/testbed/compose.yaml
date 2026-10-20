@@ -17,6 +17,10 @@ x-node: &node
     context: ../../..
     dockerfile: crates/linux-daemon/testbed/Dockerfile
     target: node
+    # The convesso repository beside this one, on the branch
+    # `convesso-transport`: see the Dockerfile.
+    additional_contexts:
+      convesso: ../../../../../convesso
   image: peerfectly-testbed-node
   # What the daemon needs and nothing more: the TUN device, and the capability
   # to configure interfaces, routes and the firewall inside the container.
@@ -42,12 +46,27 @@ services:
     <<: *node
     hostname: c
 
+  # A convesso relay, built from the convesso repository beside this one, on
+  # the branch `convesso-transport`. Its key is in its log:
+  #   docker compose -f crates/linux-daemon/testbed/compose.yaml logs relay
+  # and the nodes found on `<key>@relay:7400`. Its identity is kept in a volume,
+  # so the key survives a restart.
+  relay:
+    build:
+      context: ../../../../../convesso
+      dockerfile: docker/relay/Dockerfile
+    image: peerfectly-testbed-relay
+    volumes:
+      - relay-data:/data
+
   # The `#[ignore]`d tests, which need a kernel, a TPM and root.
   tests:
     build:
       context: ../../..
       dockerfile: crates/linux-daemon/testbed/Dockerfile
       target: tests
+      additional_contexts:
+        convesso: ../../../../../convesso
     image: peerfectly-testbed-tests
     profiles: [tests]
     cap_add: [NET_ADMIN]
@@ -59,5 +78,6 @@ services:
       - tests-registry:/usr/local/cargo/registry
 
 volumes:
+  relay-data:
   tests-target:
   tests-registry:

@@ -270,7 +270,17 @@ fn a_settings_change_must_carry_what_was_typed() {
     let removing = Command::ChangeRendezvous { network: None, rendezvous: None };
     assert!(!matches_what_was_asked(&removing, &change), "a removal is not a change of address");
 
-    let moved = params().switching_to("https://relay.example", None).unwrap();
+    // A relay as this branch writes it: its key, at its address.
+    let key: String = NodeIdentity::generate()
+        .unwrap()
+        .transport_key()
+        .public_key()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let at = |host: &str| format!("{key}@{host}");
+    let moved = params().switching_to(at("relay.example:7400"), None).unwrap();
     let moving = admin.core(OperationBody::SetNetwork(moved), Vec::new());
     let relay = |address: &str| Command::ChangeRelay {
         network: None,
@@ -278,8 +288,8 @@ fn a_settings_change_must_carry_what_was_typed() {
         pin: false,
         immediately: true,
     };
-    assert!(matches_what_was_asked(&relay("https://relay.example"), &moving));
-    assert!(!matches_what_was_asked(&relay("https://elsewhere.example"), &moving));
+    assert!(matches_what_was_asked(&relay(&at("RELAY.example:7400")), &moving));
+    assert!(!matches_what_was_asked(&relay(&at("elsewhere.example:7400")), &moving));
 }
 
 /// The reason a revocation gives is the one typed.

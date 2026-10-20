@@ -429,6 +429,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -545,6 +546,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -557,6 +559,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -693,6 +696,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "convesso-core"
+version = "0.0.0"
+dependencies = [
+ "blake2",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hmac",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "convesso-relay"
+version = "0.0.0"
+dependencies = [
+ "convesso-core",
+]
+
+[[package]]
+name = "convesso-stream"
+version = "0.0.0"
+dependencies = [
+ "convesso-core",
+]
+
+[[package]]
+name = "convesso-tokio"
+version = "0.0.0"
+dependencies = [
+ "convesso-core",
+ "convesso-relay",
+ "convesso-stream",
+ "getrandom 0.4.3",
+ "if-addrs",
+ "rustls",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -867,10 +912,10 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "convesso-core",
  "enrollment",
  "hickory-proto",
  "identity",
- "iroh-relay",
  "local-discovery",
  "netdev 0.45.1",
  "proptest",
@@ -888,7 +933,7 @@ dependencies = [
  "tokio",
  "tracing",
  "transport",
- "transport-iroh",
+ "transport-convesso",
  "tunnel",
  "url",
 ]
@@ -1003,6 +1048,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -2045,6 +2091,16 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5220,6 +5276,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "transport-convesso"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "convesso-core",
+ "convesso-relay",
+ "convesso-stream",
+ "convesso-tokio",
+ "getrandom 0.4.3",
+ "hex",
+ "identity",
+ "proptest",
+ "rcgen",
+ "roster",
+ "tokio",
+ "tracing",
+ "transport",
+ "transport-convesso",
+]
+
+[[package]]
 name = "transport-iroh"
 version = "0.3.0"
 dependencies = [
@@ -5642,7 +5719,6 @@ dependencies = [
  "daemon",
  "identity",
  "interprocess",
- "iroh-relay",
  "proptest",
  "rcgen",
  "roster",
@@ -5654,7 +5730,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transport",
- "transport-iroh",
  "tray-icon",
  "tunnel",
  "widestring",
@@ -6011,6 +6086,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "x25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.10.1",
+ "zeroize",
+]
+
+[[package]]
 name = "x509-parser"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6119,9 +6205,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
  "zeroize_derive",
 ]

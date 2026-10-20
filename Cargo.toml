@@ -13,6 +13,7 @@ members = [
     "crates/roster",
     "crates/roster-sync",
     "crates/transport",
+    "crates/transport-convesso",
     "crates/transport-iroh",
     "crates/tunnel",
     "crates/windows-daemon",

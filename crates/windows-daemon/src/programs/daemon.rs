@@ -550,7 +550,7 @@ const LOOKS_AGAIN: std::time::Duration = std::time::Duration::from_millis(500);
 async fn assemble() -> daemon::Result<std::sync::Arc<daemon::Service>> {
     use std::sync::Arc;
 
-    use crate::platform::connectivity::Iroh;
+    use crate::platform::connectivity::Convesso;
     use crate::platform::machine::Windows;
     use crate::platform::resolver::Sockets;
     use daemon::lifecycle::Lifecycle;
@@ -596,7 +596,7 @@ async fn assemble() -> daemon::Result<std::sync::Arc<daemon::Service>> {
     let service = Service::over_with_keys(
         home,
         Lifecycle::new(Arc::new(Windows::new()) as Arc<dyn Machine>),
-        Arc::new(Iroh) as Arc<dyn Connectivity>,
+        Arc::new(Convesso) as Arc<dyn Connectivity>,
         Arc::new(Sockets) as Arc<dyn Resolving>,
         keys,
     )?

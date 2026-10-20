@@ -239,6 +239,7 @@ mod startup {
         let daemon = crate::code_of(include_str!("programs/daemon.rs"));
 
         for speaking in [
+            "ConvessoTransport::bind",
             "IrohTransport::bind",
             "Waiting::listen",
             "Adapter::create()",

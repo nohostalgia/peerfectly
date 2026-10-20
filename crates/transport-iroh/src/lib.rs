@@ -49,7 +49,8 @@
 
 pub mod enrolment;
 pub mod error;
-pub mod fragment;
+// Shared with every binding that carries packets as datagrams.
+pub use transport::fragment;
 pub mod node;
 pub mod paths;
 pub(crate) mod relays;

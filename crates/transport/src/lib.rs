@@ -44,6 +44,7 @@
 pub mod auth;
 pub mod direct;
 pub mod error;
+pub mod fragment;
 pub mod limits;
 pub mod memory;
 pub mod range;

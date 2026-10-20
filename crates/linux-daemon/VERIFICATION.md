@@ -1042,3 +1042,114 @@ Two things read badly in that run and were changed after it, with tests rather t
 the waiting line read *"renaming of studio [ab0e…] to studio"*, as the device already went by the new
 name, and now reads *"renaming of [ab0e…] to studio"*; and the confirmation named the device by id
 alone, and now names it as typed, as a revocation's does: ``rename `b` (ab0e…) to `studio` ``.
+
+# Branch `convesso-transport`: the daemon on convesso
+
+Steps of the branch alone, where every daemon runs on convesso instead of iroh
+(`openspec/changes/convesso-live`). They are not counted above: the branch is not merged.
+
+## C1. Found, join, ping, names and a revocation through a convesso relay
+
+In the testbed, with the `relay` service built from the convesso repository beside this one. The
+relay printed its key on its first start:
+
+```powershell
+docker compose -f crates\linux-daemon	estbed\compose.yaml up -d relay a b
+docker compose -f crates\linux-daemon	estbed\compose.yaml logs relay
+```
+
+Then, with `<key>` that key:
+
+1. On `a`: `peerfectly found prova --name a --relay <key>@relay:7400`, then `up prova`.
+2. On `b`: `peerfectly join --relay <key>@relay:7400 --name b`; on `a`: `peerfectly admit <payload>`.
+3. Each pings the other's address, and each node's resolver is asked for the other's name.
+4. On `a`: `peerfectly revoke b lost in the testbed --network prova`; then `b` pings `a`.
+
+**Expect**:
+- the founding signed with the relay string as typed, and no certificate fetched;
+- the join completed with the same six digits on both sides;
+- pings answered both ways;
+- each name resolved to the other's address;
+- after the revocation, `b`'s session with `a` closed, and no answer to its ping.
+
+**Result**: run, 2026-10-17, passed, with one join failed first.
+- **Founding.** `infrastructure relay <key>@relay:7400`, nothing fetched.
+- **The first join failed on the joining side**, after the code was confirmed: *"the delivered
+  network is not usable: unexpected_eof"*. The admin had signed nothing. Both daemons were
+  restarted (an exchange was still pending on `b`), and the second join completed: `588592` on
+  both sides, `joined. this device is a member of a network with 2 devices`. The cause of the
+  first failure is not known; it did not recur, and it is written down to be watched for.
+- **Pings.** 4 of 4 each way, under 2 ms. `peers` on `a`: `b` `reachable yes, direct (now)`.
+- **Names.** `a`'s resolver answered `b.prova.internal` with `b`'s address, and `b`'s answered
+  `a.prova.internal` with `a`'s.
+- **Revocation.** `b` received it:
+  - its `status` read `[roster] this device is no longer in the roster; session with … closed`;
+  - `a` read `1 device, 1 revoked`;
+  - `b`'s ping to `a` got 0 of 3.
+
+## C2. A convesso relay on the VPS
+
+Beside the iroh relay, on port 7400 over UDP and TCP. The image is built on the PC from the convesso
+repository and carried over, as the server image is (`deploy/server/README.md`).
+
+On the VPS, the architecture to build for (`x86_64` is `linux/amd64`, `aarch64` is `linux/arm64`):
+
+```sh
+uname -m
+```
+
+On the PC, in PowerShell, from the convesso repository:
+
+```powershell
+cd C:\giovanni\progetti\convesso
+```
+```powershell
+docker buildx build --platform linux/arm64 -f docker/relay/Dockerfile -t convesso-relay --load .
+```
+```powershell
+docker save convesso-relay -o convesso-relay.tar
+```
+```powershell
+scp convesso-relay.tar <user>@204.216.216.139:
+```
+
+On the VPS:
+
+```sh
+docker load -i convesso-relay.tar
+```
+```sh
+docker run -d --name convesso-relay --restart unless-stopped -p 7400:7400/udp -p 7400:7400/tcp -v convesso-relay-data:/data convesso-relay
+```
+```sh
+sudo iptables -I INPUT -p udp --dport 7400 -j ACCEPT
+```
+```sh
+sudo iptables -I INPUT -p tcp --dport 7400 -j ACCEPT
+```
+```sh
+sudo netfilter-persistent save
+```
+
+In the provider's console, the instance's security list: two ingress rules from `0.0.0.0/0`, one
+UDP and one TCP, destination port 7400.
+
+On the VPS, the relay's key, from its first line:
+
+```sh
+docker logs convesso-relay
+```
+
+The network's relay is then `<key>@204.216.216.139:7400`.
+
+**Expect**: `convesso relay <64 hexadecimal digits>` and `listening on udp 0.0.0.0:7400 and tcp
+0.0.0.0:7400` in the log; a testbed node founding on `<key>@204.216.216.139:7400` registers there.
+
+**Result**: run, 2026-10-18, passed, on port 8433 rather than 7400. The container still listens
+on 7400 inside; Docker maps the host's 8433 to it (`-p 8433:7400/udp -p 8433:7400/tcp`), and the
+iptables rules and the security list name 8433.
+- A first attempt answered nothing: TCP to 8433 timed out from outside. The provider's security
+  list had no rule for the port yet. Once the person added it, the port answered.
+- The relay printed `convesso relay 1c23b31d…7e5a89`.
+- From the testbed, `join --relay 1c23…5a89@204.216.216.139:8433` on `c` registered at it in 2
+  seconds and printed its payload.

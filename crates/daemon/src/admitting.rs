@@ -18,7 +18,7 @@
 //!
 //! # This side never listens
 //!
-//! [`transport_iroh::enrolment::Admitting`] dials and has no method that
+//! [`transport_convesso::enrolment::Admitting`] dials and has no method that
 //! accepts. A machine holding a roster is not reachable through the enrolment
 //! protocol at all, which is the point: the exception that lets a stranger be
 //! spoken to belongs on the device that has nothing to lose.
@@ -35,7 +35,7 @@ use identity::NodeIdentity;
 use roster::state::RosterState;
 use roster::types::{OperationBody, OperationCore, Role};
 use tokio::sync::Mutex;
-use transport_iroh::enrolment::{Admitting, Channel};
+use transport_convesso::enrolment::{Admitting, Channel};
 
 /// Why an admission did not happen.
 pub type Refusal = String;
@@ -54,7 +54,8 @@ pub struct Pending {
     /// person answers wrongly.
     channel: Arc<Mutex<Channel>>,
     /// The endpoint the channel belongs to, kept so it outlives the exchange.
-    endpoint: Admitting,
+    /// Boxed: on convesso it is a node of its own, larger than the rest.
+    endpoint: Box<Admitting>,
     /// What the joining device said it is.
     payload: Joining,
     /// The code both screens must show.
@@ -181,11 +182,11 @@ pub async fn open(
     // instead, its socket stayed bound — found on a phone that, with every network
     // off, kept receiving into a queue nobody read.
     let payload_name = admitted_name(&payload.name);
-    match exchange(&endpoint, &payload, identity).await {
+    match exchange(&endpoint, &payload).await {
         Ok((channel, code, expires)) => {
             let pending = Pending {
                 channel: Arc::new(Mutex::new(channel)),
-                endpoint,
+                endpoint: Box::new(endpoint),
                 payload,
                 code,
                 expires,
@@ -289,7 +290,6 @@ fn refuse_a_colliding_address(payload: &Joining, state: &RosterState) -> Result<
 async fn exchange(
     endpoint: &Admitting,
     payload: &Joining,
-    identity: &NodeIdentity,
 ) -> Result<(Channel, Confirmation, Instant), Refusal> {
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
 
@@ -323,7 +323,10 @@ async fn exchange(
         transport: payload.transport.clone(),
         attestation: payload.attestation.clone(),
     };
-    let code = Confirmation::derive(&joining, &identity.transport_key().public_key(), &material)
+    // Over the key this side presented on the channel, which the joining
+    // device derives its code over too: an admission dials under a key of its
+    // own (`transport_convesso::enrolment`), not the device's transport key.
+    let code = Confirmation::derive(&joining, &channel.own(), &material)
         .map_err(|cause| cause.to_string())?;
 
     let expires = Instant::now().checked_add(deadline).unwrap_or_else(Instant::now);
@@ -344,7 +347,7 @@ pub async fn finish_with(
 ) -> Result<(Vec<u8>, String), Refusal> {
     let mut pending = pending;
     let outcome = deliver_signed(&mut pending, signed, spec_name, log, snapshot).await;
-    pending.endpoint.close().await;
+    (*pending.endpoint).close().await;
     outcome
 }
 
@@ -371,7 +374,7 @@ pub async fn confirm(
     // delivery that failed must not leave the endpoint's socket bound.
     let outcome =
         deliver(&mut pending, identity, state, heads, log, snapshot, keeping_the_name).await;
-    pending.endpoint.close().await;
+    (*pending.endpoint).close().await;
     outcome
 }
 
@@ -500,7 +503,7 @@ async fn deliver(
 
 /// Drops an exchange, leaving both machines as they were.
 pub async fn abandon(pending: Pending) {
-    pending.endpoint.close().await;
+    (*pending.endpoint).close().await;
 }
 
 /// The specification the admitting side writes, from the keys the payload named.
@@ -700,6 +703,13 @@ mod tests {
 
     // ---- F-17: the relay a payload names ----------------------------------
 
+    /// A relay as the convesso binding writes it: the key of `seed`, at `host`.
+    fn convesso(seed: u8, host: &str) -> String {
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[seed; 32])
+            .expect("a seed is an identity");
+        transport_convesso::relay::written(key.address().as_bytes(), host, false)
+    }
+
     fn waiting_at(relay: &str) -> Joining {
         let joining = NodeIdentity::generate().expect("generates");
         Joining::of(&joining, "laptop", relay).expect("valid")
@@ -708,9 +718,9 @@ mod tests {
     /// **A payload naming another relay is refused, naming both.**
     #[test]
     fn a_payload_naming_another_relay_is_refused() {
-        let state = on_relay("https://ours.example:443", None);
+        let state = on_relay(&convesso(1, "ours.example:7400"), None);
         let refused = refuse_a_relay_the_network_does_not_use(
-            &waiting_at("https://theirs.example:443"),
+            &waiting_at(&convesso(2, "theirs.example:7400")),
             &state,
             1,
         )
@@ -723,10 +733,23 @@ mod tests {
     /// The same relay, written another way, is the same relay.
     #[test]
     fn the_same_relay_written_differently_is_admitted() {
-        let state = on_relay("https://ours.example:443", None);
+        let state = on_relay(&convesso(1, "ours.example:7400"), None);
         assert!(
-            refuse_a_relay_the_network_does_not_use(&waiting_at("https://OURS.example"), &state, 1)
-                .is_ok()
+            refuse_a_relay_the_network_does_not_use(
+                &waiting_at(&convesso(1, "OURS.example:7400")),
+                &state,
+                1
+            )
+            .is_ok()
+        );
+        assert!(
+            refuse_a_relay_the_network_does_not_use(
+                &waiting_at(&convesso(2, "ours.example:7400")),
+                &state,
+                1
+            )
+            .is_err(),
+            "the same address with another key is another relay"
         );
     }
 
@@ -735,8 +758,11 @@ mod tests {
     #[test]
     fn the_relay_being_left_is_admitted_until_the_move_ends() {
         let issued = 1_000;
-        let state = on_relay("https://new.example:443", Some(("https://old.example:443", issued)));
-        let at_old = waiting_at("https://old.example:443");
+        let state = on_relay(
+            &convesso(2, "new.example:7400"),
+            Some((&convesso(1, "old.example:7400"), issued)),
+        );
+        let at_old = waiting_at(&convesso(1, "old.example:7400"));
         let end = issued + 2_592_000 * 1_000;
 
         assert!(refuse_a_relay_the_network_does_not_use(&at_old, &state, end - 1).is_ok());
@@ -746,7 +772,7 @@ mod tests {
         );
         assert!(
             refuse_a_relay_the_network_does_not_use(
-                &waiting_at("https://new.example"),
+                &waiting_at(&convesso(2, "new.example:7400")),
                 &state,
                 end
             )

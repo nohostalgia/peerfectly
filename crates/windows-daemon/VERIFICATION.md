@@ -2469,3 +2469,45 @@ on this PC's port 8000 (which `expose` opens) fetched by name with `nc`.
   the phone got 3 of 3. Windows puts the `peerfectly casa` interface in the *Public* profile, and no
   rule there lets an echo request in. That is Windows' default and not the name: the page on port 8000
   is what reaches.
+
+# Branch `convesso-transport`: the daemon on convesso
+
+Steps of the branch alone, where every daemon runs on convesso instead of iroh
+(`openspec/changes/convesso-live`). They are not counted above: the branch is not merged, and
+their results are labelled apart so that no count of results includes them.
+
+## C1. The PC and the phone in one network on the VPS's convesso relay
+
+The relay is the one in `core/crates/linux-daemon/VERIFICATION.md` C2, on the VPS's port 8433.
+
+On the PC, from an elevated console:
+
+```powershell
+msiexec /i C:\giovanni\progetti\mynet\core\target\dist\peerfectly-0.3.0-windows-x64.msi
+```
+```powershell
+peerfectly forget casa
+```
+```powershell
+peerfectly found prova --name pc --relay 1c23b31d465a430ab24cc9e7990dd18ed67800950f7c3d035c3f6cb7747e5a89@204.216.216.139:8433
+```
+```powershell
+peerfectly up prova
+```
+
+On the phone, the branch's debug app installed over adb in place of the old one. A join, with the
+relay string typed into its field over adb. Then on the PC, `peerfectly admit <payload>`.
+
+**Expect**: `status` on the PC naming the relay `(trusted by its key)`; the join completed with the
+same six digits on both; each device reaching the other by name.
+
+**Result on the branch**: run, 2026-10-18, passed (the join and the admission reported by the
+person who ran them).
+- **On the PC.**
+  - `status`: `pc.prova.internal`, `up (now)`, the relay `1c23…5a89@204.216.216.139:8433
+    (trusted by its key)`.
+  - `peers`: `phone.prova.internal` `reachable yes, direct (now)`.
+  - `ping phone.prova.internal`: 4 of 4, 11 to 47 ms.
+- **On the phone.** `pc.prova.internal` resolved to `100.107.123.181`, the PC's address.
+- **The phone's ping to the PC got no answer.** Windows admits no echo request on the *Public*
+  profile, as on `main` (step 89).
