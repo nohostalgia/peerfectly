@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "daemon",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "identity",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "linux-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "cli",
@@ -1717,7 +1717,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "local-discovery"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "programs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "linux-daemon",
  "windows-daemon",
@@ -2487,7 +2487,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "convesso-tokio",
  "daemon",
@@ -2526,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "roster"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "roster-sync"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "identity",
@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "identity",
@@ -3211,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "transport-convesso"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "convesso-core",
@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "tunnel"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3504,7 +3504,7 @@ dependencies = [
 
 [[package]]
 name = "windows-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "blake3",

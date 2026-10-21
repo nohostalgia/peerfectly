@@ -81,8 +81,8 @@ is unknown: *More info → Run anyway*.
 **Linux.** Unpack the archive and run its install script:
 
 ```sh
-tar xzf peerfectly-0.4.0-linux-x86_64.tar.gz
-sudo ./peerfectly-0.4.0-linux-x86_64/install.sh
+tar xzf peerfectly-0.4.1-linux-x86_64.tar.gz
+sudo ./peerfectly-0.4.1-linux-x86_64/install.sh
 ```
 
 The script checks everything it needs before it writes anything, and tells you which packages are
@@ -97,7 +97,7 @@ built it, from which commit, on which runner. To check that a file came out of t
 release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify peerfectly-0.4.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+gh attestation verify peerfectly-0.4.1-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
 ```
 
 That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
