@@ -15,9 +15,9 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use identity::PrivateKey;
+use local_discovery::Record;
 use local_discovery::announce::Announcement;
 use local_discovery::{Cache, Error, Multicast};
-use rendezvous::Record;
 use roster::id::NetworkId;
 use roster::types::Algorithm;
 

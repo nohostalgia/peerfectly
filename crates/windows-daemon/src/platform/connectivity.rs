@@ -20,7 +20,7 @@ mod tests {
     fn connectivity_is_only_ever_started_on_request() {
         let daemon = crate::code_of(include_str!("../programs/daemon.rs"));
         assert!(
-            !daemon.contains("ConvessoTransport::bind") && !daemon.contains("IrohTransport::bind"),
+            !daemon.contains("ConvessoTransport::bind"),
             "the daemon must not bind a transport itself; that is the service's, at bring-up"
         );
         assert!(

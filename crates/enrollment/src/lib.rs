@@ -45,8 +45,7 @@
 //!   the first admission of a device id for ever.
 //! - **The delivered roster is verified, not trusted.** Who handed it over does
 //!   not matter. It must admit this device's own keys, be signed by an admin, and
-//!   derive consistently — and where this device accepted a relay certificate
-//!   nothing had vouched for, the network must pin that same certificate.
+//!   derive consistently.
 //!
 //! # What a person still has to do
 //!
@@ -61,7 +60,7 @@
 //!   crate is a format and a set of rules about bytes, so it can be tested
 //!   without a network and reused by a phone.
 //! - The enrolment endpoint and the channel material it exports —
-//!   `transport-iroh`.
+//!   `transport-convesso`.
 //! - Membership, roles and authority — the roster's, entirely. An admin decides
 //!   what a joining device is permitted to be; the payload only proposes a name.
 

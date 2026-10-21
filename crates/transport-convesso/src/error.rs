@@ -13,9 +13,7 @@ pub enum BuildError {
         /// The algorithm it is.
         algorithm: Algorithm,
     },
-    /// The network's relay is not one this build can use: not `key@host:port`,
-    /// or written for the iroh binding, with a certificate pinned beside it. A
-    /// network written for one binding cannot be read by the other.
+    /// The network's relay is not one this build can use: not `key@host:port`.
     UnusableRelay {
         /// What is wrong with it.
         reason: String,

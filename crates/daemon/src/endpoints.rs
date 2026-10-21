@@ -1,7 +1,6 @@
 //! The endpoint cache, across a restart.
 //!
-//! §2.6b puts the restore path under 500 ms **using the endpoints in cache,
-//! without waiting for the rendezvous**. A cache that only lives in memory is
+//! §2.6b puts the restore path under 500 ms **using the endpoints in cache**. A cache that only lives in memory is
 //! empty every time the daemon starts, which is exactly when that budget is being
 //! spent — so the fast path would never once be taken on the path it was designed
 //! for.
@@ -173,7 +172,7 @@ mod tests {
     }
 
     /// The property §2.6b depends on: what was known before the restart is known
-    /// after it, without asking the rendezvous.
+    /// after it, without asking anyone.
     #[test]
     fn what_was_cached_survives_a_restart() {
         let dir = scratch();

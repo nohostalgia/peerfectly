@@ -1,7 +1,6 @@
-//! When the daemon does the things five crates left it to decide.
+//! When the daemon does the things other crates left it to decide.
 //!
-//! `roster-sync` has no loop, `rendezvous` no publish policy, `local-discovery`
-//! no announcement schedule. Each of them said so plainly and deferred here. This
+//! `roster-sync` has no loop, `local-discovery` no announcement schedule. Each of them said so plainly and deferred here. This
 //! is that decision, in one place, with the reasoning next to the numbers.
 //!
 //! # Some are findings now
@@ -16,8 +15,8 @@
 //! [`Schedule::press_longest`] and [`Schedule::idle`] are set from that
 //! measurement, and say so where they are defined.
 //!
-//! The others are still argued rather than measured: `publish`, `endpoint_cache`
-//! and `press`. If one of them is still unchanged after the daemon has run on a
+//! The others are still argued rather than measured: `endpoint_cache` and
+//! `press`. If one of them is still unchanged after the daemon has run on a
 //! real machine for a week, that is a sign nobody looked — not a sign it was
 //! right.
 
@@ -36,13 +35,6 @@ pub struct Schedule {
     /// gigabytes a month.
     pub sync: Duration,
 
-    /// How often to publish to the rendezvous when nothing has changed.
-    ///
-    /// A publish also happens whenever the observed address set changes, which is
-    /// the event that actually matters. This tick only refreshes a record that
-    /// would otherwise look stale to a peer that has never seen this device.
-    pub publish: Duration,
-
     /// How often to announce on the local network when nothing has changed.
     ///
     /// A minute. It was five seconds, which measured on 2026-10-07 as about
@@ -54,12 +46,11 @@ pub struct Schedule {
     /// [`ANNOUNCE_REPEATS`] more times, [`crate::limits::INTERFACE_RECHECK`] apart.
     pub announce: Duration,
 
-    /// How long a cached endpoint is worth trying before the rendezvous.
+    /// How long a cached endpoint is worth offering to the transport.
     ///
-    /// §2.6b puts the restore path under 500 ms using cached endpoints without
-    /// waiting for the rendezvous, so this has to outlive an ordinary overnight
-    /// gap. A stale entry costs one failed attempt; a missing one costs a
-    /// round trip to a server that may not be reachable.
+    /// §2.6b puts the restore path under 500 ms using cached endpoints, so this
+    /// has to outlive an ordinary overnight gap. A stale entry costs one packet;
+    /// a missing one leaves the first session to the relay.
     pub endpoint_cache: Duration,
 
     /// How soon to try a member that is owed something this device signed.
@@ -88,9 +79,8 @@ pub struct Schedule {
     ///
     /// A session is opened by the first packet that needs it, so a closed one
     /// costs the next packet a reopening: a handshake of a few kilobytes and a
-    /// pause of tens to hundreds of milliseconds. An open one costs a keep-alive
-    /// every three seconds each way, about 100 bytes a second, for as long as it
-    /// stays open. Ten minutes keeps a session through the ordinary pauses of
+    /// pause of tens to hundreds of milliseconds. An open one costs the
+    /// keep-alives that hold its path open, for as long as it stays open. Ten minutes keeps a session through the ordinary pauses of
     /// someone working — reading a page, thinking between commands — and closes it
     /// once they have stopped.
     pub idle: Duration,
@@ -102,7 +92,6 @@ impl Schedule {
     pub const fn provisional() -> Self {
         Self {
             sync: Duration::from_secs(60 * 60),
-            publish: Duration::from_secs(15 * 60),
             announce: Duration::from_secs(60),
             endpoint_cache: Duration::from_secs(24 * 60 * 60),
             press: Duration::from_secs(2),
@@ -114,9 +103,9 @@ impl Schedule {
 
 /// Decides how long to wait before pressing a member that is owed something.
 ///
-/// Pure, and separate from the loop that sleeps, for the same reason
-/// [`Publishing`] is: the interesting half is the decision, and a decision made
-/// inside a `sleep` can only be tested by waiting for it.
+/// Pure, and separate from the loop that sleeps: the interesting half is the
+/// decision, and a decision made inside a `sleep` can only be tested by waiting
+/// for it.
 ///
 /// The rule is that urgency decays. The attempts most likely to be answered are
 /// the ones immediately after an operation is signed — a device that is going to
@@ -176,53 +165,6 @@ pub const ANNOUNCE_REPEATS: u8 = 2;
 impl Default for Schedule {
     fn default() -> Self {
         Self::provisional()
-    }
-}
-
-/// Decides when a rendezvous publish is worth making.
-///
-/// The rule is that a publish follows a change in what this device believes it is
-/// reachable at, not the passage of time. Publishing an unchanged record teaches
-/// the rendezvous nothing and tells anyone watching it that this device is
-/// switched on, which is a metadata leak for no gain.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Publishing {
-    /// The addresses published last time, in the order they were given.
-    last: Option<Vec<String>>,
-}
-
-impl Publishing {
-    /// Nothing published yet.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { last: None }
-    }
-
-    /// Whether to publish, given what is observed now.
-    ///
-    /// `refresh_due` carries the slow tick: a record that has not changed still
-    /// gets refreshed eventually, so a peer that has never seen this device does
-    /// not find an ancient one.
-    pub fn should_publish(&mut self, observed: &[String], refresh_due: bool) -> bool {
-        let changed = match &self.last {
-            None => true,
-            Some(previous) => previous.as_slice() != observed,
-        };
-
-        if changed || refresh_due {
-            self.last = Some(observed.to_vec());
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Forgets what was published, so the next observation counts as a change.
-    ///
-    /// Used when the network comes up: what was true before it went down is not
-    /// evidence about now.
-    pub fn forget(&mut self) {
-        self.last = None;
     }
 }
 
@@ -382,75 +324,14 @@ mod tests {
         items.iter().map(|item| (*item).to_owned()).collect()
     }
 
-    /// Publishing follows a change in what is observed, not the clock.
-    #[test]
-    fn a_changed_address_set_is_published() {
-        let mut publishing = Publishing::new();
-
-        assert!(publishing.should_publish(&addresses(&["a"]), false), "the first is always new");
-        assert!(publishing.should_publish(&addresses(&["a", "b"]), false), "a change publishes");
-        assert!(publishing.should_publish(&addresses(&["b"]), false), "so does a removal");
-    }
-
-    #[test]
-    fn an_unchanged_address_set_is_not_published() {
-        let mut publishing = Publishing::new();
-        assert!(publishing.should_publish(&addresses(&["a", "b"]), false));
-
-        assert!(
-            !publishing.should_publish(&addresses(&["a", "b"]), false),
-            "republishing the same record teaches nobody anything and leaks that this device is on"
-        );
-        assert!(!publishing.should_publish(&addresses(&["a", "b"]), false));
-    }
-
-    #[test]
-    fn an_unchanged_set_is_still_refreshed_eventually() {
-        let mut publishing = Publishing::new();
-        assert!(publishing.should_publish(&addresses(&["a"]), false));
-        assert!(!publishing.should_publish(&addresses(&["a"]), false));
-        assert!(publishing.should_publish(&addresses(&["a"]), true), "the slow tick refreshes");
-    }
-
-    #[test]
-    fn ordering_counts_as_a_change_rather_than_being_guessed_at() {
-        let mut publishing = Publishing::new();
-        assert!(publishing.should_publish(&addresses(&["a", "b"]), false));
-        assert!(
-            publishing.should_publish(&addresses(&["b", "a"]), false),
-            "the transport orders these; second-guessing it here would hide a real change"
-        );
-    }
-
-    #[test]
-    fn losing_every_address_is_a_change() {
-        let mut publishing = Publishing::new();
-        assert!(publishing.should_publish(&addresses(&["a"]), false));
-        assert!(publishing.should_publish(&[], false), "having no address is news");
-    }
-
-    #[test]
-    fn coming_back_up_forgets_what_was_true_before() {
-        let mut publishing = Publishing::new();
-        assert!(publishing.should_publish(&addresses(&["a"]), false));
-        publishing.forget();
-        assert!(
-            publishing.should_publish(&addresses(&["a"]), false),
-            "what was true before the network went down is not evidence about now"
-        );
-    }
-
     /// The numbers are provisional, and the point is that they are together.
     #[test]
     fn the_schedule_is_in_one_place() {
         let schedule = Schedule::provisional();
         assert!(schedule.announce < schedule.sync, "announcing is cheap and unreliable");
-        // Not ordered against publishing any more: a published record is a
-        // device's own address, refreshed on a period because nothing else
-        // refreshes it, while operations are pushed the moment they are admitted
-        // and the sync tick only catches a push that was lost.
+        // Operations are pushed the moment they are admitted, and the sync tick
+        // only catches a push that was lost.
         assert!(schedule.sync >= Duration::from_secs(60 * 60), "a safety net, not the transport");
-        assert!(schedule.publish < schedule.endpoint_cache, "a cached endpoint outlives a record");
     }
 
     /// A quiet network hears one announcement a minute, and a change a few in

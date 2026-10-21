@@ -133,11 +133,9 @@ impl From<&netdev::Interface> for LocalInterface {
     }
 }
 
-/// Connectivity over the real network, through convesso.
-///
-/// On the branch `convesso-transport` this replaces iroh: every daemon built
-/// from it, the Windows service, the Linux daemon and the Android core, runs its
-/// sessions on `transport-convesso` (`openspec/changes/convesso-live`).
+/// Connectivity over the real network, through convesso: the Windows service,
+/// the Linux daemon and the Android core all run their sessions on
+/// `transport-convesso`.
 ///
 /// Portable: nothing here knows which platform it runs on. It lived in the Windows
 /// edge only because that was the one edge there was, and a phone would otherwise

@@ -13,15 +13,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-# On the branch `convesso-transport`, convesso is a path dependency outside the
-# repository: `../../../../convesso` from a crate, which from /src/crates/<crate>
-# is /convesso. The compose file names it as the `convesso` build context. The
-# workspace manifest comes too, since its crates inherit from it.
-COPY --from=convesso Cargo.toml /convesso/Cargo.toml
-COPY --from=convesso crates /convesso/crates
-# The cache mounts keep the registry and the build between runs, so a rebuild
-# after an edit costs minutes rather than the whole tree.
+# The cache mounts keep the registry, the git checkouts and the build between
+# runs, so a rebuild after an edit costs minutes rather than the whole tree.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     cargo build --locked --release -p programs \
     && cp target/release/peerfectlyd target/release/peerfectly /usr/local/bin/

@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 37 of 37. Step 32's budget, not met for want of an iroh change, is met in step 35 on the project's fork of iroh; step 34 is iroh 1.3.0 unpatched, the figure the patch is measured against. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
+**Run so far**: 36 of 36. Step 32's budget, not met at first for want of a change in the transport, is met in step 35. Steps 1–17, 26 and 27 were run in the testbed, the interactive steps driven
 through a pseudo-terminal; steps 18–25 were run by hand, with the Windows PC, the phone and WSL2,
 and reported as passed. Step 28 was run in plain containers and one running systemd; step 29 was
 run by hand on WSL2 and reported as passed. Steps 30 and 31, for the rename, were run by hand on WSL2 and reported as passed. Step 37, device
@@ -211,17 +211,17 @@ docker compose -f crates\linux-daemon\testbed\compose.yaml exec c ls -l /var/lib
 The owner asks, without `sudo`, for a change that must be signed:
 
 ```powershell
-docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice peerfectly rendezvous https://203.0.113.10:8444 --network casa
+docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice peerfectly relay <key>@203.0.113.10:7400 --network casa
 docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice peerfectly status
 docker compose -f crates\linux-daemon\testbed\compose.yaml logs a
 ```
 
 **Expect**:
 - `about to sign: change the network's settings`, then *"this act signs with the network's key, which only root can reach: run it again with sudo. Nothing changed."*, with no passphrase asked and an error exit;
-- `status` still showing `no rendezvous`;
+- `status` still showing the network's settings as they were;
 - in the log, `needs a signature` followed by `not signed`, so that the daemon holds nothing waiting on the act.
 
-**Result**: run, 2026-09-30, passed.
+**Result**: run, 2026-09-30, passed. It was run with a change of a setting this build no longer has; with `peerfectly relay` it is not yet run.
 
 ## 13. The unit file verifies
 
@@ -235,10 +235,10 @@ docker run --rm -v "${PWD}\deploy\linux:/unit:ro" --entrypoint sh peerfectly-tes
 
 ## 14. `b` joins a network founded on `a`, and the two reach each other
 
-The network is `prova`, founded on `a` with the relay and its certificate pinned:
+The network is `prova`, founded on `a` with the relay:
 
 ```powershell
-docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice sudo peerfectly found prova --name a --relay https://203.0.113.10 --fetch-relay-cert
+docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice sudo peerfectly found prova --name a --relay https://203.0.113.10
 docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice peerfectly up prova
 ```
 
@@ -290,8 +290,6 @@ Both have tests, and each test fails with its fix removed. After them, driven th
 - `ping -6` got 3 of 3;
 - `a`'s resolver answered `b.prova.internal` with `b`'s IPv6 and IPv4 addresses.
 
-The relay's certificate fingerprint was `00:11:22:33…CC:DD:EE:FF`, the VPS's.
-
 ## 15. A person founds, admits and signs at a real terminal
 
 Steps 3 and 14, typed by hand. **Expect**:
@@ -301,13 +299,13 @@ Steps 3 and 14, typed by hand. **Expect**:
 For the wrong passphrase, on `a`:
 
 ```powershell
-docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice sudo peerfectly rendezvous https://203.0.113.10:8444 --network prova
+docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice sudo peerfectly relay <key>@203.0.113.10:7400 --network prova
 docker compose -f crates\linux-daemon\testbed\compose.yaml exec a sudo -u alice peerfectly status
 ```
 
-**Result**: run, 2026-09-30, passed as far as a machine can see.
+**Result**: run, 2026-09-30, passed as far as a machine can see. It was run with a change of a setting this build no longer has; with `peerfectly relay` it is not yet run.
 - A passphrase typed after its prompt never appeared in the terminal's recorded output, so echo was off.
-- A wrong passphrase at a parameter change answered *"the passphrase is wrong; nothing was signed"*, with no TSS line, and `status` still showed `no rendezvous`.
+- A wrong passphrase at a parameter change answered *"the passphrase is wrong; nothing was signed"*, with no TSS line, and `status` still showed the settings as they were.
 
 What a person sees on the screen as they type was not observed by one.
 
@@ -522,15 +520,13 @@ The nodes are rebuilt with the change and started fresh (`down -v`, then `up -d 
 
 **Revoking.** `peerfectly revoke laptop test --network lotto` on `a`. **Expect** one act listed as `revoke `laptop` (…): test` with *permanent*, and one entry.
 
-**Changing settings.**
-- `peerfectly rendezvous https://203.0.113.10:8444 --network lotto` on `a`. **Expect** `change lotto's settings to: no relay (its certificate not pinned), rendezvous https://203.0.113.10:8444, IPv4 range …` with *every device in lotto follows this*, and one entry.
-- `peerfectly relay https://203.0.113.10 --network lotto`, confirming the fingerprint. **Expect** the relay and its pinned certificate's fingerprint in the list — the same fingerprint the confirmation showed — and one entry.
+**Changing settings.** `peerfectly relay https://203.0.113.10 --network lotto`, confirming the relay. **Expect** `change lotto's settings to: relay …, IPv4 range …` with *every device in lotto follows this*, the relay as the confirmation showed it, and one entry.
 
 **Refusing.** At a revocation's prompt, press Enter on an empty line. **Expect** *not signed. Nothing changed.*, and the device still a member. The dictionary-attack counter is checked by the `tpm` test `an_empty_entry_refuses_without_costing_a_guess` in step 2.
 
 **The network moving while a person decides.**
 1. In one terminal on `a`, start a revocation and leave it at the passphrase prompt.
-2. In a second terminal, change the rendezvous and complete it.
+2. In a second terminal, change the network's settings and complete it.
 3. Answer the first.
 
 **Expect** *the network changed while you were deciding … Nothing was applied; run the command again …*, and the device not revoked. Running the revocation again works.
@@ -545,13 +541,12 @@ Passphrase entries per command, against what was expected:
 
 | Command | Entries | Expected |
 |---|---|---|
-| `found lotto` (TPM, relay pinned) | 2: choose and type again | 2 |
+| `found lotto` (TPM, with a relay) | 2: choose and type again | 2 |
 | `found solo` on `c` (sealed file) | 2 | 2 |
 | `b` joins | 2 to choose, 1 for the proof | 2 + 1 |
 | `a` admits `b` | 1 | 1 |
 | `c` replaces `b` as `laptop` | 1 on `a`; `c` 2 + 1 | 1 |
 | `revoke laptop test` | 1 | 1 |
-| `rendezvous …` | 1 | 1 |
 | `relay … --network solo` (sealed) | 1 | 1 |
 
 What each showed:
@@ -578,7 +573,7 @@ What each showed:
   ```text
   solo: 1 act to sign with this network's admin key
 
-    1. change solo's settings to: relay https://203.0.113.10 (its certificate pinned as 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF), no rendezvous, IPv4 range 100.64.0.0/10
+    1. change solo's settings to: relay https://203.0.113.10 …, IPv4 range 100.64.0.0/10
        every device in solo follows this
 
   The signing key for `solo` is in a file on this machine sealed with your passphrase, and the passphrase is what unlocks it. Nothing is signed without it. Press Enter on an empty line to refuse.
@@ -586,9 +581,9 @@ What each showed:
   Passphrase for solo (sealed file):
   ```
 
-  The fingerprint is the one the pinning question had just shown.
+  The relay is the one the confirmation had just shown.
 - **Refusing:** an empty line at a revocation's prompt gave *not signed. Nothing changed.*, exit 1, and the devices were unchanged.
-- **The network moving:** a revocation was left at its prompt, and a rendezvous change was completed in a second terminal. Answering the revocation then gave *the network changed while you were deciding … Nothing was applied; run the command again …*, and nothing was revoked. The message first said *another admin's change arrived*. Here the change came from this machine, so it now says *another change was signed here or arrived from another admin*. Run again, the revocation went through with one entry.
+- **The network moving:** a revocation was left at its prompt, and a change of the network's settings was completed in a second terminal. Answering the revocation then gave *the network changed while you were deciding … Nothing was applied; run the command again …*, and nothing was revoked. The message first said *another admin's change arrived*. Here the change came from this machine, so it now says *another change was signed here or arrived from another admin*. Run again, the revocation went through with one entry.
 
 Seen and not part of this change:
 
@@ -805,7 +800,7 @@ minute, each lasting thirty seconds and retrying the handshake on every path. Ev
 
 With the peer up, the direct traffic is the session's keep-alive, a packet a second each way. The
 relay traffic is the same session's relayed path kept alive alongside it, plus the relay
-connection itself. With the peer switched off, it is QUIC Initial packets of 1228 bytes to the peer's
+connection itself. With the peer switched off, it is handshake packets of 1228 bytes to the peer's
 addresses, answered by the peer's kernel with ICMP: the peer's daemon sends nothing, as §2.6c
 requires.
 
@@ -818,14 +813,14 @@ that the session had closed for being idle:
 | switched off | 1.16 GB | 1.11 GB | 0 | 43 MB |
 
 **Result**: **the budget is not met.** Toward the peer the device now sends nothing at rest, in
-both configurations; before, that was 1.2 to 4.6 GB a month. What remains is iroh's own traffic to the
-relay: a net report every 20 to 26 seconds (`new_re_stun_timer`), which opens a fresh QUIC connection
-to the relay for address discovery, and a ping every 15 seconds. Both are constants inside iroh 1.1,
-not settings, and the task stops here for that decision, as the design says it should.
+both configurations; before, that was 1.2 to 4.6 GB a month. What remains is the transport's own
+traffic to the relay: address discovery every 20 to 26 seconds, each time over a fresh connection to
+the relay, and a ping every 15 seconds. Both were constants inside the transport, not settings, and
+the task stops here for that decision, as the design says it should.
 
 Three defects were found on the way and fixed, each with a test (design D14):
-- **the transport's own probes looped through the tunnel.** iroh probes the tunnel addresses a peer
-  advertises, those packets entered this device's tunnel, and each opened a session that probed again:
+- **the transport's own probes looped through the tunnel.** The transport probed the tunnel
+  addresses a peer advertises, those packets entered this device's tunnel, and each opened a session that probed again:
   31 GB a month toward a switched-off peer on the first run;
 - **a failed on-demand attempt was retried at once,** with no rest;
 - **the interface list was compared in the order the platform returned it,** which changes from one
@@ -835,22 +830,19 @@ Three defects were found on the way and fixed, each with a test (design D14):
 The multicast left is local-discovery announcements, on the LAN only; it is over the 15 MB line for
 traffic other than the relay, and it costs no data plan.
 
-Then with iroh's optional net-report probes off (`NetReportConfig::minimal()`: no HTTPS latency
-probe, no captive-portal check; a network has one relay, so there is nothing to choose between), peer
-switched off: **1.06 GB a month**, of which 1.02 GB to the relay. The probes were not the bulk. What
-remains is the QUIC address discovery each net report makes — a fresh QUIC connection to the relay
-every 20 to 26 seconds, about 950 MB a month — and the relay ping every 15 seconds, about 60 MB. The
-interval is a constant in iroh 1.1 to 1.3; `NetReportConfig` (PR #4020) turns probes off, not the
-interval down.
+Then with the transport's optional probes off (no HTTPS latency probe, no captive-portal check; a
+network has one relay, so there is nothing to choose between), peer switched off: **1.06 GB a
+month**, of which 1.02 GB to the relay. The probes were not the bulk. What remains is the address
+discovery, a fresh connection to the relay every 20 to 26 seconds, about 950 MB a month, and the
+relay ping every 15 seconds, about 60 MB.
 
-`minimal()` was withdrawn on the same day, before merging. Without the HTTPS probe, a device whose
-QUIC to the relay gets no answer, on a network that blocks UDP, never picks a home relay and is left
-with no relay at all. The binding tests caught it in CI, since their relay answers QUIC on another
-port. The probes' share, about 100 MB a month at rest, is left to the change that pauses the net
-report (`quiet-iroh`).
+Turning the probes off was withdrawn on the same day, before merging. Without the HTTPS probe, a
+device whose UDP to the relay gets no answer, on a network that blocks UDP, is left with no relay at
+all. The binding tests caught it in CI. The probes' share, about 100 MB a month at rest, is left to
+the change that pauses the address discovery (step 35).
 
 **Does it grow with the network?** Three nodes, `b` measured at rest twelve minutes after the last
-session, with the same build (minimal net report), on 2026-10-07:
+session, with the same build (optional probes off), on 2026-10-07:
 
 | Peers up | Relay | Direct to peers | Multicast (LAN) | Total / month |
 |---|---|---|---|---|
@@ -859,7 +851,7 @@ session, with the same build (minimal net report), on 2026-10-07:
 | 0 | 1007 MB | 0 | 41 MB | 1.05 GB |
 
 No. What a device spends at rest is the same whether two peers, one or none are up: the relay share is
-iroh's net report and ping, once per device, and nothing goes to the peers. Only the multicast grows,
+the transport's address discovery and ping, once per device, and nothing goes to the peers. Only the multicast grows,
 by the announcements of each peer on the same LAN, about 12 MB a month each, and on the LAN only.
 
 ## 33. Three devices, sessions on demand
@@ -868,8 +860,8 @@ by the announcements of each peer on the same LAN, about 12 MB a month each, and
 
 1. `b` is taken down, `c` is admitted, `b` comes back up, and `c` pings `b`'s address.
 2. Nothing is carried for eleven minutes, then `peerfectly peers prova` on `a`.
-3. `b` is taken down, `a` signs `peerfectly rendezvous https://<relay>:8444 --network prova`, `b`
-   stays down for ten minutes and comes back up; `status` on `b` 45 seconds later.
+3. `b` is taken down, `a` signs a change of `prova`'s settings, `b` stays down for ten minutes and
+   comes back up; `status` on `b` 45 seconds later.
 4. `a` revokes `c`; `status` and `peers` on `b` 20 seconds later.
 
 Throughout, `b`'s log is read for what made it contact anyone (`reconciling with the neighbours`,
@@ -878,7 +870,7 @@ Throughout, `b`'s log is read for what made it contact anyone (`reconciling with
 **Expect**:
 - `c` reaches `b`, though `b` never heard of `c` before it refused it once;
 - both members reported reachable now, with their paths, although no session was open;
-- `b` holds the new rendezvous within a minute of coming back;
+- `b` holds the new settings within a minute of coming back;
 - `b` reads `2 devices, 1 revoked` within seconds of the revocation;
 - no contact logged on `b` but on its way up and after receiving something.
 
@@ -887,25 +879,26 @@ Throughout, `b`'s log is read for what made it contact anyone (`reconciling with
 and they were run again.
 - `ping -6` from `c` to `b`: 4 of 4.
 - `peers` on `a`: `c` `reachable yes, direct (now)`, `b` `reachable yes, via relay (now)`.
-- `b`, 45 s after coming back: `meet https://…:8444`.
+- `b`, 45 s after coming back: the new setting in its `status`.
 - `b`, 20 s after the revocation: `2 devices, 1 revoked`.
 - `b`'s log: `reconciling with the neighbours` when its network came up, and `spreading to the
   neighbours` after the parameter change and the revocation reached it. Nothing in between.
 
-Run again on iroh 1.3.0 (`quiet-iroh`, before its patch), 2026-10-07: passed, the same four.
+Run again on a later build, 2026-10-07: passed, the same four.
 - `ping -6` from `c` to `b`: 4 of 4.
 - `peers` on `a`: `b` and `c` both `reachable yes, direct (now)`.
-- `b`, 45 s after coming back: `meet https://…:8444`.
+- `b`, 45 s after coming back: the new setting in its `status`.
 - `b`, 20 s after the revocation: `2 devices, 1 revoked`.
 - `b`'s log: contact on its way up and after receiving something, and nothing in between.
 
-## 34. Traffic at rest on iroh 1.3.0, before the patch
+## 34. (removed)
 
-The same as step 32, on the build of `quiet-iroh` before its patch: iroh 1.3.0 from crates.io. The
-network has a rendezvous now, so its publishes are counted, and the script counts it apart: the
-rendezvous (TCP 8444 to the relay's host), `relay-quic` (UDP to the relay's host: the net report's
-address discovery) and `relay` (the rest: the relay connection, TCP). Thirty minutes, not five, so
-that a publish every fifteen minutes falls inside:
+## 35. Traffic at rest, with the address discovery paused
+
+As step 32, on the build that pauses the transport's address discovery while no connection is open
+and pings the relay once a minute. The relay on the VPS was updated to ping once a minute too. The
+script counts UDP to the relay's host (the address discovery) apart from TCP to it (the relay
+connection). Thirty minutes, not five:
 
 ```bash
 crates/linux-daemon/testbed/measure-idle.sh b a 204.216.216.139 1800
@@ -913,53 +906,23 @@ crates/linux-daemon/testbed/measure-idle.sh b a 204.216.216.139 1800
 
 with `a` up, then with `a` switched off, each twelve minutes after the join.
 
-**Expect**: the floor of step 32, about a gigabyte a month, the same whether `a` is up or not, and
-nothing to `a`.
-
-**Result**: run, 2026-10-07.
-
-| Build | Peer | relay-quic | relay | rendezvous | peer | multicast | Total / month |
-|---|---|---|---|---|---|---|---|
-| 0.1, iroh 1.1, no rendezvous (before `quiet-iroh`'s script) | up | 933 MB | 109 MB | — | 0 | 54 MB | 1.10 GB |
-| iroh 1.3, unpatched | up | 1067 MB | 270 MB | 11 MB | **190 MB** | 68 MB | 1.61 GB |
-| iroh 1.3, unpatched | switched off | 923 MB | 102 MB | 11 MB | 0 | 41 MB | 1.08 GB |
-
-The floor is iroh 1.3's as it was 1.1's: the net report's address discovery, about 930 MB a month,
-a new QUIC connection to the relay every 20 to 26 seconds, and the relay connection's pings and the
-net report's HTTPS probes, about 100 MB. The rendezvous costs about 11 MB a month at a publish every
-fifteen minutes.
-
-**One run is not explained.** With `a` up, `b` sent and received 831 packets directly to `a` in the
-thirty minutes, 190 MB a month, and twice its usual traffic to the relay: a session, open for part
-of the window, that nothing logged at `info` accounts for. None of the other three runs with `a`
-up showed it: thirty minutes on 1.1 before, and afterwards five minutes sampled every second and
-thirty sampled every five seconds on the same 1.3 build, with nothing from `a` but its
-announcements. It is recorded rather than averaged away, and watched for in the runs after the
-patch.
-
-## 35. Traffic at rest on the patched iroh
-
-As step 34, on the build of `quiet-iroh` with its patch: iroh from the project's fork
-(`nohostalgia/iroh`, `peerfectly/1.3`, `2fc2b89a97`), the net report paused while no connection is
-open, and the relay pinged once a minute. The relay on the VPS updated to the image built from the
-same commit, with `ping_interval_secs = 60` in its `relay.toml`.
-
-**Expect** (`transport-iroh` spec, *An endpoint with no connection spends almost nothing*): nothing
-to `relay-quic`, the relay share under 20 MB a month, and nothing to `a`.
+**Expect**: no UDP to the relay, the relay share under 20 MB a month, and nothing to `a`.
 
 **Result**: run, 2026-10-08, **passed**, after two findings that each had to be fixed first.
 
-| Build | Peer | relay-quic | relay | rendezvous | peer | multicast | Total / month |
-|---|---|---|---|---|---|---|---|
-| fork, relay not yet updated | up | 0 | 57.8 MB | 11.4 MB | 0 | 35.0 MB | 104 MB |
-| fork, relay not yet updated | switched off | 0 | 45.6 MB | 11.4 MB | 0 | 23.3 MB | 80 MB |
-| fork, relay updated | switched off | 0 | 13.7 MB | 11.3 MB | 0 | 23.3 MB | **48 MB** |
-| fork, relay updated | up | 320 packets | 510 MB | 11.3 MB | **392 MB** | 53.2 MB | 1.13 GB |
-| fork, relay updated, replaced sessions closed | up | 0 | 13.1 MB | 11.6 MB | 0 | 35.2 MB | **60 MB** |
-| the same, again | up | 0 | 14.3 MB | 11.3 MB | 0 | 35.7 MB | **61 MB** |
+| Build | Peer | Relay, UDP | Relay, TCP | Peer | Multicast | Total / month |
+|---|---|---|---|---|---|---|
+| relay not yet updated | up | 0 | 57.8 MB | 0 | 35.0 MB | 104 MB |
+| relay not yet updated | switched off | 0 | 45.6 MB | 0 | 23.3 MB | 80 MB |
+| relay updated | switched off | 0 | 13.7 MB | 0 | 23.3 MB | **48 MB** |
+| relay updated | up | 320 packets | 510 MB | **392 MB** | 53.2 MB | 1.13 GB |
+| relay updated, replaced sessions closed | up | 0 | 13.1 MB | 0 | 35.2 MB | **60 MB** |
+| the same, again | up | 0 | 14.3 MB | 0 | 35.7 MB | **61 MB** |
+
+The totals also count about 11 MB a month of other TCP to the relay's host, in every run.
 
 **The address discovery is gone at rest**: no UDP to the relay in any run but the one with a session
-left open, against about 930 MB a month before.
+left open, against about 930 MB a month before it was paused.
 
 **The relay set the pace until it was updated.** Timed at rest before, `b` exchanged three packets in
 and two out with the relay every sixteen seconds: the relay's fifteen and jitter, which reset the
@@ -967,12 +930,13 @@ device's minute each time. The redeploy on the VPS had not taken (`docker compos
 wrong directory). Run again from the checkout, the exchange came once a minute, and the relay's share
 fell to about 14 MB.
 
-**A replaced session was never closed.** The fourth run is the unexplained run of step 34 again: a
-session open the whole window, its paths kept alive every three seconds and the net report running
-because iroh saw a connection. When `a` and `b` dial each other at the same moment, two connections
-open; each node keeps the one it registered last, and dropped the other from its table without
-closing it. Where both kept the same one, the other stayed open in the transport for good. It is
-closed now when it is replaced (`Node::opened`, the test
+**A replaced session was never closed.** The fourth run had a session open the whole window, its
+paths kept alive every three seconds and the address discovery running because the transport saw a
+connection. One run on the build before the pause had shown the same, 190 MB a month directly to
+`a`, with nothing logged at `info` to account for it. When `a` and `b` dial each other at the same
+moment, two connections open; each node keeps the one it registered last, and dropped the other from
+its table without closing it. Where both kept the same one, the other stayed open in the transport
+for good. It is closed now when it is replaced (`Node::opened`, the test
 `a_session_replaced_by_another_to_the_same_device_is_closed`), and the two runs after it are clean.
 
 Within the budget with the peer up or switched off: under 20 MB to the relay, nothing to `a` at rest,
@@ -991,14 +955,14 @@ ping -6 -i 1 -c 300 -q <a's address>
 with UDP to the relay's host counted on `b` during the second, and again for the twelve idle minutes
 after it.
 
-**Expect**: the first packet answered; while the session is open, one QUIC connection kept for address
-discovery, not a new one for each report.
+**Expect**: the first packet answered; while the session is open, one connection kept for address
+discovery, not a new one each time.
 
 **Result**: run, 2026-10-08, passed.
 - After eleven idle minutes, 5 of 5 answered, the first in 9 ms against about 1 ms for the others:
   the session opening again.
 - Five minutes of a session in use: 38 packets, 18 KB, to the relay over UDP, against about 120 KB in
-  five minutes on 1.3 unpatched, where every report opened a connection of its own (step 34).
+  five minutes on the build before the pause, where every discovery opened a connection of its own.
 - The twelve minutes after it, most of them with the session still open until it closed for being
   idle: 97 packets, 38 KB.
 
@@ -1045,7 +1009,7 @@ alone, and now names it as typed, as a revocation's does: ``rename `b` (ab0e…)
 
 # Branch `convesso-transport`: the daemon on convesso
 
-Steps of the branch alone, where every daemon runs on convesso instead of iroh
+Steps of the branch alone, where every daemon runs on convesso
 (`openspec/changes/convesso-live`). They are not counted above: the branch is not merged.
 
 ## C1. Found, join, ping, names and a revocation through a convesso relay
@@ -1066,7 +1030,7 @@ Then, with `<key>` that key:
 4. On `a`: `peerfectly revoke b lost in the testbed --network prova`; then `b` pings `a`.
 
 **Expect**:
-- the founding signed with the relay string as typed, and no certificate fetched;
+- the founding signed with the relay string as typed, and nothing fetched;
 - the join completed with the same six digits on both sides;
 - pings answered both ways;
 - each name resolved to the other's address;
@@ -1089,7 +1053,7 @@ Then, with `<key>` that key:
 
 ## C2. A convesso relay on the VPS
 
-Beside the iroh relay, on port 7400 over UDP and TCP. The image is built on the PC from the convesso
+On port 7400 over UDP and TCP. The image is built on the PC from the convesso
 repository and carried over, as the server image is (`deploy/server/README.md`).
 
 On the VPS, the architecture to build for (`x86_64` is `linux/amd64`, `aarch64` is `linux/arm64`):
@@ -1153,3 +1117,57 @@ iptables rules and the security list name 8433.
 - The relay printed `convesso relay 1c23b31d…7e5a89`.
 - From the testbed, `join --relay 1c23…5a89@204.216.216.139:8433` on `c` registered at it in 2
   seconds and printed its payload.
+
+## C3. The relay container, and the LAN without the relay
+
+`convesso-reach`. The testbed's relay is the container the VPS runs (`deploy/server`), built from
+this branch. The nodes are rebuilt with the change and started fresh (`down -v`, then
+`up -d --build`).
+
+1. `a` founds `prova` giving only the container's address: `--relay https://relay:8444`. **Expect**
+   the relay string and the key in groups of four, the key equal to the `relay key` line of
+   `docker compose … logs relay`, and nothing signed before `yes`.
+2. `b` joins with the relay string written out, `a` admits it, and each pings the other.
+3. The relay is cut off (`docker network disconnect`), with `relay` still resolving through
+   `/etc/hosts`. Both nodes go down and up again, `a` first, and each pings the other every 200 ms
+   from the moment both are up; then the same with `b` pinging first. **Expect** an answer within
+   10 seconds each way.
+4. The same with the name not resolving: the `/etc/hosts` line removed, so `relay` resolves to
+   nothing. **Expect** the network to come up, and the same answer.
+
+**Result**: run, 2026-10-20.
+- **Steps 1 and 2 passed.** The founding showed `de98c8aa…0c8b@relay:8443` and
+  `de98 c8aa … 0c8b`, the key the container printed; the network's parameters carry that string
+  and nothing else. `b` joined, and both pinged across.
+- **Steps 3 and 4 found two faults in the daemon, both fixed in this change:**
+  - *Two devices dialling each other at once were left with no session.* Each held two sessions
+    with the other, and each closed the one the other kept. Now both keep the one the lower id
+    dialled (`convesso-reach` 5.2). Before the fix: 2 runs in about 20 got no answer in 30 s.
+  - *The daemon's own tunnel coming up was told to convesso as a change of network*, so it
+    stopped trusting the direct path it had just found and waited for the relay. With no relay,
+    the session died and the next dial had no path (5.3). Before the fix: 1 run in 12.
+- **After both fixes**, 46 runs:
+  - relay unreachable, name resolving: 22 runs, 21 answered within 6 s each way (most in 2 to
+    7 ms); one got no answer in 30 s. In that one `b` closed both its sessions with `a` in the
+    same instant, right after a roster-sync refusal, and `a` kept dialling a peer that closed each
+    new session. Not yet understood (`convesso-reach` 5.4).
+  - name not resolving: 24 runs, all answered within 5 ms each way.
+- **5.4, run 2026-10-21**, relay unreachable and its name resolving, with temporary diagnostics
+  on every session opened, closed and replaced:
+  - *Reproduced* at run 28 of 30: no answer in 30 s either way. `b` dialled `a` twice within
+    half a second, for its neighbours and for the first ping. `a` kept the newer session and
+    dropped the older one without telling `b`. The two `ACCEPT`s reached `b` in one instant, and
+    `b` kept the older one. From then on `b` held a session `a` no longer read, and closed every
+    session `a` opened, as 5.2 has the lower id's dial kept.
+  - *Fixed* (design D8d): the daemon makes one dial to a peer at a time, and registers its session
+    before the dial returns; the binding sends a `CLOSE` for a session it replaces, and for an
+    `ACCEPT` to a dial it gave up on. 60 runs: none failed. 6 took 4.7 to 6 s.
+  - *Those 6* were the first local-discovery announcement being skipped: the binding's addresses
+    were not known yet when it was due, and the next came 5 s later. Fixed (design D8e): they are
+    read before the binding is handed over. 60 runs: all answered each way, the slowest in 24 ms.
+- **Joining on the host, run 2026-10-21** (`convesso-reach` 7.5): `a` founded on
+  `https://relay:8444`, `b` joined with `--relay https://relay:8444`, asked nothing to confirm, and
+  was admitted. Its status shows the network's relay, `0ecc…3c3b@relay:8443`, and each pinged the
+  other, 4 of 4.
+- The fixture `daemon/tests/fixtures/stranded-join/roster.log` was replaced with `a`'s roster from
+  step 1.

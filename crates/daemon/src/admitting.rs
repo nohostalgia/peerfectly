@@ -213,7 +213,7 @@ pub async fn open(
 /// A payload is written by whoever produced it. Dialling the relay it names lets
 /// that author choose a host this machine resolves and connects to — which learns
 /// the admin's address, when it admits, and that it runs this product, before any
-/// certificate is checked. So nothing is contacted unless the relay is the
+/// key is checked. So nothing is contacted unless the relay is the
 /// network's own, or the one it is leaving: a device that began joining just
 /// before a move is waiting there.
 ///
@@ -464,9 +464,7 @@ async fn deliver_signed(
     let said = match receive(&mut channel, deadline).await {
         Ok(Message::Outcome { taken: true }) => "it adopted the network".to_owned(),
         Ok(Message::Outcome { taken: false }) => {
-            "it refused the network — check that the relay certificate it accepted is the one \
-             this network pins"
-                .to_owned()
+            "it refused the network: it did not find itself admitted in it".to_owned()
         }
         Ok(_) | Err(_) => "it did not say whether it adopted the network".to_owned(),
     };
@@ -651,7 +649,7 @@ mod tests {
         )
         .expect("valid");
         let params = match leaving {
-            Some((_, issued)) => base.moving_to(relay, None, issued).expect("moves"),
+            Some((_, issued)) => base.moving_to(relay, issued).expect("moves"),
             None => base,
         };
         state_of(params, &[])

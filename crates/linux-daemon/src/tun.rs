@@ -30,8 +30,9 @@
 
 #![allow(
     unsafe_code,
-    reason = "TUNSETIFF has no safe wrapper; the unsafe surface is this one ioctl, confined to \
-              this module as `route_table` confines Windows' IP Helper calls"
+    reason = "TUNSETIFF has no safe wrapper, and tokio's registration of a descriptor asks its \
+              caller to vouch for it; the unsafe surface is those two calls, confined to this \
+              module as `route_table` confines Windows' IP Helper calls"
 )]
 
 use std::io;
@@ -93,10 +94,13 @@ impl Tun {
             ));
         }
 
-        Ok(Self {
-            fd: AsyncFd::with_interest(fd, Interest::READABLE | Interest::WRITABLE)?,
-            name: name.to_owned(),
-        })
+        // SAFETY: `fd` is an open descriptor, and the `AsyncFd` takes ownership
+        // of it: an `OwnedFd` closes it only when dropped, and always reports the
+        // same descriptor, so it stays open and the same for the `AsyncFd`'s life.
+        let fd =
+            unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE | Interest::WRITABLE) }
+                .map_err(|refused| refused.into_parts().1)?;
+        Ok(Self { fd, name: name.to_owned() })
     }
 
     /// What the interface is called.

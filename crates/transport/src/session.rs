@@ -9,8 +9,8 @@
 //!
 //! # What this interface does not promise
 //!
-//! **Confidentiality.** Nothing here encrypts anything. A real transport gets it
-//! from QUIC and TLS 1.3 (§2.1); the in-memory one has no wire to protect and
+//! **Confidentiality.** Nothing here encrypts anything. `transport-convesso` gets
+//! it from Noise (§2.1); the in-memory one has no wire to protect and
 //! provides none. This is stated rather than left implicit, because *"it goes
 //! through the transport"* is exactly the sort of phrase a later reader takes to
 //! mean *"it is encrypted"*. Anything needing confidentiality independent of the
@@ -23,7 +23,7 @@
 //!
 //! # Async, and dyn-compatible
 //!
-//! QUIC, hole punching and connection migration are asynchronous; a synchronous
+//! Handshakes, hole punching and path changes are asynchronous; a synchronous
 //! facade would hide a runtime behind blocking calls, and blocking a phone's UI
 //! thread on a relay handshake is a failure mode worth designing out. The traits
 //! use `async_trait` so they remain usable behind a trait object, which is what
@@ -55,8 +55,8 @@ pub trait Transport: Send + Sync {
 
     /// Where this node believes it can be reached, as opaque strings.
     ///
-    /// Published to a rendezvous and announced on the local network by the layer
-    /// above, which does not read them: only the implementation that produced an
+    /// Announced on the local network by the layer above, which does not read
+    /// them: only the implementation that produced an
     /// address knows what it means, and one that parsed them would need changing
     /// whenever the addressing did.
     ///

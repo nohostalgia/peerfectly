@@ -1,10 +1,13 @@
-# peerfectly
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/banner-dark.png">
+  <img alt="peerfectly — a private network between your own devices" src=".github/assets/banner-light.png" width="100%">
+</picture>
 
 Your devices, on one private network, reachable by name from wherever they are: `nas.home.internal`
 from your phone on mobile data, your desktop from your laptop in a hotel. No account to make, no
 server that runs your network for you.
 
-> **Status: pre-release (0.3).** Things may still change before 1.0.
+> **Status: pre-release (0.4).** Things may still change before 1.0.
 
 ## What makes it different
 
@@ -18,17 +21,15 @@ in**.
   your network. A device's identity is a set of keys it made itself. On Windows and Linux an admin's
   signing key lives in the TPM where there is one, and on a phone in its keystore.
 - **The infrastructure can't let anyone in.** The relay (for when two devices can't reach each other
-  directly) and the rendezvous (where devices leave sealed notes on how to reach them) carry
-  encrypted traffic and opaque records. Neither can admit a device, read your traffic, or move your
-  network somewhere else.
+  directly) carries traffic encrypted end to end between your devices, and your devices know it by
+  its key, so nothing else can stand in for it. It can't admit a device, read your traffic, or move
+  your network somewhere else.
 - **It keeps working without us.** The network's rules live in a signed roster that every device
   holds. If the relay you use disappears, devices that can reach each other directly or on the same
   LAN carry on, and an admin can move the network to another relay with a signed change.
 - **Admin acts work offline.** Admitting or revoking a device is signed where you are, and spreads to
   the other devices the next time they talk.
 
-Tailscale with Tailnet Lock gets close to the first point, if you switch it on. peerfectly has no
-switch: there is nothing else to trust.
 
 ## What it is not
 
@@ -40,8 +41,11 @@ switch: there is nothing else to trust.
 
 ## How it works, briefly
 
-- **Transport.** [iroh](https://github.com/n0-computer/iroh): QUIC with TLS 1.3, hole punching to go
-  direct when it can, a relay when it can't.
+- **Transport.** [convesso](https://github.com/nohostalgia/convesso), a sibling project: Noise IK
+  sessions between devices over UDP, with TCP to the relay where UDP doesn't get through. Devices on
+  the same LAN find each other by signed announcements and connect directly. Elsewhere a session
+  opens through a relay pinned by its key, and moves to a direct path as soon as the two ends find
+  one. peerfectly takes convesso from its repository, fixed to one commit in `Cargo.toml`.
 - **The roster.** The membership is a signed, append-only graph of operations (found, admit, revoke,
   change a setting) that any two devices can merge in any order and get the same result. Snapshots
   let it be compacted, and attestations let a device tell that its copy is recent.
@@ -77,8 +81,8 @@ is unknown: *More info → Run anyway*.
 **Linux.** Unpack the archive and run its install script:
 
 ```sh
-tar xzf peerfectly-0.3.0-linux-x86_64.tar.gz
-sudo ./peerfectly-0.3.0-linux-x86_64/install.sh
+tar xzf peerfectly-0.4.0-linux-x86_64.tar.gz
+sudo ./peerfectly-0.4.0-linux-x86_64/install.sh
 ```
 
 The script checks everything it needs before it writes anything, and tells you which packages are
@@ -93,7 +97,7 @@ built it, from which commit, on which runner. To check that a file came out of t
 release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify peerfectly-0.3.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+gh attestation verify peerfectly-0.4.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
 ```
 
 That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
@@ -106,20 +110,21 @@ You need a relay. Run your own with [`deploy/server`](deploy/server/README.md), 
 On the first device, which becomes the admin:
 
 ```sh
-peerfectly found home --relay https://relay.example
+peerfectly found home --relay https://relay.example --name laptop
 ```
 
-It fetches the relay's certificate and asks you to confirm its fingerprint, then makes the network's
-signing key. On Windows that key goes in the TPM, behind Windows Hello. On Linux it goes in the TPM,
+It asks the relay's host which key its relay has and asks you to confirm it, then makes the
+network's signing key. On Windows that key goes in the TPM, behind Windows Hello. On Linux it goes in the TPM,
 or a sealed file where there is none, behind a passphrase.
 
 On the second device:
 
 ```sh
-peerfectly join --relay https://relay.example --name laptop
+peerfectly join --relay https://relay.example --name nas
 ```
 
-It prints a QR code and a payload. Back on the admin:
+It asks the relay's host the same way, with nothing to confirm, since a join signs nothing with it.
+Then it prints a QR code and a payload. Back on the admin:
 
 ```sh
 peerfectly admit peerfectly-join-v1:…
@@ -170,14 +175,16 @@ The packages are built by the same scripts the release workflow runs:
 | `crates/roster` | the signed roster: operations, merge, snapshots, attestations |
 | `crates/identity` | device keys, and how they're stored |
 | `crates/enrollment` | joining: the payload, the code, the exchange |
-| `crates/transport`, `crates/transport-iroh` | sessions between devices, on iroh |
+| `crates/transport`, `crates/transport-convesso` | sessions between devices: the interface, and its implementation on [convesso](https://github.com/nohostalgia/convesso) |
 | `crates/tunnel` | the packet path, and the check that a packet comes from who it says |
-| `crates/roster-sync`, `crates/local-discovery`, `crates/rendezvous` | how devices find each other and stay in sync |
+| `crates/roster-sync`, `crates/local-discovery` | how devices stay in sync, and find each other on the LAN |
+| `crates/relay-server` | `peerfectly-relay`: the relay, and the HTTPS answer that tells a device its key |
 | `crates/daemon` | the node as a program: it decides, it never touches the machine |
 | `crates/windows-daemon`, `crates/linux-daemon` | the parts that touch the machine |
 | `crates/cli`, `crates/programs` | the command line and the binaries |
-| `deploy/` | installers, the systemd unit, the relay and rendezvous server |
+| `deploy/` | installers, the systemd unit, the relay container |
 | `DESIGN.md` | the principles the code is built on, and why; comments cite its sections as `§2.6c` |
+
 ## License
 
 peerfectly is free software under the [GNU Affero General Public License v3.0 or later](LICENSE).
@@ -188,6 +195,10 @@ offer them your source under the same licence.
 
 If that doesn't work for what you're building, a commercial licence is possible. Open a
 [discussion](https://github.com/nohostalgia/peerfectly/discussions) and say what you have in mind.
+
+The name "peerfectly" and its logo are not part of that licence: a modified version you distribute
+needs a name and a logo of its own. [TRADEMARKS.md](TRADEMARKS.md) says what you may and may not do
+with them.
 
 ## Contributing
 

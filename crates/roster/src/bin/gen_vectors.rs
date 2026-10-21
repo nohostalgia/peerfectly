@@ -385,10 +385,8 @@ fn build_positives() -> Vec<Positive> {
         });
     }
 
-    // A network moving relay: the second optional key, present, with the
-    // relay being left pinned and without a pin — its certificate is an array of
-    // nothing or one, like the relay's own.
-    for pinned in [true, false] {
+    // A network moving relay: the second optional key, present.
+    {
         let moving = NetworkParams::with_relay(
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             Some("https://relay-b.example:443"),
@@ -398,7 +396,6 @@ fn build_positives() -> Vec<Positive> {
         .expect("well-formed")
         .leaving(roster::types::Leaving {
             relay: "https://relay-a.example:443".to_owned(),
-            relay_cert: pinned.then(|| vec![0x30, 0x82, 0x01, 0x0a]),
             until: 1_735_689_600_000 + 2_592_000 * 1_000,
         })
         .expect("a relay to move to, and one to leave");
@@ -416,11 +413,7 @@ fn build_positives() -> Vec<Positive> {
         let core_bytes = core.encode();
         let operation = sign_operation(&core, &signer).expect("signs");
         out.push(Positive {
-            name: format!(
-                "{}/ed25519 leaving a relay {}",
-                op_type.as_str(),
-                if pinned { "that was pinned" } else { "that was not pinned" }
-            ),
+            name: format!("{}/ed25519 leaving a relay", op_type.as_str()),
             operation_type: op_type.as_str(),
             algorithm: "ed25519",
             operation: hex::encode(&operation),
@@ -510,7 +503,7 @@ fn build_negatives() -> Vec<Negative> {
         "network parameters naming two relays",
         "limit_exceeded",
         set_network(params_map(
-            6,
+            4,
             &relay_field(&["https://a.example", "https://b.example"]),
             false,
         )),
@@ -520,15 +513,11 @@ fn build_negatives() -> Vec<Negative> {
         "missing_field",
         set_network({
             let mut out = Vec::new();
-            out.push(0xa5);
+            out.push(0xa3);
             push_text(&mut out, "ula");
             push_bytes(&mut out, &[0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
             push_text(&mut out, "suffix");
             push_text(&mut out, "example.internal");
-            push_text(&mut out, "relay_cert");
-            out.push(0x80);
-            push_text(&mut out, "rendezvous");
-            out.push(0x80);
             push_text(&mut out, "snapshot_window");
             out.push(0x01);
             out
@@ -537,7 +526,7 @@ fn build_negatives() -> Vec<Negative> {
     decode_case(
         "network parameters with the relay after the suffix",
         "key_ordering",
-        set_network(params_map(6, &relay_field(&[]), true)),
+        set_network(params_map(4, &relay_field(&[]), true)),
     );
     decode_case(
         "network parameters repeating the relay",
@@ -548,17 +537,13 @@ fn build_negatives() -> Vec<Negative> {
             // other field is necessarily absent, but the repetition is the more
             // specific complaint.
             let mut out = Vec::new();
-            out.push(0xa6);
+            out.push(0xa4);
             push_text(&mut out, "ula");
             push_bytes(&mut out, &[0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
             out.extend_from_slice(&relay_field(&[]));
             out.extend_from_slice(&relay_field(&[]));
             push_text(&mut out, "suffix");
             push_text(&mut out, "example.internal");
-            push_text(&mut out, "relay_cert");
-            out.push(0x80);
-            push_text(&mut out, "rendezvous");
-            out.push(0x80);
             out
         }),
     );
@@ -566,7 +551,7 @@ fn build_negatives() -> Vec<Negative> {
         "network parameters with the relay as text rather than an array",
         "type_mismatch",
         set_network(params_map(
-            6,
+            4,
             &{
                 let mut field = Vec::new();
                 push_text(&mut field, "relay");
@@ -579,7 +564,7 @@ fn build_negatives() -> Vec<Negative> {
     decode_case(
         "network parameters with an empty relay address",
         "invalid_value",
-        set_network(params_map(6, &relay_field(&[""]), false)),
+        set_network(params_map(4, &relay_field(&[""]), false)),
     );
 
     // --- The IPv4 range in the network parameters ------------------------
@@ -588,42 +573,42 @@ fn build_negatives() -> Vec<Negative> {
     decode_case(
         "network parameters with an empty ipv4 range",
         "invalid_value",
-        set_network(params_map_with_ipv4(7, &[&[]], false)),
+        set_network(params_map_with_ipv4(5, &[&[]], false)),
     );
     decode_case(
         "network parameters with an ipv4 range with host bits set",
         "invalid_value",
-        set_network(params_map_with_ipv4(7, &[&[10, 42, 0, 1, 16]], false)),
+        set_network(params_map_with_ipv4(5, &[&[10, 42, 0, 1, 16]], false)),
     );
     decode_case(
         "network parameters with an ipv4 range of four bytes",
         "invalid_value",
-        set_network(params_map_with_ipv4(7, &[&[10, 42, 0, 0]], false)),
+        set_network(params_map_with_ipv4(5, &[&[10, 42, 0, 0]], false)),
     );
     decode_case(
         "network parameters with an ipv4 range prefix length of 29",
         "invalid_value",
-        set_network(params_map_with_ipv4(7, &[&[10, 42, 0, 0, 29]], false)),
+        set_network(params_map_with_ipv4(5, &[&[10, 42, 0, 0, 29]], false)),
     );
     decode_case(
         "network parameters with an ipv4 range in public space",
         "invalid_value",
-        set_network(params_map_with_ipv4(7, &[&[8, 8, 8, 0, 24]], false)),
+        set_network(params_map_with_ipv4(5, &[&[8, 8, 8, 0, 24]], false)),
     );
     decode_case(
         "network parameters with an ipv4 range in loopback",
         "invalid_value",
-        set_network(params_map_with_ipv4(7, &[&[127, 0, 0, 0, 8]], false)),
+        set_network(params_map_with_ipv4(5, &[&[127, 0, 0, 0, 8]], false)),
     );
     decode_case(
         "network parameters repeating the ipv4 range",
         "duplicate_key",
-        set_network(params_map_with_ipv4(7, &[&[10, 42, 0, 0, 16], &[10, 42, 0, 0, 16]], false)),
+        set_network(params_map_with_ipv4(5, &[&[10, 42, 0, 0, 16], &[10, 42, 0, 0, 16]], false)),
     );
     decode_case(
         "network parameters with the ipv4 range after the relay",
         "key_ordering",
-        set_network(params_map_with_ipv4(7, &[&[10, 42, 0, 0, 16]], true)),
+        set_network(params_map_with_ipv4(5, &[&[10, 42, 0, 0, 16]], true)),
     );
     decode_case(
         "network parameters with one entry more than the schema",
@@ -1610,14 +1595,6 @@ fn params_map(fields: usize, relay: &[u8], misordered: bool) -> Vec<u8> {
         // which puts a five-byte key before a six-byte one.
         out.extend_from_slice(relay);
     }
-    // Ten bytes, so it sits between `suffix` and `snapshot_window`. Absent here,
-    // which for this field means an empty array.
-    push_text(&mut out, "relay_cert");
-    out.push(0x80);
-    // Also ten bytes, and `relay_cert` sorts before it: same length, so bytes
-    // decide, and `l` precedes `n`.
-    push_text(&mut out, "rendezvous");
-    out.push(0x80);
     push_text(&mut out, "snapshot_window");
     out.push(0x01);
     out
@@ -1646,10 +1623,6 @@ fn params_map_with_ipv4(entries: u8, ipv4: &[&[u8]], after_relay: bool) -> Vec<u
     }
     push_text(&mut out, "suffix");
     push_text(&mut out, "example.internal");
-    push_text(&mut out, "relay_cert");
-    out.push(0x80);
-    push_text(&mut out, "rendezvous");
-    out.push(0x80);
     push_text(&mut out, "snapshot_window");
     out.push(0x01);
     out
@@ -1660,20 +1633,16 @@ const ULA: [u8; 8] = [0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 /// Builds the network parameters map by hand with a chosen prefix and suffix.
 ///
-/// Six entries, canonically ordered, with no relay and no range — so the only
+/// Four entries, canonically ordered, with no relay and no range — so the only
 /// thing a case built from this can be refused for is the prefix or the suffix.
 fn params_map_bounded(ula: &[u8], suffix: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(0xa6);
+    out.push(0xa4);
     push_text(&mut out, "ula");
     push_bytes(&mut out, ula);
     out.extend_from_slice(&relay_field(&[]));
     push_text(&mut out, "suffix");
     push_text(&mut out, suffix);
-    push_text(&mut out, "relay_cert");
-    out.push(0x80);
-    push_text(&mut out, "rendezvous");
-    out.push(0x80);
     push_text(&mut out, "snapshot_window");
     out.push(0x01);
     out

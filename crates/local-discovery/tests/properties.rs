@@ -6,11 +6,11 @@
 use std::time::{Duration, Instant};
 
 use identity::PrivateKey;
+use local_discovery::Record;
 use local_discovery::announce::{self, Announcement};
 use local_discovery::order::{Candidate, Conditions, Source};
 use local_discovery::{Cache, order};
 use proptest::prelude::*;
-use rendezvous::Record;
 use roster::id::NetworkId;
 use roster::types::Algorithm;
 
@@ -19,10 +19,9 @@ fn network() -> NetworkId {
 }
 
 fn source_of(tag: u8) -> Source {
-    match tag % 3 {
+    match tag % 2 {
         0 => Source::Local,
-        1 => Source::Global,
-        _ => Source::Rendezvous,
+        _ => Source::Global,
     }
 }
 
@@ -96,11 +95,11 @@ proptest! {
         let twice = order(&candidates, &conditions);
         prop_assert_eq!(&once, &twice, "the same inputs must give the same order");
 
-        // Every local candidate precedes every rendezvous one.
+        // Every local candidate precedes every global one.
         let last_local = once.iter().rposition(|c| c.source == Source::Local);
-        let first_rendezvous = once.iter().position(|c| c.source == Source::Rendezvous);
-        if let (Some(local), Some(rendezvous)) = (last_local, first_rendezvous) {
-            prop_assert!(local < rendezvous, "a local candidate must precede a rendezvous one");
+        let first_global = once.iter().position(|c| c.source == Source::Global);
+        if let (Some(local), Some(global)) = (last_local, first_global) {
+            prop_assert!(local < global, "a local candidate must precede a global one");
         }
 
         prop_assert_eq!(once.len(), candidates.len(), "ordering drops nothing");
@@ -168,9 +167,8 @@ fn the_dependency_direction_holds() {
     for (name, manifest) in [
         ("roster", include_str!("../../roster/Cargo.toml")),
         ("identity", include_str!("../../identity/Cargo.toml")),
-        ("rendezvous", include_str!("../../rendezvous/Cargo.toml")),
         ("transport", include_str!("../../transport/Cargo.toml")),
-        ("transport-iroh", include_str!("../../transport-iroh/Cargo.toml")),
+        ("transport-convesso", include_str!("../../transport-convesso/Cargo.toml")),
     ] {
         assert!(!manifest.contains("local-discovery"), "`{name}` must not depend on this crate");
     }

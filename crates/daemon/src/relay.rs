@@ -1,137 +1,286 @@
-//! Getting a relay's certificate, and deciding whether it can be one.
+//! Reading the relay a person gives, and asking a relay's host for its key.
 //!
-//! Two commands need this and they need it for opposite reasons. **Founding**
-//! pins the certificate into the signed parameters, so it had better be a
-//! certificate a verifying client will accept — a pin that cannot work produces
-//! a network where every device fails to reach the relay and the only sign of it
-//! is an alert in the relay's log. **Joining** has to reach a relay before any
-//! roster exists to vouch for it, so it verifies the ordinary way and falls back
-//! to accepting one on sight, showing the fingerprint.
+//! A relay is signed into the roster as `key@host:port`: its address names its
+//! key, so the roster authenticates it with nothing beside it. Typing 64
+//! hexadecimal digits is the least pleasant thing peerfectly asked of a person,
+//! so a relay may also be given as the host of a peerfectly relay container,
+//! which answers over HTTPS with the key and the port it serves
+//! (`relay-server`). The daemon asks, shows the key, and signs nothing until a
+//! person confirms it.
 //!
-//! # Why the fingerprint is SHA-256, in that shape
+//! # Trust on first use, and said so
 //!
-//! Because that is what `openssl x509 -noout -fingerprint -sha256` prints on the
-//! relay host. A digest nobody can compare against anything is not a check.
+//! The answer is not authenticated. TLS hides the request from the path and
+//! accepts any certificate, because there is no root of trust before the key
+//! itself. Whoever answers at that host in that moment is what a person is asked
+//! about, and the question names where the same key is printed on the relay
+//! host. A wrong key costs availability and metadata, never content: sessions
+//! between members are end-to-end under their roster keys.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
+use std::time::Duration;
 
-/// Why a certificate could not be obtained or used.
+/// Why a relay could not be read or asked.
 ///
 /// A message rather than a variant, deliberately: every one of these ends the
 /// command that hit it, so there is nothing for a caller to branch on, and the
 /// person standing at the terminal needs the sentence rather than the category.
-/// What each says is tested; that they are distinct kinds is not, because
-/// nothing acts on the difference.
 pub type Refusal = String;
 
-/// Reads a certificate from a file, as PEM or as DER.
-///
-/// Whoever runs a relay has a PEM file, because that is what the tools that make
-/// certificates write. The roster carries DER, so the conversion happens here.
-///
-/// # Errors
-///
-/// When the file cannot be read, or is neither PEM nor DER.
-pub fn read_certificate(path: &str) -> Result<Vec<u8>, Refusal> {
-    use rustls_pki_types::CertificateDer;
-    use rustls_pki_types::pem::PemObject as _;
-
-    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
-
-    let bytes = std::fs::read(path).map_err(|cause| format!("{path}: {cause}"))?;
-
-    if bytes.windows(BEGIN.len()).any(|window| window == BEGIN) {
-        let certificate = CertificateDer::from_pem_slice(&bytes)
-            .map_err(|cause| format!("{path}: not a usable PEM certificate: {cause}"))?;
-        return Ok(certificate.to_vec());
-    }
-
-    // DER. A certificate is an ASN.1 SEQUENCE, which begins 0x30.
-    if bytes.first() != Some(&0x30) {
-        return Err(format!("{path}: neither a PEM certificate nor DER"));
-    }
-    Ok(bytes)
-}
-
-/// Asks a relay for the certificate it presents, and pins it once confirmed.
-///
-/// This is **trust on first use**, and the prompt says so rather than implying a
-/// check that did not happen: whoever answers at that address in this moment is
-/// what gets signed into the roster. Copying the file off the relay by hand is
-/// no better — the same bytes, obtained the same way — unless the fingerprint is
-/// compared against the relay host, which is what the prompt puts in front of
-/// the person founding the network.
-///
-/// # Errors
-///
-/// When the relay cannot be reached, presents a certificate a verifying client
-/// could not accept, or the person declines.
-pub fn fetch_and_confirm(relay: &str) -> Result<Vec<u8>, Refusal> {
-    let (host, port) = host_and_port(relay)?;
-    println!("asking {host}:{port} for its certificate...");
-    let certificate = presented_certificate(&host, port)?;
-
-    // Refused here, not pinned and discovered later. This certificate is the one
-    // the relay presents as its own, so if a verifying client cannot accept it,
-    // pinning it produces a network where every device fails to reach the relay
-    // and the only sign of it is an alert in the relay's log.
-    if let Err(reason) = usable_as_a_server_certificate(&certificate, &host) {
-        return Err(format!("{host}:{port} presented a certificate that cannot work:\n{reason}"));
-    }
-
-    println!();
-    println!("  SHA-256  {}", fingerprint(&certificate));
-    println!("  {} bytes of DER", certificate.len());
-    println!();
-    println!("Nothing has checked that this is your relay. Anyone in the path could");
-    println!("have answered. On the relay host, the same certificate prints as:");
-    println!();
-    println!("  openssl x509 -in <the relay's cert file> -noout -fingerprint -sha256");
-    println!();
-    print!("Pin this certificate? [yes/no] ");
-    std::io::stdout().flush().map_err(|cause| cause.to_string())?;
-
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer).map_err(|cause| cause.to_string())?;
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
-        return Err("not pinned; nothing was written".to_owned());
-    }
-    Ok(certificate)
-}
-
-/// Splits a relay URL into the host and port to connect to.
-///
-/// # Errors
-///
-/// When it is not a URL, or names no host.
-pub fn host_and_port(relay: &str) -> Result<(String, u16), Refusal> {
-    let parsed = url::Url::parse(relay).map_err(|cause| format!("{relay}: {cause}"))?;
-    // Not `host_str`, which returns an IPv6 address inside the brackets the URL
-    // syntax requires — `[2001:db8::1]` is neither a name that resolves nor an
-    // address that connects. Found by the test below.
-    let host = match parsed.host() {
-        Some(url::Host::Domain(name)) => name.to_owned(),
-        Some(url::Host::Ipv4(address)) => address.to_string(),
-        Some(url::Host::Ipv6(address)) => address.to_string(),
-        None => return Err(format!("{relay}: no host in the address")),
-    };
-    // 443 for a relay served on https with no port written down, which is what
-    // `transport-iroh` assumes when it dials the same address.
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    Ok((host, port))
-}
-
-/// The form a relay is written in on this branch, for a person reading a
-/// refusal.
+/// The form a relay is written in, for a person reading a refusal.
 pub const FORM: &str = transport_convesso::relay::FORM;
+
+/// The forms a relay may be given in, for a person reading a refusal.
+pub const FORMS: &str = "a relay is given as the host of its peerfectly relay container \
+                         (`relay.example` or `203.0.113.10`), as `https://host:port` when the \
+                         container answers on another port, or written out as `<key>@host:port`";
+
+/// The port a relay container answers on unless told otherwise.
+pub const KEY_PORT: u16 = 443;
+
+/// How long asking a relay's host may take, from connecting to the last byte.
+pub const ASKING_WITHIN: Duration = Duration::from_secs(10);
+
+/// The most an answer may be, headers included. The body is a key and a port.
+const ANSWER_LIMIT: usize = 4096;
+
+/// A relay as a person gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Given {
+    /// Written out, `key@host:port` or `tls://key@host:port`: used as it is.
+    Written(String),
+    /// The host of a relay container, to be asked for its key.
+    Asked {
+        /// The host to connect to: a name, or an address without brackets.
+        host: String,
+        /// The same host as a relay string writes it: IPv6 in brackets.
+        written: String,
+        /// The port the container answers on.
+        port: u16,
+    },
+}
+
+impl Given {
+    /// Reads a relay as a person typed it.
+    ///
+    /// # Errors
+    ///
+    /// When it is none of the forms, naming them. A host and a port with no key
+    /// is refused rather than guessed at: it is as likely a relay written without
+    /// its key as a container on another port.
+    pub fn read(text: &str) -> Result<Self, Refusal> {
+        let text = text.trim();
+        let refused = || format!("`{}` is not a relay: {FORMS}.", crate::control::shown(text));
+        if text.contains('@') {
+            return match transport_convesso::relay::parse(text) {
+                Ok(_) => Ok(Self::Written(text.to_owned())),
+                Err(cause) => Err(format!("{cause}. {FORMS}.")),
+            };
+        }
+        if text.starts_with("https://") {
+            let parsed = url::Url::parse(text).map_err(|_| refused())?;
+            if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() {
+                return Err(refused());
+            }
+            let port = parsed.port().unwrap_or(KEY_PORT);
+            let (host, written) = match parsed.host() {
+                Some(url::Host::Domain(name)) => (name.to_owned(), name.to_owned()),
+                Some(url::Host::Ipv4(address)) => (address.to_string(), address.to_string()),
+                Some(url::Host::Ipv6(address)) => (address.to_string(), format!("[{address}]")),
+                None => return Err(refused()),
+            };
+            return Ok(Self::Asked { host, written, port });
+        }
+        if text.contains("://") {
+            return Err(refused());
+        }
+        if let Some(inner) = text.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            let address: std::net::Ipv6Addr = inner.parse().map_err(|_| refused())?;
+            return Ok(Self::Asked {
+                host: address.to_string(),
+                written: format!("[{address}]"),
+                port: KEY_PORT,
+            });
+        }
+        let usable = !text.is_empty()
+            && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        if !usable {
+            // `host:port` lands here, with every other shape that is not a host.
+            return Err(refused());
+        }
+        Ok(Self::Asked { host: text.to_owned(), written: text.to_owned(), port: KEY_PORT })
+    }
+}
+
+/// What a relay container answers: the key it serves, and where.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct Answer {
+    /// The relay's key, 64 hexadecimal digits.
+    pub key: String,
+    /// The port the relay listens on, for UDP and TCP alike.
+    pub port: u16,
+    /// Whether its TCP link is wrapped in TLS.
+    #[serde(default)]
+    pub tls: bool,
+}
+
+impl Answer {
+    /// The relay string this answer makes with the host it was asked on.
+    ///
+    /// # Errors
+    ///
+    /// When the key is not a relay key.
+    pub fn relay(&self, written_host: &str) -> Result<String, Refusal> {
+        let bytes = hex::decode(&self.key)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(|| "the host answered with something that is not a relay key".to_owned())?;
+        let relay = transport_convesso::relay::written(
+            &bytes,
+            &format!("{written_host}:{}", self.port),
+            self.tls,
+        );
+        transport_convesso::relay::parse(&relay)
+            .map_err(|cause| format!("the host answered with an unusable relay: {cause}"))?;
+        Ok(relay)
+    }
+}
+
+/// Asks the relay container at `host:port` which relay it serves, and makes the
+/// relay string with `written` as its host.
+///
+/// Blocking: run it off the runtime's reactor.
+///
+/// # Errors
+///
+/// When the host cannot be reached, does not answer as a relay container, or
+/// answers with something that is not a relay.
+pub fn ask(host: &str, written: &str, port: u16) -> Result<String, Refusal> {
+    let body = fetch(host, port)?;
+    let answer: Answer = serde_json::from_slice(&body)
+        .map_err(|_| format!("{host}:{port} answered, but not as a peerfectly relay container"))?;
+    answer.relay(written)
+}
+
+/// `GET /relay` over TLS, accepting any certificate, and the body that came back.
+fn fetch(host: &str, port: u16) -> Result<Vec<u8>, Refusal> {
+    use std::net::ToSocketAddrs as _;
+
+    let unreachable =
+        |cause: &dyn core::fmt::Display| format!("could not reach {host}:{port}: {cause}");
+    let addresses = (host, port).to_socket_addrs().map_err(|cause| unreachable(&cause))?;
+    let mut socket = None;
+    let mut last = None;
+    for address in addresses {
+        match std::net::TcpStream::connect_timeout(&address, ASKING_WITHIN) {
+            Ok(connected) => {
+                socket = Some(connected);
+                break;
+            }
+            Err(cause) => last = Some(cause),
+        }
+    }
+    let socket = socket.ok_or_else(|| match last {
+        Some(cause) => unreachable(&cause),
+        None => unreachable(&"the name has no address"),
+    })?;
+    socket.set_read_timeout(Some(ASKING_WITHIN)).map_err(|cause| cause.to_string())?;
+    socket.set_write_timeout(Some(ASKING_WITHIN)).map_err(|cause| cause.to_string())?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|cause| cause.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnything { provider }))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|cause| format!("{host}: not a usable server name: {cause}"))?;
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), name).map_err(|cause| cause.to_string())?;
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+
+    let request = format!(
+        "GET /relay HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nConnection: \
+         close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|cause| format!("the exchange with {host}:{port} failed: {cause}"))?;
+
+    let mut answer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                answer.extend_from_slice(chunk.get(..read).unwrap_or_default());
+                if answer.len() > ANSWER_LIMIT {
+                    return Err(format!("{host}:{port} answered with more than a relay's key"));
+                }
+            }
+            // A server that closes without TLS's own goodbye has still said
+            // everything it was going to.
+            Err(cause) if cause.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(cause) => return Err(format!("the exchange with {host}:{port} failed: {cause}")),
+        }
+    }
+    body_of(&answer).map_err(|why| format!("{host}:{port} {why}"))
+}
+
+/// The body of an HTTP/1.1 response that said 200, or what it said instead.
+fn body_of(response: &[u8]) -> Result<Vec<u8>, String> {
+    let end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "did not answer over HTTP".to_owned())?;
+    let head = String::from_utf8_lossy(response.get(..end).unwrap_or_default()).to_string();
+    let body = response.get(end.saturating_add(4)..).unwrap_or_default();
+    let mut lines = head.lines();
+    let status = lines.next().unwrap_or_default();
+    let code = status.split_whitespace().nth(1).unwrap_or_default();
+    match code {
+        "200" => {}
+        "404" => {
+            return Err("answered that it serves no relay key: is it a peerfectly relay \
+                        container?"
+                .to_owned());
+        }
+        _ => return Err(format!("answered `{}`", crate::control::shown(status))),
+    }
+    let chunked = lines.any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.starts_with("transfer-encoding:") && line.contains("chunked")
+    });
+    if chunked {
+        return Err("answered in a form a relay container does not use".to_owned());
+    }
+    Ok(body.to_vec())
+}
+
+/// A relay's key in groups of four hexadecimal digits, for a person to compare
+/// with the line the relay printed on its host.
+#[must_use]
+pub fn grouped_key(relay: &str) -> String {
+    let key = relay
+        .strip_prefix(transport_convesso::relay::TLS_PREFIX)
+        .unwrap_or(relay)
+        .split('@')
+        .next()
+        .unwrap_or_default();
+    key.as_bytes()
+        .chunks(4)
+        .map(|group| String::from_utf8_lossy(group).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Whether two relay addresses name the same relay.
 ///
-/// A relay is `key@host:port`, or `tls://key@host:port` (on this branch, the
-/// convesso binding's form): the same relay when the keys, the hosts compared
-/// without regard to case or a trailing dot, the ports and the use of TLS all
-/// agree. `transport_convesso::relay::same` decides.
+/// A relay is `key@host:port`, or `tls://key@host:port`: the same relay when the
+/// keys, the hosts compared without regard to case or a trailing dot, the ports
+/// and the use of TLS all agree. `transport_convesso::relay::same` decides.
 ///
 /// **Nothing is resolved.** An address and a name that resolves to it are two
 /// relays here: resolving to compare would be the contact this exists to
@@ -143,176 +292,49 @@ pub fn same_relay(one: &str, other: &str) -> bool {
     transport_convesso::relay::same(one, other)
 }
 
-/// Whether two URLs name the same host, whatever their scheme and port.
+/// Whether a signed relay is what a person asked for when they gave `given`.
 ///
-/// A name case-folded and without a trailing dot; an address as an address,
-/// so two spellings of one IPv6 address agree. Compared as written, never by
-/// resolving: a name and the address it resolves to are **different** hosts
-/// here, as they are to a certificate check.
+/// Written out, it must be the same relay. Given as a host, the key and port
+/// came from that host's answer, so the signed relay must be on that host: a
+/// daemon that asked one host and signed another's relay is caught here.
 #[must_use]
-pub fn same_host(one: &str, other: &str) -> bool {
-    match (host_of(one), host_of(other)) {
-        (Some(one), Some(other)) => one == other,
-        _ => false,
+pub fn answers_given(signed: &str, given: &str) -> bool {
+    match Given::read(given) {
+        Ok(Given::Written(written)) => same_relay(signed, &written),
+        Ok(Given::Asked { written, .. }) => transport_convesso::relay::parse(signed)
+            .ok()
+            .and_then(|location| {
+                location.host.rsplit_once(':').map(|(host, _)| host.to_ascii_lowercase())
+            })
+            .is_some_and(|host| {
+                host.trim_end_matches('.') == written.to_ascii_lowercase().trim_end_matches('.')
+            }),
+        Err(_) => false,
     }
 }
 
-/// The host a URL names, as [`same_host`] compares it.
-fn host_of(address: &str) -> Option<url::Host<String>> {
-    match url::Url::parse(address).ok()?.host()? {
-        url::Host::Domain(name) => {
-            let name = name.to_ascii_lowercase();
-            Some(url::Host::Domain(name.strip_suffix('.').map_or(name.clone(), str::to_owned)))
-        }
-        url::Host::Ipv4(address) => Some(url::Host::Ipv4(address)),
-        url::Host::Ipv6(address) => Some(url::Host::Ipv6(address)),
-    }
-}
-
-/// The first certificate the server at `host:port` presents.
+/// The SHA-256 of some bytes, in the shape `openssl` prints a fingerprint.
 ///
-/// # Errors
-///
-/// When the host cannot be reached or the handshake fails.
-pub fn presented_certificate(host: &str, port: u16) -> Result<Vec<u8>, Refusal> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_safe_default_protocol_versions()
-        .map_err(|cause| cause.to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnything { provider }))
-        .with_no_client_auth();
-
-    let name = rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|cause| format!("{host}: not a usable server name: {cause}"))?;
-    let mut connection =
-        rustls::ClientConnection::new(Arc::new(config), name).map_err(|cause| cause.to_string())?;
-    let mut socket = std::net::TcpStream::connect((host, port))
-        .map_err(|cause| format!("could not reach {host}:{port}: {cause}"))?;
-
-    while connection.is_handshaking() {
-        connection
-            .complete_io(&mut socket)
-            .map_err(|cause| format!("the handshake with {host}:{port} failed: {cause}"))?;
-    }
-
-    let presented = connection
-        .peer_certificates()
-        .and_then(|chain| chain.first().cloned())
-        .ok_or_else(|| format!("{host}:{port} presented no certificate"))?;
-    Ok(presented.to_vec())
-}
-
-/// Whether a verifying client can accept this certificate from `host`.
-///
-/// The certificate is pinned as the trust anchor *and* presented as the server's
-/// own certificate, so both roles have to hold at once. Checked because the
-/// failure is otherwise unreadable: the client sends a TLS alert, the relay logs
-/// it, and nothing on the machine that refused says a word.
-///
-/// Written after a real one. A certificate made with `openssl req -x509` carries
-/// `basicConstraints: CA:TRUE` by default, rustls refuses a certificate authority
-/// as an end entity, and the resulting `certificate_unknown` alert names nothing
-/// a person can act on.
-///
-/// # Errors
-///
-/// When no verifying client could accept it, with the reason spelled out.
-pub fn usable_as_a_server_certificate(certificate: &[u8], host: &str) -> Result<(), Refusal> {
-    use rustls::client::danger::ServerCertVerifier as _;
-
-    let der = rustls::pki_types::CertificateDer::from(certificate.to_vec());
-    let mut store = rustls::RootCertStore::empty();
-    let (accepted, _) = store.add_parsable_certificates([der.clone()]);
-    if accepted == 0 {
-        return Err("  it cannot be used as a trust anchor at all — the bytes parse as a \
-                    certificate but nothing can be verified against them"
-            .to_owned());
-    }
-
-    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(store),
-        Arc::new(rustls::crypto::ring::default_provider()),
-    )
-    .build()
-    .map_err(|cause| format!("  it cannot be used as a trust anchor: {cause}"))?;
-
-    let name = rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|cause| format!("  {host} is not a usable server name: {cause}"))?;
-
-    match verifier.verify_server_cert(&der, &[], &name, &[], rustls::pki_types::UnixTime::now()) {
-        Ok(_) => Ok(()),
-        Err(refusal) => Err(explain(&refusal, host)),
-    }
-}
-
-/// Turns a verification failure into something a person can act on.
-fn explain(refusal: &rustls::Error, host: &str) -> Refusal {
-    use rustls::CertificateError;
-
-    let rustls::Error::InvalidCertificate(reason) = refusal else {
-        return format!("  {refusal}");
-    };
-    match reason {
-        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
-            format!(
-                "  it does not cover {host}. A certificate for an address needs that\n  address \
-                 in its subjectAltName — `IP:{host}` for an address, `DNS:` for a\n  name — and \
-                 the relay has to be reached by exactly what is written there."
-            )
-        }
-        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-            "  it has expired. A pin is signed into the roster, so an expired certificate stops\n  \
-             the whole network reaching the relay until a `set_network` operation replaces it.\n  \
-             Issue a long-lived one before founding."
-                .to_owned()
-        }
-        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
-            "  it is not valid yet — check the clock on this machine and on the relay.".to_owned()
-        }
-        other => {
-            let described = format!("{other:?}");
-            if described.contains("CaUsedAsEndEntity") {
-                "  it is a certificate authority's certificate — `basicConstraints: CA:TRUE` —\n  \
-                 and a verifying client will not accept one as a server's own certificate.\n  \
-                 `openssl req -x509` sets that by default, which is how this usually happens.\n\n  \
-                 Either reissue the relay's certificate with \
-                 `basicConstraints=critical,CA:FALSE`,\n  or keep this one as an authority, serve \
-                 a certificate signed by it, and pin this\n  one with `--relay-cert` rather than \
-                 fetching."
-                    .to_owned()
-            } else {
-                format!("  {other:?}")
-            }
-        }
-    }
-}
-
-/// A certificate's SHA-256 fingerprint, in the shape `openssl` prints.
-///
-/// Colon-separated uppercase hex, so it can be compared against
-/// `openssl x509 -noout -fingerprint -sha256` character for character. A
-/// fingerprint in some other shape is one nobody checks.
+/// Colon-separated uppercase hex, so it can be compared character for
+/// character. A fingerprint in some other shape is one nobody checks.
 #[must_use]
-pub fn fingerprint(certificate: &[u8]) -> String {
+pub fn fingerprint(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
 
-    let digest = Sha256::digest(certificate);
+    let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":")
 }
 
-/// A verifier that accepts any certificate, because the point is to *see* one.
+/// A verifier that accepts any certificate, because nothing roots trust here
+/// before the key the person confirms.
 ///
-/// It exists only inside [`presented_certificate`], which authenticates nothing
-/// and says so. It must not migrate into the node: a device that accepted any
-/// relay certificate could be steered onto an impostor relay, which learns who
-/// talks to whom and when.
+/// It exists only inside [`fetch`], which authenticates nothing and says so. It
+/// must not migrate into the node.
 #[derive(Debug)]
 struct AcceptAnything {
     /// The provider whose algorithms verify the handshake signature.
     ///
-    /// The signature is still checked. Only the *identity* is unverified, which
-    /// is the question this fetch exists to put to a person.
+    /// The signature is still checked. Only the *identity* is unverified.
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
@@ -361,6 +383,47 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnything {
     }
 }
 
+/// A relay container for tests: a TLS server on the loopback that answers one
+/// request with `response`, a whole HTTP/1.1 response.
+#[cfg(test)]
+pub(crate) fn answering_once(response: String) -> u16 {
+    let issued =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("a certificate");
+    let presented = issued.cert.der().to_vec();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der());
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocols supported by ring")
+    .with_no_client_auth()
+    .with_single_cert(vec![rustls::pki_types::CertificateDer::from(presented)], key.into())
+    .expect("a usable key pair");
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("binds");
+    let port = listener.local_addr().expect("bound").port();
+    std::thread::spawn(move || {
+        let Ok((socket, _)) = listener.accept() else { return };
+        let Ok(server) = rustls::ServerConnection::new(Arc::new(config)) else { return };
+        let mut stream = rustls::StreamOwned::new(server, socket);
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        let _ = stream.write_all(response.as_bytes());
+        stream.conn.send_close_notify();
+        let _ = stream.flush();
+    });
+    port
+}
+
+/// A whole HTTP/1.1 response with `status` and `body`.
+#[cfg(test)]
+pub(crate) fn http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: \
+         close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
@@ -368,9 +431,14 @@ mod tests {
 
     /// A relay written as the convesso binding writes it, with the key of `seed`.
     fn relay(seed: u8, host: &str, tls: bool) -> String {
-        let identity = convesso_core::identity::Identity::from_ed25519_seed(&[seed; 32])
-            .expect("a seed is an identity");
-        transport_convesso::relay::written(identity.address().as_bytes(), host, tls)
+        transport_convesso::relay::written(&key(seed), host, tls)
+    }
+
+    fn key(seed: u8) -> [u8; 32] {
+        *convesso_core::identity::Identity::from_ed25519_seed(&[seed; 32])
+            .expect("a seed is an identity")
+            .address()
+            .as_bytes()
     }
 
     /// One relay, however its host is written.
@@ -423,142 +491,127 @@ mod tests {
         }
     }
 
-    /// A stand-in for a certificate: these tests are about which file shapes are
-    /// read, and the roster does not parse the bytes either.
-    const DER: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x00];
+    /// Every form a relay may be given in, and the ones refused.
+    #[test]
+    fn a_relay_is_read_in_each_form_it_may_be_given_in() {
+        let written = relay(1, "relay.example:8443", false);
+        assert_eq!(Given::read(&written), Ok(Given::Written(written.clone())));
+        let tls = relay(1, "relay.example:8443", true);
+        assert_eq!(Given::read(&tls), Ok(Given::Written(tls.clone())));
 
-    /// A self-signed certificate for `name`, as an authority or as a leaf — the
-    /// difference the usability check exists for.
-    fn self_signed(name: &str, authority: bool) -> Vec<u8> {
-        let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("params");
-        params.is_ca = if authority {
-            rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained)
-        } else {
-            rcgen::IsCa::NoCa
+        let asked = |host: &str, written: &str, port| Given::Asked {
+            host: host.to_owned(),
+            written: written.to_owned(),
+            port,
         };
-        let key = rcgen::KeyPair::generate().expect("a key");
-        params.self_signed(&key).expect("signs").der().to_vec()
+        for (text, expected) in [
+            ("relay.example", asked("relay.example", "relay.example", 443)),
+            ("204.216.216.139", asked("204.216.216.139", "204.216.216.139", 443)),
+            ("[2001:db8::1]", asked("2001:db8::1", "[2001:db8::1]", 443)),
+            ("https://relay.example", asked("relay.example", "relay.example", 443)),
+            ("https://relay.example:9443", asked("relay.example", "relay.example", 9443)),
+            ("https://[2001:db8::1]:9443", asked("2001:db8::1", "[2001:db8::1]", 9443)),
+            (" relay.example ", asked("relay.example", "relay.example", 443)),
+        ] {
+            assert_eq!(Given::read(text), Ok(expected), "`{text}`");
+        }
+
+        for refused in [
+            "relay.example:8443",
+            "204.216.216.139:8443",
+            "http://relay.example",
+            "https://relay.example/somewhere",
+            "",
+            "relay example",
+            "@relay.example:8443",
+        ] {
+            let refusal = Given::read(refused).expect_err(refused);
+            assert!(
+                refusal.contains("host of its peerfectly relay container")
+                    || refusal.contains("key"),
+                "{refusal}"
+            );
+        }
     }
 
-    /// The relay operator has a PEM file; the roster carries DER. Whichever they
-    /// point at, the same bytes end up signed.
+    /// The string signed is the key and port answered, on the host the person
+    /// gave, written as the binding writes it.
     #[test]
-    fn a_certificate_is_read_as_pem_or_as_der() {
-        let dir = tempfile::tempdir().expect("a scratch directory");
+    fn an_answer_makes_the_relay_string() {
+        let answer = Answer { key: hex::encode(key(3)), port: 8443, tls: false };
+        assert_eq!(answer.relay("relay.example"), Ok(relay(3, "relay.example:8443", false)));
+        assert_eq!(answer.relay("[2001:db8::1]"), Ok(relay(3, "[2001:db8::1]:8443", false)));
+        let wrapped = Answer { tls: true, ..answer.clone() };
+        assert_eq!(wrapped.relay("relay.example"), Ok(relay(3, "relay.example:8443", true)));
 
-        let pem = dir.path().join("relay.pem");
-        std::fs::write(&pem, "-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n")
-            .expect("writes");
-
-        let der = dir.path().join("relay.der");
-        std::fs::write(&der, DER).expect("writes");
-
-        assert_eq!(read_certificate(&pem.to_string_lossy()).expect("reads"), DER);
-        assert_eq!(read_certificate(&der.to_string_lossy()).expect("reads"), DER);
+        let short = Answer { key: "abcd".to_owned(), ..answer };
+        assert!(short.relay("relay.example").is_err());
     }
 
+    /// A signed relay answers what was asked: the same relay when written out,
+    /// a relay on that host when the host was asked.
     #[test]
-    fn a_file_that_is_not_a_certificate_is_refused() {
-        let dir = tempfile::tempdir().expect("a scratch directory");
-
-        let text = dir.path().join("notes.txt");
-        std::fs::write(&text, "the relay is at relay.example").expect("writes");
-        let refusal = read_certificate(&text.to_string_lossy()).expect_err("not a certificate");
-        assert!(refusal.contains("neither a PEM certificate nor DER"), "{refusal}");
-
-        let broken = dir.path().join("broken.pem");
-        std::fs::write(&broken, "-----BEGIN CERTIFICATE-----\nnot base64 at all\n")
-            .expect("writes");
-        let refusal = read_certificate(&broken.to_string_lossy()).expect_err("not a certificate");
-        assert!(refusal.contains("PEM"), "{refusal}");
+    fn a_signed_relay_answers_what_was_given() {
+        let signed = relay(4, "relay.example:8443", false);
+        assert!(answers_given(&signed, &signed));
+        assert!(answers_given(&signed, "relay.example"));
+        assert!(answers_given(&signed, "https://Relay.Example:9443"));
+        assert!(!answers_given(&signed, "other.example"));
+        assert!(!answers_given(&signed, &relay(5, "relay.example:8443", false)));
+        let six = relay(4, "[2001:db8::1]:8443", false);
+        assert!(answers_given(&six, "[2001:db8::1]"));
+        assert!(!answers_given(&signed, "relay.example:8443"), "not a form at all");
     }
 
-    /// The shape matters as much as the value: this is compared by eye against
-    /// what `openssl` prints on the relay host.
+    /// The key is shown in groups a person can compare by eye.
     #[test]
-    fn a_fingerprint_reads_the_way_openssl_prints_one() {
+    fn a_key_is_grouped_for_reading() {
+        let written = relay(1, "relay.example:8443", true);
+        let grouped = grouped_key(&written);
+        assert_eq!(grouped.replace(' ', ""), hex::encode(key(1)));
+        assert_eq!(grouped.split(' ').count(), 16);
+    }
+
+    /// Asked over TLS, against a real server, the answer becomes a relay.
+    #[test]
+    fn a_relay_container_is_asked_for_its_key() {
+        let body = format!(r#"{{"key":"{}","port":8443,"tls":false}}"#, hex::encode(key(5)));
+        let port = answering_once(http_response("200 OK", &body));
         assert_eq!(
-            fingerprint(DER),
-            "B5:60:83:3D:6F:78:7A:F4:61:13:B9:6A:AD:4D:D5:B5:\
-             D1:AE:00:DC:CC:69:CF:30:CC:92:BE:D6:51:C5:66:17"
+            ask("127.0.0.1", "relay.example", port),
+            Ok(relay(5, "relay.example:8443", false))
         );
     }
 
-    /// The port is where the relay is, and getting it wrong means fetching a
-    /// certificate from somewhere the network will never talk to. IPv6 literals
-    /// are here because hand-parsing is what gets them wrong.
+    /// What is not a relay container is refused, saying what it did.
     #[test]
-    fn a_relay_address_is_split_into_the_host_and_port_it_is_reached_on() {
-        for (address, host, port) in [
-            ("https://relay.example.com:4433", "relay.example.com", 4433),
-            ("https://relay.example.com", "relay.example.com", 443),
-            ("https://203.0.113.9:443", "203.0.113.9", 443),
-            ("https://[2001:db8::1]:4433", "2001:db8::1", 4433),
-        ] {
-            assert_eq!(host_and_port(address).expect("parses"), (host.to_owned(), port));
-        }
+    fn a_host_that_is_not_a_relay_container_is_refused() {
+        let port = answering_once(http_response("404 Not Found", ""));
+        let refusal = ask("127.0.0.1", "relay.example", port).expect_err("no key there");
+        assert!(refusal.contains("serves no relay key"), "{refusal}");
 
-        assert!(host_and_port("not an address").is_err());
+        let port = answering_once(http_response("200 OK", "<html>hello</html>"));
+        let refusal = ask("127.0.0.1", "relay.example", port).expect_err("not a key");
+        assert!(refusal.contains("not as a peerfectly relay container"), "{refusal}");
+
+        let port = answering_once(http_response("500 Internal Server Error", ""));
+        let refusal = ask("127.0.0.1", "relay.example", port).expect_err("an error");
+        assert!(refusal.contains("500"), "{refusal}");
+
+        let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let nobody = closed.local_addr().unwrap().port();
+        drop(closed);
+        let refusal = ask("127.0.0.1", "relay.example", nobody).expect_err("nobody there");
+        assert!(refusal.contains("could not reach"), "{refusal}");
     }
 
-    /// A certificate a client cannot accept must be refused where a person can
-    /// read it, not pinned and left to become a TLS alert in the relay's log.
+    /// The shape matters as much as the value: compared by eye.
     #[test]
-    fn a_certificate_the_relay_cannot_present_is_refused_with_the_reason() {
-        let authority = self_signed("203.0.113.10", true);
-        let refusal = usable_as_a_server_certificate(&authority, "203.0.113.10")
-            .expect_err("a certificate authority is not a server certificate");
-        assert!(refusal.contains("CA:FALSE"), "{refusal}");
-        assert!(refusal.contains("--relay-cert"), "the other way out is named: {refusal}");
-
-        let leaf = self_signed("203.0.113.10", false);
-        usable_as_a_server_certificate(&leaf, "203.0.113.10").expect("a leaf is usable");
-
-        let elsewhere = usable_as_a_server_certificate(&leaf, "203.0.113.7")
-            .expect_err("a certificate for one address is not one for another");
-        assert!(elsewhere.contains("subjectAltName"), "{elsewhere}");
-    }
-
-    /// The fetch is exercised against a real TLS server rather than asserted
-    /// about. What gets signed into a roster must be exactly the bytes the
-    /// server presented — a fetch that returned anything else would pin a
-    /// certificate nobody has.
-    #[test]
-    fn the_certificate_fetched_is_the_one_the_server_presented() {
-        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-            .expect("a certificate");
-        let presented = issued.cert.der().to_vec();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der());
-
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("protocols supported by ring")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(presented.clone())],
-            key.into(),
-        )
-        .expect("a usable key pair");
-
-        let listener =
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("binds");
-        let port = listener.local_addr().expect("bound").port();
-        std::thread::spawn(move || {
-            let Ok((mut socket, _)) = listener.accept() else {
-                return;
-            };
-            let Ok(mut server) = rustls::ServerConnection::new(Arc::new(config)) else {
-                return;
-            };
-            // The client hangs up as soon as it has the certificate, so a
-            // failure here is the expected end of the conversation.
-            let _ = server.complete_io(&mut socket);
-        });
-
-        let fetched = presented_certificate("127.0.0.1", port).expect("fetches");
-        assert_eq!(fetched, presented, "the bytes pinned must be the bytes presented");
-        assert_eq!(fingerprint(&fetched), fingerprint(&presented));
+    fn a_fingerprint_reads_the_way_openssl_prints_one() {
+        assert_eq!(
+            fingerprint(&[0x30, 0x03, 0x02, 0x01, 0x00]),
+            "B5:60:83:3D:6F:78:7A:F4:61:13:B9:6A:AD:4D:D5:B5:\
+             D1:AE:00:DC:CC:69:CF:30:CC:92:BE:D6:51:C5:66:17"
+        );
     }
 }

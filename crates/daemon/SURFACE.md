@@ -73,7 +73,7 @@ These fields carry strings exactly as another device signed them:
 | `Peer::name`, `Named::name` | whoever admitted or renamed the device |
 | `Revocation::reason` | the admin that revoked |
 | `Act::Renames(_, to)` | the device that signed the rename |
-| `Network::relay`, `Network::rendezvous` | the founder, in the signed parameters |
+| `Network::relay` | the founder, in the signed parameters |
 | `Fault::cause` | this device, but it can quote any of the above |
 
 A renderer must draw control characters, bidirectional formatting characters

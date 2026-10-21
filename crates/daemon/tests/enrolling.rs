@@ -266,8 +266,6 @@ fn founded(paths: &Paths, relay: &str) -> roster::state::RosterState {
             name: "nas".to_owned(),
             suffix: "peerfectly.internal".to_owned(),
             relay: Some(relay.to_owned()),
-            rendezvous: None,
-            certificate: None,
             ipv4_range: None,
         },
     )
@@ -350,7 +348,6 @@ async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
 
     assert_eq!(joined.devices, 2, "every device appears together, not only the admin");
     assert_eq!(joined.suffix, "peerfectly.internal");
-    assert!(joined.relay_confirmed, "a relay trusted by its key, never on sight");
     assert!(said.contains("adopted"), "{said}");
 
     // The joining device wrote the network, and it is the same network.

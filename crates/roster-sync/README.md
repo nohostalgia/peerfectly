@@ -51,8 +51,7 @@ a missing revocation is the wrong trade at this size.
 
 **Symmetric.** There is no server. §4.7's *"no privileged channel"* is a
 security property rather than a convenience: a protocol where one side asks and
-the other answers has a role in it that a rendezvous or a relay would eventually
-be given.
+the other answers has a role in it that a relay would eventually be given.
 
 **Push carries the operation, not a notification.** An operation admitted locally
 goes whole to every open session except the one it came from. Announcing would
@@ -153,7 +152,7 @@ in a chosen order rather than as races.
 The tests run it over both `MemoryTransport` and `DirectTransport`. Those two are
 behaviourally interchangeable by construction — one suite, two independent
 internals — so a reconciliation working over both works over anything satisfying
-that suite, which `transport-iroh` must.
+that suite, which `transport-convesso` does.
 
 ## What is tested
 
@@ -171,8 +170,7 @@ that suite, which `transport-iroh` must.
 
 | Deferred | To | Why |
 |---|---|---|
-| Dialling, addressing, NAT, relays | `transport-iroh` | needs a real-world NAT test; this crate needs no network at all |
-| The relay path that lets two nodes meet | `rendezvous-service` | signed records with a monotone sequence, a separate concern |
+| Dialling, addressing, NAT, relays | `transport-convesso` | needs a real-world NAT test; this crate needs no network at all |
 | Multicast announcement on a LAN | `local-discovery` | |
 | Detecting that an author equivocated across peers | `equivocation-detection` | this crate must preserve the evidence, not act on it |
 | Timers, scheduling, the concurrency shape | `windows-daemon` | it will know the session lifetimes and power constraints |

@@ -141,7 +141,7 @@ A ─── transfer ─▶ B
 **Symmetric.** There is no server. A node that has just joined and the node that
 founded the network run the same exchange. §4.7 says there is no privileged
 channel, and a protocol where one side asks and the other answers has a
-privileged role in it — one a rendezvous or relay would eventually be given.
+privileged role in it — one a relay would eventually be given.
 
 **Terminating by structure, not by negotiation.** Each side sends one offer and
 one answer. There is no state machine to be left waiting in, and an interrupted
@@ -274,8 +274,7 @@ Collected, because each is a way to be subtly wrong:
 
 | Not here | Where |
 |---|---|
-| Dialling, addressing, NAT, relays | `transport`, `transport-iroh` |
-| The relay path that lets two nodes meet | `rendezvous-service` |
-| Multicast announcement on a LAN | `local-discovery` |
+| Dialling, addressing, NAT, relays | `transport`, `transport-convesso` |
+| How two nodes meet: announcements on a LAN, and the relay elsewhere | `local-discovery`, `transport-convesso` |
 | Detecting that an author equivocated across peers | `equivocation-detection` |
 | Timers, scheduling, the concurrency shape | `windows-daemon` |

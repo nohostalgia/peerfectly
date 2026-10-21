@@ -114,6 +114,15 @@
          elevated. -->
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)notice.rtf" />
+    <!-- The pictures, from branding/installer, written out as bitmaps by
+         package.ps1: the banner across the top of the notice and the progress,
+         the dialog behind the first and last pages. -->
+    <WixVariable Id="WixUIBannerBmp" Value="$(Stage)\installer-banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(Stage)\installer-dialog.bmp" />
+
+    <!-- The icon the programs carry, for the list of installed apps. -->
+    <Icon Id="peerfectly.ico" SourceFile="$(sys.SOURCEFILEDIR)peerfectly.ico" />
+    <Property Id="ARPPRODUCTICON" Value="peerfectly.ico" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open peerfectly in the notification area" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <SetProperty Id="WixShellExecTarget" Value="[ProgramMenuFolder]peerfectly.lnk" After="CostFinalize" Sequence="ui" />

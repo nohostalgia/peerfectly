@@ -167,24 +167,12 @@ fn now_ms() -> u64 {
         .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// A relay, from the roster: its string, and the pinned value beside it.
-///
-/// The string is `key@host:port` (`crate::relay`). A pinned value is what the
-/// iroh binding writes, a certificate, and a network written for it cannot be
-/// read here: refused, saying so, rather than read as a relay never reached.
+/// A relay, from the roster: its string, `key@host:port` (`crate::relay`).
 ///
 /// # Errors
 ///
-/// When the string is not a relay, or a value is pinned beside it.
-pub fn relay_location(address: &str, pin: Option<&[u8]>) -> Result<RelayLocation> {
-    if pin.is_some() {
-        return Err(BuildError::UnusableRelay {
-            reason: "the network pins a certificate for its relay, as the iroh binding writes \
-                     it; this build speaks convesso, whose relays carry their key in their \
-                     address"
-                .to_owned(),
-        });
-    }
+/// When the string is not a relay.
+pub fn relay_location(address: &str) -> Result<RelayLocation> {
     crate::relay::parse(address)
         .map_err(|cause| BuildError::UnusableRelay { reason: cause.to_string() })
 }
@@ -192,8 +180,8 @@ pub fn relay_location(address: &str, pin: Option<&[u8]>) -> Result<RelayLocation
 /// The relay a node lives on at `now`: the relay being left while a move
 /// lasts, the relay otherwise.
 ///
-/// **Everybody on the old relay until the end, then everybody on the new one**,
-/// as in the iroh binding. convesso keeps one relay at a time
+/// **Everybody on the old relay until the end, then everybody on the new one.**
+/// convesso keeps one relay at a time
 /// (`DESIGN.md §6`): peers on different relays reach each other only directly,
 /// so the moment everybody switches is the end of the move, which every device
 /// reads from the same signed parameters.
@@ -203,10 +191,10 @@ pub fn relay_location(address: &str, pin: Option<&[u8]>) -> Result<RelayLocation
 /// When the relay is not one this build can use.
 pub fn home_at(params: &NetworkParams, now: u64) -> Result<Option<RelayLocation>> {
     if let Some(leaving) = params.leaving_at(now) {
-        return relay_location(&leaving.relay, leaving.relay_cert.as_deref()).map(Some);
+        return relay_location(&leaving.relay).map(Some);
     }
     match params.relay.as_deref() {
-        Some(address) => relay_location(address, params.relay_cert.as_deref()).map(Some),
+        Some(address) => relay_location(address).map(Some),
         None => Ok(None),
     }
 }
@@ -220,6 +208,30 @@ impl ConvessoTransport {
     /// When the transport key is not ed25519, the relay's pinned key is not
     /// one, or the node cannot start.
     pub async fn bind(identity: &NodeIdentity, state: RosterState) -> Result<Self> {
+        Self::bind_with(identity, state, None).await
+    }
+
+    /// [`Self::bind`], with convesso resolving the relay's host through
+    /// `resolver` rather than the system: for tests of a name that resolves
+    /// late, which the system's resolver cannot be made to do.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bind`].
+    #[cfg(feature = "fixture")]
+    pub async fn bind_resolving(
+        identity: &NodeIdentity,
+        state: RosterState,
+        resolver: convesso_tokio::Resolver,
+    ) -> Result<Self> {
+        Self::bind_with(identity, state, Some(resolver)).await
+    }
+
+    async fn bind_with(
+        identity: &NodeIdentity,
+        state: RosterState,
+        resolver: Option<convesso_tokio::Resolver>,
+    ) -> Result<Self> {
         let key = identity.transport_key();
         if key.algorithm() != Algorithm::Ed25519 {
             return Err(BuildError::NotEd25519 { algorithm: key.algorithm() });
@@ -228,7 +240,10 @@ impl ConvessoTransport {
             .map_err(|cause| BuildError::Start(cause.to_string()))?;
         let home = home_at(&state.params, now_ms())?;
 
-        let config = Config { relay: home.clone(), ..Config::default() };
+        // The host is resolved by convesso when it needs the relay, so a name
+        // that does not resolve yet stops nothing: the node starts, reaches its
+        // LAN, and takes the relay once the name answers.
+        let config = Config { relay: home.clone(), resolver, ..Config::default() };
         let (node, node_events) =
             convesso_tokio::start_with_stream::<Stream, _>(own, config, OsEntropy)
                 .await
@@ -249,6 +264,15 @@ impl ConvessoTransport {
             node.set_reachable(true).await.map_err(|cause| BuildError::Start(cause.to_string()))?;
         }
 
+        // Known before the node is handed over, so the first announcement on
+        // the LAN carries them. Asked for in the background, they were not
+        // there yet, and the next announcement was five seconds away
+        // (`convesso-reach` 5.4).
+        let addresses = node.candidates().await.map_or_else(
+            |_| Vec::new(),
+            |candidates| candidates.iter().map(|candidate| candidate.address.to_string()).collect(),
+        );
+
         let (incoming, accepted) = mpsc::channel(limits::MAX_PENDING_DIALS);
         let (outbound, queued) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
@@ -261,14 +285,13 @@ impl ConvessoTransport {
             dials: std::sync::Mutex::new(HashMap::new()),
             incoming,
             outbound,
-            addresses: std::sync::Mutex::new(Vec::new()),
+            addresses: std::sync::Mutex::new(addresses),
             relay: std::sync::Mutex::new(home),
             online: watch::Sender::new(false),
             readers: std::sync::Mutex::new(HashMap::new()),
             move_ends: std::sync::Mutex::new(None),
             following: std::sync::Mutex::new(None),
         });
-        refresh_addresses(&shared);
         ensure_readers(&shared);
         schedule_move_end(&shared, &state.params);
         let tasks = vec![
@@ -288,9 +311,8 @@ impl ConvessoTransport {
 
     /// Waits until the relay has this node registered, so peers reach it there.
     ///
-    /// For a caller that must not dial into a race with a peer still coming up,
-    /// as `iroh`'s `Endpoint::online` is for the iroh binding. Returns at once
-    /// for a node with no relay.
+    /// For a caller that must not dial into a race with a peer still coming up.
+    /// Returns at once for a node with no relay.
     pub async fn online(&self) {
         let has_relay = self.shared.relay.lock().is_ok_and(|relay| relay.is_some());
         if has_relay {
@@ -337,8 +359,7 @@ impl Transport for ConvessoTransport {
 
         // Decided now, acted on once the far end has answered. A dialler that
         // refused before sending anything would leave the far end's `accept`
-        // waiting for ever; this one dials, as the iroh binding does, and closes
-        // what it opened (design D3).
+        // waiting for ever; this one dials, and closes what it opened (design D3).
         let verdict = {
             let state = shared.state.lock().await;
             transport::auth::authorize(&state, &peer.key_id())
@@ -804,12 +825,25 @@ fn fail_dials(shared: &Shared, peer: &PeerId, error: &Error) {
 }
 
 /// Answers a dial `id` from `peer`.
+///
+/// **A session accepted for a dial this side gave up on is closed.** The far
+/// end holds it as open, and a peer that holds a session nobody here reads
+/// keeps choosing it over every new one (`convesso-reach` 5.4).
 fn answer_dial(shared: &Shared, id: SessionId, peer: &PeerId, answer: Answer) {
     let dial = shared.dials.lock().ok().and_then(|mut dials| {
         if dials.get(&id).is_some_and(|dial| dial.peer == *peer) { dials.remove(&id) } else { None }
     });
-    if let Some(dial) = dial {
-        let _ = dial.answer.send(answer);
+    let unwanted = match dial {
+        // Sent back when whoever dialled has stopped waiting.
+        Some(dial) => dial.answer.send(answer).err(),
+        None => Some(answer),
+    };
+    if matches!(unwanted, Some(Answer::Accepted)) {
+        if let Ok(mut sessions) = shared.sessions.lock() {
+            sessions.remove(&id);
+        }
+        let close = Frame::Close { id, reason: Reason::Ordinary }.encode();
+        let _ = shared.outbound.send(Out::Reply(*peer, close));
     }
 }
 
@@ -844,7 +878,13 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
     sessions.insert(id, Arc::clone(&live));
     let replaced = shared.accepted_from.lock().ok().and_then(|mut from| from.insert(peer, id));
     if let Some(older) = replaced.and_then(|older| sessions.get(&older).cloned()) {
-        older.shut(Error::ClosedByPeer);
+        // The dialler is told. It may still hold the older one: two dials in
+        // flight at once, and, not told, it kept a session this side no
+        // longer reads (`convesso-reach` 5.4).
+        if older.shut(Error::ClosedByPeer) {
+            let close = Frame::Close { id: older.id, reason: Reason::Ordinary }.encode();
+            let _ = shared.outbound.send(Out::Reply(peer, close));
+        }
     }
     drop(sessions);
 
@@ -934,20 +974,16 @@ mod tests {
         }
     }
 
-    /// The roster's relay is read through `crate::relay`, and a pinned value,
-    /// which only the iroh binding writes, is refused.
+    /// The roster's relay is read through `crate::relay`, and anything else is
+    /// refused.
     #[test]
-    fn a_relay_is_its_string_and_a_pin_is_refused() {
+    fn a_relay_is_its_string() {
         let key = convesso_core::identity::Identity::from_ed25519_seed(&[3; 32]).unwrap();
         let written = crate::relay::written(key.address().as_bytes(), "relay.example:7400", true);
-        let read = relay_location(&written, None).unwrap();
+        let read = relay_location(&written).unwrap();
         assert_eq!((read.host.as_str(), read.tls), ("relay.example:7400", true));
         assert!(matches!(
-            relay_location(&written, Some(&[0x30; 400])),
-            Err(BuildError::UnusableRelay { .. })
-        ));
-        assert!(matches!(
-            relay_location("https://relay.example:443", None),
+            relay_location("https://relay.example:443"),
             Err(BuildError::UnusableRelay { .. })
         ));
     }

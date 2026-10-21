@@ -294,9 +294,10 @@ than one that admits it.
 ## Three ways to find a peer, and the relay is the last
 
 §2.9 orders the paths: the local network, then addresses cached from when it
-was, then the rendezvous, then the relay. The relay alone would work — it
-introduces two peers and iroh punches a direct path from there — but it needs the
-internet and a server, and two machines in one room should not need either.
+was, then the relay. The relay alone would work — a session opens through it,
+the two ends swap their addresses there and probe them at once, and the session
+moves to a direct path when one answers — but it needs the internet and a
+server, and two machines in one room should not need either.
 
 [`discovery.rs`](src/discovery.rs) runs what the relay does not provide.
 **Announcing** puts this device's addresses on a multicast group every few
@@ -304,8 +305,9 @@ seconds, signed with its transport key, and immediately whenever they change —
 the case that matters is a laptop moving from tethering to home Wi-Fi, half a
 metre from its own server. **Listening** hears others do it, checks the
 announcing key against the roster, and hands the addresses to the transport as a
-hint. **Publishing** does the same through the rendezvous for peers that are not
-on this network, and the cache is consulted before the rendezvous is asked.
+hint. **Hinting** offers the transport what was heard before, from a cache kept
+across restarts, for peers that have no session. A dial tries every hint at
+once, and the relay a quarter of a second later.
 
 Two properties hold this together. **Nothing here decides anything**: an address
 is a hint, and a session opened over one is authorised from the signed roster

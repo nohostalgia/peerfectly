@@ -30,7 +30,6 @@ async fn an_exchange_binds_both_ends_to_one_channel() {
 
     let waiting = Waiting::listen(&joining, &relay.written()).await.unwrap();
     tokio::time::timeout(PATIENCE, waiting.online()).await.expect("registers at the relay");
-    assert!(waiting.accepted_on_sight().is_none(), "nothing is trusted on sight");
     assert_eq!(waiting.relay(), relay.written());
 
     let admitting = Admitting::dialling(&network.founder, &network.state).await.unwrap();

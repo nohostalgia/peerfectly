@@ -30,8 +30,8 @@ pub const FORM: &str = "<key>@host:port, or tls://<key>@host:port, where <key> i
 /// Why a string is not a relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayError {
-    /// A relay of another kind: an `https://` URL, written for the iroh binding.
-    OtherKind,
+    /// A scheme other than `tls://`, such as an `https://` URL.
+    Scheme,
     /// No key in front of the address.
     NoKey,
     /// The key is not one.
@@ -43,9 +43,7 @@ pub enum RelayError {
 impl fmt::Display for RelayError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OtherKind => {
-                write!(f, "this build speaks convesso, and a relay is written {FORM}")
-            }
+            Self::Scheme => write!(f, "a relay is written {FORM}"),
             Self::NoKey => write!(f, "the relay's key is missing: a relay is written {FORM}"),
             Self::Key(reason) => write!(f, "the relay's key is unusable: {reason}"),
             Self::Address(reason) => write!(f, "the relay's address is unusable: {reason}"),
@@ -66,7 +64,7 @@ pub fn parse(text: &str) -> Result<RelayLocation, RelayError> {
         None => (text, false),
     };
     if rest.contains("://") {
-        return Err(RelayError::OtherKind);
+        return Err(RelayError::Scheme);
     }
     let (key, host) = rest.split_once('@').ok_or(RelayError::NoKey)?;
     let address = key_of(key)?;
@@ -179,10 +177,10 @@ mod tests {
     }
 
     #[test]
-    fn a_relay_of_the_other_kind_is_refused_saying_so() {
+    fn a_relay_with_another_scheme_is_refused_saying_how_one_is_written() {
         let refused = parse("https://relay.example:443").unwrap_err();
-        assert_eq!(refused, RelayError::OtherKind);
-        assert!(refused.to_string().contains("convesso"));
+        assert_eq!(refused, RelayError::Scheme);
+        assert!(refused.to_string().contains("tls://<key>@host:port"));
         assert_eq!(parse("relay.example:7400"), Err(RelayError::NoKey));
     }
 

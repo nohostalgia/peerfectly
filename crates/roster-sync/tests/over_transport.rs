@@ -3,7 +3,7 @@
 //! Run against both of `transport`'s implementations. They are behaviourally
 //! interchangeable by construction — one suite, two independent internals — so a
 //! reconciliation that works over both works over anything satisfying that
-//! suite, which `transport-iroh` must.
+//! suite, which `transport-convesso` does.
 //!
 //! The loop here is the *caller's*, which is the point of the syncer owning no
 //! runtime: `windows-daemon` will write a different one, knowing things this crate

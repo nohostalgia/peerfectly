@@ -144,7 +144,7 @@ mod tests {
 
     /// A network founded by one device, with a second admitted.
     fn network() -> (RosterState, Arc<NodeIdentity>, Arc<NodeIdentity>) {
-        let network = crate::fixture::Network::found(None, None);
+        let network = crate::fixture::Network::found(None);
         (network.state, network.founder, network.joiner)
     }
 

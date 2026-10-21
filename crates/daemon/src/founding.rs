@@ -31,12 +31,8 @@ pub struct Founding {
     pub name: String,
     /// The DNS suffix every name in the network sits under.
     pub suffix: String,
-    /// The relay, if the network has one.
+    /// The relay, if the network has one, as it will be signed: `key@host:port`.
     pub relay: Option<String>,
-    /// The rendezvous, if the network has one.
-    pub rendezvous: Option<String>,
-    /// The relay's certificate to pin, if one is being pinned.
-    pub certificate: Option<Vec<u8>>,
     /// The IPv4 range the network's devices derive their addresses in, if one
     /// other than the default was chosen.
     pub ipv4_range: Option<roster::types::Ipv4Range>,
@@ -327,20 +323,10 @@ fn parameters(identity: &NodeIdentity, wanted: &Founding) -> Result<NetworkParam
     )
     .map_err(|cause| cause.to_string())?;
 
-    let params = match wanted.certificate.clone() {
-        Some(certificate) => params.pinning(certificate).map_err(|cause| cause.to_string())?,
-        None => params,
-    };
-
-    let params = match wanted.ipv4_range {
+    Ok(match wanted.ipv4_range {
         Some(range) => params.in_ipv4_range(range),
         None => params,
-    };
-
-    match wanted.rendezvous.clone() {
-        Some(address) => params.meeting_at(address).map_err(|cause| cause.to_string()),
-        None => Ok(params),
-    }
+    })
 }
 
 /// The network's ULA prefix, derived from the founding device.
@@ -409,8 +395,6 @@ mod tests {
             name: "nas".to_owned(),
             suffix: "peerfectly.internal".to_owned(),
             relay: Some("https://relay.example:443".to_owned()),
-            rendezvous: None,
-            certificate: None,
             ipv4_range: None,
         }
     }
@@ -559,21 +543,17 @@ mod tests {
         assert_eq!(prefix.first(), Some(&0xfd), "unique-local, as RFC 4193 requires");
     }
 
-    /// A pinned certificate and a rendezvous both reach the signed parameters,
-    /// where every device will read them.
+    /// The relay a person supplies reaches the signed parameters, where every
+    /// device will read it.
     #[test]
     fn what_a_person_supplies_ends_up_signed() {
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let paths = Paths::under(scratch.path());
 
-        let mut asked = wanted();
-        asked.certificate = Some(vec![0x30, 0x01, 0x02]);
-        asked.rendezvous = Some("https://meet.example".to_owned());
-        found(&paths, &asked).expect("founds");
+        found(&paths, &wanted()).expect("founds");
 
         let state = state_at(&paths);
-        assert_eq!(state.params.relay_cert.as_deref(), Some([0x30, 0x01, 0x02].as_slice()));
-        assert_eq!(state.params.rendezvous.as_deref(), Some("https://meet.example"));
+        assert_eq!(state.params.relay.as_deref(), Some("https://relay.example:443"));
     }
 
     /// The roster's own rules decide what a parameter may be, and founding does

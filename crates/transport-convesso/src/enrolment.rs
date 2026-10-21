@@ -1,6 +1,5 @@
 //! The endpoints two devices use to enrol, and nothing else.
 //!
-//! The same shape as the iroh binding's, so the daemon calls them alike:
 //! [`Waiting`] accepts and cannot dial; [`Admitting`] dials and serves nothing
 //! anyone can open; a [`Channel`] carries whole messages and the material a
 //! confirmation code is bound to.
@@ -281,13 +280,6 @@ impl Waiting {
     #[must_use]
     pub fn transport_key(&self) -> PublicKey {
         self.endpoint.own()
-    }
-
-    /// Always `None`: a convesso relay is trusted by the key written with its
-    /// address, never on sight.
-    #[must_use]
-    pub const fn accepted_on_sight(&self) -> Option<Vec<u8>> {
-        None
     }
 
     /// Waits for somebody to open an enrolment exchange.

@@ -606,15 +606,6 @@ pub struct Network {
     /// command run as the person and writing to another. Nothing else in this
     /// report would show it, and it cost a day of two-machine testing once.
     pub relay: Option<String>,
-    /// The rendezvous it uses, as its roster names it.
-    pub rendezvous: Option<String>,
-    /// Whether that roster pins the relay's certificate, or, on the branch
-    /// `convesso-transport`, names a relay by its key, which is its pin.
-    ///
-    /// Without a pin a relay presenting a self-signed certificate is refused, no
-    /// device registers a home relay, and every peer reads `not reachable` with
-    /// no mention of a certificate anywhere.
-    pub relay_pinned: bool,
     /// The relay this network is moving away from, while the move lasts.
     ///
     /// **Shown because whoever runs the old relay needs to know it is still
@@ -791,7 +782,7 @@ impl fmt::Display for Trouble {
                 "this device has an identity for that network and no roster. Nothing arrived, or what arrived was lost. Joining again is what fixes it."
             }
             Self::RosterRefused => {
-                "that network's roster is here and this version will not load it. It was written by a build whose rules differ, or the file has been damaged. Nothing has been removed."
+                "that network's roster is here and this version will not load it. It was written by a build whose rules differ — a network made before this build is founded again — or the file has been damaged. Nothing has been removed."
             }
             Self::RosterProvesNothing => {
                 "that network's roster is here and describes no network this device belongs to. Nothing has been removed."
@@ -904,27 +895,6 @@ impl Report {
             _ => None,
         }
     }
-}
-
-/// Which certificate a founding network pins for its relay.
-///
-/// Modelled rather than left as an `Option<Vec<u8>>` plus a flag, because the
-/// third case is not a certificate at all: it is an instruction to go and get one
-/// and show a person what came back. Only that case needs somebody to look at a
-/// fingerprint before anything is signed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Certificate {
-    /// None pinned. A relay whose certificate verifies by ordinary means.
-    None,
-    /// These bytes, read from a file the person named.
-    Given(Vec<u8>),
-    /// Whatever the relay presents — to be shown to a person before it is pinned.
-    ///
-    /// Nothing has vouched for it: anyone in the path could have answered. So the
-    /// daemon fetches, reports the fingerprint, and signs nothing until somebody
-    /// confirms it against the relay host.
-    FromTheRelay,
 }
 
 /// A signing key the daemon needs and cannot make.
@@ -1215,8 +1185,7 @@ impl Command {
             | Self::Admit { network, .. }
             | Self::Revoke { network, .. }
             | Self::Rename { network, .. }
-            | Self::ChangeRelay { network, .. }
-            | Self::ChangeRendezvous { network, .. } => Needs::TheOwnerOf(network.clone()),
+            | Self::ChangeRelay { network, .. } => Needs::TheOwnerOf(network.clone()),
             Self::Expose { network, .. } | Self::Unexpose { network, .. } => {
                 Needs::TheOwnerOfAsAdministrator(network.clone())
             }
@@ -1291,8 +1260,8 @@ pub enum Command {
     ///
     /// Two things wait that way: an **admission**, after a person has looked at
     /// the device being enrolled and seen it say the code was accepted; and a
-    /// **founding**, after a person has checked a relay certificate's
-    /// fingerprint. Neither carries a value, because in both the person is
+    /// **founding** or a **relay change**, after a person has checked the key a
+    /// relay's host said it serves. Neither carries a value, because in both the person is
     /// answering a question about something already on screen.
     ///
     /// A **join** is the one that does not belong here: what its person supplies
@@ -1393,12 +1362,9 @@ pub enum Command {
         name: String,
         /// The DNS suffix every name in the network sits under.
         suffix: String,
-        /// The relay, if the network has one.
+        /// The relay, if the network has one: `key@host:port`, or a host whose
+        /// relay container is asked for its key (`crate::relay::Given`).
         relay: Option<String>,
-        /// The rendezvous, if the network has one.
-        rendezvous: Option<String>,
-        /// Which certificate, if any, the network pins for its relay.
-        certificate: Certificate,
         /// The IPv4 range every device of the network derives its IPv4 address
         /// in, as `a.b.c.d/len`, or `None` for the default.
         ///
@@ -1473,22 +1439,10 @@ pub enum Command {
     ChangeRelay {
         /// Which network, or `None` when only one could be meant.
         network: Option<String>,
-        /// The relay to move to.
+        /// The relay to move to, as `Found`'s is given.
         relay: String,
-        /// Whether to fetch its certificate, show it, and pin it once confirmed.
-        /// `false` for a relay with a publicly trusted certificate that renews.
-        pin: bool,
         /// Whether to move at once, with no transition.
         immediately: bool,
-    },
-
-    /// Set or remove a network's rendezvous, as its admin: a signed change of
-    /// its parameters, as a relay change is.
-    ChangeRendezvous {
-        /// Which network, or `None` when only one could be meant.
-        network: Option<String>,
-        /// The rendezvous, an HTTPS address, or `None` to remove it.
-        rendezvous: Option<String>,
     },
 
     /// Open a port on this machine to one network, and to nothing else (F-11).
@@ -1597,11 +1551,8 @@ impl Command {
                                              peerfectly rename --id <id> <new name> [--network N]";
 
     /// The usage line for moving a network to another relay.
-    pub const RELAY_USAGE: &'static str = "peerfectly relay <KEY@HOST:PORT> [--network N] [--now]";
-
-    /// The usage line for setting or removing a network's rendezvous.
-    pub const RENDEZVOUS_USAGE: &'static str =
-        "peerfectly rendezvous <https address> | --none [--network N]";
+    pub const RELAY_USAGE: &'static str =
+        "peerfectly relay <HOST | https://HOST:PORT | KEY@HOST:PORT> [--network N] [--now]";
 
     /// The usage lines for exposing a service to one network.
     pub const EXPOSE_USAGE: &'static str = "peerfectly expose <network> tcp|udp <port>\n       \
@@ -1651,78 +1602,26 @@ impl Command {
         let usage = || format!("usage: {}", Self::RELAY_USAGE);
         let mut relay = None;
         let mut network = None;
-        let mut pin = true;
         let mut immediately = false;
         let mut rest = words.iter();
         while let Some(word) = rest.next() {
             match word.as_str() {
                 "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
-                "--no-relay-cert" => pin = false,
                 "--now" => immediately = true,
                 flag if flag.starts_with("--") => return Err(usage()),
                 // An empty word is not an address: taken as one, it would be a
-                // move to nowhere, found out only once a certificate had been
-                // asked for.
+                // move to nowhere, found out only once a host had been asked.
                 address if relay.is_none() && !address.is_empty() => {
                     relay = Some(address.to_owned());
                 }
                 _ => return Err(usage()),
             }
         }
-        Ok(Self::ChangeRelay { network, relay: relay.ok_or_else(usage)?, pin, immediately })
-    }
-
-    /// Reads a rendezvous change from the words after `rendezvous`.
-    ///
-    /// # Errors
-    ///
-    /// When neither an address nor `--none` is given, both are, a flag is not
-    /// one this knows, or the address is not HTTPS.
-    pub fn rendezvous_change(words: &[String]) -> core::result::Result<Self, String> {
-        let usage = || format!("usage: {}", Self::RENDEZVOUS_USAGE);
-        let mut address = None;
-        let mut none = false;
-        let mut network = None;
-        let mut rest = words.iter();
-        while let Some(word) = rest.next() {
-            match word.as_str() {
-                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
-                "--none" => none = true,
-                flag if flag.starts_with("--") => return Err(usage()),
-                given if address.is_none() && !given.is_empty() => {
-                    address = Some(given.to_owned());
-                }
-                _ => return Err(usage()),
-            }
-        }
-        match (address, none) {
-            (Some(address), false) => {
-                Self::rendezvous_address(&address)?;
-                Ok(Self::ChangeRendezvous { network, rendezvous: Some(address) })
-            }
-            (None, true) => Ok(Self::ChangeRendezvous { network, rendezvous: None }),
-            _ => Err(usage()),
-        }
-    }
-
-    /// Whether an address can be a rendezvous: HTTPS, with a host.
-    ///
-    /// Checked by the command line and again by the daemon, which does not
-    /// trust whoever sent the command to have checked it.
-    ///
-    /// # Errors
-    ///
-    /// When it does not parse, is not `https`, or names no host.
-    pub fn rendezvous_address(address: &str) -> core::result::Result<(), String> {
-        let parsed = url::Url::parse(address)
-            .map_err(|cause| format!("`{}` is not an address: {cause}", shown(address)))?;
-        if parsed.scheme() != "https" || parsed.host().is_none() {
-            return Err(format!(
-                "`{}` is not an HTTPS address: a rendezvous is only spoken to over TLS",
-                shown(address)
-            ));
-        }
-        Ok(())
+        let relay = relay.ok_or_else(usage)?;
+        // Read here as the daemon will read it, so a form it would refuse is
+        // refused before anything is sent.
+        crate::relay::Given::read(&relay)?;
+        Ok(Self::ChangeRelay { network, relay, immediately })
     }
 
     /// Reads a revocation from the words after `revoke`.
@@ -1936,7 +1835,6 @@ impl Command {
             Self::Signed { .. } => ("signed", None),
             Self::TakeOwnership { network } => ("takeownership", network.as_deref()),
             Self::ChangeRelay { network, .. } => ("relay", network.as_deref()),
-            Self::ChangeRendezvous { network, .. } => ("rendezvous", network.as_deref()),
             Self::Expose { network, .. } => ("expose", network.as_deref()),
             Self::Unexpose { network, .. } => ("unexpose", network.as_deref()),
             Self::KeyMade { .. } => ("key made", None),
@@ -1958,7 +1856,7 @@ impl Outcome {
             Self::Enrolling => "enrolling",
             Self::Joining { .. } => "joining",
             Self::Adopted { .. } => "adopted",
-            Self::Pinning { .. } => "pinning",
+            Self::ConfirmingRelay { .. } => "confirming a relay",
             Self::NeedsSignatures(_) => "needs signatures",
             Self::Declined { .. } => "declined",
             Self::NeedsKey(_) => "needs a key",
@@ -2104,8 +2002,6 @@ pub enum Outcome {
         suffix: String,
         /// How many devices it has, this one included.
         devices: usize,
-        /// Whether the relay this device used was confirmed by the network.
-        relay_confirmed: bool,
         /// Whether that network is carrying traffic once the join has ended.
         ///
         /// A first join leaves it down: §2.6b makes turning a network on the
@@ -2116,19 +2012,18 @@ pub enum Outcome {
         carrying: bool,
     },
 
-    /// A relay certificate is waiting to be confirmed before it is pinned.
+    /// A relay's key, asked of its host, is waiting to be confirmed before it is
+    /// signed.
     ///
-    /// Nothing has been signed. Nothing has vouched for this certificate either:
-    /// anyone in the path could have answered, which is why a person is asked to
-    /// compare the fingerprint against the relay host before it becomes part of a
+    /// Nothing has been signed. Nothing has vouched for this key either: anyone
+    /// in the path could have answered, which is why a person is asked to compare
+    /// it with the key the relay printed on its host before it becomes part of a
     /// signed network.
-    Pinning {
-        /// The relay it came from.
+    ConfirmingRelay {
+        /// The relay as it will be signed: `key@host:port`.
         relay: String,
-        /// Its SHA-256 fingerprint, in the shape `openssl x509` prints.
-        fingerprint: String,
-        /// How many bytes of DER, so a person can see it is a certificate.
-        der_len: usize,
+        /// Its key, in groups of four hexadecimal digits, for a person to compare.
+        key: String,
         /// The network being moved to this relay, or `None` for a founding.
         /// A screen resumed from `Waiting` must still say which act it confirms.
         #[serde(default)]
@@ -2323,8 +2218,6 @@ mod tests {
             owner_taken: false,
             confirmation: None,
             relay: Some("https://relay.example:443".to_owned()),
-            rendezvous: Some("https://meet.example".to_owned()),
-            relay_pinned: true,
             relay_leaving: None,
             accused: Vec::new(),
             peers: vec![Peer {
@@ -2489,31 +2382,16 @@ mod tests {
 
     /// The daemon and the person can be reading two different rosters, so what
     /// the daemon loaded has to be visible rather than inferred from behaviour.
-    /// An unpinned relay reads as unreachable peers and nothing else, which is
-    /// what made this worth a line of its own.
     #[test]
-    fn the_relay_and_whether_it_is_pinned_are_reported() {
-        let pinned = report(Standing::Current, Vec::new()).to_string();
-        assert!(
-            pinned.contains("relay https://relay.example:443 (certificate pinned)"),
-            "{pinned}"
-        );
-
-        let mut unpinned = report(Standing::Current, Vec::new());
-        the_one(&mut unpinned).relay_pinned = false;
-        assert!(unpinned.to_string().contains("(no certificate pinned)"), "{unpinned}");
-
-        let mut convesso = report(Standing::Current, Vec::new());
-        the_one(&mut convesso).relay = Some(format!("{}@relay.example:7400", "0".repeat(64)));
-        the_one(&mut convesso).relay_pinned = false;
-        assert!(convesso.to_string().contains("(no certificate pinned)"), "not a key: {convesso}");
+    fn the_relay_is_reported_as_trusted_by_its_key() {
+        let mut reported = report(Standing::Current, Vec::new());
         let key = convesso_core::identity::Identity::from_ed25519_seed(&[5; 32]).unwrap();
-        the_one(&mut convesso).relay = Some(transport_convesso::relay::written(
+        the_one(&mut reported).relay = Some(transport_convesso::relay::written(
             key.address().as_bytes(),
             "relay.example:7400",
             false,
         ));
-        assert!(convesso.to_string().contains("(trusted by its key)"), "{convesso}");
+        assert!(reported.to_string().contains("(trusted by its key)"), "{reported}");
 
         let mut none = report(Standing::Current, Vec::new());
         the_one(&mut none).relay = None;
@@ -3155,7 +3033,6 @@ mod tests {
         let mut report = report(Standing::Current, vec![revocation_owed_to(&[(hostile, false)])]);
         let network = the_one(&mut report);
         network.relay = Some(hostile.to_owned());
-        network.rendezvous = Some(hostile.to_owned());
         if let Some(peer) = network.peers.first_mut() {
             peer.name = hostile.to_owned();
         }
@@ -3314,36 +3191,8 @@ mod tests {
         assert!(!drawn.contains("1970"), "{drawn}");
     }
 
-    /// **A rendezvous change is an HTTPS address or `--none`, never both, never
-    /// neither**, and it is the network's owner's to ask.
-    #[test]
-    fn a_rendezvous_change_is_read_from_its_words() {
-        let words = |text: &str| text.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
-
-        assert_eq!(
-            Ok(Command::ChangeRendezvous {
-                network: None,
-                rendezvous: Some("https://203.0.113.10:8444".to_owned())
-            }),
-            Command::rendezvous_change(&words("https://203.0.113.10:8444"))
-        );
-        assert_eq!(
-            Ok(Command::ChangeRendezvous { network: Some("casa".to_owned()), rendezvous: None }),
-            Command::rendezvous_change(&words("--none --network casa"))
-        );
-        for refused in ["", "http://a.example:8444", "https://a.example --none", "a.example", "--x"]
-        {
-            assert!(Command::rendezvous_change(&words(refused)).is_err(), "`{refused}`");
-        }
-
-        let casa = Some("casa".to_owned());
-        assert_eq!(
-            Needs::TheOwnerOf(casa.clone()),
-            Command::ChangeRendezvous { network: casa, rendezvous: None }.needs()
-        );
-    }
-
-    /// A relay change is a transition that pins, unless it is told otherwise.
+    /// A relay change is a transition, unless it is told otherwise, to a relay
+    /// in a form the daemon reads.
     #[test]
     fn a_relay_change_is_read_from_its_words() {
         let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
@@ -3352,22 +3201,27 @@ mod tests {
             Ok(Command::ChangeRelay {
                 network: None,
                 relay: "https://b.example".to_owned(),
-                pin: true,
                 immediately: false,
             }),
             Command::relay_change(&words("https://b.example")),
-            "by default: a transition, and the certificate confirmed and pinned"
+            "by default: a transition"
         );
         assert_eq!(
             Ok(Command::ChangeRelay {
                 network: Some("casa".to_owned()),
-                relay: "https://b.example".to_owned(),
-                pin: false,
+                relay: "b.example".to_owned(),
                 immediately: true,
             }),
-            Command::relay_change(&words("--now https://b.example --network casa --no-relay-cert"))
+            Command::relay_change(&words("--now b.example --network casa"))
         );
-        for wrong in ["", "--now", "https://a https://b", "https://a --frobnicate"] {
+        for wrong in [
+            "",
+            "--now",
+            "https://a https://b",
+            "https://a --frobnicate",
+            "b.example --colour",
+            "b.example:8443",
+        ] {
             assert!(Command::relay_change(&words(wrong)).is_err(), "`{wrong}` is not a change");
         }
     }

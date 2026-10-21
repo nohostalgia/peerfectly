@@ -236,7 +236,6 @@ mod tests {
             .join("\n");
         for speaking in [
             "ConvessoTransport::bind",
-            "IrohTransport::bind",
             "Waiting::listen",
             "Tun::open",
             "connectivity.start",

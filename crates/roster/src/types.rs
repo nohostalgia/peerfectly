@@ -58,14 +58,14 @@ pub const DEVICE_RECORD_SCHEMA: &[&str] =
 ///
 /// `ipv4` and `leaving` may be absent: see [`NETWORK_PARAMS_OPTIONAL`].
 pub const NETWORK_PARAMS_SCHEMA: &[&str] =
-    &["ula", "ipv4", "relay", "suffix", "leaving", "relay_cert", "rendezvous", "snapshot_window"];
+    &["ula", "ipv4", "relay", "suffix", "leaving", "snapshot_window"];
 /// The keys of the network parameters that may be absent.
 ///
 /// Each is left out when absent rather than written empty, so that parameters
 /// without it encode exactly as they did before it existed.
 pub const NETWORK_PARAMS_OPTIONAL: &[&str] = &["ipv4", "leaving"];
 /// Field names of a relay being left, in canonical order.
-pub const LEAVING_SCHEMA: &[&str] = &["relay", "until", "relay_cert"];
+pub const LEAVING_SCHEMA: &[&str] = &["relay", "until"];
 /// Field names of a `create_network` body, in canonical order.
 pub const CREATE_NETWORK_SCHEMA: &[&str] = &["device", "params"];
 /// Field names of a `revoke_device` body, in canonical order.
@@ -161,7 +161,7 @@ impl Algorithm {
 pub enum KeyPurpose {
     /// Signs roster operations.
     Signing,
-    /// Establishes transport sessions; the iroh `NodeId`.
+    /// Establishes transport sessions; what a device is dialled by.
     Transport,
     /// Signs attestations, which date a roster and describe none.
     ///
@@ -791,8 +791,6 @@ impl core::str::FromStr for Ipv4Range {
 pub struct Leaving {
     /// The relay being left.
     pub relay: String,
-    /// Its certificate, if the network pinned one.
-    pub relay_cert: Option<Vec<u8>>,
     /// When the transition ends, in milliseconds since the epoch — the same
     /// clock operations are dated by.
     pub until: u64,
@@ -830,46 +828,11 @@ pub struct NetworkParams {
     ///
     /// `None` is a network with no relay: one confined to a LAN, or one still
     /// being set up. It is not the same as an empty address, which is refused.
+    ///
+    /// The address names the relay's key as well as where it is
+    /// (`key@host:port`), so the roster authenticates the relay with nothing
+    /// beside it.
     pub relay: Option<String>,
-    /// The relay's certificate, if the network pins one. DER.
-    ///
-    /// Present so the **roster** authenticates the relay. The address above says
-    /// where to go; this says who must be there. Without it a node reaching that
-    /// address trusts whatever certificate authority happens to vouch for
-    /// whoever answers — and a relay learns who talks to whom and when, which is
-    /// the one thing §2.8 is careful about even though the relay can read
-    /// nothing.
-    ///
-    /// Pinning here rather than leaning on the certificate authorities is the
-    /// same argument the product rests on: the trust root belongs to the network,
-    /// on its own devices, not to a third party. It also makes a self-signed
-    /// relay a first-class arrangement rather than a workaround — which matters
-    /// to anyone running one on an address with no domain name.
-    ///
-    /// `None` is a network whose relay presents an ordinary publicly trusted
-    /// certificate, or one with no relay at all.
-    pub relay_cert: Option<Vec<u8>>,
-    /// The rendezvous service this network uses, if it has one.
-    ///
-    /// Where a device publishes the addresses it believes it can be reached at,
-    /// and where it looks for a peer's. §2.9 makes it the third path tried,
-    /// after the local network and the cached addresses.
-    ///
-    /// Here for the reason the relay is here. Whoever answers this address
-    /// learns which devices are looking for which others and when — less than
-    /// the relay learns, and still more than a third party should. Left to local
-    /// configuration, no two nodes would necessarily agree and anyone able to
-    /// write that file could substitute their own. Signed, it is one answer,
-    /// changed by `set_network` like anything else.
-    ///
-    /// The records it stores are signed and sequence-numbered by the devices
-    /// themselves, so a hostile rendezvous can withhold and delay but cannot
-    /// forge an address or roll one back. That is why an address is enough here
-    /// and no certificate is pinned beside it, unlike the relay.
-    ///
-    /// `None` is a network with no rendezvous: one confined to a LAN, or one
-    /// relying on the relay's own path discovery.
-    pub rendezvous: Option<String>,
     /// The DNS suffix, under `.internal`.
     pub suffix: String,
     /// The relay this network is moving away from, while it is.
@@ -920,16 +883,7 @@ impl NetworkParams {
             }
             _ => {}
         }
-        Ok(Self {
-            ula,
-            ipv4: None,
-            relay,
-            relay_cert: None,
-            rendezvous: None,
-            suffix,
-            leaving: None,
-            snapshot_window,
-        })
+        Ok(Self { ula, ipv4: None, relay, suffix, leaving: None, snapshot_window })
     }
 
     /// Chooses the IPv4 range. The range was checked when it was built.
@@ -943,25 +897,6 @@ impl NetworkParams {
     #[must_use]
     pub fn ipv4_range(&self) -> Ipv4Range {
         self.ipv4.unwrap_or(Ipv4Range::DEFAULT)
-    }
-
-    /// Pins the relay's certificate.
-    ///
-    /// # Errors
-    ///
-    /// When the certificate is empty or longer than the bound. Empty is refused
-    /// rather than treated as absence: absence already has an encoding, and a
-    /// second spelling of the same thing would mean two byte strings decoding to
-    /// one value.
-    pub fn pinning(mut self, certificate: Vec<u8>) -> Result<Self> {
-        if certificate.is_empty() {
-            return Err(Error::InvalidValue("empty relay certificate"));
-        }
-        if certificate.len() > limits::MAX_RELAY_CERT_LEN {
-            return Err(Error::LimitExceeded("relay certificate length"));
-        }
-        self.relay_cert = Some(certificate);
-        Ok(self)
     }
 
     /// The parameters for moving this network to `relay`, issued at `issued`
@@ -979,30 +914,18 @@ impl NetworkParams {
     ///
     /// # Errors
     ///
-    /// As [`Self::leaving`], and when the new relay or certificate is outside its
-    /// bound.
-    pub fn moving_to(
-        &self,
-        relay: impl Into<String>,
-        relay_cert: Option<Vec<u8>>,
-        issued: u64,
-    ) -> Result<Self> {
+    /// As [`Self::leaving`], and when the new relay is outside its bound.
+    pub fn moving_to(&self, relay: impl Into<String>, issued: u64) -> Result<Self> {
         let relay = relay.into();
         let window_ms = self.snapshot_window.saturating_mul(1_000);
-        let leaving = self.relay.clone().map(|current| Leaving {
-            relay: current,
-            relay_cert: self.relay_cert.clone(),
-            until: issued.saturating_add(window_ms),
-        });
+        let leaving = self
+            .relay
+            .clone()
+            .map(|current| Leaving { relay: current, until: issued.saturating_add(window_ms) });
 
         let mut moved =
             Self::with_relay(self.ula.clone(), Some(relay), &*self.suffix, self.snapshot_window)?;
         moved.ipv4 = self.ipv4;
-        moved.rendezvous = self.rendezvous.clone();
-        let moved = match relay_cert {
-            Some(certificate) => moved.pinning(certificate)?,
-            None => moved,
-        };
         match leaving {
             Some(leaving) => moved.leaving(leaving),
             None => Ok(moved),
@@ -1020,12 +943,8 @@ impl NetworkParams {
     ///
     /// # Errors
     ///
-    /// When the new relay or certificate is outside its bound.
-    pub fn switching_to(
-        &self,
-        relay: impl Into<String>,
-        relay_cert: Option<Vec<u8>>,
-    ) -> Result<Self> {
+    /// When the new relay is outside its bound.
+    pub fn switching_to(&self, relay: impl Into<String>) -> Result<Self> {
         let mut moved = Self::with_relay(
             self.ula.clone(),
             Some(relay.into()),
@@ -1033,11 +952,7 @@ impl NetworkParams {
             self.snapshot_window,
         )?;
         moved.ipv4 = self.ipv4;
-        moved.rendezvous = self.rendezvous.clone();
-        match relay_cert {
-            Some(certificate) => moved.pinning(certificate),
-            None => Ok(moved),
-        }
+        Ok(moved)
     }
 
     /// The relay being left, while the transition has not ended at `now`
@@ -1057,8 +972,7 @@ impl NetworkParams {
     ///
     /// When there is no relay to move *to* — a network leaving a relay for none
     /// would be one reachable on nothing once the transition ended — when the
-    /// relay being left is the relay, or when it or its certificate is outside
-    /// its bound. The relay is compared as written: two spellings of one relay
+    /// relay being left is the relay, or when it is outside its bound. The relay is compared as written: two spellings of one relay
     /// are refused before anything is signed, where the network's own relays
     /// can be compared the way admission compares them.
     pub fn leaving(mut self, leaving: Leaving) -> Result<Self> {
@@ -1074,45 +988,17 @@ impl NetworkParams {
         if leaving.relay.len() > limits::MAX_RELAY_LEN {
             return Err(Error::LimitExceeded("relay address length"));
         }
-        match &leaving.relay_cert {
-            Some(certificate) if certificate.is_empty() => {
-                return Err(Error::InvalidValue("empty relay certificate"));
-            }
-            Some(certificate) if certificate.len() > limits::MAX_RELAY_CERT_LEN => {
-                return Err(Error::LimitExceeded("relay certificate length"));
-            }
-            _ => {}
-        }
         self.leaving = Some(leaving);
-        Ok(self)
-    }
-
-    /// Names the rendezvous service.
-    ///
-    /// # Errors
-    ///
-    /// When the address is empty or longer than the bound. Empty is refused for
-    /// the reason an empty relay address is: absence already has an encoding.
-    pub fn meeting_at(mut self, address: impl Into<String>) -> Result<Self> {
-        let address = address.into();
-        if address.is_empty() {
-            return Err(Error::InvalidValue("empty rendezvous address"));
-        }
-        if address.len() > limits::MAX_RENDEZVOUS_LEN {
-            return Err(Error::LimitExceeded("rendezvous address length"));
-        }
-        self.rendezvous = Some(address);
         Ok(self)
     }
 
     /// Writes the parameters.
     ///
-    /// The relay, its certificate and the rendezvous are each an array of
-    /// nothing or of one value, so absence has exactly one encoding. The IPv4
-    /// range is instead left out when absent, so that parameters without one
-    /// encode exactly as they did before it existed.
+    /// The relay is an array of nothing or of one value, so absence has exactly
+    /// one encoding. The IPv4 range is instead left out when absent, so that
+    /// parameters without one encode exactly as they did before it existed.
     pub(crate) fn encode(&self, writer: &mut Writer) {
-        let present = 6_u64
+        let present = 4_u64
             .saturating_add(u64::from(self.ipv4.is_some()))
             .saturating_add(u64::from(self.leaving.is_some()));
         writer.map(present);
@@ -1132,39 +1018,9 @@ impl NetworkParams {
         }
         writer.key("suffix").str(&self.suffix);
         if let Some(leaving) = &self.leaving {
-            writer.key("leaving").map(3);
+            writer.key("leaving").map(2);
             writer.key("relay").str(&leaving.relay);
             writer.key("until").u64(leaving.until);
-            writer.key("relay_cert");
-            match &leaving.relay_cert {
-                Some(certificate) => {
-                    writer.array(1);
-                    writer.bytes(certificate);
-                }
-                None => {
-                    writer.array(0);
-                }
-            }
-        }
-        writer.key("relay_cert");
-        match &self.relay_cert {
-            Some(certificate) => {
-                writer.array(1);
-                writer.bytes(certificate);
-            }
-            None => {
-                writer.array(0);
-            }
-        }
-        writer.key("rendezvous");
-        match &self.rendezvous {
-            Some(address) => {
-                writer.array(1);
-                writer.str(address);
-            }
-            None => {
-                writer.array(0);
-            }
         }
         writer.key("snapshot_window").u64(self.snapshot_window);
     }
@@ -1191,8 +1047,8 @@ impl NetworkParams {
             }
         };
         let suffix = map.key("suffix")?.str(limits::MAX_SUFFIX_LEN, "suffix length")?.to_owned();
-        // One key holding all three, so a relay being left without an end, or an
-        // end without a relay, is not something the encoding can say at all.
+        // One key holding both, so a relay being left without an end, or an end
+        // without a relay, is not something the encoding can say at all.
         let leaving = match map.optional_key("leaving")? {
             Some(value) => {
                 let mut group = value.map(LEAVING_SCHEMA)?;
@@ -1201,39 +1057,10 @@ impl NetworkParams {
                     .str(limits::MAX_RELAY_LEN, "relay address length")?
                     .to_owned();
                 let until = group.key("until")?.u64()?;
-                let relay_cert = {
-                    let certificate = group.key("relay_cert")?;
-                    match certificate.array(1, "relay_cert")? {
-                        0 => None,
-                        _ => Some(
-                            certificate
-                                .bytes(limits::MAX_RELAY_CERT_LEN, "relay certificate length")?
-                                .to_vec(),
-                        ),
-                    }
-                };
                 group.finish()?;
-                Some(Leaving { relay, relay_cert, until })
+                Some(Leaving { relay, until })
             }
             None => None,
-        };
-        let relay_cert = {
-            let value = map.key("relay_cert")?;
-            match value.array(1, "relay_cert")? {
-                0 => None,
-                _ => Some(
-                    value.bytes(limits::MAX_RELAY_CERT_LEN, "relay certificate length")?.to_vec(),
-                ),
-            }
-        };
-        let rendezvous = {
-            let value = map.key("rendezvous")?;
-            match value.array(1, "rendezvous")? {
-                0 => None,
-                _ => Some(
-                    value.str(limits::MAX_RENDEZVOUS_LEN, "rendezvous address length")?.to_owned(),
-                ),
-            }
         };
         let snapshot_window = map.key("snapshot_window")?.u64()?;
         map.finish()?;
@@ -1241,14 +1068,6 @@ impl NetworkParams {
         let params = Self::with_relay(ula, relay, suffix, snapshot_window)?;
         let params = match ipv4 {
             Some(range) => params.in_ipv4_range(range),
-            None => params,
-        };
-        let params = match relay_cert {
-            Some(certificate) => params.pinning(certificate)?,
-            None => params,
-        };
-        let params = match rendezvous {
-            Some(address) => params.meeting_at(address)?,
             None => params,
         };
         match leaving {
@@ -1597,29 +1416,21 @@ mod tests {
     /// A move carries the relay it leaves, and changes nothing else.
     #[test]
     fn a_move_carries_the_relay_it_leaves_and_nothing_else() {
-        let before = on("https://a.example:443")
-            .pinning(vec![0xaa; 4])
-            .expect("pins")
-            .in_ipv4_range("10.42.0.0/16".parse().expect("allowed"))
-            .meeting_at("https://meet.example")
-            .expect("names it");
+        let before =
+            on("https://a.example:443").in_ipv4_range("10.42.0.0/16".parse().expect("allowed"));
 
         let issued = 1_735_689_600_000;
-        let after =
-            before.moving_to("https://b.example:443", Some(vec![0xbb; 4]), issued).expect("moves");
+        let after = before.moving_to("https://b.example:443", issued).expect("moves");
 
         assert_eq!(Some("https://b.example:443"), after.relay.as_deref());
-        assert_eq!(Some(vec![0xbb; 4]), after.relay_cert);
         let leaving = after.leaving.clone().expect("it is leaving something");
         assert_eq!("https://a.example:443", leaving.relay);
-        assert_eq!(Some(vec![0xaa; 4]), leaving.relay_cert, "with the certificate it had");
         assert_eq!(issued + 604_800 * 1_000, leaving.until, "one freshness window after");
 
         // Everything else, untouched.
         assert_eq!(before.ula, after.ula);
         assert_eq!(before.ipv4, after.ipv4);
         assert_eq!(before.suffix, after.suffix);
-        assert_eq!(before.rendezvous, after.rendezvous);
         assert_eq!(before.snapshot_window, after.snapshot_window);
 
         assert_eq!(Ok(after.clone()), round_trip(&after), "and it survives its own encoding");
@@ -1629,10 +1440,9 @@ mod tests {
     #[test]
     fn a_move_during_a_move_drops_the_older_relay() {
         let issued = 1_735_689_600_000;
-        let to_b = on("https://a.example:443")
-            .moving_to("https://b.example:443", None, issued)
-            .expect("moves");
-        let to_c = to_b.moving_to("https://c.example:443", None, issued + 1).expect("moves again");
+        let to_b =
+            on("https://a.example:443").moving_to("https://b.example:443", issued).expect("moves");
+        let to_c = to_b.moving_to("https://c.example:443", issued + 1).expect("moves again");
 
         assert_eq!(Some("https://c.example:443"), to_c.relay.as_deref());
         let leaving = to_c.leaving.expect("leaving the one it was on");
@@ -1650,8 +1460,8 @@ mod tests {
         fn to_c_encoded(writer: &mut cbor::Writer) {
             let issued = 1_735_689_600_000;
             on("https://a.example:443")
-                .moving_to("https://b.example:443", None, issued)
-                .and_then(|to_b| to_b.moving_to("https://c.example:443", None, issued + 1))
+                .moving_to("https://b.example:443", issued)
+                .and_then(|to_b| to_b.moving_to("https://c.example:443", issued + 1))
                 .expect("moves")
                 .encode(writer);
         }
@@ -1662,7 +1472,7 @@ mod tests {
     fn a_first_relay_is_not_a_move() {
         let none = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 604_800)
             .expect("well-formed");
-        let given = none.moving_to("https://a.example:443", None, 1).expect("given one");
+        let given = none.moving_to("https://a.example:443", 1).expect("given one");
         assert_eq!(Some("https://a.example:443"), given.relay.as_deref());
         assert!(given.leaving.is_none(), "there was nothing to leave");
     }
@@ -1671,8 +1481,8 @@ mod tests {
     #[test]
     fn an_immediate_move_leaves_nothing_to_find() {
         let moving =
-            on("https://a.example:443").moving_to("https://b.example:443", None, 1).expect("moves");
-        let now = moving.switching_to("https://c.example:443", None).expect("switches");
+            on("https://a.example:443").moving_to("https://b.example:443", 1).expect("moves");
+        let now = moving.switching_to("https://c.example:443").expect("switches");
         assert_eq!(Some("https://c.example:443"), now.relay.as_deref());
         assert!(now.leaving.is_none(), "no relay being left, not even the one in flight");
         assert_eq!(moving.suffix, now.suffix);
@@ -1681,8 +1491,7 @@ mod tests {
     /// The group is refused where it cannot mean anything.
     #[test]
     fn a_relay_being_left_is_refused_where_it_means_nothing() {
-        let leaving =
-            |relay: &str| Leaving { relay: relay.to_owned(), relay_cert: None, until: 10 };
+        let leaving = |relay: &str| Leaving { relay: relay.to_owned(), until: 10 };
 
         let same = on("https://a.example:443").leaving(leaving("https://a.example:443"));
         assert_eq!(Err(Error::InvalidValue("the relay being left is the relay")), same);
@@ -1705,15 +1514,12 @@ mod tests {
     #[test]
     fn a_partial_group_does_not_decode() {
         let mut writer = cbor::Writer::new();
-        writer.map(7);
+        writer.map(5);
         writer.key("ula").bytes(&[0xfd, 0, 0, 0, 0, 0, 0, 0]);
         writer.key("relay").array(1).str("https://b.example:443");
         writer.key("suffix").str("casa.internal");
-        writer.key("leaving").map(2);
+        writer.key("leaving").map(1);
         writer.key("relay").str("https://a.example:443");
-        writer.key("relay_cert").array(0);
-        writer.key("relay_cert").array(0);
-        writer.key("rendezvous").array(0);
         writer.key("snapshot_window").u64(604_800);
         let bytes = writer.finish();
 
@@ -1726,9 +1532,8 @@ mod tests {
     #[test]
     fn a_transition_ends_on_its_own() {
         let issued = 1_000;
-        let moving = on("https://a.example:443")
-            .moving_to("https://b.example:443", None, issued)
-            .expect("moves");
+        let moving =
+            on("https://a.example:443").moving_to("https://b.example:443", issued).expect("moves");
         let end = issued + 604_800 * 1_000;
 
         assert!(moving.leaving_at(end - 1).is_some(), "still in use a moment before");
@@ -1839,10 +1644,6 @@ mod tests {
         out.push(0x80);
         text(&mut out, "suffix");
         text(&mut out, "example.internal");
-        text(&mut out, "relay_cert");
-        out.push(0x80);
-        text(&mut out, "rendezvous");
-        out.push(0x80);
         text(&mut out, "snapshot_window");
         out.push(0x01);
         out
@@ -1851,20 +1652,36 @@ mod tests {
     /// The parameters map by hand with a chosen prefix and suffix, so a decoder
     /// can be offered values no encoder here would produce.
     fn hand_built_with(ula: &[u8], suffix: &str) -> Vec<u8> {
-        let mut out = vec![0xa6];
+        let mut out = vec![0xa4];
         text(&mut out, "ula");
         bytes(&mut out, ula);
         text(&mut out, "relay");
         out.push(0x80);
         text(&mut out, "suffix");
         text(&mut out, suffix);
-        text(&mut out, "relay_cert");
-        out.push(0x80);
-        text(&mut out, "rendezvous");
-        out.push(0x80);
         text(&mut out, "snapshot_window");
         out.push(0x01);
         out
+    }
+
+    /// A parameter this format does not name is refused, so a map carrying one
+    /// is never read half.
+    #[test]
+    fn a_parameter_this_format_does_not_name_is_refused() {
+        for (key, entries) in [("unexpected", 0xa5), ("relay_note", 0xa5)] {
+            let mut out = vec![entries];
+            text(&mut out, "ula");
+            bytes(&mut out, &[0xfd, 0, 0, 0, 0, 0, 0, 0]);
+            text(&mut out, "relay");
+            out.push(0x80);
+            text(&mut out, "suffix");
+            text(&mut out, "example.internal");
+            text(&mut out, key);
+            out.push(0x80);
+            text(&mut out, "snapshot_window");
+            out.push(0x01);
+            assert_eq!(decoded(&out), Err(Error::UnknownField), "{key}");
+        }
     }
 
     fn plain() -> NetworkParams {
@@ -1889,8 +1706,8 @@ mod tests {
     /// existing operation id moves.
     #[test]
     fn parameters_without_a_range_encode_as_before() {
-        assert_eq!(encoded(&plain()), hand_built(6, &[]));
-        assert_eq!(decoded(&hand_built(6, &[])), Ok(plain()));
+        assert_eq!(encoded(&plain()), hand_built(4, &[]));
+        assert_eq!(decoded(&hand_built(4, &[])), Ok(plain()));
         assert_eq!(plain().ipv4_range(), Ipv4Range::DEFAULT);
     }
 
@@ -1899,7 +1716,7 @@ mod tests {
         let range = Ipv4Range::new([10, 42, 0, 0], 16).unwrap_or_else(|_| unreachable!());
         let params = plain().in_ipv4_range(range);
         let bytes = encoded(&params);
-        assert_eq!(bytes, hand_built(7, &[&[10, 42, 0, 0, 16]]));
+        assert_eq!(bytes, hand_built(5, &[&[10, 42, 0, 0, 16]]));
         assert_eq!(decoded(&bytes), Ok(params));
         assert_eq!(decoded(&bytes).map(|params| params.ipv4_range()), Ok(range));
     }
@@ -1908,16 +1725,15 @@ mod tests {
     #[test]
     fn a_range_cannot_be_spelled_two_ways() {
         assert_eq!(
-            decoded(&hand_built(7, &[&[]])),
+            decoded(&hand_built(5, &[&[]])),
             Err(Error::InvalidValue("empty ipv4 range")),
             "an empty value is not absence"
         );
         assert_eq!(
-            decoded(&hand_built(7, &[&[10, 42, 0, 1, 16]])),
+            decoded(&hand_built(5, &[&[10, 42, 0, 1, 16]])),
             Err(Error::InvalidValue("ipv4 range has host bits set"))
         );
-        // One more than the schema, from the schema: this was `8`, and stopped
-        // being one too many when `leaving` made the schema eight keys long.
+        // One more than the schema, from the schema.
         let too_many = u8::try_from(NETWORK_PARAMS_SCHEMA.len() + 1).unwrap_or(u8::MAX);
         assert_eq!(
             decoded(&hand_built(
@@ -1928,16 +1744,16 @@ mod tests {
             "a map one entry too long is refused on its count"
         );
         assert_eq!(
-            decoded(&hand_built(7, &[&[10, 42, 0, 0, 16], &[10, 42, 0, 0, 16]])),
+            decoded(&hand_built(5, &[&[10, 42, 0, 0, 16], &[10, 42, 0, 0, 16]])),
             Err(Error::DuplicateKey),
             "a repeated key within the count is refused as a repetition"
         );
         assert_eq!(
-            decoded(&hand_built(7, &[&[10, 42, 0, 0]])),
+            decoded(&hand_built(5, &[&[10, 42, 0, 0]])),
             Err(Error::InvalidValue("ipv4 range length"))
         );
         assert_eq!(
-            decoded(&hand_built(7, &[&[10, 42, 0, 0, 16, 0]])),
+            decoded(&hand_built(5, &[&[10, 42, 0, 0, 16, 0]])),
             Err(Error::InvalidValue("ipv4 range length"))
         );
     }
@@ -1978,7 +1794,7 @@ mod tests {
 
     #[test]
     fn a_range_after_the_relay_is_misordered() {
-        let mut out = vec![0xa7];
+        let mut out = vec![0xa5];
         text(&mut out, "ula");
         bytes(&mut out, &[0xfd, 0, 0, 0]);
         text(&mut out, "relay");
@@ -1987,10 +1803,6 @@ mod tests {
         bytes(&mut out, &[10, 42, 0, 0, 16]);
         text(&mut out, "suffix");
         text(&mut out, "example.internal");
-        text(&mut out, "relay_cert");
-        out.push(0x80);
-        text(&mut out, "rendezvous");
-        out.push(0x80);
         text(&mut out, "snapshot_window");
         out.push(0x01);
         assert_eq!(decoded(&out), Err(Error::KeyOrdering));

@@ -333,7 +333,7 @@ impl fmt::Debug for SigningKey {
 pub struct NodeIdentity {
     /// Signs roster operations and snapshots.
     signing: SigningKey,
-    /// Establishes transport sessions. The iroh `NodeId` is derived from this.
+    /// Establishes transport sessions. A device is dialled by its public half.
     transport: PrivateKey,
     /// Signs attestations, which date a roster and describe none.
     ///
@@ -494,8 +494,8 @@ impl NodeIdentity {
 
     /// The transport key.
     ///
-    /// `transport-iroh` adapts this into an iroh `NodeId`; nothing here depends
-    /// on iroh to say so.
+    /// `transport-convesso` makes it the device's address on the wire; nothing
+    /// here depends on the transport to say so.
     #[must_use]
     pub const fn transport_key(&self) -> &PrivateKey {
         &self.transport

@@ -144,9 +144,8 @@ pub const NETWORK_CHECK: std::time::Duration = std::time::Duration::from_secs(1)
 
 /// The largest request the control protocol carries, in bytes.
 ///
-/// The biggest real one is `Command::Found`, whose relay certificate is DER
-/// written out as a JSON array of numbers — a few kilobytes at the outside. This
-/// is comfortably above anything the product sends and far below anything worth
+/// The biggest real ones are a signed batch's requests and signatures, a few
+/// kilobytes at the outside. This is comfortably above anything the product sends and far below anything worth
 /// holding, which is the point: a bound is not a guess at what is needed, it is
 /// the line past which nothing is read.
 ///

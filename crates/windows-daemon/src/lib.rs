@@ -240,7 +240,6 @@ mod startup {
 
         for speaking in [
             "ConvessoTransport::bind",
-            "IrohTransport::bind",
             "Waiting::listen",
             "Adapter::create()",
             "connectivity.start",

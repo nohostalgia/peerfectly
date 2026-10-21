@@ -1,22 +1,11 @@
 //! What goes on the wire, and what a stranger sees instead.
 //!
-//! # The payload is a rendezvous record, under a different context
+//! # The payload is a record, under a context of its own
 //!
-//! §8's announcement is a public key plus an endpoint, signed — exactly what
-//! [`rendezvous::Record`] carries. Copying the struct would mean two canonical
-//! formats for one thing, drifting apart in the way this project has already had
-//! to correct once.
-//!
-//! **The signing context differs, and that is not cosmetic.** Signed under
-//! [`DOMAIN_TAG`], never the rendezvous tag. Without the separation, an
-//! announcement *is* a valid rendezvous record: anyone sharing a café network
-//! could capture one and publish it, and because the device itself signed it at
-//! a sequence above whatever it last published globally, it would **replace that
-//! device's published addresses with LAN-only ones**. Peers elsewhere would
-//! fetch `192.168.x` and fail until the device published again — reachability
-//! destroyed by an observer holding no key at all.
-//!
-//! Two tags make that impossible in both directions.
+//! §8's announcement is a public key plus an endpoint, signed: a
+//! [`crate::record::Record`]. It is signed under [`DOMAIN_TAG`], a context no
+//! other signature in the system uses, so an announcement cannot be presented
+//! as anything else the same transport key signs.
 //!
 //! # The wire form is obfuscated, and that is all it is
 //!
@@ -39,9 +28,9 @@
 //! That is most of what the encryption is for. A listener attempts decryption
 //! instead, which on a dedicated port costs one AEAD failure per foreign packet.
 
+use crate::record::Record;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rendezvous::Record;
 use roster::id::NetworkId;
 use roster::limits::SIGNATURE_LEN;
 use roster::sign::Signer;
@@ -51,10 +40,9 @@ use crate::limits;
 
 /// The version tag every announcement signature is bound to.
 ///
-/// The fifth signing context in the system, after `roster/v1`,
-/// `roster-snapshot/v1`, `transport-session/v1` and `rendezvous-record/v1`. It
-/// exists so an announcement and a rendezvous record cannot be exchanged; see
-/// the module documentation for what that prevents.
+/// Distinct from every other signing context in the system — `roster/v1`,
+/// `roster-snapshot/v1`, `transport-session/v1` — so an announcement cannot be
+/// presented as any of them.
 pub const DOMAIN_TAG: &str = "local-announce/v1";
 
 /// The context string the packet key is derived under.
@@ -238,73 +226,12 @@ mod tests {
         Announcement::sign(record, device.signer()).expect("signs")
     }
 
-    /// The fifth signing context, distinct from every other. Without this an
-    /// announcement is a valid rendezvous record.
-    /// One network's announcement key never opens its rendezvous records: the
-    /// two seals are derived under different contexts from the same id.
-    #[test]
-    fn the_packet_key_is_not_the_rendezvous_seal() {
-        assert_ne!(KEY_CONTEXT, rendezvous::SEAL_CONTEXT);
-    }
-
     #[test]
     fn the_tag_is_distinct_from_every_other_context() {
-        for other in
-            ["roster/v1", "roster-snapshot/v1", "transport-session/v1", "rendezvous-record/v1"]
-        {
+        for other in ["roster/v1", "roster-snapshot/v1", "transport-session/v1"] {
             assert_ne!(DOMAIN_TAG, other);
         }
         assert_eq!(DOMAIN_TAG, "local-announce/v1");
-    }
-
-    /// The attack the separation prevents: an announcement captured on a café
-    /// network and published as a rendezvous record would replace a device's
-    /// global addresses with LAN-only ones it signed itself.
-    #[test]
-    fn an_announcement_does_not_verify_as_a_rendezvous_record() {
-        let device = device();
-        let net = network();
-        let record =
-            Record::new(device.public_key(), net, 1, vec!["ip:192.168.1.5:41641".to_owned()])
-                .expect("within bounds");
-
-        let announced = Announcement::sign(record.clone(), device.signer()).expect("signs");
-        let mut as_rendezvous = announced.bytes.clone();
-        as_rendezvous.extend_from_slice(&announced.signature);
-
-        assert!(
-            rendezvous::SignedRecord::decode_and_verify(&as_rendezvous).is_err(),
-            "an announcement must not be publishable as a rendezvous record"
-        );
-    }
-
-    #[test]
-    fn a_rendezvous_record_does_not_verify_as_an_announcement() {
-        let device = device();
-        let net = network();
-        let record =
-            Record::new(device.public_key(), net, 1, vec!["ip:a".to_owned()]).expect("bounds");
-        let signed = rendezvous::SignedRecord::sign(record, device.signer()).expect("signs");
-
-        let sealed = {
-            let cipher = ChaCha20Poly1305::new(&packet_key(&net));
-            let nonce = [7u8; limits::NONCE_LEN];
-            let body = cipher
-                .encrypt(&Nonce::from(nonce), signed.to_bytes().as_slice())
-                .expect("encrypts");
-            let mut packet = nonce.to_vec();
-            packet.extend_from_slice(&body);
-            packet
-        };
-
-        // Since the rendezvous format's v2 a record no longer has an
-        // announcement's shape at all, so it is refused on the schema before the
-        // signature is reached. Either refusal is the property; accepting it is not.
-        assert!(
-            matches!(open(&sealed, &net), Err(Error::SignatureInvalid | Error::Malformed(_))),
-            "{:?}",
-            open(&sealed, &net)
-        );
     }
 
     #[test]

@@ -12,6 +12,23 @@
 /// on a wireless network is a datagram that does not arrive.
 pub const MAX_PACKET_SIZE: usize = 1200;
 
+/// Maximum size of a record's canonical bytes.
+///
+/// Larger than any packet can carry, so the packet's own bound decides first;
+/// this one keeps a decoder from trusting a length it was not given.
+pub const MAX_RECORD_SIZE: usize = 8192;
+
+/// Maximum number of addresses one record may name.
+///
+/// A device has a handful of paths. More than this is not a device describing
+/// itself.
+pub const MAX_RECORD_ADDRESSES: usize = 16;
+
+/// Maximum length of one address in a record.
+///
+/// Addresses are opaque here, so this bounds a string rather than a parsed form.
+pub const MAX_ADDRESS_LEN: usize = 256;
+
 /// Length of the random nonce prefixed to every packet.
 pub const NONCE_LEN: usize = 12;
 

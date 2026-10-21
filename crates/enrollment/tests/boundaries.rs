@@ -23,7 +23,7 @@ fn nothing_here_depends_on_a_platform_or_a_transport() {
         "wintun",
         "winreg",
         "tokio",
-        "iroh",
+        "convesso",
         "socket2",
         "transport",
         "reqwest",
@@ -117,7 +117,7 @@ fn the_readme_covers_what_it_must() {
         ("what the admin's confirmation defends", "substituted on its way"),
         ("why both keys are proved", "first** admission of a device id"),
         ("that delivery proves nothing", "Delivery proves nothing"),
-        ("the relay accepted on sight", "never confirmed"),
+        ("why the relay needs no check", "nothing is ever accepted on sight"),
         ("what the bounds do not buy", "Denial of the enrolment remains possible"),
         ("the limit that stays", "accepted\nlimit"),
     ] {
@@ -129,7 +129,7 @@ fn the_readme_covers_what_it_must() {
 #[test]
 fn every_deferral_names_its_destination() {
     let readme = include_str!("../README.md");
-    for destination in ["windows-daemon", "transport-iroh", "roster", "§10.2"] {
+    for destination in ["windows-daemon", "transport-convesso", "roster", "§10.2"] {
         assert!(readme.contains(destination), "a deferral must name `{destination}`");
     }
 }

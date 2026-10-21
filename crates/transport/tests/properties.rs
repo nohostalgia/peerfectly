@@ -190,10 +190,7 @@ fn the_interface_says_it_promises_no_confidentiality() {
         source.contains("Confidentiality") || source.contains("confidentiality"),
         "the interface must state what it does not promise"
     );
-    assert!(
-        source.contains("TLS") || source.contains("QUIC"),
-        "and say where a real transport gets it instead"
-    );
+    assert!(source.contains("Noise"), "and say where a real transport gets it instead");
 }
 
 /// No connectivity-layer type appears in the interface. The whole value of
@@ -213,7 +210,7 @@ fn no_connectivity_layer_type_appears_in_the_interface() {
         .join("\n");
 
     assert!(signatures.contains("async fn connect"), "the scan found the real signatures");
-    for leaked in ["iroh", "NodeAddr", "Endpoint", "QuicConn", "SocketAddr", "TcpStream"] {
+    for leaked in ["convesso", "PeerId", "Endpoint", "SocketAddr", "UdpSocket", "TcpStream"] {
         assert!(
             !signatures.contains(leaked),
             "`{leaked}` must not appear in the interface; a leaked connectivity type \
@@ -296,19 +293,20 @@ fn the_transport_keeps_no_independent_membership_list() {
     }
 }
 
-/// `iroh` really is absent, so the deferral is enforced rather than intended.
+/// No network library is a dependency, so the split is enforced rather than
+/// intended.
 #[test]
-fn iroh_is_not_a_dependency_of_this_crate() {
+fn no_network_library_is_a_dependency_of_this_crate() {
     let manifest = include_str!("../Cargo.toml");
     assert!(
-        !manifest.contains("iroh"),
-        "the iroh binding is `transport-iroh`, deferred because DESIGN.md §0 forbids \
-         merging network code without a real-world NAT test"
+        !manifest.contains("convesso"),
+        "the binding to the real network is `transport-convesso`, kept apart because \
+         DESIGN.md §0 forbids merging network code without a real-world NAT test"
     );
 }
 
-/// The README covers every requirement the specification adds. `transport-iroh`
-/// is written from it, and a requirement missing here is one the binding is not
+/// The README covers every requirement the specification adds. A binding is
+/// written from it, and a requirement missing here is one the binding is not
 /// told it has to satisfy.
 #[test]
 fn the_readme_covers_every_requirement() {
@@ -334,7 +332,7 @@ fn the_readme_covers_every_requirement() {
 #[test]
 fn every_deferral_names_its_destination() {
     let readme = include_str!("../README.md");
-    for destination in ["transport-iroh", "roster-sync", "tunnel"] {
+    for destination in ["transport-convesso", "roster-sync", "tunnel"] {
         assert!(readme.contains(destination), "a deferral must name `{destination}`");
     }
     for deferred in ["NAT", "gossip", "quota", "source validation", "Path selection"] {

@@ -1,7 +1,7 @@
 # The workflows pin every action by commit, and `Cargo.lock` every crate, so
 # nothing moves on its own. This proposes each update as a pull request, and CI
 # runs on it like on any other change. Cargo is here because a pin that falls
-# behind is otherwise found by accident: iroh stayed on 1.1.0 for two releases.
+# behind is otherwise found only by accident.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -17,9 +17,3 @@ updates:
     groups:
       compatible:
         update-types: [minor, patch]
-    ignore:
-      # Kept at the version iroh's `netwatch` builds on Windows, so that the
-      # daemon compiles no second copy there (crates/daemon/Cargo.toml). Lift
-      # this when netwatch moves Windows to the version proposed.
-      - dependency-name: netdev
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]

@@ -351,7 +351,7 @@ pub fn narrow_program(program: &Path) -> Result<Narrowed, String> {
                 .map_err(failed("make a rule"))?;
             rule.SetName(&BSTR::from(DAEMON_RULE)).map_err(&set)?;
             rule.SetDescription(&BSTR::from(
-                "peerfectly's transport: QUIC over UDP. Made by `peerfectlyd install`, removed by `peerfectlyd uninstall`.",
+                "peerfectly's transport: its direct paths, over UDP. Made by `peerfectlyd install`, removed by `peerfectlyd uninstall`.",
             ))
             .map_err(&set)?;
             rule.SetGrouping(&BSTR::from(GROUP)).map_err(&set)?;

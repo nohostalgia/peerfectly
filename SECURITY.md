@@ -36,7 +36,9 @@ Please **don't** open a public issue, pull request or discussion for it.
 ## In scope
 
 The daemon, the command line, the protocol and its formats, the installers and deploy files in this
-repository, and the relay and rendezvous configuration in `deploy/server`.
+repository, and the relay container in `deploy/server` with the program it runs,
+`crates/relay-server`.
 
-Bugs in dependencies, such as iroh, Wintun or the TSS libraries, belong to their projects. If one
+Bugs in dependencies, such as Wintun, rustls or the TSS libraries, belong to their projects; bugs in
+the transport itself belong to [convesso](https://github.com/nohostalgia/convesso). If one
 affects peerfectly in a particular way, tell us as well.

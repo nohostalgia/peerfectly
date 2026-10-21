@@ -7,9 +7,8 @@
 //!
 //! The suite below is written against [`Packets`] and never names a concrete
 //! type, so a `windows-daemon` or `android-client` device inherits it unchanged.
-//! That is the pattern `transport-session` established and `transport-iroh`
-//! used: an interface with one implementation is an untested claim about
-//! replaceability.
+//! That is the pattern of `transport` and `transport-convesso`: an interface
+//! with one implementation is an untested claim about replaceability.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

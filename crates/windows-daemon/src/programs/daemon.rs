@@ -95,7 +95,7 @@ fn install() -> std::process::ExitCode {
 /// Narrows this program's inbound rules to UDP, and says what changed (F-11).
 ///
 /// Windows' own prompt allows a program TCP and UDP on every port, on public
-/// networks too. The transport is QUIC over UDP and the control channel is a
+/// networks too. The transport's direct paths are UDP and the control channel is a
 /// pipe, so UDP is all this program needs to receive. A failure here does not
 /// undo the registration: it is said, with how to try again.
 #[cfg(windows)]

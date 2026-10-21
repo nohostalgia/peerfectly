@@ -125,7 +125,7 @@ impl Joining {
     ///
     /// Neither the transport key's algorithm nor the attestation key's is
     /// carried: §2.3 fixes device transport keys as ed25519 and
-    /// `transport-iroh` refuses anything else at bind, and an attestation key is
+    /// `transport-convesso` refuses anything else at bind, and an attestation key is
     /// ed25519 for a reason of its own — it is never held in an enclave, because
     /// a key in one is a key that asks. The signing key's algorithm is carried,
     /// because a root key in a phone's enclave is P-256.

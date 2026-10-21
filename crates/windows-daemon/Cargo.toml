@@ -21,7 +21,7 @@ transport = { path = "../transport" }
 identity = { path = "../identity" }
 # What CNG signs is a hash, and ECDSA over P-256 fixes which one. The roster's
 # own hash is BLAKE3 everywhere else; this is the one place it is not, because
-# the curve says so. Already in the tree for the relay certificate's fingerprint.
+# the curve says so. Already in the tree for the daemon's fingerprints.
 sha2 = "0.11"
 roster = { path = "../roster" }
 async-trait.workspace = true
@@ -34,8 +34,8 @@ blake3.workspace = true
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json.workspace = true
 # The service's log: the daemon emits events, and this is where they are
-# written on Windows. Both already in the tree through iroh; the formatter only,
-# with no environment filter and no colours.
+# written on Windows. The formatter only, with no environment filter and no
+# colours.
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
 
@@ -84,8 +84,8 @@ windows-sys = { workspace = true, features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
 ] }
-# The firewall, through the COM API its own tools use (F-11). Already in the
-# graph through iroh; this is a direct use with the features the firewall needs.
+# The firewall, through the COM API its own tools use (F-11), with the features
+# the firewall needs.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_WindowsFirewall",
@@ -103,11 +103,6 @@ interprocess = { version = "2.4.4", features = ["tokio"] }
 widestring = "1.2.1"
 
 [dev-dependencies]
-# A certificate for the TLS server the fetch test talks to. Already built for
-# the workspace, and generating one is the only way to know what the fetch was
-# supposed to return.
-rcgen = "0.14"
-proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 

@@ -1,8 +1,7 @@
 //! What to try first.
 //!
-//! §2.9 fixes the order: the local network, then globally routable addressing,
-//! then whatever the rendezvous knew. This decides which candidate goes where in
-//! that list.
+//! §2.9 fixes the order: the local network, then globally routable addressing.
+//! This decides which candidate goes where in that list.
 //!
 //! # It is a pure function
 //!
@@ -35,8 +34,6 @@ pub enum Source {
     Local,
     /// Believed globally routable.
     Global,
-    /// Learned from the rendezvous.
-    Rendezvous,
 }
 
 /// One address a peer might be reachable at.
@@ -106,7 +103,6 @@ fn rank(candidate: &Candidate, conditions: &Conditions) -> u8 {
         Source::Local if conditions.shares_external_address => 0,
         Source::Local => 1,
         Source::Global => 2,
-        Source::Rendezvous => 3,
     }
 }
 
@@ -132,10 +128,6 @@ mod tests {
         Candidate::new(address, Source::Global)
     }
 
-    fn from_rendezvous(address: &str) -> Candidate {
-        Candidate::new(address, Source::Rendezvous)
-    }
-
     fn addresses(ordered: &[Candidate]) -> Vec<&str> {
         ordered.iter().map(|c| c.address.as_str()).collect()
     }
@@ -147,23 +139,12 @@ mod tests {
         assert_eq!(addresses(&ordered), vec!["ip:192.168.1.5", "ip:203.0.113.5"]);
     }
 
-    /// §2.9's order: the rendezvous is the last resort, behind anything already
-    /// known locally.
-    #[test]
-    fn the_rendezvous_is_the_last_resort() {
-        let ordered = order(
-            &[from_rendezvous("ip:203.0.113.9"), local("ip:192.168.1.5"), global("ip:203.0.113.5")],
-            &Conditions::default(),
-        );
-        assert_eq!(addresses(&ordered), vec!["ip:192.168.1.5", "ip:203.0.113.5", "ip:203.0.113.9"]);
-    }
-
     /// The failure §8 names: a node that computed an order once stays on the
     /// relay after arriving home. Recomputing must move the now-local address
     /// to the front, whatever it was labelled when it was learned.
     #[test]
     fn an_interface_change_reorders() {
-        let candidates = [from_rendezvous("ip:192.168.1.5:41641"), global("ip:203.0.113.5:41641")];
+        let candidates = [global("ip:203.0.113.5:41641"), global("ip:192.168.1.5:41641")];
 
         let away = order(&candidates, &Conditions::default());
         assert_eq!(addresses(&away).first().copied(), Some("ip:203.0.113.5:41641"));
@@ -200,7 +181,7 @@ mod tests {
     /// recomputing on every interface change safe to do repeatedly.
     #[test]
     fn the_same_inputs_give_the_same_order() {
-        let candidates = [from_rendezvous("ip:a"), local("ip:b"), global("ip:c"), local("ip:d")];
+        let candidates = [global("ip:a"), local("ip:b"), global("ip:c"), local("ip:d")];
         let conditions =
             Conditions { local_prefixes: vec!["ip:b".to_owned()], shares_external_address: false };
 
@@ -219,7 +200,7 @@ mod tests {
     fn an_empty_prefix_matches_nothing() {
         // A caller with no interfaces must not accidentally promote everything.
         let ordered = order(
-            &[from_rendezvous("ip:a"), local("ip:b")],
+            &[global("ip:a"), local("ip:b")],
             &Conditions { local_prefixes: vec![String::new()], ..Conditions::default() },
         );
         assert_eq!(addresses(&ordered), vec!["ip:b", "ip:a"]);

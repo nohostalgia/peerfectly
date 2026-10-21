@@ -1,10 +1,9 @@
 //! Packets cut to fit datagrams, and put back together.
 //!
-//! A QUIC datagram holds what one QUIC packet on the current path can carry —
-//! around 1,150 bytes on a path whose MTU has not been discovered, and never
-//! less than a little over a kilobyte. A tunnel packet is up to 1,280 bytes, the
-//! least IPv6 allows on a link. So a full-size packet travels as two datagrams,
-//! and is delivered only once both have arrived.
+//! A datagram holds what the connectivity layer can carry in one packet on its
+//! path, and that is less than the largest tunnel packet. A packet that does not
+//! fit travels as several datagrams, and is delivered only once all of them have
+//! arrived.
 //!
 //! # The header
 //!
@@ -36,7 +35,7 @@ pub const HEADER: usize = 6;
 
 /// The most pieces a packet may be cut into.
 ///
-/// A 1,500-byte packet over the smallest datagram QUIC guarantees needs two;
+/// A 1,500-byte packet over the datagrams `transport-convesso` sends needs two;
 /// four leaves room for a path that reports less, and refuses anything that
 /// would need many.
 pub const MAX_FRAGMENTS: usize = 4;

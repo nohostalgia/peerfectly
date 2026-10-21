@@ -13,10 +13,10 @@
 //! untested claim, so this crate ships two and runs one behavioural suite
 //! against both.
 //!
-//! **`iroh` is not here.** `DESIGN.md` §0 forbids merging network code without a
-//! test against a real-world NAT edge case, and that test cannot run in CI. The
-//! binding is `transport-iroh`, which carries that obligation and inherits this
-//! suite, so its remaining job is connectivity rather than semantics.
+//! **No network code is here.** `DESIGN.md` §0 forbids merging network code
+//! without a test against a real-world NAT edge case, and that test cannot run
+//! in CI. The binding is `transport-convesso`, which carries that obligation and
+//! runs this suite, so its job is connectivity rather than semantics.
 //!
 //! # What a session proves, and what it does not
 //!
@@ -25,12 +25,13 @@
 //! what that device may *do*: roles, admin rights and founder status are derived
 //! state, and asking the transport about them would make it a second authority.
 //!
-//! It also promises **no confidentiality**. A real transport gets that from QUIC
-//! and TLS 1.3; the in-memory one has no wire to protect.
+//! It also promises **no confidentiality**. `transport-convesso` gets that from
+//! Noise; the in-memory one has no wire to protect.
 //!
 //! # Deliberately elsewhere
 //!
-//! - **The iroh binding**, with path selection (§2.9) — `transport-iroh`.
+//! - **The binding to the real network**, with path selection (§2.9) —
+//!   `transport-convesso`.
 //! - **§4.7's operation gossip**, and the per-peer quota on the roster's pending
 //!   set that `roster`'s `FORMAT.md` §19 records as this capability's debt —
 //!   `roster-sync`, which runs over these sessions. Bounding that set fairly

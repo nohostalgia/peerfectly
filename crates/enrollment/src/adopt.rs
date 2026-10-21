@@ -8,12 +8,10 @@
 //!
 //! - an operation admitting **this device's own keys**, which is what makes it
 //!   the network that was being joined rather than some other network;
-//! - that operation surviving the roster's own rules, which admit a device only
-//!   when an admin signed it;
-//! - and, where this device had to accept a relay certificate that nothing had
-//!   vouched for, the network pinning that same certificate.
+//! - and that operation surviving the roster's own rules, which admit a device
+//!   only when an admin signed it.
 //!
-//! A network that satisfies all three is adopted no matter who delivered it. One
+//! A network that satisfies both is adopted no matter who delivered it. One
 //! that fails any is refused, and nothing is written.
 
 use identity::NodeIdentity;
@@ -30,32 +28,17 @@ use crate::error::{Error, Result};
 pub struct Adopted {
     /// The state derived from what was delivered.
     pub state: RosterState,
-    /// Whether the relay this device accepted was confirmed by the network.
-    ///
-    /// False when the network pins no relay certificate: the relay was accepted
-    /// on sight and nothing ever vouched for it. Reported rather than smoothed
-    /// over, because presenting an unconfirmed relay as verified is the kind of
-    /// small lie that makes a later compromise inexplicable.
-    pub relay_confirmed: bool,
 }
 
 /// Decides whether a delivered network may be adopted.
-///
-/// `accepted_relay` is the certificate this device accepted on sight in order to
-/// reach the exchange at all, if it had to accept one.
 ///
 /// # Errors
 ///
 /// [`Error::NotAdmitted`] when the network does not admit this device,
 /// [`Error::NotSignedByAdmin`] when it contains an admission that an admin did
-/// not sign, [`Error::RelayCertificateChanged`] when the network pins a relay
-/// certificate other than the one accepted, and [`Error::RosterUnusable`] when
-/// what arrived does not derive to a state at all.
-pub fn adopt(
-    operations: &[Vec<u8>],
-    identity: &NodeIdentity,
-    accepted_relay: Option<&[u8]>,
-) -> Result<Adopted> {
+/// not sign, and [`Error::RosterUnusable`] when what arrived does not derive to
+/// a state at all.
+pub fn adopt(operations: &[Vec<u8>], identity: &NodeIdentity) -> Result<Adopted> {
     let signing = identity.signing_key().public_key();
     let transport = identity.transport_key().public_key();
 
@@ -90,23 +73,7 @@ pub fn adopt(
         return Err(Error::NotAdmitted);
     }
 
-    let relay_confirmed = match (accepted_relay, state.params.relay_cert.as_deref()) {
-        // A relay accepted on sight, and the network says which relay is its
-        // own: they must be the same, or the relay was substituted while this
-        // device had no roster to check it against.
-        (Some(accepted), Some(pinned)) => {
-            if accepted != pinned {
-                return Err(Error::RelayCertificateChanged);
-            }
-            true
-        }
-        // Nothing was accepted on sight — ordinary verification was enough.
-        (None, _) => true,
-        // Accepted on sight and never confirmed by anything.
-        (Some(_), None) => false,
-    };
-
-    Ok(Adopted { state, relay_confirmed })
+    Ok(Adopted { state })
 }
 
 /// Whether what arrived contains an admission of this device that the roster
@@ -145,12 +112,7 @@ mod tests {
     use super::*;
 
     /// A founder, and a network that admits `joiner` if `admit` is set.
-    fn network(
-        founder: &NodeIdentity,
-        joiner: &NodeIdentity,
-        admit: bool,
-        certificate: Option<Vec<u8>>,
-    ) -> Vec<Vec<u8>> {
+    fn network(founder: &NodeIdentity, joiner: &NodeIdentity, admit: bool) -> Vec<Vec<u8>> {
         let params = NetworkParams::with_relay(
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             Some("https://relay.example:443"),
@@ -158,10 +120,6 @@ mod tests {
             2_592_000,
         )
         .expect("valid");
-        let params = match certificate {
-            Some(certificate) => params.pinning(certificate).expect("usable"),
-            None => params,
-        };
 
         let genesis = OperationCore::new(
             1,
@@ -200,11 +158,10 @@ mod tests {
     fn a_network_that_admits_this_device_is_adopted() {
         let founder = NodeIdentity::generate().expect("generates");
         let joiner = NodeIdentity::generate().expect("generates");
-        let delivered = network(&founder, &joiner, true, None);
+        let delivered = network(&founder, &joiner, true);
 
-        let adopted = adopt(&delivered, &joiner, None).expect("adopts");
+        let adopted = adopt(&delivered, &joiner).expect("adopts");
         assert!(adopted.state.devices.len() >= 2);
-        assert!(adopted.relay_confirmed, "nothing was accepted on sight");
     }
 
     /// Who delivered it is not one of the questions asked.
@@ -212,19 +169,19 @@ mod tests {
     fn delivery_by_a_stranger_is_not_itself_a_problem() {
         let founder = NodeIdentity::generate().expect("generates");
         let joiner = NodeIdentity::generate().expect("generates");
-        let delivered = network(&founder, &joiner, true, None);
+        let delivered = network(&founder, &joiner, true);
 
         // The bytes are the same whoever carried them, and that is the point.
-        adopt(&delivered, &joiner, None).expect("adopts");
+        adopt(&delivered, &joiner).expect("adopts");
     }
 
     #[test]
     fn a_network_that_does_not_admit_this_device_is_refused() {
         let founder = NodeIdentity::generate().expect("generates");
         let joiner = NodeIdentity::generate().expect("generates");
-        let delivered = network(&founder, &joiner, false, None);
+        let delivered = network(&founder, &joiner, false);
 
-        assert!(matches!(adopt(&delivered, &joiner, None), Err(Error::NotAdmitted)));
+        assert!(matches!(adopt(&delivered, &joiner), Err(Error::NotAdmitted)));
     }
 
     /// An admission signed by somebody who is not an admin is dropped by the
@@ -236,7 +193,7 @@ mod tests {
         let outsider = NodeIdentity::generate().expect("generates");
         let joiner = NodeIdentity::generate().expect("generates");
 
-        let mut delivered = network(&founder, &joiner, false, None);
+        let mut delivered = network(&founder, &joiner, false);
         let genesis = RawOperation::decode(delivered.first().expect("genesis")).expect("decodes");
 
         let add = OperationCore::new(
@@ -252,38 +209,12 @@ mod tests {
         .expect("well-formed");
         delivered.push(sign_operation(&add, outsider.signer()).expect("signs"));
 
-        assert!(matches!(adopt(&delivered, &joiner, None), Err(Error::NotSignedByAdmin)));
-    }
-
-    /// A relay accepted on sight must be the relay the network names, or it was
-    /// substituted while this device had nothing to check it against.
-    #[test]
-    fn a_relay_certificate_that_changed_is_refused() {
-        let founder = NodeIdentity::generate().expect("generates");
-        let joiner = NodeIdentity::generate().expect("generates");
-        let delivered = network(&founder, &joiner, true, Some(vec![0x30, 0x01, 0x02]));
-
-        assert!(matches!(
-            adopt(&delivered, &joiner, Some(&[0x30, 0x09, 0x09])),
-            Err(Error::RelayCertificateChanged)
-        ));
-        adopt(&delivered, &joiner, Some(&[0x30, 0x01, 0x02])).expect("the same certificate adopts");
-    }
-
-    /// Accepted on sight, and the network pins nothing: allowed, and said.
-    #[test]
-    fn an_unpinned_network_leaves_the_relay_unconfirmed() {
-        let founder = NodeIdentity::generate().expect("generates");
-        let joiner = NodeIdentity::generate().expect("generates");
-        let delivered = network(&founder, &joiner, true, None);
-
-        let adopted = adopt(&delivered, &joiner, Some(&[0x30, 0x01])).expect("adopts");
-        assert!(!adopted.relay_confirmed, "nothing vouched for that relay, and it must say so");
+        assert!(matches!(adopt(&delivered, &joiner), Err(Error::NotSignedByAdmin)));
     }
 
     #[test]
     fn nothing_at_all_is_refused_rather_than_adopted() {
         let joiner = NodeIdentity::generate().expect("generates");
-        assert!(adopt(&[], &joiner, None).is_err());
+        assert!(adopt(&[], &joiner).is_err());
     }
 }

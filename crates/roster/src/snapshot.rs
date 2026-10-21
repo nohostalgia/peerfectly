@@ -85,7 +85,7 @@ fn push_framed(out: &mut Vec<u8>, component: &[u8]) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Monotone sequence number. A node refuses anything that does not advance
-    /// it, which is what stops a compromised rendezvous serving an old roster.
+    /// it, which is what stops a compromised peer serving an old roster.
     pub seq: u64,
     /// Canonical bytes of the roster state derived from everything the heads
     /// cover — the output of `RosterState::to_bytes`.

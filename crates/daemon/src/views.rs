@@ -278,19 +278,10 @@ fn counted(network: &Network) -> String {
 /// not — and nothing else in the report would show it. That cost a day of
 /// two-machine testing once.
 fn infrastructure(network: &Network) -> String {
-    let relay = match (&network.relay, network.relay_pinned) {
-        // A convesso relay carries its key in its address: that key is what is
-        // trusted, and there is no certificate to pin or to miss.
-        (Some(relay), _) if transport_convesso::relay::parse(relay).is_ok() => {
-            format!("relay {} (trusted by its key)", shown(relay))
-        }
-        (Some(relay), true) => format!("relay {} (certificate pinned)", shown(relay)),
-        (Some(relay), false) => format!("relay {} (no certificate pinned)", shown(relay)),
-        (None, _) => "no relay — direct paths only".to_owned(),
-    };
-    let line = match &network.rendezvous {
-        Some(meeting) => format!("{relay}, meet {}", shown(meeting)),
-        None => format!("{relay}, no rendezvous"),
+    // A relay carries its key in its address: that key is what is trusted.
+    let line = match &network.relay {
+        Some(relay) => format!("relay {} (trusted by its key)", shown(relay)),
+        None => "no relay — direct paths only".to_owned(),
     };
     // **Said, because whoever runs the old relay needs to read it.** Switched
     // off before the end, it strands every device that has not come back yet —
@@ -497,8 +488,6 @@ mod tests {
             owner_taken: false,
             confirmation: None,
             relay: Some("https://relay.example:443".to_owned()),
-            rendezvous: None,
-            relay_pinned: true,
             relay_leaving: None,
             accused: Vec::new(),
             peers,
@@ -562,7 +551,7 @@ mod tests {
             "::1",
             "100.64.0.1",
             "2 devices",
-            "relay https://relay.example:443 (certificate pinned)",
+            "relay https://relay.example:443 (trusted by its key)",
         ] {
             assert!(said(&drawn).contains(expected), "status says `{expected}`: {drawn}");
         }
@@ -578,7 +567,7 @@ mod tests {
     fn status_says_where_the_infrastructure_is_even_when_it_is_in_order() {
         let drawn = two_networks().to_string();
         assert!(drawn.contains("infrastructure"), "{drawn}");
-        assert!(said(&drawn).contains("no rendezvous"), "an absent one is still said: {drawn}");
+        assert!(said(&drawn).contains("trusted by its key"), "{drawn}");
 
         let mut without = two_networks();
         without.networks[0].relay = None;

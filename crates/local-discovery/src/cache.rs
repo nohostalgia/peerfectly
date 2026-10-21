@@ -79,7 +79,7 @@ impl Cache {
 
     /// Records what an announcement said, if it is newer than what is held.
     ///
-    /// The same sequence rule the rendezvous applies, and for the same reason: a
+    /// The sequence rule, for the reason any signed record has one: a
     /// replayed older announcement must not be able to walk a peer's addresses
     /// backwards to somewhere it no longer is.
     pub fn record(

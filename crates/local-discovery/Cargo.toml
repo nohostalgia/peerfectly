@@ -10,10 +10,6 @@ rust-version.workspace = true
 [dependencies]
 roster = { path = "../roster" }
 identity = { path = "../identity" }
-# For the announcement payload. The same "key plus endpoint" the rendezvous
-# carries, signed under a different context; a second copy of the format would
-# drift, which this project has already had to correct once.
-rendezvous = { path = "../rendezvous" }
 blake3.workspace = true
 getrandom.workspace = true
 # A real AEAD rather than a bare stream cipher. The payload is already signed,

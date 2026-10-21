@@ -1,0 +1,35 @@
+[package]
+name = "relay-server"
+description = "The relay container's one program: a convesso relay, and the key it serves over HTTPS."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "peerfectly-relay"
+path = "src/main.rs"
+
+[dependencies]
+# The relay itself, started from its configuration file's format.
+convesso-tokio = { workspace = true, features = ["relay-bin"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# The key's HTTPS, with `ring` as the rest of the workspace uses it: the default
+# provider builds `aws-lc-rs`, which needs a C toolchain in the image.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pki-types = { version = "1.15", features = ["std"] }
+# The certificate it makes for itself on first start. It authenticates nothing:
+# what a person confirms is the key.
+rcgen = "0.14"
+serde_json.workspace = true
+
+[dev-dependencies]
+# The daemon's own asking, so the test is the exchange that runs for real.
+daemon = { path = "../daemon" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true

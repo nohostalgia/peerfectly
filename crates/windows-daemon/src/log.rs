@@ -210,7 +210,7 @@ mod tests {
         let path = writer.path();
 
         tracing::subscriber::with_default(writing_to(writer), || {
-            tracing::warn!(target: "iroh::magicsock", "the library said something");
+            tracing::warn!(target: "convesso_tokio::node", "the library said something");
             tracing::info!(target: "daemon::service", "the daemon said something");
             tracing::debug!(target: "daemon::node", "and something too fine for the log");
         });

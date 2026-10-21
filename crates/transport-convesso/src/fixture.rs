@@ -95,9 +95,8 @@ pub struct Network {
 }
 
 impl Network {
-    /// Founds a network whose parameters name `relay` and pin `pin`. Only a
-    /// test of what the iroh binding writes pins anything.
-    pub fn found(relay: Option<&str>, pin: Option<Vec<u8>>) -> Self {
+    /// Founds a network whose parameters name `relay`.
+    pub fn found(relay: Option<&str>) -> Self {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
         let third = Arc::new(NodeIdentity::generate().expect("generates"));
@@ -108,10 +107,6 @@ impl Network {
             2_592_000,
         )
         .expect("valid parameters");
-        let params = match pin {
-            Some(pin) => params.pinning(pin).expect("a pin the roster accepts"),
-            None => params,
-        };
 
         let genesis = OperationCore::new(
             1,
@@ -163,6 +158,6 @@ impl Network {
 
     /// Founds a network on `relay`.
     pub fn on(relay: &TestRelay) -> Self {
-        Self::found(Some(&relay.written()), None)
+        Self::found(Some(&relay.written()))
     }
 }

@@ -387,8 +387,7 @@ fn the_dependency_direction_holds() {
         ("roster", include_str!("../../roster/Cargo.toml")),
         ("identity", include_str!("../../identity/Cargo.toml")),
         ("transport", include_str!("../../transport/Cargo.toml")),
-        ("transport-iroh", include_str!("../../transport-iroh/Cargo.toml")),
-        ("rendezvous", include_str!("../../rendezvous/Cargo.toml")),
+        ("transport-convesso", include_str!("../../transport-convesso/Cargo.toml")),
         ("local-discovery", include_str!("../../local-discovery/Cargo.toml")),
     ] {
         assert!(

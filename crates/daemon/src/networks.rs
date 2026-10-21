@@ -976,17 +976,14 @@ mod tests {
     /// Recovery runs the join's own check. A roster that derives a network this
     /// device is not in proves nothing, whatever else it proves.
     ///
-    /// The log here is a real one, lifted off the test phone: it derives a valid
-    /// network, and the device it names holds its keys in that phone's keystore
-    /// and not here.
+    /// The log here is a real one, written by a device: it derives a valid
+    /// network, and the devices it names hold their keys elsewhere, not here.
     ///
-    /// Replaced on 2026-09-19, after `membership-freshness` made an attestation
-    /// key part of every device record and no roster operation adds a key to a
-    /// device that already exists — so the log this test used before, written by
-    /// the same phone under the older format, stopped deriving. It was not
-    /// synthesised: a built log would pass this test while proving nothing about
-    /// a log a phone actually wrote, which is the whole reason the fixture is
-    /// real. The network was refounded and the new log taken off the phone.
+    /// It is not synthesised: a built log would pass this test while proving
+    /// nothing about a log a device actually wrote, which is the whole reason
+    /// the fixture is real. It was written by the Linux testbed's node `a`,
+    /// founding `prova` on the testbed's relay and admitting `b` (Linux
+    /// `VERIFICATION.md`, C3).
     #[test]
     fn a_roster_that_does_not_name_this_device_is_removed() {
         let scratch = tempfile::tempdir().expect("a scratch directory");

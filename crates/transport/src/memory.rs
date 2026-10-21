@@ -8,8 +8,8 @@
 //! That completeness is the point. A stub that only did the happy path would let
 //! the interface drift into describing the stub, which is the failure mode that
 //! makes an abstraction worthless. The behavioural suite is written against the
-//! trait and run against this; `transport-iroh` will be expected to pass the same
-//! suite unchanged, so its remaining job is connectivity rather than semantics.
+//! trait and run against this; `transport-convesso` passes the same suite
+//! unchanged, so its job is connectivity rather than semantics.
 //!
 //! What it does **not** provide is confidentiality. There is no wire here to
 //! protect, and the interface promises none.

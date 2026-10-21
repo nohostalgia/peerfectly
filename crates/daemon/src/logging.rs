@@ -190,7 +190,9 @@ mod tests {
         for kept in ["daemon", "daemon::node", "windows_daemon::service"] {
             assert!(ours(kept), "{kept}");
         }
-        for dropped in ["iroh", "iroh::magicsock", "daemonic", "iroh_relay::daemon", ""] {
+        for dropped in
+            ["convesso_tokio", "convesso_core::endpoint", "daemonic", "transport_convesso", ""]
+        {
             assert!(!ours(dropped), "{dropped}");
         }
     }
