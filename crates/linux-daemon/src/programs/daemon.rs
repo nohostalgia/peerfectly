@@ -132,7 +132,7 @@ fn may_run_from_here() -> bool {
 /// Assembles the service, writes the firewall table, and brings back what was
 /// left on.
 async fn start() -> daemon::Result<Arc<daemon::Service>> {
-    use daemon::connectivity::Iroh;
+    use daemon::connectivity::Convesso;
     use daemon::lifecycle::Lifecycle;
     use daemon::resolving::sockets::Sockets;
     use daemon::{Connectivity, Machine, Resolving, Service};
@@ -148,7 +148,7 @@ async fn start() -> daemon::Result<Arc<daemon::Service>> {
             Lifecycle::new(
                 Arc::new(crate::machine::Linux::new(firewall.clone())) as Arc<dyn Machine>
             ),
-            Arc::new(Iroh) as Arc<dyn Connectivity>,
+            Arc::new(Convesso) as Arc<dyn Connectivity>,
             Arc::new(Sockets) as Arc<dyn Resolving>,
             Arc::new(keys),
         )?
@@ -235,7 +235,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for speaking in [
-            "IrohTransport::bind",
+            "ConvessoTransport::bind",
             "Waiting::listen",
             "Tun::open",
             "connectivity.start",

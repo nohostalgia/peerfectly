@@ -35,12 +35,12 @@ fn the_dependency_direction_holds() {
     assert!(own.contains("transport"), "and on transport");
 }
 
-/// The iroh binding is still deferred. This crate runs over the in-memory
-/// transports precisely so it needs no network.
+/// The binding to the real network is `transport-convesso`. This crate runs over
+/// the in-memory transports precisely so it needs no network.
 #[test]
 fn no_network_dependency_creeps_in() {
     let own = include_str!("../Cargo.toml");
-    for forbidden in ["iroh", "quinn", "reqwest", "hyper"] {
+    for forbidden in ["convesso", "reqwest", "hyper"] {
         assert!(
             !own.contains(forbidden),
             "`{forbidden}` would make this network code, which `DESIGN.md` §0 forbids \
@@ -137,7 +137,7 @@ fn sync_closes_no_sessions() {
 fn every_deferral_names_its_destination() {
     let lib = include_str!("../src/lib.rs");
     for destination in
-        ["rendezvous-service", "local-discovery", "equivocation-detection", "windows-daemon"]
+        ["transport-convesso", "local-discovery", "equivocation-detection", "windows-daemon"]
     {
         assert!(lib.contains(destination), "a deferral must name `{destination}`");
     }

@@ -8,12 +8,11 @@ members = [
     "crates/linux-daemon",
     "crates/local-discovery",
     "crates/programs",
-    "crates/rendezvous",
-    "crates/rendezvous-server",
+    "crates/relay-server",
     "crates/roster",
     "crates/roster-sync",
     "crates/transport",
-    "crates/transport-iroh",
+    "crates/transport-convesso",
     "crates/tunnel",
     "crates/windows-daemon",
 ]
@@ -23,19 +22,23 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.4.0"
 license = "AGPL-3.0-or-later"
 # Built and shipped from here, as programs and packages; none of the crates
 # goes to crates.io, and they depend on each other by path.
 publish = false
-# 1.91 because `iroh` 1.3 and its tree require it — `iroh-base`, `iroh-dns`,
-# `netwatch` and `portmapper` all declare it. The value here was 1.85 and was
-# simply untrue: it only ever showed up when building on a toolchain older than
-# the one this machine happens to have, which is exactly when a declared minimum
-# is the thing being relied on.
-rust-version = "1.91"
+# 1.95 because convesso, which `transport-convesso` binds, declares it. A
+# declared minimum is relied on exactly when building on an older toolchain, so
+# it follows the strictest crate in the tree.
+rust-version = "1.95"
 
 [workspace.dependencies]
+# The transport, from its repository, fixed to one commit: a new one is taken on
+# purpose, never by an update.
+convesso-core = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
+convesso-stream = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
+convesso-tokio = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
+convesso-relay = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
 # Canonical CBOR. Chosen over serde-based codecs so encoding stays byte-exact and
 # under our control.
 minicbor = { version = "2.3.0", features = ["alloc"] }
@@ -43,7 +46,6 @@ blake3 = "1.8.7"
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 p256 = { version = "0.14.0", features = ["ecdsa"] }
 signature = "3.0.0"
-rand_core = "0.10.1"
 getrandom = "0.4.3"
 tokio = { version = "1.48.0", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1.90"
@@ -78,14 +80,3 @@ opt-level = 3
 # seventy-five million hashes: minutes unoptimised, seconds optimised.
 [profile.dev.package.blake3]
 opt-level = 3
-
-# iroh 1.3.0 with three fixes that no release carries yet, from the project's
-# fork (`nohostalgia/iroh`, branch `peerfectly/1.3`), pinned by commit. Up to
-# 1.3, an idle device spent about a gigabyte a month on iroh's own traffic to
-# the relay (crates/linux-daemon/VERIFICATION.md, steps 32 and 34). Each fix is
-# one commit on the tag, and `deny.toml` says which upstream issue each waits
-# on. `iroh-base` and `iroh-dns` follow from the fork too, unchanged: iroh takes
-# them by path inside its own repository.
-[patch.crates-io]
-iroh = { git = "https://github.com/nohostalgia/iroh", rev = "2fc2b89a97ce79c8faa2516d59ff3e08faa670e6" }
-iroh-relay = { git = "https://github.com/nohostalgia/iroh", rev = "2fc2b89a97ce79c8faa2516d59ff3e08faa670e6" }

@@ -28,7 +28,7 @@ pub enum Error {
         ///
         /// Added because a dial that failed on a real network reported only that
         /// it had failed. The abstraction is right to keep its error set small
-        /// and closed — a caller must not have to know about QUIC — but a closed
+        /// and closed — a caller must not have to know about the wire — but a closed
         /// set with nothing behind it makes a failure undiagnosable, and somebody
         /// eventually has to diagnose it.
         cause: Option<String>,

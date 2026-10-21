@@ -1,16 +1,16 @@
 //! Finding a peer the relay alone would not find, and being findable.
 //!
 //! §2.9 orders the paths to a peer: the local network first, then addresses
-//! already cached from when it was, then the rendezvous, and only then the
-//! relay. Everything above this module supplies one of those; this module runs
-//! the two that need something said out loud.
+//! already cached from when it was, and then the relay, through which the
+//! transport finds the rest itself. This module runs the two that need
+//! something said out loud.
 //!
 //! **Announcing** puts this device's own addresses on the local network, signed
 //! with its transport key, every few seconds and immediately whenever they
 //! change. **Listening** hears other devices do the same, checks the announcing
 //! key against the roster, and hands what it heard to the transport as a hint.
-//! **Hinting** does the same job through the rendezvous for peers that are not
-//! on this network at all.
+//! **Hinting** offers the transport what was heard before, for peers that have
+//! no session.
 //!
 //! # Nothing here decides anything
 //!
@@ -23,8 +23,8 @@
 //!
 //! # Why it starts with the tunnel and not before
 //!
-//! Multicast is a socket and the rendezvous is an HTTP request. §2.6c says a
-//! node reaches nothing while the person believes it is off, so both loops are
+//! Multicast is a socket. §2.6c says a node reaches nothing while the person
+//! believes it is off, so the loops are
 //! spawned by `bring_up` and aborted by `take_down`, and the sockets they own
 //! cease to exist with them. There is no flag to forget to check.
 
@@ -32,9 +32,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use local_discovery::Record;
 use local_discovery::{Announcement, Cache, Candidate, Conditions, Multicast, Source, order};
-use rendezvous::{Client, Record};
-use roster::id::DeviceId;
 use roster::sign::PublicKey;
 use roster::state::RosterState;
 use tokio::sync::Mutex;
@@ -42,12 +41,12 @@ use tokio::sync::Mutex;
 use crate::endpoints::Endpoints;
 use crate::node::Node;
 use crate::routes::Interface;
-use crate::schedule::{Announcing, Publishing};
+use crate::schedule::Announcing;
 
 /// The subsystem name faults from here carry.
 const SUBSYSTEM: &str = "discovery";
 
-/// The local network and the rendezvous, for as long as the tunnel is up.
+/// The local network, for as long as the tunnel is up.
 pub struct Discovery {
     /// The node whose peers are being looked for.
     node: Arc<Node>,
@@ -349,31 +348,35 @@ impl Discovery {
         if let Some(transport) = self.node.transport().await {
             transport.learned(&record.key, &record.addresses);
         }
+        // Newer news of where it is: a rest earned before it says nothing now.
+        let announcing = state.devices.values().find(|device| {
+            transport_key_of(device).is_some_and(|held| held.as_bytes() == record.key.as_bytes())
+        });
+        if let Some(device) = announcing {
+            self.node.announced(device.id);
+        }
     }
 
     /// Offers the transport what is known about peers it has no session with.
     ///
-    /// The cache first and the rendezvous only for what it does not answer —
-    /// §2.9's order, and the reason the cache is kept across restarts at all.
+    /// What was heard before, which is the reason the cache is kept across
+    /// restarts at all.
     pub async fn hint_forever(self: Arc<Self>) {
         let interval = self.node.schedule().sync;
-        let mut fetched: std::collections::BTreeMap<DeviceId, u64> =
-            std::collections::BTreeMap::new();
 
         loop {
-            self.hint_once(&mut fetched).await;
+            self.hint_once().await;
             self.persist().await;
             tokio::time::sleep(interval).await;
         }
     }
 
     /// One pass over the peers with no session.
-    async fn hint_once(&self, fetched: &mut std::collections::BTreeMap<DeviceId, u64>) {
+    async fn hint_once(&self) {
         let Ok(state) = self.node.state().await else { return };
         let Some(transport) = self.node.transport().await else { return };
 
         let me = self.node.identity().device_id();
-        let client = rendezvous_client(&state.params, state.network);
 
         for device in state.devices.values() {
             if device.id == me || self.node.has_session(&device.id).await {
@@ -384,89 +387,9 @@ impl Discovery {
             let cached = self.cache.lock().await.addresses_for(&key.key_id(), Instant::now());
             if !cached.is_empty() {
                 // Heard on this network, or heard on it recently enough to be
-                // worth one attempt. Nothing is asked of a server for a peer
-                // that is standing next to us.
+                // worth one attempt.
                 transport.learned(&key, &ranked(cached, Source::Local));
-                continue;
             }
-
-            let Some(client) = client.as_ref() else { continue };
-            match client.fetch(&key.key_id(), fetched.get(&device.id).copied()).await {
-                Ok(Some(found)) => {
-                    fetched.insert(device.id, found.sequence);
-                    transport.learned(&key, &ranked(found.addresses, Source::Rendezvous));
-                }
-                // No record is the ordinary state of a device that has never
-                // been switched on, or one that has nothing to publish.
-                Ok(None) => {}
-                Err(cause) => {
-                    self.node
-                        .record(
-                            crate::node::Severity::Event,
-                            SUBSYSTEM,
-                            format!("{}: the rendezvous said {cause}", device.name),
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-
-    /// Publishes this device's addresses to the rendezvous, for as long as it
-    /// runs.
-    ///
-    /// The rendezvous is read from the roster on every round, so one set or
-    /// removed while the network is up is followed without a restart. With none,
-    /// nothing is published: inventing somewhere would be exactly the third
-    /// party §2.8 refuses.
-    pub async fn publish_forever(self: Arc<Self>) {
-        let interval = self.node.schedule().publish;
-        let mut publishing = Publishing::new();
-        let mut publishing_to: Option<String> = None;
-
-        loop {
-            let Some(transport) = self.node.transport().await else { return };
-            let Some(state) = self.network().await else { return };
-            let Some(client) = rendezvous_client(&state.params, state.network) else {
-                publishing_to = None;
-                tokio::time::sleep(interval).await;
-                continue;
-            };
-            // A different rendezvous has never seen this device: what was
-            // published elsewhere says nothing about what it holds.
-            if publishing_to != state.params.rendezvous {
-                publishing = Publishing::new();
-                publishing_to.clone_from(&state.params.rendezvous);
-            }
-            // Only what a peer elsewhere could reach: never the LAN, which local
-            // discovery covers, in a record the whole internet can read.
-            let addresses = publishable(transport.addresses(), &state.params);
-
-            // A publish follows a change in what this device believes it is
-            // reachable at. Publishing an unchanged record teaches the
-            // rendezvous nothing and tells whoever watches it that this device
-            // is switched on, which is a leak for no gain.
-            if publishing.should_publish(&addresses, true) && !addresses.is_empty() {
-                let identity = self.node.identity();
-                if let Err(cause) = client
-                    .publish(
-                        sequence_now(),
-                        addresses,
-                        identity.transport_key().signer(),
-                        identity.transport_key().public_key(),
-                    )
-                    .await
-                {
-                    self.node
-                        .record(
-                            crate::node::Severity::Problem,
-                            SUBSYSTEM,
-                            format!("the rendezvous refused a publish: {cause}"),
-                        )
-                        .await;
-                }
-            }
-            tokio::time::sleep(interval).await;
         }
     }
 
@@ -518,35 +441,6 @@ fn transport_key_of(record: &roster::types::DeviceRecord) -> Option<PublicKey> {
 /// The transport receives a list and tries what it is given; the ordering is
 /// this layer's answer to "which first", and `local-discovery` already holds
 /// the rule.
-/// The client that speaks to a network's rendezvous, if it names one.
-///
-/// Pinned by the relay's certificate where [`rendezvous_pin`] says so, and on
-/// the public roots otherwise. A pin that cannot be used gives no client —
-/// the same as no rendezvous — and never a client on the public roots.
-pub(crate) fn rendezvous_client(
-    params: &roster::types::NetworkParams,
-    network: roster::id::NetworkId,
-) -> Option<Client> {
-    let base = params.rendezvous.as_deref()?;
-    match rendezvous_pin(params) {
-        Some(certificate) => Client::pinned(base, network, certificate),
-        None => Some(Client::new(base, network)),
-    }
-}
-
-/// The certificate a rendezvous is verified with, when it is not the public
-/// roots: the relay's pin, when the rendezvous is on the relay's host and the
-/// network pins its relay.
-///
-/// During a move, the relay compared is the one being moved to, with its own
-/// pin: a rendezvous beside the old relay goes with it.
-pub(crate) fn rendezvous_pin(params: &roster::types::NetworkParams) -> Option<&[u8]> {
-    let rendezvous = params.rendezvous.as_deref()?;
-    let relay = params.relay.as_deref()?;
-    let pin = params.relay_cert.as_deref()?;
-    crate::relay::same_host(rendezvous, relay).then_some(pin)
-}
-
 fn ranked(addresses: Vec<String>, source: Source) -> Vec<String> {
     let candidates: Vec<Candidate> =
         addresses.into_iter().map(|address| Candidate::new(address, source)).collect();
@@ -559,13 +453,13 @@ fn ranked(addresses: Vec<String>, source: Source) -> Vec<String> {
 
 /// A sequence that increases across restarts.
 ///
-/// Seconds since the epoch. The rule the rendezvous and the announcement cache
-/// both enforce is that a record must be *newer* than the last one accepted, so
-/// what matters is that this never goes backwards for a given device — and a
-/// counter kept in memory would restart at zero, after which nothing this
-/// device published would be accepted until it caught up.
+/// Seconds since the epoch. The rule the announcement cache enforces is that a
+/// record must be *newer* than the last one accepted, so what matters is that
+/// this never goes backwards for a given device — and a counter kept in memory
+/// would restart at zero, after which nothing this device announced would be
+/// accepted until it caught up.
 ///
-/// A clock moved backwards by more than the gap between two publishes has the
+/// A clock moved backwards by more than the gap between two announcements has the
 /// same effect until it catches up. That is a worse failure than it sounds and
 /// a better one than the alternative, and it is why this is written down here.
 fn sequence_now() -> u64 {
@@ -578,208 +472,6 @@ fn sequence_now() -> u64 {
 /// intervals stay in one place if that changes.
 #[allow(dead_code, reason = "the schedules live in `schedule.rs`; this is the floor")]
 const RETRY: Duration = Duration::from_secs(1);
-
-/// The addresses worth putting in a public record: those a peer elsewhere on the
-/// internet could reach (F-12).
-///
-/// A private address in a public record helps no peer that is not already on
-/// that network — local discovery covers those — and tells whoever reads it
-/// where the device lives. Dropped: IPv4 private ranges, CGNAT, loopback,
-/// link-local, broadcast, multicast and unspecified; IPv6 unique-local,
-/// link-local, loopback, multicast and unspecified; and anything inside this
-/// network's own IPv4 range or overlay prefix. An address that does not parse as
-/// `ip:port` is dropped too: this cannot tell what it is.
-pub(crate) fn publishable(
-    addresses: Vec<String>,
-    params: &roster::types::NetworkParams,
-) -> Vec<String> {
-    use std::net::{IpAddr, SocketAddr};
-
-    let range = params.ipv4_range();
-    let overlay = params.ula.as_slice();
-    addresses
-        .into_iter()
-        .filter(|text| {
-            let Ok(socket) = text.parse::<SocketAddr>() else { return false };
-            match socket.ip() {
-                IpAddr::V4(ip) => {
-                    let [a, b, ..] = ip.octets();
-                    let cgnat = a == 100 && (64..128).contains(&b);
-                    !(ip.is_private()
-                        || cgnat
-                        || ip.is_loopback()
-                        || ip.is_link_local()
-                        || ip.is_broadcast()
-                        || ip.is_multicast()
-                        || ip.is_unspecified()
-                        || range.contains(ip.octets()))
-                }
-                IpAddr::V6(ip) => {
-                    let first = ip.segments()[0];
-                    let unique_local = first & 0xfe00 == 0xfc00;
-                    let link_local = first & 0xffc0 == 0xfe80;
-                    let ours = ip.octets().starts_with(overlay) && !overlay.is_empty();
-                    !(unique_local
-                        || link_local
-                        || ours
-                        || ip.is_loopback()
-                        || ip.is_multicast()
-                        || ip.is_unspecified())
-                }
-            }
-        })
-        .collect()
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "a test reports failure by panicking")]
-mod publishing {
-    use super::publishable;
-
-    fn params(ipv4: Option<roster::types::Ipv4Range>) -> roster::types::NetworkParams {
-        let mut params = roster::types::NetworkParams::new(
-            vec![0xfd, 1, 2, 3, 4, 5, 6, 7],
-            "casa.internal",
-            600,
-        )
-        .unwrap();
-        params.ipv4 = ipv4;
-        params
-    }
-
-    /// **The relay's pin verifies a rendezvous on the relay's host, and only
-    /// there.** Same host on another port is the relay's host; a name and an
-    /// address are not the same host; an unpinned network uses the public roots;
-    /// during a move, the relay compared is the one being moved to.
-    #[test]
-    fn the_relays_pin_is_used_only_on_the_relays_host() {
-        let pinned = |relay: &str, rendezvous: &str| {
-            let mut one = params(None);
-            one.relay = Some(relay.to_owned());
-            one.relay_cert = Some(vec![1, 2, 3]);
-            one.rendezvous = Some(rendezvous.to_owned());
-            one
-        };
-
-        let same = pinned("https://203.0.113.10", "https://203.0.113.10:8444");
-        assert_eq!(
-            Some(&[1_u8, 2, 3][..]),
-            super::rendezvous_pin(&same),
-            "another port, same host"
-        );
-
-        let named = pinned("https://Relay.Example.", "https://relay.example:8444");
-        assert!(super::rendezvous_pin(&named).is_some(), "a name case-folded, its dot dropped");
-
-        let spelled = pinned("https://[2001:db8::1]", "https://[2001:db8:0::1]:8444");
-        assert!(super::rendezvous_pin(&spelled).is_some(), "one address, two spellings");
-
-        for (relay, rendezvous) in [
-            ("https://203.0.113.10", "https://rendezvous.example:8444"),
-            ("https://relay.example", "https://203.0.113.10:8444"),
-        ] {
-            assert!(super::rendezvous_pin(&pinned(relay, rendezvous)).is_none(), "{rendezvous}");
-        }
-
-        let mut unpinned = pinned("https://203.0.113.10", "https://203.0.113.10:8444");
-        unpinned.relay_cert = None;
-        assert!(super::rendezvous_pin(&unpinned).is_none(), "an unpinned relay pins nothing");
-
-        let moving = pinned("https://old.example", "https://new.example:8444")
-            .moving_to("https://new.example", Some(vec![9]), 1_000)
-            .unwrap();
-        assert_eq!(Some(&[9_u8][..]), super::rendezvous_pin(&moving), "the relay moved to");
-    }
-
-    fn kept(addresses: &[&str], params: &roster::types::NetworkParams) -> Vec<String> {
-        publishable(addresses.iter().map(|a| (*a).to_owned()).collect(), params)
-    }
-
-    #[test]
-    fn a_device_at_home_publishes_its_public_address_only() {
-        let wanted = kept(
-            &[
-                "192.168.1.9:4433",
-                "[fd01:203:405:607::9]:4433",
-                "203.0.113.7:4433",
-                "[2001:db8::7]:4433",
-            ],
-            &params(None),
-        );
-        assert_eq!(vec!["203.0.113.7:4433".to_owned(), "[2001:db8::7]:4433".to_owned()], wanted);
-    }
-
-    #[test]
-    fn every_private_or_special_ipv4_address_is_dropped() {
-        for address in [
-            "10.1.2.3:1",
-            "172.16.0.1:1",
-            "172.31.255.1:1",
-            "192.168.0.1:1",
-            "100.64.0.1:1",
-            "100.127.255.1:1",
-            "127.0.0.1:1",
-            "169.254.1.1:1",
-            "255.255.255.255:1",
-            "224.0.0.1:1",
-            "0.0.0.0:1",
-        ] {
-            assert!(kept(&[address], &params(None)).is_empty(), "{address} was kept");
-        }
-        assert_eq!(1, kept(&["100.128.0.1:1"], &params(None)).len(), "just outside CGNAT");
-    }
-
-    #[test]
-    fn every_private_or_special_ipv6_address_is_dropped() {
-        for address in
-            ["[fc00::1]:1", "[fdab::1]:1", "[fe80::1]:1", "[::1]:1", "[ff02::1]:1", "[::]:1"]
-        {
-            assert!(kept(&[address], &params(None)).is_empty(), "{address} was kept");
-        }
-    }
-
-    /// The network's own ranges. The roster already confines an IPv4 range to
-    /// the private blocks, so the private filter catches these first; the check
-    /// on the network's own range is the second line, should that ever widen.
-    #[test]
-    fn the_networks_own_ranges_are_dropped() {
-        let chosen = roster::types::Ipv4Range::new([10, 42, 0, 0], 16).unwrap();
-        assert!(kept(&["10.42.0.7:4433"], &params(Some(chosen))).is_empty());
-        assert!(kept(&["[fd01:203:405:607::1]:1"], &params(None)).is_empty());
-    }
-
-    /// The filter is applied where the rendezvous is published, and only there:
-    /// local announcements must keep the LAN addresses, which is what they are for.
-    #[test]
-    fn the_rendezvous_publishes_through_the_filter() {
-        let code = crate::code_of(include_str!("discovery.rs"));
-        let start = code.find("pub async fn publish_forever").expect("the publish loop");
-        let body = &code[start..];
-        let end = body.find("async fn persist").unwrap_or(body.len());
-        assert!(
-            body[..end].contains("publishable(transport.addresses()"),
-            "the rendezvous must publish only what `publishable` keeps"
-        );
-        let announce = code.find("pub async fn announce_forever").expect("the announce loop");
-        let announced = &code[announce..start.max(announce)];
-        assert!(!announced.contains("publishable("), "local announcements keep the LAN");
-    }
-
-    #[test]
-    fn an_address_that_does_not_parse_is_dropped() {
-        assert!(kept(&["relay:somewhere", "203.0.113.7"], &params(None)).is_empty());
-    }
-
-    /// Nothing reachable, nothing to publish: an empty list, which the publish
-    /// loop already refuses to send.
-    #[test]
-    fn a_device_behind_cgnat_has_nothing_to_publish() {
-        assert!(
-            kept(&["100.72.1.9:4433", "192.168.1.9:4433", "[fe80::1]:4433"], &params(None))
-                .is_empty()
-        );
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
@@ -939,18 +631,15 @@ mod tests {
         assert_eq!(after.len(), 2);
     }
 
-    /// second one. A local address comes before one learned from a server.
+    /// second one.
     #[test]
-    fn local_addresses_are_offered_before_rendezvous_ones() {
+    fn local_addresses_are_offered_as_they_were_heard() {
         let local = ranked(vec!["192.168.1.7:41641".to_owned()], Source::Local);
-        let remote = ranked(vec!["203.0.113.9:41641".to_owned()], Source::Rendezvous);
-
         assert_eq!(local, vec!["192.168.1.7:41641".to_owned()]);
-        assert_eq!(remote, vec!["203.0.113.9:41641".to_owned()]);
     }
 
     /// A sequence that restarted at zero would leave this device unable to
-    /// publish anything a peer would accept until it caught up.
+    /// announce anything a peer would accept until it caught up.
     #[test]
     fn the_sequence_does_not_restart_at_zero() {
         assert!(sequence_now() > 1_700_000_000, "seconds since the epoch, not a counter");
@@ -962,11 +651,11 @@ mod tests {
     #[test]
     fn every_loop_ends_when_the_transport_does() {
         let source = crate::code_of(include_str!("discovery.rs"));
-        for loop_name in ["announce_forever", "hint_once", "publish_forever"] {
+        for loop_name in ["announce_forever", "hint_once"] {
             assert!(source.contains(loop_name), "{loop_name} must exist to be checked");
         }
         assert!(
-            source.matches("self.node.transport().await else").count() >= 3,
+            source.matches("self.node.transport().await else").count() >= 2,
             "each loop must end rather than spin when the transport is gone"
         );
     }
@@ -1001,6 +690,8 @@ mod over_the_wire {
         mine: Vec<String>,
         /// Every hint handed down, in order.
         heard: SyncMutex<Vec<(Vec<u8>, Vec<String>)>>,
+        /// How many times it was asked to connect.
+        dialled: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -1009,6 +700,7 @@ mod over_the_wire {
             &self,
             _peer: &PublicKey,
         ) -> transport::error::Result<Box<dyn transport::session::Session>> {
+            self.dialled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(transport::error::Error::PeerUnreachable { cause: Some("not dialled".to_owned()) })
         }
 
@@ -1108,8 +800,13 @@ mod over_the_wire {
         let speaker = Arc::new(Speaking {
             mine: vec!["192.168.1.7:41641".to_owned()],
             heard: SyncMutex::new(Vec::new()),
+            dialled: 0.into(),
         });
-        let listener = Arc::new(Speaking { mine: Vec::new(), heard: SyncMutex::new(Vec::new()) });
+        let listener = Arc::new(Speaking {
+            mine: Vec::new(),
+            heard: SyncMutex::new(Vec::new()),
+            dialled: 0.into(),
+        });
         a.started(Arc::clone(&speaker) as Arc<dyn transport::session::Transport>).await;
         b.started(Arc::clone(&listener) as Arc<dyn transport::session::Transport>).await;
 
@@ -1177,7 +874,11 @@ mod over_the_wire {
     #[tokio::test]
     async fn a_revoked_devices_announcements_are_not_contact() {
         let (a, b, _scratches) = two_nodes();
-        let transport = Arc::new(Speaking { mine: Vec::new(), heard: SyncMutex::new(Vec::new()) });
+        let transport = Arc::new(Speaking {
+            mine: Vec::new(),
+            heard: SyncMutex::new(Vec::new()),
+            dialled: 0.into(),
+        });
         a.started(Arc::clone(&transport) as Arc<dyn transport::session::Transport>).await;
 
         let scratch = tempfile::tempdir().expect("a scratch directory");
@@ -1218,9 +919,55 @@ mod over_the_wire {
     /// An announcement from a key the roster does not name is background, not a
     /// peer. Nothing is cached and nothing is handed to the transport.
     #[tokio::test]
+    async fn a_members_newer_announcement_ends_its_rest_and_dials_nothing() {
+        let (a, b, _scratches) = two_nodes();
+        let transport = Arc::new(Speaking {
+            mine: Vec::new(),
+            heard: SyncMutex::new(Vec::new()),
+            dialled: 0.into(),
+        });
+        a.started(Arc::clone(&transport) as Arc<dyn transport::session::Transport>).await;
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let discovery = Arc::new(
+            Discovery::resume(Arc::clone(&a), Endpoints::at(scratch.path().join("e")), None).await,
+        );
+        let state = a.state().await.expect("derives");
+        let announcing = |sequence| {
+            let record = Record::new(
+                b.identity().transport_key().public_key(),
+                state.network,
+                sequence,
+                vec!["10.0.0.9:41641".to_owned()],
+            )
+            .expect("well-formed");
+            Announcement::sign(record, b.identity().transport_key().signer()).expect("signs")
+        };
+        let peer = b.identity().device_id();
+
+        a.rest_after_failure(peer);
+        a.rest(peer);
+        discovery.heard(announcing(5)).await;
+        assert!(!a.resting_after_failure(&peer), "a newer announcement ends the rest");
+        assert!(!a.resting_as_a_neighbour(&peer), "both rests");
+        assert_eq!(
+            0,
+            transport.dialled.load(std::sync::atomic::Ordering::SeqCst),
+            "and the announcement alone dials nothing"
+        );
+
+        a.rest_after_failure(peer);
+        discovery.heard(announcing(5)).await;
+        assert!(a.resting_after_failure(&peer), "an announcement that is not newer leaves it");
+    }
+
+    #[tokio::test]
     async fn an_announcement_from_a_stranger_is_ignored() {
         let (a, _b, _scratches) = two_nodes();
-        let transport = Arc::new(Speaking { mine: Vec::new(), heard: SyncMutex::new(Vec::new()) });
+        let transport = Arc::new(Speaking {
+            mine: Vec::new(),
+            heard: SyncMutex::new(Vec::new()),
+            dialled: 0.into(),
+        });
         a.started(Arc::clone(&transport) as Arc<dyn transport::session::Transport>).await;
 
         let scratch = tempfile::tempdir().expect("a scratch directory");

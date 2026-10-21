@@ -133,7 +133,9 @@ impl From<&netdev::Interface> for LocalInterface {
     }
 }
 
-/// Connectivity over the real network, through iroh.
+/// Connectivity over the real network, through convesso: the Windows service,
+/// the Linux daemon and the Android core all run their sessions on
+/// `transport-convesso`.
 ///
 /// Portable: nothing here knows which platform it runs on. It lived in the Windows
 /// edge only because that was the one edge there was, and a phone would otherwise
@@ -144,22 +146,21 @@ impl From<&netdev::Interface> for LocalInterface {
 /// traffic to infrastructure, which is why it is only ever reached through
 /// [`Connectivity::start`] at bring-up.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Iroh;
+pub struct Convesso;
 
 #[async_trait]
-impl Connectivity for Iroh {
+impl Connectivity for Convesso {
     async fn start(
         &self,
         identity: &Arc<NodeIdentity>,
         state: RosterState,
     ) -> Result<Arc<dyn Transport>> {
-        let transport =
-            transport_iroh::IrohTransport::bind(identity, state).await.map_err(|cause| {
-                crate::error::Error::BringUp {
-                    step: crate::error::Step::StartingTransport,
-                    cause: cause.to_string(),
-                    left: Vec::new(),
-                }
+        let transport = transport_convesso::ConvessoTransport::bind(identity, state)
+            .await
+            .map_err(|cause| crate::error::Error::BringUp {
+                step: crate::error::Step::StartingTransport,
+                cause: cause.to_string(),
+                left: Vec::new(),
             })?;
         Ok(Arc::new(transport))
     }
@@ -274,12 +275,18 @@ pub(crate) mod testing {
     pub(crate) struct Watched {
         inner: MemoryTransport,
         avoided: Mutex<Vec<transport::Range>>,
+        moved: Mutex<usize>,
     }
 
     impl Watched {
         /// The ranges it was last told, in the order they were given.
         pub(crate) fn avoided(&self) -> Vec<transport::Range> {
             self.avoided.lock().expect("not poisoned").clone()
+        }
+
+        /// How many times it was told the machine's network changed.
+        pub(crate) fn moved(&self) -> usize {
+            *self.moved.lock().expect("not poisoned")
         }
     }
 
@@ -317,6 +324,11 @@ pub(crate) mod testing {
         async fn path_to(&self, peer: &roster::id::DeviceId) -> Option<transport::Path> {
             self.inner.path_to(peer).await
         }
+
+        async fn network_changed(&self) {
+            let mut moved = self.moved.lock().expect("not poisoned");
+            *moved = moved.saturating_add(1);
+        }
     }
 
     /// A connectivity handing out [`Watched`] transports, kept by network order.
@@ -344,7 +356,8 @@ pub(crate) mod testing {
             state: RosterState,
         ) -> Result<Arc<dyn Transport>> {
             let inner = MemoryTransport::join(&self.fabric, Arc::clone(identity), state).await;
-            let watched = Arc::new(Watched { inner, avoided: Mutex::new(Vec::new()) });
+            let watched =
+                Arc::new(Watched { inner, avoided: Mutex::new(Vec::new()), moved: Mutex::new(0) });
             self.handed.lock().expect("not poisoned").push(Arc::clone(&watched));
             Ok(watched as Arc<dyn Transport>)
         }

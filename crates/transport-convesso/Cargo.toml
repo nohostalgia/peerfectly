@@ -1,0 +1,43 @@
+[package]
+name = "transport-convesso"
+description = "The convesso binding: the transport interface over convesso."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# A network and a relay in this process, for this crate's own tests. Off in any
+# ordinary build.
+fixture = ["dep:convesso-relay", "dep:rcgen"]
+
+[dependencies]
+roster = { path = "../roster" }
+transport = { path = "../transport" }
+identity = { path = "../identity" }
+convesso-core = { workspace = true, features = ["alloc", "ed25519-seed"] }
+convesso-stream = { workspace = true, features = ["alloc"] }
+convesso-tokio = { workspace = true, features = ["stream", "tls"] }
+async-trait.workspace = true
+tokio.workspace = true
+getrandom.workspace = true
+# What the relay and a change of network did, for whoever collects the log.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# The relay's key, written in its address as hexadecimal digits.
+hex.workspace = true
+convesso-relay = { workspace = true, optional = true }
+# A self-signed certificate for a TLS-wrapped relay link in the fixture. TLS
+# there authenticates nothing; the relay's pinned key is what is trusted.
+rcgen = { version = "0.14", optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+# Depending on itself with the feature on is what makes `cargo test` enable it
+# without a flag, while an ordinary build still cannot see it.
+transport-convesso = { path = ".", features = ["fixture"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+
+[lints]
+workspace = true

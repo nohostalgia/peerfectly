@@ -83,7 +83,6 @@ fn typed_label(asked: &Command) -> Option<&str> {
         Command::Found { label, .. } => Some(label.as_str()),
         Command::Revoke { network, .. }
         | Command::ChangeRelay { network, .. }
-        | Command::ChangeRendezvous { network, .. }
         | Command::Rename { network, .. }
         | Command::Admit { network, .. } => network.as_deref(),
         _ => None,
@@ -100,8 +99,8 @@ fn typed_label(asked: &Command) -> Option<&str> {
 ///
 /// **Down to the values typed**, where the bytes carry them: the reason a
 /// revocation gives, the name a founding gives this device or a rename gives a
-/// device, the rendezvous or relay a settings change moves to. A daemon that
-/// kept the act and changed the address would otherwise have it signed. A name
+/// device, the relay a settings change moves to. A daemon that kept the act and
+/// changed the address would otherwise have it signed. A name
 /// is compared as the daemon keeps it, in lower case: `Laptop` typed is
 /// `laptop` signed, and a name that is no name matches nothing.
 ///
@@ -121,14 +120,12 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
             &core.body,
             OperationBody::Rename { name: signed, .. } if is_named(signed, name)
         ),
-        Command::ChangeRendezvous { rendezvous, .. } => matches!(
-            &core.body,
-            OperationBody::SetNetwork(params) if params.rendezvous == *rendezvous
-        ),
+        // A relay given as its host is signed as the key and port that host
+        // answered with: on that host, and confirmed by the person.
         Command::ChangeRelay { relay, .. } => matches!(
             &core.body,
             OperationBody::SetNetwork(params)
-                if params.relay.as_deref().is_some_and(|signed| daemon::relay::same_relay(signed, relay))
+                if params.relay.as_deref().is_some_and(|signed| daemon::relay::answers_given(signed, relay))
         ),
         _ => true,
     }
@@ -354,15 +351,7 @@ fn settings(params: &NetworkParams) -> String {
         || "no relay".to_owned(),
         |relay| format!("relay {}", daemon::control::shown(relay)),
     );
-    let pinned = params.relay_cert.as_deref().map_or_else(
-        || "its certificate not pinned".to_owned(),
-        |der| format!("its certificate pinned as {}", daemon::relay::fingerprint(der)),
-    );
-    let rendezvous = params.rendezvous.as_deref().map_or_else(
-        || "no rendezvous".to_owned(),
-        |address| format!("rendezvous {}", daemon::control::shown(address)),
-    );
-    let mut said = format!("{relay} ({pinned}), {rendezvous}, IPv4 range {}", params.ipv4_range());
+    let mut said = format!("{relay}, IPv4 range {}", params.ipv4_range());
     if let Some(leaving) = &params.leaving {
         let until = std::time::UNIX_EPOCH
             .checked_add(std::time::Duration::from_millis(leaving.until))

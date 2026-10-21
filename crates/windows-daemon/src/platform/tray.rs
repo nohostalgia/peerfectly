@@ -398,21 +398,57 @@ fn disc(picture: &mut Picture, size: u32, (cx, cy, radius): (f32, f32, f32), col
     }
 }
 
-/// The tray icon for an overall state, 32 pixels square: a light ring, the
-/// product's mark, with a dot in the state's colour.
+/// The product's icon, the one built into the programs (`branding/README.md`).
+/// The tray draws on its 32-pixel image.
+const ICON: &[u8] = include_bytes!("../../../../deploy/windows/peerfectly.ico");
+
+/// The background the icon is drawn on, where the mark leaves it.
+const ICON_BACKGROUND: [u8; 4] = [0x0d, 0x0d, 0x0c, 0xff];
+
+/// The icon's 32-pixel image, as RGBA from the top row down. `None` when the
+/// icon holds no 32-bit bitmap of that size, which the icon is made with.
+fn mark() -> Option<Picture> {
+    const SIZE: usize = 32;
+    let count = u16::from_le_bytes(ICON.get(4..6)?.try_into().ok()?);
+    let entry = (0..usize::from(count)).find_map(|index| {
+        let at = index.checked_mul(16)?.checked_add(6)?;
+        let entry = ICON.get(at..at.checked_add(16)?)?;
+        (entry.first() == Some(&32) && entry.get(1) == Some(&32)).then_some(entry)
+    })?;
+    let offset = usize::try_from(u32::from_le_bytes(entry.get(12..16)?.try_into().ok()?)).ok()?;
+    // A BITMAPINFOHEADER of 40 bytes, then the rows, the bottom one first, as BGRA.
+    let header = ICON.get(offset..offset.checked_add(40)?)?;
+    if header.get(14..16)? != 32u16.to_le_bytes() {
+        return None;
+    }
+    let rows = offset.checked_add(40)?;
+    let mut picture = Vec::with_capacity(SIZE * SIZE * 4);
+    for y in (0..SIZE).rev() {
+        let row = rows.checked_add(y.checked_mul(SIZE * 4)?)?;
+        for bgra in ICON.get(row..row.checked_add(SIZE * 4)?)?.chunks_exact(4) {
+            if let [blue, green, red, alpha] = *bgra {
+                picture.extend_from_slice(&[red, green, blue, alpha]);
+            }
+        }
+    }
+    Some(picture)
+}
+
+/// The tray icon for an overall state, 32 pixels square: the product's icon,
+/// with a dot in the state's colour at its lower right.
 #[must_use]
 pub fn picture(overall: Overall) -> Picture {
     const SIZE: u32 = 32;
-    let mut picture = vec![0; (SIZE * SIZE * 4) as usize];
-    disc(&mut picture, SIZE, (14.0, 14.0, 12.0), [0xe6, 0xe8, 0xec, 0xff]);
-    disc(&mut picture, SIZE, (14.0, 14.0, 7.5), [0, 0, 0, 0]);
+    let mut picture = mark().unwrap_or_else(|| ICON_BACKGROUND.repeat((SIZE * SIZE) as usize));
     let dot = match overall {
         Overall::Stopped => [0x4a, 0x4e, 0x55, 0xff],
         Overall::AllOff => colour(State::Off),
         Overall::SomethingOn => colour(State::On),
         Overall::SomethingWrong => colour(State::Problem),
     };
-    disc(&mut picture, SIZE, (24.0, 24.0, 7.5), dot);
+    // Set apart from the mark by a band of its background.
+    disc(&mut picture, SIZE, (25.0, 25.0, 7.0), ICON_BACKGROUND);
+    disc(&mut picture, SIZE, (25.0, 25.0, 5.5), dot);
     picture
 }
 
@@ -933,6 +969,18 @@ mod tests {
         }
         assert_ne!(dot(State::On), dot(State::Problem));
         assert_eq!(16 * 16 * 4, dot(State::Off).len());
+    }
+
+    /// **The tray shows the product's icon**, read from the same file the
+    /// programs carry, with the mark's light P in the middle.
+    #[test]
+    fn the_tray_draws_on_the_products_icon() {
+        let mark = super::mark().expect("the icon holds a 32-pixel bitmap");
+        assert_eq!(32 * 32 * 4, mark.len());
+        let pixel = |x: usize, y: usize| mark.get((y * 32 + x) * 4..(y * 32 + x) * 4 + 4).unwrap();
+        assert_eq!(&super::ICON_BACKGROUND, pixel(1, 1), "the corner is the background");
+        assert!(pixel(12, 12).iter().take(3).all(|&channel| channel > 0xc0), "the P is light");
+        assert_eq!(pixel(12, 12), &picture(Overall::SomethingOn)[(12 * 32 + 12) * 4..][..4]);
     }
 
     /// **What is offered is read off the daemon's answer, not worked out here.**

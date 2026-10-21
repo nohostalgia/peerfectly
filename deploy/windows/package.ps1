@@ -176,6 +176,20 @@ finally {
 Copy-Item $driver $Stage
 Copy-Item (Join-Path $wintun 'wintun\LICENSE.txt') (Join-Path $Stage 'wintun-LICENSE.txt')
 
+# The installer's pictures, from branding/installer. Windows Installer shows
+# bitmaps, so the PNGs are written out as 24-bit BMP; it scales them to its
+# dialogs, and drawn at twice the size they stay sharp on a dense screen.
+Add-Type -AssemblyName System.Drawing
+foreach ($picture in 'banner', 'dialog') {
+    $drawn = [System.Drawing.Image]::FromFile((Join-Path $Root "branding\installer\$picture.png"))
+    $flat = New-Object System.Drawing.Bitmap $drawn.Width, $drawn.Height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $canvas = [System.Drawing.Graphics]::FromImage($flat)
+    $canvas.DrawImage($drawn, 0, 0, $drawn.Width, $drawn.Height)
+    $canvas.Dispose()
+    $flat.Save((Join-Path $Stage "installer-$picture.bmp"), [System.Drawing.Imaging.ImageFormat]::Bmp)
+    $flat.Dispose(); $drawn.Dispose()
+}
+
 # ---- 4 and 5. Signing and the package --------------------------------------
 
 $programs = @('peerfectlyd.exe', 'peerfectly.exe', 'peerfectly-tray.exe') | ForEach-Object { Join-Path $Stage $_ }

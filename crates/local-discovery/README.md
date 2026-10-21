@@ -6,15 +6,14 @@ Finding a peer on the same network, with no internet at all.
 
 ## Why it exists
 
-Every path built before this one leaves the building. `transport-iroh` reaches a
-peer through a relay on a VPS; `rendezvous-service` says where a peer was last
-seen, from a server on the internet. Both stop working when the internet does.
+Every other path leaves the building. The relay sits on a server somewhere else,
+and a path through it stops working when the internet does.
 
 DESIGN.md §8 states the requirement and the failure it prevents:
 
 > **The network works with the internet off.** If LAN candidates came only
-> through the rendezvous, failing to connect half a metre from the device would
-> be an absurd failure for a product that sells itself on not depending on anyone.
+> through the relay, failing to connect half a metre from the device would be an
+> absurd failure for a product that sells itself on not depending on anyone.
 
 Half a metre from your own server, unable to connect, because someone else's
 machine was down. For a product sold on sovereignty that is not a missing
@@ -67,17 +66,9 @@ decryption instead.
 
 ## Its own signing context
 
-`local-announce/v1`, never the rendezvous tag, even though the payload is the
-same record.
-
-Without the separation an announcement *is* a valid rendezvous record. Anyone on
-a café network could capture one and publish it — and because the device signed
-it at a sequence above whatever it last published globally, it would **replace
-that device's published addresses with LAN-only ones**. Peers elsewhere would
-fetch `192.168.x` and fail until the device published again. Reachability
-destroyed by an observer holding no key.
-
-Two tags make that impossible in both directions, and a test asserts it.
+`local-announce/v1`, a context no other signature in the system uses, so an
+announcement cannot be presented as anything else the same transport key signs.
+A test asserts the tag is distinct.
 
 ## The medium is assumed to fail
 
@@ -115,12 +106,10 @@ keeps the ordering testable without a network.
 
 ## One coupling worth naming
 
-The announcement payload is `rendezvous::Record`. §8 and §2.8 describe the same
-thing — a public key plus an endpoint — and a second copy would drift, which this
-project has already had to correct once.
-
-If a third channel ever carries that record, the type should move below both
-rather than being copied a second time.
+The announcement payload is [`record::Record`](src/record.rs), in roster's
+canonical encoding, and every device on a LAN has to read every other's. A test
+holds its bytes to a fixed vector, so a change to the encoding cannot pass as a
+refactor: it would be devices on one network that cannot hear each other.
 
 ## Deliberately elsewhere
 

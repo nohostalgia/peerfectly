@@ -1,8 +1,8 @@
 //! The node, assembled.
 //!
-//! Seven crates, each deliberately missing the same thing. `roster-sync` has no
-//! loop, `rendezvous` no publish policy, `local-discovery` no schedule,
-//! `transport-iroh` no opinion about when to connect, `tunnel` no device. Every
+//! Several crates, each deliberately missing the same thing. `roster-sync` has
+//! no loop, `local-discovery` no schedule, the transport no opinion about when
+//! to connect, `tunnel` no device. Every
 //! one of them wrote "the daemon owns this". This is where they are joined.
 //!
 //! It is in the core, over [`transport::Transport`], so the whole assembly runs
@@ -12,7 +12,7 @@
 //!
 //! # A failure in one part is not a failure of the node
 //!
-//! The rendezvous is unreachable on a train. Multicast is filtered on most
+//! The relay is unreachable on a train. Multicast is filtered on most
 //! corporate Wi-Fi. A peer hangs up mid-sync. None of these is a reason to stop
 //! carrying packets on the sessions that are working, and a node that treated
 //! them that way would be least available exactly when a person most wanted it.
@@ -24,8 +24,8 @@
 //!
 //! # There is no transport while the tunnel is down
 //!
-//! Section 2.6c: with the network off, the daemon sends nothing to the
-//! rendezvous, the relay, or any other infrastructure. Not "sends little" — a
+//! Section 2.6c: with the network off, the daemon sends nothing to the relay,
+//! or to any other infrastructure. Not "sends little" — a
 //! person with a packet capture must see nothing.
 //!
 //! A transport bound for the life of the process cannot honour that. Binding one
@@ -179,6 +179,14 @@ pub struct Node {
     withheld: std::sync::Mutex<Arc<BTreeMap<DeviceId, crate::conflicts::Conflict>>>,
     /// Live sessions, by the device they belong to.
     sessions: Mutex<BTreeMap<DeviceId, Arc<dyn Session>>>,
+    /// Which way each live session was opened, by the same key.
+    openings: std::sync::Mutex<BTreeMap<DeviceId, Opening>>,
+    /// Dials in flight, by the peer's transport key, each with where its
+    /// outcome will be told. A second caller waits for that outcome rather than
+    /// dialling again: two dials to one peer at once opened two sessions in
+    /// the same direction, and the two sides kept different ones
+    /// (`convesso-reach` 5.4).
+    dialling: std::sync::Mutex<InFlight>,
     /// Devices whose session has refused a packet because the far end does not
     /// accept packets, so it is recorded once per session rather than once per
     /// packet.
@@ -359,6 +367,8 @@ impl Node {
             holdings: watch::Sender::new(Arc::new(holdings)),
             withheld: std::sync::Mutex::new(Arc::new(BTreeMap::new())),
             sessions: Mutex::new(BTreeMap::new()),
+            openings: std::sync::Mutex::new(BTreeMap::new()),
+            dialling: std::sync::Mutex::new(BTreeMap::new()),
             refusing_packets: Mutex::new(BTreeSet::new()),
             fault: Mutex::new(latest),
             event: Mutex::new(None),
@@ -1086,18 +1096,44 @@ impl Node {
     /// The greeting is the offer `roster-sync` defines: reconciliation starts on
     /// contact rather than on a timer, because a node that has been away needs
     /// to catch up now and not in a minute.
-    pub async fn opened(&self, session: Box<dyn Session>) -> Arc<dyn Session> {
+    ///
+    /// `None` when the session is not the one kept: it was closed, and there is
+    /// nothing to serve.
+    pub async fn opened(
+        &self,
+        session: Box<dyn Session>,
+        opening: Opening,
+    ) -> Option<Arc<dyn Session>> {
         let session: Arc<dyn Session> = Arc::from(session);
         let peer = session.peer();
 
+        let replaced = {
+            let mut sessions = self.sessions.lock().await;
+            // **Two devices that dial each other keep the same session.** Each
+            // holds two, opened in opposite directions, and "keep the newer" is
+            // not the same session on both sides: each closed the one the other
+            // kept, and both were left with none (`convesso-reach` 9.2). Between
+            // opposite directions, both keep the one the lower id dialled.
+            let held = self.openings.lock().ok().and_then(|openings| openings.get(&peer).copied());
+            if sessions.contains_key(&peer)
+                && held.is_some_and(|held| held != opening)
+                && !self.keeps(opening, &peer)
+            {
+                drop(sessions);
+                let _closing = session.close().await;
+                return None;
+            }
+            let replaced = sessions.insert(peer, Arc::clone(&session));
+            if let Ok(mut openings) = self.openings.lock() {
+                openings.insert(peer, opening);
+            }
+            replaced
+        };
         self.router.lock().await.opened(peer);
-        let replaced = self.sessions.lock().await.insert(peer, Arc::clone(&session));
-        // Two sessions to one device: the newer is kept, and the one it replaces
-        // is closed, not merely dropped from the table. Dropped, it stayed open in
-        // the transport, since its own reader holds it, and kept both its paths
-        // and the net report alive at rest for good. Two devices that dial each
-        // other at the same moment is how it happens (Linux `VERIFICATION.md`,
-        // step 35).
+        // The one replaced is closed, not merely dropped from the table. Dropped,
+        // it stayed open in the transport, since its own reader holds it, and
+        // kept both its paths alive at rest for good (Linux
+        // `VERIFICATION.md`, step 35).
         if let Some(old) = replaced.filter(|old| !Arc::ptr_eq(old, &session)) {
             let _closing = old.close().await;
         }
@@ -1105,7 +1141,18 @@ impl Node {
         self.note_contact(peer).await;
         self.date_for(peer).await;
 
-        session
+        Some(session)
+    }
+
+    /// Whether, of two sessions with `peer` opened in opposite directions, the
+    /// one opened `opening` is kept: the one the device with the lower id
+    /// dialled, so both sides keep the same.
+    fn keeps(&self, opening: Opening, peer: &DeviceId) -> bool {
+        let dialled_by_the_lower = self.identity.device_id() < *peer;
+        match opening {
+            Opening::Dialled => dialled_by_the_lower,
+            Opening::Accepted => !dialled_by_the_lower,
+        }
     }
 
     /// Sends this node's current attestation to a peer whose session has just
@@ -1220,8 +1267,13 @@ impl Node {
     /// peer; without something reading from it afterwards, a node accepts a
     /// connection and then ignores everything the far end says. Every method
     /// below it was tested — by a test that called them in order itself.
-    pub async fn serve(self: Arc<Self>, session: Box<dyn Session>) {
-        let session = self.opened(session).await;
+    pub async fn serve(self: Arc<Self>, session: Box<dyn Session>, opening: Opening) {
+        let Some(session) = self.opened(session, opening).await else { return };
+        self.serving(session).await;
+    }
+
+    /// Serves a session [`Self::opened`] registered, until it ends.
+    async fn serving(self: Arc<Self>, session: Arc<dyn Session>) {
         let peer = session.peer();
 
         // What waited for this session is sent first, in the order it arrived,
@@ -1278,7 +1330,7 @@ impl Node {
             };
             match accepted {
                 Ok(session) => {
-                    tokio::spawn(Arc::clone(&self).serve(session));
+                    tokio::spawn(Arc::clone(&self).serve(session, Opening::Accepted));
                 }
                 // A device this roster does not name. Possibly a newcomer this
                 // node has not heard of yet, so it catches up; never a reason to
@@ -1470,7 +1522,7 @@ impl Node {
 
     /// Rests a neighbour that did not answer: twice as long as last time, from a
     /// minute up to six hours.
-    fn rest(&self, device: DeviceId) {
+    pub(crate) fn rest(&self, device: DeviceId) {
         const FIRST: std::time::Duration = std::time::Duration::from_secs(60);
         const LONGEST: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
         let Ok(mut unanswered) = self.unanswered.lock() else { return };
@@ -1507,6 +1559,35 @@ impl Node {
             }
         }
     }
+}
+
+/// Dials in flight, by the peer's transport key, each with where its outcome
+/// will be told.
+type InFlight = BTreeMap<Vec<u8>, watch::Receiver<Option<crate::Result<()>>>>;
+
+/// The dial in flight to one peer, taken out of the table when it ends,
+/// however it ends: one abandoned half-way would otherwise hold every later
+/// dial to that peer waiting for ever.
+struct Leading<'a> {
+    dialling: &'a std::sync::Mutex<InFlight>,
+    key: Vec<u8>,
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut dialling) = self.dialling.lock() {
+            dialling.remove(&self.key);
+        }
+    }
+}
+
+/// Which way a session was opened, as seen from this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opening {
+    /// This node dialled.
+    Dialled,
+    /// The peer dialled, and this node accepted.
+    Accepted,
 }
 
 /// What a device refuses to carry while it cannot confirm its roster.
@@ -1738,6 +1819,9 @@ impl Node {
     pub async fn closed(&self, peer: &DeviceId) {
         self.router.lock().await.closed(peer);
         self.sessions.lock().await.remove(peer);
+        if let Ok(mut openings) = self.openings.lock() {
+            openings.remove(peer);
+        }
         if let Ok(mut activity) = self.activity.lock() {
             activity.remove(peer);
         }
@@ -2080,7 +2164,7 @@ impl Node {
     }
 
     /// Whether packets for `device` are being dropped after a failed attempt.
-    fn resting_after_failure(&self, device: &DeviceId) -> bool {
+    pub(crate) fn resting_after_failure(&self, device: &DeviceId) -> bool {
         let now = tokio::time::Instant::now();
         self.unreached
             .lock()
@@ -2092,9 +2176,27 @@ impl Node {
     /// See [`Self::UNREACHED_FIRST`].
     pub const UNREACHED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+    /// Ends whatever rest `device` is on, because it has just announced itself
+    /// on the local network: there is news about where it is, and a rest earned
+    /// before it says nothing about now.
+    ///
+    /// **Dials nothing.** The next packet for it, or the next round of
+    /// neighbours, tries it again: sessions stay on demand. A member that
+    /// announces itself and still cannot be reached costs one attempt an
+    /// announcement, which on a quiet network is one a minute.
+    pub fn announced(&self, device: DeviceId) {
+        if let Ok(mut unreached) = self.unreached.lock() {
+            unreached.remove(&device);
+        }
+        if let Ok(mut unanswered) = self.unanswered.lock() {
+            unanswered.remove(&device);
+        }
+    }
+
     /// Rests a member a packet failed to reach: half a minute, then twice as long
-    /// each time, up to ten minutes. A session opening ends it.
-    fn rest_after_failure(&self, device: DeviceId) {
+    /// each time, up to ten minutes. A session opening ends it, and so does the
+    /// member announcing itself ([`Self::announced`]).
+    pub(crate) fn rest_after_failure(&self, device: DeviceId) {
         let Ok(mut unreached) = self.unreached.lock() else { return };
         let now = tokio::time::Instant::now();
         let entry =
@@ -2445,7 +2547,49 @@ impl Node {
     /// [`Self::NEWCOMER_RETRY`], up to [`Self::NEWCOMER_ATTEMPTS`] times, while
     /// the peer catches up with its own neighbours. Over a real connection the
     /// refusal can arrive as the peer closing it, so that is retried the same way.
+    ///
+    /// **One dial to a peer at a time.** A caller that finds one in flight waits
+    /// for its outcome and is told the same. The session a dial opens is
+    /// registered before the dial is done, so a caller that comes after it
+    /// finds the session.
     pub async fn connect(self: &Arc<Self>, peer: &roster::sign::PublicKey) -> crate::Result<()> {
+        let key = peer.as_bytes().to_vec();
+        loop {
+            let turn = {
+                let Ok(mut dialling) = self.dialling.lock() else {
+                    return self.dial_once(peer).await;
+                };
+                match dialling.get(&key) {
+                    Some(in_flight) => Err(in_flight.clone()),
+                    None => {
+                        let (tell, told) = watch::channel(None);
+                        dialling.insert(key.clone(), told);
+                        Ok(tell)
+                    }
+                }
+            };
+            match turn {
+                Ok(tell) => {
+                    let _leading = Leading { dialling: &self.dialling, key: key.clone() };
+                    let outcome = self.dial_once(peer).await;
+                    tell.send_replace(Some(outcome.clone()));
+                    return outcome;
+                }
+                Err(mut in_flight) => {
+                    // A dial abandoned before it finished told nothing: this
+                    // caller dials itself.
+                    if let Ok(told) = in_flight.wait_for(Option::is_some).await
+                        && let Some(outcome) = told.clone()
+                    {
+                        return outcome;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dials a peer once, retrying only a refusal from a peer that may be behind.
+    async fn dial_once(self: &Arc<Self>, peer: &roster::sign::PublicKey) -> crate::Result<()> {
         // Retried only toward a device this roster names: then a refusal means
         // the other side is the one behind. A device this side does not know
         // either is a stranger to both, and insisting would only delay saying so.
@@ -2460,7 +2604,9 @@ impl Node {
             let transport = self.transport.lock().await.clone().ok_or(crate::Error::NotUp)?;
             match transport.connect(peer).await {
                 Ok(session) => {
-                    tokio::spawn(Arc::clone(self).serve(session));
+                    if let Some(session) = self.opened(session, Opening::Dialled).await {
+                        tokio::spawn(Arc::clone(self).serving(session));
+                    }
                     return Ok(());
                 }
                 Err(refusal @ (transport::Error::NotAMember | transport::Error::ClosedByPeer))
@@ -2491,7 +2637,7 @@ impl Node {
             .await
             .map_err(|cause| crate::Error::Refused { cause: cause.to_string() })?;
 
-        tokio::spawn(Arc::clone(self).serve(session));
+        tokio::spawn(Arc::clone(self).serve(session, Opening::Accepted));
         Ok(())
     }
 }
@@ -2912,6 +3058,30 @@ mod replacing {
         }
     }
 
+    /// A transport whose dials wait until released and then fail, counting
+    /// them.
+    #[derive(Default)]
+    struct Held {
+        dialled: AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for Held {
+        async fn connect(
+            &self,
+            _peer: &roster::sign::PublicKey,
+        ) -> transport::Result<Box<dyn transport::Session>> {
+            self.dialled.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Err(transport::Error::PeerUnreachable { cause: None })
+        }
+
+        async fn accept(&self) -> transport::Result<Box<dyn transport::Session>> {
+            core::future::pending().await
+        }
+    }
+
     fn a_node() -> (Arc<Node>, tempfile::TempDir) {
         let founder = Arc::new(NodeIdentity::generate().unwrap());
         let params =
@@ -2978,11 +3148,69 @@ mod replacing {
         accepting.abort();
     }
 
+    /// **Two dials to one peer at once are one dial, and both callers are told
+    /// its outcome.** Two in flight opened two sessions in the same direction,
+    /// and the two sides kept different ones (`convesso-reach` 5.4).
+    #[tokio::test]
+    async fn two_dials_to_one_peer_at_once_are_one() {
+        let (node, _scratch) = a_node();
+        let held = Arc::new(Held::default());
+        node.started(Arc::clone(&held) as Arc<dyn Transport>).await;
+        let peer = NodeIdentity::generate().unwrap().transport_key().public_key();
+        let dial = || {
+            let (node, peer) = (Arc::clone(&node), peer.clone());
+            tokio::spawn(async move { node.connect(&peer).await })
+        };
+
+        let (one, other) = (dial(), dial());
+        until(|| held.dialled.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(core::time::Duration::from_millis(100)).await;
+        held.release.notify_waiters();
+        let (one, other) = (one.await.unwrap(), other.await.unwrap());
+
+        assert_eq!(held.dialled.load(Ordering::SeqCst), 1, "one dial reached the transport");
+        assert!(one.is_err(), "the dial failed");
+        assert_eq!(one, other, "and both callers are told so");
+    }
+
+    /// A dial abandoned half-way holds no later dial to the same peer waiting.
+    #[tokio::test]
+    async fn a_dial_abandoned_half_way_holds_up_no_later_one() {
+        let (node, _scratch) = a_node();
+        let held = Arc::new(Held::default());
+        node.started(Arc::clone(&held) as Arc<dyn Transport>).await;
+        let peer = NodeIdentity::generate().unwrap().transport_key().public_key();
+        let dial = || {
+            let (node, peer) = (Arc::clone(&node), peer.clone());
+            tokio::spawn(async move { node.connect(&peer).await })
+        };
+
+        let abandoned = dial();
+        until(|| held.dialled.load(Ordering::SeqCst) == 1).await;
+        abandoned.abort();
+        let _aborted = abandoned.await;
+
+        let later = dial();
+        until(|| held.dialled.load(Ordering::SeqCst) == 2).await;
+        held.release.notify_waiters();
+        assert!(later.await.unwrap().is_err(), "the later dial ran to its own end");
+    }
+
     /// A node that is down is not given a transport by a relay moving.
     #[tokio::test]
     async fn a_down_node_is_not_given_a_transport() {
         let (node, _scratch) = a_node();
         node.replace_transport(Arc::new(Parked::default()) as Arc<dyn Transport>).await;
         assert!(!node.is_reachable().await, "§2.6c: nothing to reach a relay with");
+    }
+}
+
+/// What tests read of a node's rests. Here, after everything else, because
+/// the guards that read this file's code stop at the first test attribute.
+#[cfg(test)]
+impl Node {
+    /// Whether `device` is rested as a neighbour that did not answer.
+    pub(crate) fn resting_as_a_neighbour(&self, device: &DeviceId) -> bool {
+        self.unanswered.lock().is_ok_and(|unanswered| unanswered.contains_key(device))
     }
 }

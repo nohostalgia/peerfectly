@@ -28,12 +28,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "BSL-1.0",
     # minicbor, the canonical CBOR encoder: a permissive licence.
     "BlueOak-1.0.0",
     "CC0-1.0",
-    # webpki-roots: the Mozilla root certificates, as data.
-    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MIT-0",
@@ -46,8 +43,8 @@ allow = [
 confidence-threshold = 0.93
 
 [bans]
-# Several versions of one crate come in through iroh. That costs build time,
-# not safety, so it warns.
+# Several versions of one crate can come in through dependencies. That costs
+# build time, not safety, so it warns.
 multiple-versions = "warn"
 wildcards = "deny"
 # The workspace's own crates depend on each other by path, with no version. That
@@ -55,23 +52,9 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 [sources]
-# crates.io and nothing else: no other registry, and one git dependency.
+# crates.io and nothing else: no other registry, and no git dependency.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The exception: the project's fork of iroh, which the workspace takes through
-# `[patch.crates-io]`, pinned by commit. It is iroh's tag `v1.3.0` plus one commit
-# per fix, and each fix goes when an iroh release carries it:
-#
-# - "fix(iroh): seed the kept QAD connection with its first report":
-#   n0-computer/iroh#4523. Upstream means to rework the net report as a stream
-#   (#4400) rather than take a small fix.
-# - "feat(iroh): NetReportConfig::pause_when_idle": n0-computer/iroh#4589.
-#   Upstream agrees on the aim and leans towards several modes.
-# - "feat(iroh, iroh-relay): configurable relay ping interval":
-#   n0-computer/iroh#4590. Upstream agrees the ping is too frequent and would
-#   rather fix the default than add a setting; a quieter default is as good.
-#
-# When the last one goes, so do the fork, this entry and the `[patch]` sections.
-# A fix iroh turns down is decided again here, not kept quietly.
-allow-git = ["https://github.com/nohostalgia/iroh"]
+# The transport, from its own repository: its crates are not on crates.io.
+allow-git = ["https://github.com/nohostalgia/convesso"]

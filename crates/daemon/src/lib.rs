@@ -1,9 +1,9 @@
 //! The node as a program: what it decides, what it answers, and the loops that
 //! drive it.
 //!
-//! Eight crates decided things and none of them ran. `roster-sync` has no loop,
-//! `rendezvous` no cache policy, `local-discovery` no schedule, `transport-iroh`
-//! no opinion about when to connect, `tunnel` no device. Every one of them wrote
+//! Several crates decided things and none of them ran. `roster-sync` has no
+//! loop, `local-discovery` no schedule, the transport no opinion about when to
+//! connect, `tunnel` no device. Every one of them wrote
 //! "the daemon owns this". This is the daemon.
 //!
 //! # This half decides; another half acts
@@ -108,7 +108,7 @@ pub use resolving::{Answering, Resolving};
 pub use router::Router;
 pub use routes::{Interface, Plan, Route};
 pub use rule::Rule;
-pub use schedule::{Announcing, Publishing, Schedule};
+pub use schedule::{Announcing, Schedule};
 pub use service::Service;
 pub use state::{Choice, Log, Paths};
 
@@ -249,7 +249,6 @@ mod surface {
             "NotRecorded",
             "waiting_unlisted",
             "reason",
-            "rendezvous",
         ] {
             assert!(surface.contains(field), "SURFACE.md says what to do with `{field}`");
             assert!(control.contains(field), "`{field}` is still a name in control.rs");

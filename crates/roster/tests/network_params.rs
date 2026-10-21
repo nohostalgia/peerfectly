@@ -63,25 +63,15 @@ fn loaded(history: &History) -> Roster {
 // ---------------------------------------------------------------------------
 
 /// Length-first, not alphabetical. `relay` is five bytes and belongs between
-/// `ula` and `suffix`; `leaving`, seven, between `suffix` and `relay_cert`;
-/// `relay_cert`, ten, between `leaving` and `snapshot_window`. Anywhere else they produce bytes a conforming decoder
-/// refuses. This is the single easiest rule to get wrong by habit — and the
+/// `ula` and `suffix`; `leaving`, seven, between `suffix` and `snapshot_window`.
+/// Anywhere else they produce bytes a conforming decoder refuses. This is the single easiest rule to get wrong by habit — and the
 /// reason to spell the whole order out rather than trust the eye.
 #[test]
 fn the_schema_is_in_canonical_key_order() {
     assert!(is_canonical_schema(NETWORK_PARAMS_SCHEMA), "{NETWORK_PARAMS_SCHEMA:?}");
     assert_eq!(
         NETWORK_PARAMS_SCHEMA,
-        &[
-            "ula",
-            "ipv4",
-            "relay",
-            "suffix",
-            "leaving",
-            "relay_cert",
-            "rendezvous",
-            "snapshot_window"
-        ]
+        &["ula", "ipv4", "relay", "suffix", "leaving", "snapshot_window"]
     );
 }
 
@@ -273,148 +263,6 @@ fn two_concurrent_relay_changes_settle_deterministically() {
         forward.params.relay
     );
     assert_eq!(forward.to_bytes(), backward.to_bytes(), "and the whole state agrees");
-}
-
-// ---------------------------------------------------------------------------
-// The relay's certificate
-// ---------------------------------------------------------------------------
-
-/// A certificate that looks like DER without being one. The roster carries
-/// bytes and asks no questions about them; whether they parse is the
-/// transport's business, and the roster having an opinion would be a second
-/// authority on what a certificate is.
-const CERTIFICATE: &[u8] = &[0x30, 0x82, 0x01, 0x0a, 0xde, 0xad, 0xbe, 0xef];
-
-/// A history founded with a relay whose certificate the network pins.
-fn founded_with_pinned_relay() -> History {
-    let params = params_with_relay(RELAY).pinning(CERTIFICATE.to_vec()).expect("usable");
-
-    let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), params);
-    history
-}
-
-/// The roster authenticates the relay, so the certificate has to survive a
-/// signature and come back byte for byte.
-#[test]
-fn a_pinned_certificate_survives_a_signed_operation() {
-    let state = loaded(&founded_with_pinned_relay()).state().expect("derives");
-
-    assert_eq!(state.params.relay_cert.as_deref(), Some(CERTIFICATE));
-    assert_eq!(state.params.relay.as_deref(), Some(RELAY), "the address is still there too");
-}
-
-/// A network with a relay and no pin is the ordinary case: a relay presenting a
-/// publicly trusted certificate, or one still being set up.
-#[test]
-fn a_network_may_carry_a_relay_without_pinning_it() {
-    let state = loaded(&founded_with_relay()).state().expect("derives");
-    assert_eq!(state.params.relay_cert, None);
-}
-
-/// Empty is refused rather than treated as absence: absence already has an
-/// encoding, and two spellings of one value is how two implementations come to
-/// disagree about what was signed.
-#[test]
-fn an_empty_certificate_is_refused() {
-    assert!(params_with_relay(RELAY).pinning(Vec::new()).is_err());
-}
-
-#[test]
-fn an_oversized_certificate_is_refused() {
-    let huge = vec![0u8; roster::limits::MAX_RELAY_CERT_LEN + 1];
-    assert!(params_with_relay(RELAY).pinning(huge).is_err());
-}
-
-/// The bound is inclusive: a chain is allowed to be large.
-///
-/// And a certificate at the bound must still fit inside a signed operation. Two
-/// limits meet here — the certificate's own and `MAX_OPERATION_SIZE` — and a
-/// certificate the parameters accept but no genesis can carry would be a bound
-/// that is not really the bound, discovered by whoever founds a network with a
-/// large chain.
-#[test]
-fn a_certificate_at_the_bound_still_fits_in_a_signed_operation() {
-    let exact = vec![0u8; roster::limits::MAX_RELAY_CERT_LEN];
-    let params = params_with_relay(RELAY).pinning(exact).expect("at the bound");
-
-    let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), params);
-
-    let state = loaded(&history).state().expect("derives");
-    assert_eq!(
-        state.params.relay_cert.map(|certificate| certificate.len()),
-        Some(roster::limits::MAX_RELAY_CERT_LEN)
-    );
-}
-
-/// Pinning a certificate for a network with no relay is allowed but useless,
-/// and the roster does not police it — the transport ignores a pin it has no
-/// relay to check against, and a parameter set that refused would be one more
-/// rule to keep in step with a layer that does not care.
-#[test]
-fn a_pin_without_a_relay_is_carried_rather_than_refused() {
-    let params = params().pinning(CERTIFICATE.to_vec()).expect("carried");
-    assert_eq!(params.relay, None);
-    assert_eq!(params.relay_cert.as_deref(), Some(CERTIFICATE));
-}
-
-// ---------------------------------------------------------------------------
-// The rendezvous
-// ---------------------------------------------------------------------------
-
-const MEETING: &str = "https://rendezvous.example.com";
-
-/// The address has to survive a signature, like the relay's: a rendezvous each
-/// node were told about separately is one anybody who can write a config file
-/// can move.
-#[test]
-fn a_rendezvous_survives_a_signed_operation() {
-    let params = params_with_relay(RELAY).meeting_at(MEETING).expect("usable");
-
-    let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), params);
-
-    let state = loaded(&history).state().expect("derives");
-    assert_eq!(state.params.rendezvous.as_deref(), Some(MEETING));
-    assert_eq!(state.params.relay.as_deref(), Some(RELAY), "the relay is untouched");
-}
-
-/// A network confined to a LAN needs none, and must not be made to invent one.
-#[test]
-fn a_network_may_have_no_rendezvous() {
-    let state = loaded(&founded_with_relay()).state().expect("derives");
-    assert_eq!(state.params.rendezvous, None);
-}
-
-#[test]
-fn an_empty_rendezvous_address_is_refused() {
-    assert!(params().meeting_at("").is_err());
-}
-
-#[test]
-fn an_oversized_rendezvous_address_is_refused() {
-    let long = "h".repeat(roster::limits::MAX_RENDEZVOUS_LEN + 1);
-    assert!(params().meeting_at(long).is_err());
-}
-
-/// The three infrastructure answers are independent: a network may pin a relay
-/// certificate and name no rendezvous, or the reverse.
-#[test]
-fn the_relay_the_pin_and_the_rendezvous_are_carried_independently() {
-    let both = params_with_relay(RELAY)
-        .pinning(CERTIFICATE.to_vec())
-        .expect("pins")
-        .meeting_at(MEETING)
-        .expect("meets");
-
-    let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), both);
-    let state = loaded(&history).state().expect("derives");
-
-    assert_eq!(state.params.relay.as_deref(), Some(RELAY));
-    assert_eq!(state.params.relay_cert.as_deref(), Some(CERTIFICATE));
-    assert_eq!(state.params.rendezvous.as_deref(), Some(MEETING));
 }
 
 // ---------------------------------------------------------------------------

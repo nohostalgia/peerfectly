@@ -109,16 +109,10 @@ and presented on another.
 A roster is signed operations. Who hands it over changes nothing about whether
 it is true, so a joining device asks only what it contains: an operation
 admitting **its own keys**, signed by an admin, deriving to a consistent state.
-And where the device had to accept a relay certificate that nothing had vouched
-for, the network must pin **that same certificate** — so a relay substituted
-during the bootstrap can prevent an enrolment but cannot survive into
-membership.
 
-A relay whose certificate ordinary verification accepts is verified the ordinary
-way and no person is bothered. Only when that fails is one accepted on sight,
-with the fingerprint shown and the absence of any vouching stated plainly. If
-the network pins nothing at all, the device records that the relay was accepted
-on sight and never confirmed, rather than presenting it as verified.
+The relay needs no such check. Its address names its key (`key@host:port`), so
+the payload that tells a joining device where the relay is also tells it who
+must answer there, and nothing is ever accepted on sight.
 
 ## The bounds, and what they do not buy
 
@@ -151,7 +145,7 @@ talked into it. That is written here rather than left to be discovered.
 | Deferred | To |
 |---|---|
 | Sockets, waiting, deadlines, the terminal | `windows-daemon` |
-| The enrolment endpoint and its channel material | `transport-iroh` |
+| The enrolment endpoint and its channel material | `transport-convesso` |
 | Membership, roles, authority | the roster's, entirely |
 | Scanning a code with a camera | a client with a camera; this renders one and reads its text |
 | Capability switches at admission (§3.1) | when something consults capabilities |

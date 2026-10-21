@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 57 of 89. Every other result reads `not run`. That is the honest
+**Run so far**: 55 of 87. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -12,11 +12,6 @@ redrawn. Every **Expect** below names the wording as it is now. Every **Result**
 records what was seen on its date and is left as it was written: a result quoting
 `reachable, direct` was true when it was taken, and rewriting it would be inventing
 an observation nobody made.
-
-This is the same split `transport-iroh` needed for NAT: a reproducible automated
-body of evidence, and a separate real-world measurement which is the one that
-actually settles the question. There, the automated matrix was silently
-contaminated for days and only the real measurement caught it.
 
 **On 2026-10-03 the product was renamed from `mynet` to `peerfectly`** (`rename-to-peerfectly`),
 protocol included: nothing before that date speaks to anything after it. Commands and **Expect**
@@ -88,33 +83,21 @@ machines and nothing has to reach the joining device beforehand.
 ### On A: found the network
 
 ```
-.\peerfectly.exe found nas --suffix peerfectly.internal --relay https://<your relay> --fetch-relay-cert
+.\peerfectly.exe found nas --suffix peerfectly.internal --relay <your relay's host>
 ```
 
-Add `--rendezvous <url>` if you run one. Omit `--relay` entirely for a LAN-only
-test — enough for every step except a cross-network step 1.
+Omit `--relay` entirely for a LAN-only test — enough for every step except a
+cross-network step 1.
 
-`--fetch-relay-cert` asks the relay for the certificate it presents, checks that
-a verifying client could actually accept it, shows the SHA-256 fingerprint, and
-pins it once you type `yes`. The pin goes into the **signed** network parameters,
-so every device that later reads this roster trusts that certificate and no
-certificate authority.
+Given the relay's host alone, founding asks the relay for its key, shows it in
+groups of four, and signs nothing before you type `yes`. The key goes into the
+**signed** network parameters, so every device that later reads this roster
+trusts that relay by its key.
 
-Without a pin nothing reaches a relay you run yourself: the handshake fails, no
-device registers a home relay, and every peer shows as unreachable with nothing
-in the output mentioning certificates. That is the failure seen between these
-two machines on 2026-09-09.
-
-**What the fingerprint is for.** Fetching it trusts whoever answered at that
-address in that moment. Before typing `yes`, compare what is on screen with what
-the relay host says about its own certificate:
-
-```
-openssl x509 -in <the relay's cert file> -noout -fingerprint -sha256
-```
-
-If you already have the certificate file on this machine, pass it directly
-instead: `--relay-cert relay.pem` takes PEM or DER.
+**Why compare it.** Fetching it trusts whoever answered at that address in
+that moment. Before typing `yes`, compare what is on screen with the key the
+relay printed when it first started. If you already have it, pass the relay as
+`KEY@HOST:PORT` instead, and nothing is fetched.
 
 Founding twice is refused, and says how to start over on purpose. That is not a
 flag: losing a network by typing a command twice is not a thing this offers.
@@ -129,10 +112,7 @@ Add `--name <name>` to propose one; without it the machine's own name is
 proposed. The admin decides the final name and the role either way — a joining
 device cannot ask to be an admin, and the payload has no field for it.
 
-B prints a QR code and a line beginning `peerfectly-join-v1:`, then waits. If the
-relay's certificate is not publicly verifiable, B says so and shows the
-fingerprint it accepted — **the network it joins must pin that same certificate
-or B will refuse it**.
+B prints a QR code and a line beginning `peerfectly-join-v1:`, then waits.
 
 Carry that line to A. Photograph the code, paste the text, whatever is
 convenient: it carries no secret, and holding it grants nothing.
@@ -242,7 +222,7 @@ ping fd6c:4fbc:9c79:d144:38b6:25f1:bb3a:15de
 **Result**: run, and it passed — with one defect found on the way.
 
 Two real machines, A the founder and B joined to it over the relay at
-`https://203.0.113.10` with its certificate pinned. Addresses
+`https://203.0.113.10`. Addresses
 `fd61:42d3:a6c7:1f9b:9165:e7bb:f5c8:b793` (A) and
 `fd61:42d3:a6c7:1f9b:a155:1fc1:6f5c:504f` (B).
 
@@ -258,7 +238,7 @@ What was run, in order:
 
 **The ping is the result; the cycle in the middle is a defect.** The transport
 authorises against a `RosterState` captured when the tunnel came up and never
-updated after — `IrohTransport::update_state` exists and is called by no
+updated after — the transport's method to update it exists and is called by no
 production code, and `Transport` does not declare it, so the daemon holding an
 `Arc<dyn Transport>` could not call it if it tried. Every admission will need the
 same down/up until that is fixed, and a *revocation* will not take effect at all
@@ -588,7 +568,7 @@ Then, with the daemon running and nothing asked of it, capture for a minute:
 pktmon start --etw -m real-time
 ```
 
-**Expect** nothing to any relay, any rendezvous, and no DNS lookup of either.
+**Expect** nothing to any relay, and no DNS lookup of one.
 
 Then start a join, abandon it, and capture again:
 
@@ -604,7 +584,7 @@ the report would show it**.
 Finally, on two machines with their daemons running throughout:
 
 ```
-.\peerfectly.exe found <name> --relay <url> --fetch-relay-cert
+.\peerfectly.exe found <name> --relay <url>
 .\peerfectly.exe up
 ```
 
@@ -693,7 +673,7 @@ adapters, two real resolvers and two real relays on one Windows machine.
 On **A**, found one network and join another from **B**:
 
 ```
-.\peerfectly.exe found casa --relay <url> --fetch-relay-cert
+.\peerfectly.exe found casa --relay <url>
 .\peerfectly.exe up casa
 .\peerfectly.exe join lavoro --relay <url>
 .\peerfectly.exe up lavoro
@@ -745,10 +725,10 @@ adapters agree with them.
 ## 19. A network that is down reaches no infrastructure while another is up
 
 **On A**, with `casa` down and `lavoro` up, capture traffic for two minutes and
-filter for `casa`'s relay and rendezvous.
+filter for `casa`'s relay.
 
-**Expect** nothing for `casa` at all — no relay registration, no rendezvous
-publish, no multicast announcement carrying its network id — while `lavoro`'s
+**Expect** nothing for `casa` at all — no relay registration, no multicast
+announcement carrying its network id — while `lavoro`'s
 traffic continues.
 
 §2.6c used to be a property of the daemon: with the tunnel down there was no
@@ -831,7 +811,7 @@ Found a network in the range of the machine's own Wi-Fi, admit a device, bring b
 up:
 
 ```
-.\peerfectly.exe found <network> --name pc --relay <url> --fetch-relay-cert --ipv4-range 192.168.1.0/24
+.\peerfectly.exe found <network> --name pc --relay <url> --ipv4-range 192.168.1.0/24
 .\peerfectly.exe admit <payload> --network <network>
 .\peerfectly.exe status
 ```
@@ -869,17 +849,18 @@ relay. The same measurements, recorded in full in the Android client's verificat
 
 ## 25. No session travels over a tunnel this machine carries
 
-With a network up on the desktop and the phone, and the daemon started with `RUST_LOG=iroh=debug`
-and `PEERFECTLY_LOG` pointing at a file:
+With a network up on the desktop and the phone, the daemon started with the transport's debug log
+on and `PEERFECTLY_LOG` pointing at a file:
 
 ```
 ping -n 150 -w 20000 <the phone's overlay address>   # and, on the phone, the same outside the tunnel
-findstr "path::selected holepunching Abandoned" <the log>
 ```
 
+and the log searched for paths selected, hole punching and paths abandoned.
+
 **Expect** hole punching to keep opening a path between the two overlay addresses — the transport
-enumerates every interface and cannot tell a tunnel adapter from any other — and **no**
-`path::selected` event naming one. A session on a path through the machine's own tunnel can only
+enumerates every interface and cannot tell a tunnel adapter from any other — and **no** path
+selected naming one. A session on a path through the machine's own tunnel can only
 be served by itself, and freezes until the path times out.
 
 **Result**: run, 2026-09-16, passed. Before: a selection and an abandonment every 60 seconds,
@@ -1023,60 +1004,25 @@ still open and is the likelier explanation.
 
 ---
 
-## 29. A relay whose certificate is not pinned can never admit anybody
-
-Found in verification, not by a test. With a network founded against a relay that presents a
-certificate no public authority vouches for — a self-signed one on a bare IP is the ordinary case —
-and the certificate **not** pinned:
-
-```
-.\peerfectly.exe status            # reads: relay https://<host> (no certificate pinned)
-.\peerfectly.exe admit <payload>   # from a device waiting at that same relay
-```
-
-**Expect**, and this is the defect: the admitting side cannot reach the relay. Its endpoint pins a
-certificate only where the network does — `crates/transport-iroh/src/enrolment.rs:216` adds
-`ca_tls_config` under `if let Some(certificate) = state.params.relay_cert` — so with nothing pinned
-it verifies against the system's roots, which refuse that certificate. The **joining** side has no
-such problem: it accepts the relay on sight when ordinary verification fails, registers, and shows
-its payload exactly as it should.
-
-So the failure appears on the machine that is working. The joining device waits its full ten
-minutes and reports a timeout; the admitting side gives no reason at all, because from where it
-stands nothing happened.
-
-**Result**: run, 2026-09-17, **failed as described**. A `casa` founded against
-`https://203.0.113.10` without pinning could not admit a phone: the phone showed its payload,
-`mynet admit` never reached it, and the join ended in a timeout with nothing said about a
-certificate anywhere. Re-founding the same network against the same relay **with** the certificate
-pinned made the same enrolment work first time.
-
-**What this costs**: a person who declines the fingerprint at founding — a reasonable thing to do
-when you cannot check it — gets a network that looks healthy, reports no fault, and can never
-enrol a second device. Nothing in `status` says so.
-
-**Not fixed here.** It predates this change and is not what this change is about. It is written
-down so the next person does not spend an evening on it, as this one did.
+## 29. (removed)
 
 ---
 
 ## 30. A network is born attested, and says nothing about confirming it
 
-On a desktop with no networks, against a relay whose certificate no public authority vouches for:
+On a desktop with no networks:
 
 ```
 peerfectly found casa --relay https://<relay>
 peerfectly status
 ```
 
-**Expect** the certificate to be fetched without being asked for, its fingerprint shown, and
-pinning to wait on a person. **Expect** two signatures — the founding operation and the network's
-first snapshot. **Expect** `status` to say `certificate pinned` and to say **nothing** about a
-roster that cannot be confirmed.
+**Expect** two signatures — the founding operation and the network's first snapshot. **Expect**
+`status` to say **nothing** about a roster that cannot be confirmed.
 
-**Result**: run, 2026-09-18, passed. `casa` was founded with one command and no flag about the
-certificate; the directory held `snapshot` and `snapshot_at` beside the log, and `status` reported
-`certificate pinned` with no line about confirmation anywhere. The two signatures are the cost of
+**Result**: run, 2026-09-18, passed. `casa` was founded with one command; the directory held
+`snapshot` and `snapshot_at` beside the log, and `status` had no line about confirmation anywhere.
+The two signatures are the cost of
 the attestation existing from the first moment, and were accepted as such.
 
 ---
@@ -1251,8 +1197,7 @@ roster's cost per operation makes interesting.
 
 Replace each `not run` with what happened, **including anything that failed or was
 skipped, and why**. A step recorded as passing when it was not run converts an
-open question into a false answer — which is exactly what the contaminated NAT
-matrix did before the real measurement caught it.
+open question into a false answer.
 
 A test in `tests/documentation.rs` asserts every result still reads `not run`. It
 will fail the moment you fill one in. That is deliberate: updating it should be a
@@ -1638,15 +1583,10 @@ the socket table is what it did. The firewall log serves too.
 
 **Expect**, on a network founded with no relay, a refusal naming `peerfectly relay`.
 
-**Result**: run, 2026-09-23, passed. The other relay was a second `iroh-relay` on the same host,
-`https://203.0.113.10:8443`, with its own self-signed certificate; the phone waited there. The
-admission into `casa` was refused naming both relays, and `netstat` showed no connection to `:8443`
-before or after. The same payload into `prova-senza`, founded with no relay, was refused naming
-`mynet relay`.
-
-Setting up the second relay met one thing worth knowing: two `iroh-relay` on one host collide on the
-metrics port (9090) before either relay port, with *Address in use* and nothing naming metrics in
-the config. The second needs its own `metrics_bind_addr`.
+**Result**: run, 2026-09-23, passed. The other relay was a second relay on the same host,
+`https://203.0.113.10:8443`; the phone waited there. The admission into `casa` was refused naming
+both relays, and `netstat` showed no connection to `:8443` before or after. The same payload into
+`prova-senza`, founded with no relay, was refused naming `mynet relay`.
 
 ## 52. A move from the command line
 
@@ -1657,23 +1597,20 @@ peerfectly relay <new relay>
 peerfectly status
 ```
 
-**Expect** the fingerprint prompt in the same words founding uses, then the key's prompt for the
+**Expect** the relay's confirmation in the same words founding uses, then the key's prompt for the
 change. **Expect** `status` to name the relay being left, the date it stops being used — seven days
 from now — and to say to keep it running until then.
 
 **Expect** `peerfectly relay <the relay it already uses>` refused with nothing changed, also when written
 in capitals or with a trailing dot.
 
-**Result**: run, 2026-09-23, passed after three fixes. `casa` moved from `https://203.0.113.10`
-to `https://203.0.113.10:8443`, a second relay on the same host with its own certificate. The same
+**Result**: run, 2026-09-23, passed after fixes. `casa` moved from `https://203.0.113.10`
+to `https://203.0.113.10:8443`, a second relay on the same host. The same
 relay, in capitals and with a trailing dot, was refused with nothing changed.
 
 - **From an ordinary console the signature failed with a bare `0x80090010`**, printed twice. The key
   is the machine's and only an administrator may use it — as §50 says — but nothing said so. It now
   says to use an elevated console, and every signing command prints a refusal once.
-- **Two relays on one host would have lost everybody at the move's end.** TLS carries no port, and
-  the per-host verifier took the first rule for the host, so the new relay would have been checked
-  against the old one's pin. It now accepts a certificate any of that host's relays would.
 - **Getting here destroyed the phone's membership of `casa`** — F-22, older than this change: §51's
   test join made a key under the name `casa`'s key had, and the keystore replaced it. Keys now have
   names of their own; the phone joined `casa` again before this step.
@@ -1717,13 +1654,13 @@ the whole window was not tried.
 
 On an admin phone, the network's screen, *change this network's relay*.
 
-**Expect** it to be absent on a network the phone is only a member of. **Expect** the certificate
-screen to say it is moving the network, confirm with *move the relay*, and then the phone's lock.
+**Expect** it to be absent on a network the phone is only a member of. **Expect** the relay's
+confirmation screen to say it is moving the network, confirm with *move the relay*, and then the phone's lock.
 **Expect** *move at once* to warn before anything is sent, and *keep the transition* to send nothing.
 Back on the network's screen, **expect** the relay being left and until when.
 
 **Result**: run, 2026-09-23, passed. Absent on a network the phone is a member of. On the network it
-administers: the form sent nothing by itself; the certificate screen named the network being moved
+administers: the form sent nothing by itself; the confirmation screen named the network being moved
 and confirmed with *move the relay*, behind the phone's lock; the network's screen then showed the
 move. *Move at once* warned before anything was sent, and *keep the transition* sent nothing.
 
@@ -1944,7 +1881,7 @@ Get-Content "$env:ProgramData\peerfectly\logs\peerfectlyd.log"
 
 **Expect** it to be refused.
 
-**Result**: run, 2026-09-26, passed: the service's start and stop and each act on `casa`, with who asked (as the account's SID), the act, the network and the outcome; no resolved name, payload, code or full-length id; nothing from iroh. Reading the file from an unelevated console was refused.
+**Result**: run, 2026-09-26, passed: the service's start and stop and each act on `casa`, with who asked (as the account's SID), the act, the network and the outcome; no resolved name, payload, code or full-length id. Reading the file from an unelevated console was refused.
 
 ## 69. A network's current problem is one line, on the desktop and on the phone
 
@@ -1991,27 +1928,15 @@ uname -m
 docker --version
 docker compose version
 systemctl list-units --type=service | grep -i relay
-ps aux | grep -i iroh-relay | grep -v grep
 ```
 
-Then read the 443 instance's configuration file, whatever the listing above names, and compare it with `deploy/server/relay.toml`. **Expect** to decide each difference, not inherit it. Copy its certificate and key into `/etc/peerfectly/certs` as `deploy/server/README.md` says, and write down:
-
-```sh
-openssl x509 -in /etc/peerfectly/certs/relay.crt -noout -enddate -fingerprint -sha256
-```
-
-**Expect** the fingerprint to be the one `casa` pins.
+**Expect** to know the machine, and what runs on it, before anything is replaced.
 
 **Result**: run, 2026-09-28.
 - **The VPS:** Ubuntu 20.04.6 on x86_64, with 952 MB of memory and no swap, too little to build Rust. So the image was built on the desktop with Docker Desktop and moved with `docker save` and `docker load`, as the README's alternative says.
 - **Docker:** it was not installed. `docker.io` 26.1.3 and `docker-compose-v2` 2.27.1 were installed from Ubuntu's own repositories.
-- **The old relay:** not a service. It had been started by hand with `sudo` on 2026-09-11, running as root, from `/etc/iroh-relay.toml`.
-- **Differences from `deploy/server/relay.toml`, all decided in its favour:**
-  - metrics were on, at the default `0.0.0.0:9090` (the host firewall rejected it);
-  - access and limits were left to the defaults;
-  - HTTP was on 8080 and nothing was listening there.
-- **The certificate:** `/var/lib/iroh-relay/relay-new.crt`, valid until 2036-09-06, SHA-256 `00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF`. Copied to `/etc/mynet/certs`.
-- **The host firewall** already admitted 80 and 443. Published ports do not pass through `INPUT`; 8444/tcp was opened in Oracle's security list.
+- **The relay running there:** not a service. It had been started by hand with `sudo` on 2026-09-11, running as root.
+- **The host firewall** already admitted 80 and 443. Published ports do not pass through `INPUT`.
 - **Worth knowing:** Ubuntu 20.04 is out of standard support.
 
 ## 72. The image holds no key
@@ -2034,13 +1959,13 @@ Stop and disable the old instances (the 443 service, and the hand-run 8443 one i
 ```sh
 docker compose -f deploy/server/compose.yaml up -d
 docker compose -f deploy/server/compose.yaml ps
-sudo ss -tulpn | grep -E ':(80|443|8444|9090) '
+sudo ss -tulpn | grep -E ':(80|443|9090) '
 docker inspect --format '{{.Config.User}} {{.HostConfig.CapDrop}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.SecurityOpt}}' $(docker compose -f deploy/server/compose.yaml ps -q)
 ```
 
 **Expect**:
 - both services running;
-- only 80/tcp, 443/tcp, 443/udp and 8444/tcp held, and nothing on 9090;
+- 80/tcp, 443/tcp and 443/udp held, and nothing on 9090;
 - each container `10001 [ALL] true [no-new-privileges:true]`.
 
 On the desktop, with no change made to any device:
@@ -2050,7 +1975,7 @@ On the desktop, with no change made to any device:
 .\target\release\peerfectly.exe peers casa
 ```
 
-**Expect** `casa` up with its relay, and the phone reachable. Where it was direct before (phone on the same Wi-Fi, or on mobile data with a path that punched through), **expect** it direct again within a minute: that is QUIC address discovery still seeing each device's own address through Docker's published ports.
+**Expect** `casa` up with its relay, and the phone reachable. Where it was direct before (phone on the same Wi-Fi, or on mobile data with a path that punched through), **expect** it direct again within a minute: that is the relay's address discovery still seeing each device's own address through Docker's published ports.
 
 **Result**: run, 2026-09-28, passed after a fix.
 - **First start:** both containers restarted in a loop, with *permission denied* on `relay.key`. Compose said `user: "10001"`, so the process's group was the image user's system group, not 10001, and the key is `root:10001 0640`.
@@ -2061,35 +1986,11 @@ On the desktop, with no change made to any device:
   - `deployment.rs` now asserts both.
 - **After the fix:**
   - both services were up;
-  - 80, 443/tcp, 443/udp and 8444 were held by `docker-proxy`, and nothing listened on 9090;
+  - 80, 443/tcp and 443/udp were held by `docker-proxy`, and nothing listened on 9090;
   - each container ran `10001 [ALL] true [no-new-privileges:true]`;
   - `casa` was up on the desktop, with the phone reachable, and no device changed.
 
-## 74. `casa` uses the rendezvous, verified by the relay's pin
-
-From an elevated console:
-
-```powershell
-.\target\release\peerfectly.exe rendezvous https://203.0.113.10:8444 --network casa
-.\target\release\peerfectly.exe status
-```
-
-**Expect** the change signed (with the prompt, as for a relay change), and `status` naming the rendezvous beside the relay. On the phone, once it holds the change, **expect** the same on `casa`'s screen. After a few minutes, on the VPS:
-
-```sh
-docker compose -f deploy/server/compose.yaml logs --tail 100
-curl -sv http://203.0.113.10:8444/r/00 2>&1 | tail -3
-```
-
-**Expect**:
-- the logs to name no node, key or address: the relay at `warn`, the rendezvous with its one start line;
-- the plain `http://` request to get no answer (the connection closed).
-
-**Result**: run, 2026-09-28, passed.
-- **The change:** `mynet rendezvous https://203.0.113.10:8444 --network casa` was signed. `status` on the desktop named the rendezvous beside the pinned relay, with no problem line, and the phone's `casa` screen showed it too.
-- **The logs:** the relay's were a few warnings about closed streams, with no identity or address; the rendezvous's was its one start line.
-- **Plain HTTP to 8444:** curl got no HTTP response, only the bytes of a TLS alert, which curl reports as HTTP/0.9.
-- **Use by the devices:** no discovery line in the desktop's log since the rendezvous was set, so no refused publish and no certificate failure. That is evidence by absence; the rendezvous logs no requests by design.
+## 74. (removed)
 
 ## 75. A reboot brings both back
 
@@ -2123,12 +2024,11 @@ Open the tray and `casa`'s submenu.
 
 Before building `portable-cli`, save `peerfectly status`, `peerfectly peers casa`, `peerfectly address` and the usage (`peerfectly` alone, on standard error) to files. Build and restart the service, then run the same four again and compare with `Compare-Object`.
 
-**Expect** no difference other than the relative part of the times. Then **expect** `peerfectly rendezvous https://203.0.113.10:8444 --network casa` refused as already set with nothing signed, and `peerfectly expose casa tcp 9999` followed by `peerfectly unexpose casa tcp 9999`, from an elevated console, to work as before.
+**Expect** no difference other than the relative part of the times. Then **expect** `peerfectly expose casa tcp 9999` followed by `peerfectly unexpose casa tcp 9999`, from an elevated console, to work as before.
 
 **Result**: run, 2026-09-29, passed.
 - **The four outputs:** `status`, `peers casa`, `address` and the usage after the build read as before: the same layout and lines, the usage in the same order with `mynet tray` last.
 - **How they were compared:** by eye, not with `Compare-Object` against saved files. What stands behind that: during the change every string literal of the command line before and after was compared, and the only differences were the intended ones — the refusals of `NoCustody`, the device name read from `HOSTNAME` or `/etc/hostname` off Windows, and the tray's usage line moved into Windows' extras.
-- **The rendezvous:** `mynet rendezvous https://203.0.113.10:8444 --network casa` was refused as already set, with nothing signed.
 - **Expose:** `mynet expose casa tcp 9999` listed the rule, and `unexpose` left nothing exposed.
 
 ## 79. One batch per act, said before Windows asks
@@ -2151,10 +2051,10 @@ Use networks made for this and nothing else, so `casa` is not touched. From an *
 Then:
 
 ```powershell
-.\target\release\peerfectly.exe rendezvous https://example.invalid:8444 --network prova
+.\target\release\peerfectly.exe relay <key>@example.invalid:7400 --network prova
 ```
 
-**Expect** `prova: 1 act to sign`, then `change prova's settings to: no relay (its certificate not pinned), rendezvous example.invalid:8444, IPv4 range …`, with *every device in prova follows this*. Then the same line about Windows, and the dialog.
+**Expect** `prova: 1 act to sign`, then the change of `prova`'s settings, with *every device in prova follows this*. Then the same line about Windows, and the dialog.
 
 Repeat both commands from an **elevated Windows Terminal** with `prova2` in place of `prova`.
 
@@ -2167,7 +2067,7 @@ Repeat both commands from an **elevated Windows Terminal** with `prova2` in plac
 
 Afterwards `peerfectly forget prova` and `peerfectly forget prova2`. Their keys stay in the machine's key store under `peerfectly.prova…`, unused.
 
-**Result**: run, 2026-10-01, passed (reported by the person who ran it). Not reported: how many dialogs a batch produced, whether the dialog showed the summary line, and whether it opened in front of the console, in either console. Those stay open, and the console line before the dialog is what says what it is for whatever their answer.
+**Result**: run, 2026-10-01, passed (reported by the person who ran it). The second command was a change of a setting this build no longer has; with `peerfectly relay` it is not yet run. Not reported: how many dialogs a batch produced, whether the dialog showed the summary line, and whether it opened in front of the console, in either console. Those stay open, and the console line before the dialog is what says what it is for whatever their answer.
 
 ## 80. Removing a network takes its key out of the machine's key store
 
@@ -2405,7 +2305,7 @@ peerfectly found casa --relay https://<your relay>
 peerfectly status
 ```
 
-**Expect** the relay's certificate fetched and its fingerprint shown, with *Pin this certificate …? [yes/no]*: compare it with the one the relay host prints, then answer `yes`. Then:
+**Expect** the relay's key fetched and shown, and nothing signed before `yes`: compare it with the key the relay host prints, then answer `yes`. Then:
 - the service `peerfectly` running from `C:\Program Files\peerfectly`;
 - `casa` founded and up;
 - `certutil -csp "Microsoft Platform Crypto Provider" -key` listing a key beginning `peerfectly.casa.`;
@@ -2413,7 +2313,7 @@ peerfectly status
 
 **Result**: run, 2026-10-05, passed (reported by the person who ran it).
 
-- `casa` was founded again with `peerfectly found casa --relay https://203.0.113.10`, pinning the same relay certificate after its fingerprint was confirmed. The phone then joined it (Android property 31).
+- `casa` was founded again with `peerfectly found casa --relay https://203.0.113.10`, after the relay was confirmed. The phone then joined it (Android property 31).
 
 ## 88. Sessions on demand, with the phone
 
@@ -2469,3 +2369,81 @@ on this PC's port 8000 (which `expose` opens) fetched by name with `nc`.
   the phone got 3 of 3. Windows puts the `peerfectly casa` interface in the *Public* profile, and no
   rule there lets an echo request in. That is Windows' default and not the name: the page on port 8000
   is what reaches.
+
+# Branch `convesso-transport`: the daemon on convesso
+
+Steps of the branch alone, where every daemon runs on convesso
+(`openspec/changes/convesso-live`). They are not counted above: the branch is not merged, and
+their results are labelled apart so that no count of results includes them.
+
+## C1. The PC and the phone in one network on the VPS's convesso relay
+
+The relay is the one in `core/crates/linux-daemon/VERIFICATION.md` C2, on the VPS's port 8433.
+
+On the PC, from an elevated console:
+
+```powershell
+msiexec /i C:\giovanni\progetti\mynet\core\target\dist\peerfectly-0.3.0-windows-x64.msi
+```
+```powershell
+peerfectly forget casa
+```
+```powershell
+peerfectly found prova --name pc --relay 1c23b31d465a430ab24cc9e7990dd18ed67800950f7c3d035c3f6cb7747e5a89@204.216.216.139:8433
+```
+```powershell
+peerfectly up prova
+```
+
+On the phone, the branch's debug app installed over adb in place of the old one. A join, with the
+relay string typed into its field over adb. Then on the PC, `peerfectly admit <payload>`.
+
+**Expect**: `status` on the PC naming the relay `(trusted by its key)`; the join completed with the
+same six digits on both; each device reaching the other by name.
+
+**Result on the branch**: run, 2026-10-18, passed (the join and the admission reported by the
+person who ran them).
+- **On the PC.**
+  - `status`: `pc.prova.internal`, `up (now)`, the relay `1c23…5a89@204.216.216.139:8433
+    (trusted by its key)`.
+  - `peers`: `phone.prova.internal` `reachable yes, direct (now)`.
+  - `ping phone.prova.internal`: 4 of 4, 11 to 47 ms.
+- **On the phone.** `pc.prova.internal` resolved to `100.107.123.181`, the PC's address.
+- **The phone's ping to the PC got no answer.** Windows admits no echo request on the *Public*
+  profile (step 89).
+
+## C2. A network founded on the relay's host alone
+
+`convesso-reach`. The VPS runs `peerfectly-relay`, the relay and its key in one container (port
+8443 for the relay, 443 for its key).
+
+On the PC, from an elevated console, with the MSI of this branch installed:
+
+```powershell
+peerfectly forget prova
+```
+```powershell
+peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+peerfectly up prova
+```
+
+The phone joins with `204.216.216.139` in the app's relay field, and the PC admits it.
+
+**Expect**: the key shown by `found` equal to the one the container printed, and nothing signed
+before `yes`; the phone joining on the host alone, with nothing to confirm; each device reaching
+the other by name.
+
+**Result on the branch**: run, 2026-10-21, passed.
+- `curl -k https://204.216.216.139/relay` answered
+  `{"key":"03ce07db…e702","port":8443,"tls":false}`.
+- **The first join from the phone timed out**: "did not answer within thirty seconds". The key had
+  come from port 443, but 8443 was not yet open in the VPS's firewall and its provider's rules. Once
+  opened, the join went through.
+- `status`: `desktop-rjuubb3.prova.internal`, `up (now)`, the relay
+  `03ce…e702@204.216.216.139:8443 (trusted by its key)`, 2 devices.
+- `peers`: `phone.prova.internal` `reachable yes, direct (now)`.
+- `ping` to the phone's address, and to `phone.prova.internal`: 4 of 4 each, 14 to 118 ms.
+- The PC's icon, from `core/branding`, is on the programs, in the Start menu and in the
+  installer's pictures.

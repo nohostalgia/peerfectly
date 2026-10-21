@@ -9,8 +9,8 @@
 //!
 //! # What this interface does not promise
 //!
-//! **Confidentiality.** Nothing here encrypts anything. A real transport gets it
-//! from QUIC and TLS 1.3 (§2.1); the in-memory one has no wire to protect and
+//! **Confidentiality.** Nothing here encrypts anything. `transport-convesso` gets
+//! it from Noise (§2.1); the in-memory one has no wire to protect and
 //! provides none. This is stated rather than left implicit, because *"it goes
 //! through the transport"* is exactly the sort of phrase a later reader takes to
 //! mean *"it is encrypted"*. Anything needing confidentiality independent of the
@@ -23,7 +23,7 @@
 //!
 //! # Async, and dyn-compatible
 //!
-//! QUIC, hole punching and connection migration are asynchronous; a synchronous
+//! Handshakes, hole punching and path changes are asynchronous; a synchronous
 //! facade would hide a runtime behind blocking calls, and blocking a phone's UI
 //! thread on a relay handshake is a failure mode worth designing out. The traits
 //! use `async_trait` so they remain usable behind a trait object, which is what
@@ -55,8 +55,8 @@ pub trait Transport: Send + Sync {
 
     /// Where this node believes it can be reached, as opaque strings.
     ///
-    /// Published to a rendezvous and announced on the local network by the layer
-    /// above, which does not read them: only the implementation that produced an
+    /// Announced on the local network by the layer above, which does not read
+    /// them: only the implementation that produced an
     /// address knows what it means, and one that parsed them would need changing
     /// whenever the addressing did.
     ///
@@ -136,6 +136,23 @@ pub trait Transport: Send + Sync {
     fn own_ports(&self) -> Vec<u16> {
         Vec::new()
     }
+
+    /// Says that this machine's network changed: an interface came or went, or
+    /// one of its addresses moved.
+    ///
+    /// Called by the daemon the moment it sees the change, not once it has
+    /// settled: a phone that left Wi-Fi for mobile data is unreachable until its
+    /// connectivity layer stops waiting on a network that is gone. Measured on
+    /// the convesso branch on 2026-10-19: told nothing, the phone answered
+    /// nothing for 92 seconds after its Wi-Fi went off, and a TCP connection
+    /// across the change was given up by the far end (Android
+    /// `VERIFICATION.md`, C3).
+    ///
+    /// A hint, as [`Self::learned`] is: the layer decides what to do with it,
+    /// and one that watches the network itself may ignore it. The default does
+    /// nothing, which is right for the in-memory implementations and for one that
+    /// notices on its own.
+    async fn network_changed(&self) {}
 
     /// Whether the session with `peer` is carried on a direct path or through a
     /// relay, as the connection stands now.

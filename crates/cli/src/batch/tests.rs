@@ -259,27 +259,30 @@ fn a_network_named_differently_from_the_one_typed_is_refused() {
 #[test]
 fn a_settings_change_must_carry_what_was_typed() {
     let admin = Admin::new();
-    let meeting = params().meeting_at("https://meet.example:8444").unwrap();
-    let change = admin.core(OperationBody::SetNetwork(meeting), Vec::new());
-    let asked = |address: &str| Command::ChangeRendezvous {
-        network: None,
-        rendezvous: Some(address.to_owned()),
-    };
-    assert!(matches_what_was_asked(&asked("https://meet.example:8444"), &change));
-    assert!(!matches_what_was_asked(&asked("https://other.example:8444"), &change));
-    let removing = Command::ChangeRendezvous { network: None, rendezvous: None };
-    assert!(!matches_what_was_asked(&removing, &change), "a removal is not a change of address");
 
-    let moved = params().switching_to("https://relay.example", None).unwrap();
+    // A relay as it is written: its key, at its address.
+    let key: String = NodeIdentity::generate()
+        .unwrap()
+        .transport_key()
+        .public_key()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let at = |host: &str| format!("{key}@{host}");
+    let moved = params().switching_to(at("relay.example:7400")).unwrap();
     let moving = admin.core(OperationBody::SetNetwork(moved), Vec::new());
     let relay = |address: &str| Command::ChangeRelay {
         network: None,
         relay: address.to_owned(),
-        pin: false,
         immediately: true,
     };
-    assert!(matches_what_was_asked(&relay("https://relay.example"), &moving));
-    assert!(!matches_what_was_asked(&relay("https://elsewhere.example"), &moving));
+    assert!(matches_what_was_asked(&relay(&at("RELAY.example:7400")), &moving));
+    assert!(!matches_what_was_asked(&relay(&at("elsewhere.example:7400")), &moving));
+
+    // Given as its host, the relay signed must be on that host.
+    assert!(matches_what_was_asked(&relay("relay.example"), &moving));
+    assert!(!matches_what_was_asked(&relay("elsewhere.example"), &moving));
 }
 
 /// The reason a revocation gives is the one typed.
@@ -310,8 +313,6 @@ fn a_founding_typed_in_upper_case_is_the_one_asked_for() {
         name: name.to_owned(),
         suffix: "home.internal".to_owned(),
         relay: None,
-        rendezvous: None,
-        certificate: daemon::control::Certificate::None,
         ipv4_range: None,
     };
     assert!(matches_what_was_asked(&asked("Laptop"), &founding));
@@ -404,22 +405,15 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("prove") && text.contains("no roster changes"), "{text}");
 }
 
-/// A settings change shows the new values: relay, the pinned certificate's
-/// fingerprint, rendezvous, IPv4 range — and that everybody follows them.
+/// A settings change shows the new values: relay, IPv4 range — and that
+/// everybody follows them.
 #[test]
 fn a_settings_change_shows_its_values() {
     let admin = Admin::new();
-    let certificate = vec![0x30, 0x82, 0x01, 0x0a];
-    let changed = params()
-        .switching_to("https://relay.example", Some(certificate.clone()))
-        .unwrap()
-        .meeting_at("https://meet.example:8444")
-        .unwrap();
+    let changed = params().switching_to("https://relay.example").unwrap();
     let change = admin.core(OperationBody::SetNetwork(changed), Vec::new());
     let text = said(&Read::Operation(Box::new(change)), &Command::Confirm);
     assert!(text.contains("relay.example"), "{text}");
-    assert!(text.contains(&daemon::relay::fingerprint(&certificate)), "{text}");
-    assert!(text.contains("meet.example"), "{text}");
     assert!(text.contains("IPv4 range"), "{text}");
     assert!(text.contains("every device in casa follows this"), "{text}");
 }

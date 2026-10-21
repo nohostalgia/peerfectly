@@ -130,11 +130,22 @@ pub const MAX_DNS_MESSAGE: usize = 512;
 /// listing interfaces this often costs nothing a person would notice.
 pub const INTERFACE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often the daemon reads this device's interfaces to notice that its
+/// network changed, where the platform does not say so itself.
+///
+/// The connectivity layer is told at once (`Transport::network_changed`), and a
+/// device is unreachable until it is: this is how long a change can go unseen.
+/// Measured on 2026-10-19 at the five seconds of [`INTERFACE_RECHECK`]: a phone
+/// leaving Wi-Fi was unreachable for 4.1 s, nearly all of it waiting to be
+/// noticed. Reading the local interface list is all a check does, so once a
+/// second costs nothing. Android says so itself, at once
+/// (`Service::interfaces_may_have_changed`).
+pub const NETWORK_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The largest request the control protocol carries, in bytes.
 ///
-/// The biggest real one is `Command::Found`, whose relay certificate is DER
-/// written out as a JSON array of numbers — a few kilobytes at the outside. This
-/// is comfortably above anything the product sends and far below anything worth
+/// The biggest real ones are a signed batch's requests and signatures, a few
+/// kilobytes at the outside. This is comfortably above anything the product sends and far below anything worth
 /// holding, which is the point: a bound is not a guess at what is needed, it is
 /// the line past which nothing is read.
 ///

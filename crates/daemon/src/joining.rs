@@ -20,9 +20,8 @@
 //! While waiting, this accepts an exchange from a peer no roster names — there
 //! is no roster with which to name anyone. It grants that peer nothing. What
 //! arrives is verified afterwards: the network must admit this device's own
-//! keys, be signed by an admin, and pin the relay certificate this device had to
-//! accept on sight. And a person compares six digits before any of it is
-//! believed.
+//! keys and be signed by an admin. And a person compares six digits before any
+//! of it is believed.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +31,7 @@ use enrollment::exchange::{Message, Possession};
 use enrollment::payload::Joining;
 use enrollment::{adopt, limits};
 use identity::NodeIdentity;
-use transport_iroh::enrolment::{Channel, Waiting};
+use transport_convesso::enrolment::{Channel, Waiting};
 
 use crate::state::{Log, Paths};
 
@@ -50,8 +49,8 @@ pub type Refusal = String;
 ///
 /// # These are called off the runtime
 ///
-/// Every method here may block for as long as a person takes, and the QUIC
-/// connection this enrolment runs over needs the runtime to keep driving it
+/// Every method here may block for as long as a person takes, and the
+/// session this enrolment runs over needs the runtime to keep driving it
 /// meanwhile. So they are called on a blocking thread — an implementation may
 /// read from a terminal without thinking about it.
 ///
@@ -145,8 +144,6 @@ pub enum Progress {
         suffix: String,
         /// How many devices it has, this one included.
         devices: usize,
-        /// Whether the relay this device used was confirmed by the network.
-        relay_confirmed: bool,
     },
     /// It ended without a network, and why.
     Failed(String),
@@ -215,11 +212,7 @@ impl AcrossTheChannel {
     /// needs is whether they have a network, and if not, why not.
     pub fn finished(&self, outcome: Result<Joined, Refusal>) {
         self.reached(match outcome {
-            Ok(joined) => Progress::Joined {
-                suffix: joined.suffix,
-                devices: joined.devices,
-                relay_confirmed: joined.relay_confirmed,
-            },
+            Ok(joined) => Progress::Joined { suffix: joined.suffix, devices: joined.devices },
             Err(refusal) => Progress::Failed(refusal),
         });
     }
@@ -363,8 +356,6 @@ pub struct Joined {
     pub suffix: String,
     /// How many devices the network has, this one included.
     pub devices: usize,
-    /// Whether the relay this device used was confirmed by the network.
-    pub relay_confirmed: bool,
 }
 
 /// Waits to be admitted, and adopts the network if everything checks out.
@@ -418,20 +409,6 @@ pub async fn join_with(
             .await
             .map_err(|_| format!("{relay} did not answer within thirty seconds"))?;
 
-        if let Some(certificate) = waiting.accepted_on_sight() {
-            note(
-                &person,
-                &format!(
-                    "
-the relay's certificate was accepted on sight — nothing vouches for it yet:
-                       SHA-256  {}
-the network you join must pin this same certificate, or it will be refused.",
-                    crate::relay::fingerprint(&certificate)
-                ),
-            )
-            .await;
-        }
-
         let payload =
             Joining::of(&identity, name, waiting.relay()).map_err(|cause| cause.to_string())?;
         show(&person, payload.to_text()).await;
@@ -451,11 +428,7 @@ the network you join must pin this same certificate, or it will be refused.",
 
     keep_delivered_snapshot(paths, &operations, snapshot.as_deref());
 
-    Ok(Joined {
-        suffix: adopted.state.params.suffix.clone(),
-        devices: adopted.state.devices.len(),
-        relay_confirmed: adopted.relay_confirmed,
-    })
+    Ok(Joined { suffix: adopted.state.params.suffix.clone(), devices: adopted.state.devices.len() })
 }
 
 /// Checks a delivered snapshot against the operations it came with, and keeps it.
@@ -614,8 +587,8 @@ async fn one_exchange(
     };
 
     // Delivery proves nothing. What arrived must admit this device's own keys,
-    // be signed by an admin, and pin the relay certificate already accepted.
-    let adopted = adopt::adopt(&operations, identity, None).map_err(|cause| cause.to_string());
+    // and be signed by an admin.
+    let adopted = adopt::adopt(&operations, identity).map_err(|cause| cause.to_string());
     let taken = adopted.is_ok();
     let _ = send(&mut channel, &Message::Outcome { taken }, deadline).await;
 
@@ -639,7 +612,7 @@ pub struct Delivered {
 
 /// Asks the person for the code, without stalling the connection.
 ///
-/// The exchange is a live QUIC connection and the runtime has to keep driving it
+/// The exchange is a live session and the runtime has to keep driving it
 /// while somebody reads a number off another screen and types it in. Doing this
 /// on the runtime's own thread killed the connection mid-question.
 async fn ask(person: &Arc<dyn Person>, ours: Confirmation) -> Option<String> {
@@ -757,8 +730,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "peerfectly.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: None,
                 ipv4_range: None,
             },
         )

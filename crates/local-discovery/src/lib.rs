@@ -2,7 +2,7 @@
 //!
 //! Every path built before this one leaves the building. DESIGN.md §8 states
 //! the requirement and the failure it exists to prevent: the network must work
-//! with the internet off, and if LAN candidates came only from the rendezvous,
+//! with the internet off, and if LAN candidates came only from a server,
 //! failing to connect while standing half a metre from your own node would be an
 //! absurd outcome for a product sold on sovereignty.
 //!
@@ -49,9 +49,11 @@ pub mod error;
 pub mod limits;
 pub mod multicast;
 pub mod order;
+pub mod record;
 
 pub use announce::{Announcement, DOMAIN_TAG};
 pub use cache::Cache;
 pub use error::{Error, Result};
 pub use multicast::Multicast;
 pub use order::{Candidate, Conditions, Source, order};
+pub use record::Record;

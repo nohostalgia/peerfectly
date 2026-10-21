@@ -95,7 +95,7 @@ fn install() -> std::process::ExitCode {
 /// Narrows this program's inbound rules to UDP, and says what changed (F-11).
 ///
 /// Windows' own prompt allows a program TCP and UDP on every port, on public
-/// networks too. The transport is QUIC over UDP and the control channel is a
+/// networks too. The transport's direct paths are UDP and the control channel is a
 /// pipe, so UDP is all this program needs to receive. A failure here does not
 /// undo the registration: it is said, with how to try again.
 #[cfg(windows)]
@@ -550,7 +550,7 @@ const LOOKS_AGAIN: std::time::Duration = std::time::Duration::from_millis(500);
 async fn assemble() -> daemon::Result<std::sync::Arc<daemon::Service>> {
     use std::sync::Arc;
 
-    use crate::platform::connectivity::Iroh;
+    use crate::platform::connectivity::Convesso;
     use crate::platform::machine::Windows;
     use crate::platform::resolver::Sockets;
     use daemon::lifecycle::Lifecycle;
@@ -596,7 +596,7 @@ async fn assemble() -> daemon::Result<std::sync::Arc<daemon::Service>> {
     let service = Service::over_with_keys(
         home,
         Lifecycle::new(Arc::new(Windows::new()) as Arc<dyn Machine>),
-        Arc::new(Iroh) as Arc<dyn Connectivity>,
+        Arc::new(Convesso) as Arc<dyn Connectivity>,
         Arc::new(Sockets) as Arc<dyn Resolving>,
         keys,
     )?

@@ -39,8 +39,6 @@ pub enum Conflict {
     Resolver,
     /// The relay this network's transport reaches.
     Relay,
-    /// The rendezvous this network's transport reaches.
-    Rendezvous,
     /// This device's own IPv4 address in another network.
     OwnAddressIn {
         /// That network's local label.
@@ -70,7 +68,6 @@ impl fmt::Display for Conflict {
             Self::Gateway => write!(f, "a gateway of this device"),
             Self::Resolver => write!(f, "a resolver of this device"),
             Self::Relay => write!(f, "the relay"),
-            Self::Rendezvous => write!(f, "the rendezvous"),
             Self::OwnAddressIn { network } => {
                 write!(f, "this device's address in network {network}")
             }
@@ -98,22 +95,17 @@ pub struct OtherNetwork {
 pub struct Infrastructure {
     /// The relay's addresses: a literal one, or those it resolved to.
     pub relay: Vec<Ipv4Addr>,
-    /// The rendezvous's addresses, the same way.
-    pub rendezvous: Vec<Ipv4Addr>,
 }
 
 impl Infrastructure {
-    /// The addresses written literally in the relay and rendezvous URLs.
+    /// The address written literally in the relay, `key@host:port`.
     ///
     /// A name is not resolved here: resolving is traffic, and this is called
     /// whenever anything changes. Resolved addresses join when the transport
     /// resolves them.
     #[must_use]
-    pub fn literal(relay: Option<&str>, rendezvous: Option<&str>) -> Self {
-        Self {
-            relay: relay.and_then(literal_ipv4).into_iter().collect(),
-            rendezvous: rendezvous.and_then(literal_ipv4).into_iter().collect(),
-        }
+    pub fn literal(relay: Option<&str>) -> Self {
+        Self { relay: relay.and_then(literal_ipv4).into_iter().collect() }
     }
 }
 
@@ -171,9 +163,6 @@ fn conflict(
     if infrastructure.relay.contains(&address) {
         return Some(Conflict::Relay);
     }
-    if infrastructure.rendezvous.contains(&address) {
-        return Some(Conflict::Rendezvous);
-    }
     for other in others.iter().filter(|other| other.label != this) {
         if other.own == Some(address) {
             return Some(Conflict::OwnAddressIn { network: other.label.clone() });
@@ -223,10 +212,9 @@ mod tests {
         withheld(
             "casa",
             local,
-            &Infrastructure::literal(
-                Some("https://203.0.113.9:4433"),
-                Some("https://198.51.100.7"),
-            ),
+            &Infrastructure::literal(Some(
+                "0000000000000000000000000000000000000000000000000000000000000000@203.0.113.9:8443",
+            )),
             others,
             [(device(1), address)],
         )
@@ -277,9 +265,8 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_equal_to_the_relay_or_rendezvous_is_withheld() {
+    fn a_peer_equal_to_the_relay_is_withheld() {
         assert_eq!(only(Ipv4Addr::new(203, 0, 113, 9), &[], &[]), Some(Conflict::Relay));
-        assert_eq!(only(Ipv4Addr::new(198, 51, 100, 7), &[], &[]), Some(Conflict::Rendezvous));
     }
 
     /// Between two networks the earlier label keeps the address, whichever

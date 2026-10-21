@@ -17,7 +17,7 @@
 //! consequences call the most dangerous in the system: a person believing a
 //! revocation has taken effect while it sits in a queue.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,15 +41,13 @@ use crate::state::{Choice, Paths};
 /// apply to whatever is waiting, and a person confirming has one screen in front
 /// of them.
 enum Pending {
-    /// A relay change, waiting for a person to confirm the new relay's
-    /// certificate before anything is signed.
+    /// A relay change, waiting for a person to confirm the key the new relay's
+    /// host answered with before anything is signed.
     ChangingRelay {
         /// Which network.
         label: Label,
-        /// Where it is moving.
+        /// Where it is moving, as it will be signed: `key@host:port`.
         relay: String,
-        /// What it presented, to be pinned once confirmed.
-        certificate: Option<Vec<u8>>,
         /// Whether everybody moves at once.
         immediately: bool,
         /// Who asked, carried for the reason `Founding` gives.
@@ -67,8 +65,8 @@ enum Pending {
         /// The exchange itself.
         pending: crate::admitting::Pending,
     },
-    /// A network is being founded, and a relay certificate nobody has vouched for
-    /// is waiting to be confirmed against the relay host.
+    /// A network is being founded, and a relay key nobody has vouched for is
+    /// waiting to be confirmed against the relay host.
     Founding {
         /// What this device will call the network, once it exists.
         label: Label,
@@ -127,7 +125,7 @@ enum Resume {
         prepared_against: crate::signing::Moment,
     },
     /// The network this device calls `label` is changing its parameters: its
-    /// relay, or its rendezvous. Resumed the same way for either.
+    /// relay.
     ChangingParameters {
         /// Which network.
         label: Label,
@@ -264,13 +262,12 @@ pub struct Network {
 
 /// Which relays a transport is built for, at a moment.
 ///
-/// The relay, its pin, and the relay being left while its transition lasts.
+/// The relay, and the relay being left while its transition lasts.
 /// Two plans that differ need two different transports; two that are equal need
 /// nothing done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayPlan {
     relay: Option<String>,
-    pinned: Option<Vec<u8>>,
     leaving: Option<roster::types::Leaving>,
 }
 
@@ -281,11 +278,7 @@ impl RelayPlan {
     /// nothing signed to announce it: the same parameters give one plan the
     /// minute before and another the minute after.
     pub(crate) fn of(params: &roster::types::NetworkParams, now: u64) -> Self {
-        Self {
-            relay: params.relay.clone(),
-            pinned: params.relay_cert.clone(),
-            leaving: params.leaving_at(now).cloned(),
-        }
+        Self { relay: params.relay.clone(), leaving: params.leaving_at(now).cloned() }
     }
 }
 
@@ -410,7 +403,7 @@ pub struct Service {
     ///
     /// Held here rather than passed back and forth because a person stands in the
     /// middle of it: an enrolment is a live connection that has to survive the gap
-    /// between two commands, and a founding is a certificate nobody has vouched
+    /// between two commands, and a founding is a relay key nobody has vouched
     /// for yet. Nothing in either has been signed, so dropping one costs the
     /// attempt and nothing else.
     ///
@@ -444,6 +437,9 @@ pub struct Service {
     /// Woken when IPv4 routes may need to change: a roster change on a network
     /// that is up. Networks coming up or down reconcile directly.
     reconciling: Arc<tokio::sync::Notify>,
+    /// Woken when the platform says the device's network may have changed, so
+    /// the interfaces are read at once rather than at the next check.
+    interfaces_moved: Arc<tokio::sync::Notify>,
 }
 
 /// An act held while a signing key is made where a person can be asked.
@@ -639,6 +635,7 @@ impl Service {
             unkeyed: Mutex::new(None),
             stopping: Mutex::new(false),
             reconciling: Arc::new(tokio::sync::Notify::new()),
+            interfaces_moved: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -998,10 +995,10 @@ impl Service {
             }
         }));
 
-        // The paths a relay does not provide: the local network, the addresses
-        // cached from when it was, and the rendezvous. §2.9 puts all three
-        // before the relay, and all three are sockets — so they start here, with
-        // the tunnel, and stop with it. §2.6c is kept by there being nothing
+        // The paths a relay does not provide: the local network, and the
+        // addresses cached from when it was. §2.9 puts both before the relay,
+        // and both are sockets — so they start here, with the tunnel, and stop
+        // with it. §2.6c is kept by there being nothing
         // left running rather than by a flag.
         let discovery = Arc::new(
             crate::discovery::Discovery::resume_with(
@@ -1016,8 +1013,7 @@ impl Service {
         );
         driving.push(tokio::spawn(Arc::clone(&discovery).announce_forever()));
         driving.push(tokio::spawn(Arc::clone(&discovery).listen_forever()));
-        driving.push(tokio::spawn(Arc::clone(&discovery).hint_forever()));
-        driving.push(tokio::spawn(discovery.publish_forever()));
+        driving.push(tokio::spawn(discovery.hint_forever()));
 
         *network.driving.lock().await = driving;
 
@@ -1170,8 +1166,8 @@ impl Service {
     /// be now.
     ///
     /// Decides, in label order, which peers each network withholds on this
-    /// device — against this device's interfaces, the network's relay and
-    /// rendezvous, and every other network that is up — then hands each network's
+    /// device — against this device's interfaces, the network's relay, and
+    /// every other network that is up — then hands each network's
     /// plan to the lifecycle. Idempotent: a network whose plan has not changed
     /// has nothing added or removed.
     ///
@@ -1249,10 +1245,8 @@ impl Service {
         let mut served: Vec<transport::Range> = Vec::new();
         for (index, each) in gathered.iter().enumerate() {
             let label = each.network.label().to_string();
-            let infrastructure = crate::conflicts::Infrastructure::literal(
-                each.state.params.relay.as_deref(),
-                each.state.params.rendezvous.as_deref(),
-            );
+            let infrastructure =
+                crate::conflicts::Infrastructure::literal(each.state.params.relay.as_deref());
             let withheld = crate::conflicts::withheld(
                 &label,
                 &local,
@@ -1333,24 +1327,33 @@ impl Service {
         // order from one call to the next, and compared as listed they read as a
         // change every few seconds — which, since a change of network makes a
         // device catch up with its neighbours, kept every session busy for ever.
-        let listed = || {
+        //
+        // And without this daemon's own tunnels. They are not a network the
+        // device is on: one appearing as a network comes up was told as a
+        // change of network, and the layer stopped trusting the direct paths it
+        // had just found, which with no relay to fall back on lost the LAN
+        // (`convesso-reach` 9.2).
+        let listed = |own: &BTreeSet<u32>| {
             let mut interfaces = self.interfaces.list();
+            interfaces.retain(|interface| !own.contains(&interface.index));
             interfaces.sort_by_key(|interface| interface.index);
             interfaces
         };
-        let mut seen = listed();
+        let mut seen = listed(&self.own_adapters().await);
         let mut settling = crate::schedule::Settling::new(seen.clone());
         loop {
             let woken = tokio::select! {
                 () = self.reconciling.notified() => true,
-                () = tokio::time::sleep(crate::limits::INTERFACE_RECHECK) => false,
+                // A check, as the timer's: the interfaces are read now.
+                () = self.interfaces_moved.notified() => false,
+                () = tokio::time::sleep(crate::limits::NETWORK_CHECK) => false,
             };
             // Every wake, notified or not: a roster change can move a relay, and
             // a move ends with nothing arriving to say so — this tick is what
             // notices, within one interval of the end.
             self.follow_relays().await;
             if !woken {
-                let now = listed();
+                let now = listed(&self.own_adapters().await);
                 // Catching up waits for a change that holds; reconciling below
                 // follows every change at once, since it contacts nobody.
                 if settling.observe(now.clone()) {
@@ -1359,9 +1362,53 @@ impl Service {
                 if now == seen {
                     continue;
                 }
+                // At once, not once it has settled: a device that changed
+                // network is unreachable until its connectivity layer stops
+                // waiting on the one it left. A change that undoes itself costs
+                // a relay link replaced, a few hundred bytes.
+                //
+                // Not while there is no network at all. A phone leaving Wi-Fi
+                // lists nothing for a moment before its mobile network appears,
+                // 155 ms later on 2026-10-19 (Android `VERIFICATION.md`, C3); a
+                // relay link tried then has nothing to carry it. The next
+                // change, to a network that is there, is told instead.
+                if carries_traffic(&now) {
+                    self.network_changed().await;
+                }
                 seen = now;
             }
             self.reconcile().await;
+        }
+    }
+
+    /// The interfaces this daemon's own tunnels are, by index.
+    async fn own_adapters(&self) -> BTreeSet<u32> {
+        let mut own = BTreeSet::new();
+        for network in self.all().await {
+            if let Some(up) = network.up.lock().await.as_ref() {
+                own.insert(up.interface().index());
+            }
+        }
+        own
+    }
+
+    /// Says the device's network may have changed: the interfaces are read at
+    /// once, and a change is passed on to every network's connectivity layer.
+    ///
+    /// For a platform that is told by the system, as Android is, so that a phone
+    /// leaving Wi-Fi is not left waiting for the next check. Nothing happens if
+    /// the interfaces turn out the same.
+    pub fn interfaces_may_have_changed(&self) {
+        self.interfaces_moved.notify_one();
+    }
+
+    /// Tells the connectivity layer of every network that is up that this
+    /// machine's network changed.
+    async fn network_changed(&self) {
+        for network in self.all().await {
+            if let Some(transport) = network.node().transport().await {
+                transport.network_changed().await;
+            }
         }
     }
 
@@ -1553,8 +1600,6 @@ impl Service {
                 // itself.
                 confirmation: None,
                 relay: None,
-                rendezvous: None,
-                relay_pinned: false,
                 relay_leaving: None,
                 accused: Vec::new(),
                 peers: Vec::new(),
@@ -1630,8 +1675,6 @@ impl Service {
                 .get(&me)
                 .is_some_and(|record| record.role == roster::types::Role::Admin),
             relay: state.params.relay.clone(),
-            rendezvous: state.params.rendezvous.clone(),
-            relay_pinned: state.params.relay_cert.is_some(),
             relay_leaving: state.params.leaving_at(crate::clock::now_ms()).map(|leaving| {
                 crate::control::RelayLeaving {
                     relay: leaving.relay.clone(),
@@ -2026,66 +2069,43 @@ impl Service {
         self.with_the_snapshot(&network, carried, artifacts.next()).await
     }
 
-    /// Fetches the certificate a relay presents, and refuses one that cannot
-    /// work as a server certificate.
+    /// Asks a relay container for the relay it serves, and makes the relay
+    /// string with the host the person gave.
     ///
-    /// Shared by founding and by moving a relay, so the two confirm a relay the
-    /// same way. The refusal is an answer to give a person, not an error.
-    async fn fetched_certificate(&self, address: &str) -> core::result::Result<Vec<u8>, Outcome> {
-        let (host, port) = match crate::relay::host_and_port(address) {
-            Ok(parts) => parts,
-            Err(refusal) => {
-                return Err(Outcome::Failed { message: refusal, left_behind: Vec::new() });
-            }
-        };
-        // On the blocking pool: the fetch is a synchronous TLS handshake, and
-        // running it on the reactor would stall every other task in the daemon
-        // for as long as the relay takes to answer — including the QUIC sessions
-        // of a network that is already up. A blocking call inside the runtime is
-        // how the enrolment test once hung for forty-three minutes.
-        let fetching = tokio::task::spawn_blocking(move || {
-            crate::relay::presented_certificate(&host, port).map(|der| (der, host))
-        });
-        let (certificate, host) = match fetching.await {
-            Ok(Ok(fetched)) => fetched,
-            Ok(Err(refusal)) => {
-                return Err(Outcome::Failed { message: refusal, left_behind: Vec::new() });
-            }
-            Err(cause) => {
-                return Err(Outcome::Failed {
-                    message: format!("the certificate fetch did not finish: {cause}"),
-                    left_behind: Vec::new(),
-                });
-            }
-        };
-        // Refused now rather than pinned and discovered later: a certificate a
-        // verifying client cannot accept produces a network where every device
-        // fails to reach the relay, and the only sign of it is a line in the
-        // relay's log.
-        if let Err(reason) = crate::relay::usable_as_a_server_certificate(&certificate, &host) {
-            return Err(Outcome::Failed {
-                message: format!(
-                    "{host}:{port} presented a certificate that cannot work:
-{reason}"
-                ),
+    /// Shared by founding, moving a relay and joining, so a host is asked the
+    /// same way by all three. The refusal is an answer to give a person, not an
+    /// error.
+    async fn asked_relay(
+        &self,
+        host: String,
+        written: String,
+        port: u16,
+    ) -> core::result::Result<String, Outcome> {
+        // On the blocking pool: the exchange is a synchronous TLS connection, and
+        // running it on the reactor would stall every other task in the daemon for
+        // as long as the host takes to answer — including the sessions of a
+        // network that is already up.
+        let asking = tokio::task::spawn_blocking(move || crate::relay::ask(&host, &written, port));
+        match asking.await {
+            Ok(Ok(relay)) => Ok(relay),
+            Ok(Err(refusal)) => Err(Outcome::Failed { message: refusal, left_behind: Vec::new() }),
+            Err(cause) => Err(Outcome::Failed {
+                message: format!("asking the relay's host did not finish: {cause}"),
                 left_behind: Vec::new(),
-            });
+            }),
         }
-
-        Ok(certificate)
     }
 
     /// Starts moving a network to another relay.
     ///
-    /// Refused before anything is fetched where it would change nothing. Where
-    /// the relay is to be pinned its certificate is fetched and shown, and the act
-    /// waits for a person — **nothing is signed before that confirmation**, and a
-    /// declined one changes nothing. Where it is not, it goes straight to signing.
+    /// A relay written out, `key@host:port`, goes straight to signing. A relay
+    /// given as its host is asked for its key, which is shown, and the act waits
+    /// for a person — **nothing is signed before that confirmation**, and a
+    /// declined one changes nothing. Refused where it would change nothing.
     async fn change_relay(
         &self,
         which: Option<&Label>,
-        relay: &str,
-        pin: bool,
+        given: crate::relay::Given,
         immediately: bool,
     ) -> Outcome {
         let network = match self.which(which).await {
@@ -2104,43 +2124,41 @@ impl Service {
                 };
             }
         };
-        // Compared the way admission compares relays, so a relay written
-        // differently is not mistaken for a move.
-        if let Some(current) = state.params.relay.as_deref()
-            && crate::relay::same_relay(current, relay)
-        {
-            return Outcome::refused(format!(
-                "`{label}` already uses {}. Nothing was changed.",
-                crate::control::shown(relay)
-            ));
-        }
         if self.pending.lock().await.is_some() {
             return Outcome::Failed {
                 message: "something is already waiting to be confirmed".to_owned(),
                 left_behind: Vec::new(),
             };
         }
-
-        if !pin {
-            return self.finish_changing_relay(&label, relay, None, immediately).await;
+        let (relay, asked) = match given {
+            crate::relay::Given::Written(relay) => (relay, false),
+            crate::relay::Given::Asked { host, written, port } => {
+                match self.asked_relay(host, written, port).await {
+                    Ok(relay) => (relay, true),
+                    Err(refused) => return refused,
+                }
+            }
+        };
+        // Compared the way admission compares relays, so a relay written
+        // differently is not mistaken for a move.
+        if let Some(current) = state.params.relay.as_deref()
+            && crate::relay::same_relay(current, &relay)
+        {
+            return Outcome::refused(format!(
+                "`{label}` already uses {}. Nothing was changed.",
+                crate::control::shown(&relay)
+            ));
+        }
+        if !asked {
+            return self.finish_changing_relay(&label, &relay, immediately).await;
         }
 
-        let certificate = match self.fetched_certificate(relay).await {
-            Ok(certificate) => certificate,
-            Err(refused) => return refused,
-        };
-        let fingerprint = crate::relay::fingerprint(&certificate);
-        let der_len = certificate.len();
+        let key = crate::relay::grouped_key(&relay);
         let moving = Some(label.to_string());
         let for_whom = self.asking.lock().await.clone();
-        *self.pending.lock().await = Some(Pending::ChangingRelay {
-            label,
-            relay: relay.to_owned(),
-            certificate: Some(certificate),
-            immediately,
-            for_whom,
-        });
-        Outcome::Pinning { fingerprint, der_len, relay: relay.to_owned(), moving }
+        *self.pending.lock().await =
+            Some(Pending::ChangingRelay { label, relay: relay.clone(), immediately, for_whom });
+        Outcome::ConfirmingRelay { relay, key, moving }
     }
 
     /// Builds the move and signs it, or asks for it to be signed elsewhere.
@@ -2151,7 +2169,6 @@ impl Service {
         &self,
         label: &Label,
         relay: &str,
-        certificate: Option<Vec<u8>>,
         immediately: bool,
     ) -> Outcome {
         let network = match self.named(label).await {
@@ -2178,9 +2195,9 @@ impl Service {
 
         let issued = crate::clock::signing_time();
         let params = if immediately {
-            state.params.switching_to(relay, certificate)
+            state.params.switching_to(relay)
         } else {
-            state.params.moving_to(relay, certificate, issued)
+            state.params.moving_to(relay, issued)
         };
         let params = match params {
             Ok(params) => params,
@@ -2194,8 +2211,8 @@ impl Service {
     /// Signs new parameters for a network as its admin, and carries them.
     ///
     /// **One path for every parameter change**, so the admin check, the custody
-    /// prompt, a signature made elsewhere and the refusals are the same whether
-    /// the relay or the rendezvous is changing.
+    /// prompt, a signature made elsewhere and the refusals are the same for any
+    /// change of parameters.
     async fn sign_parameters(
         &self,
         network: &Arc<Network>,
@@ -2228,62 +2245,6 @@ impl Service {
             Ok(signed) => self.carry_relay_change(network, signed).await,
             Err(cause) => Outcome::refused(crate::control::declined(&cause)),
         }
-    }
-
-    /// Sets or removes a network's rendezvous, as its admin.
-    ///
-    /// Refused before anything is signed when the address is not HTTPS, or is
-    /// the rendezvous the network already has.
-    async fn change_rendezvous(&self, which: Option<&Label>, rendezvous: Option<&str>) -> Outcome {
-        if let Some(address) = rendezvous
-            && let Err(refusal) = crate::control::Command::rendezvous_address(address)
-        {
-            return Outcome::refused(refusal);
-        }
-        let network = match self.which(which).await {
-            Ok(network) => network,
-            Err(cause) => {
-                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
-            }
-        };
-        let label = network.label().clone();
-        if let Some(refusal) = self.keys.admin_refusal() {
-            return Outcome::refused(format!(
-                "this network makes this device an admin, and {refusal}. Nothing was signed."
-            ));
-        }
-        let state = match network.node().state().await {
-            Ok(state) => state,
-            Err(cause) => {
-                return Outcome::Failed {
-                    message: format!("the roster does not describe a network: {cause}"),
-                    left_behind: Vec::new(),
-                };
-            }
-        };
-        if state.params.rendezvous.as_deref() == rendezvous {
-            let said = rendezvous.map_or_else(
-                || "no rendezvous".to_owned(),
-                |address| crate::control::shown(address).to_string(),
-            );
-            return Outcome::refused(format!("`{label}` already has {said}. Nothing was changed."));
-        }
-
-        let params = match rendezvous {
-            Some(address) => match state.params.clone().meeting_at(address) {
-                Ok(params) => params,
-                Err(cause) => {
-                    return Outcome::refused(format!("that rendezvous cannot be used: {cause}"));
-                }
-            },
-            None => {
-                let mut params = state.params.clone();
-                params.rendezvous = None;
-                params
-            }
-        };
-        let issued = crate::clock::signing_time();
-        self.sign_parameters(&network, &label, &state, params, issued).await
     }
 
     /// Keeps a parameter change that was signed elsewhere, and the snapshot
@@ -2788,16 +2749,20 @@ impl Service {
                 Ok(label) => self.exposed(label.as_ref()).await,
                 Err(cause) => Self::said(Err(cause)),
             },
-            Command::ChangeRelay { network, relay, pin, immediately } => {
+            // A relay is given written out, `key@host:port`, or as the host of
+            // its relay container, which is asked for its key.
+            Command::ChangeRelay { network, relay, immediately } => {
+                let given = match crate::relay::Given::read(&relay) {
+                    Ok(given) => given,
+                    Err(refusal) => {
+                        return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                    }
+                };
                 match Self::wanted(network) {
-                    Ok(label) => self.change_relay(label.as_ref(), &relay, pin, immediately).await,
+                    Ok(label) => self.change_relay(label.as_ref(), given, immediately).await,
                     Err(cause) => Self::said(Err(cause)),
                 }
             }
-            Command::ChangeRendezvous { network, rendezvous } => match Self::wanted(network) {
-                Ok(label) => self.change_rendezvous(label.as_ref(), rendezvous.as_deref()).await,
-                Err(cause) => Self::said(Err(cause)),
-            },
             // Said rather than left to expire: the act is over the moment a
             // person declines, and holding it for five more minutes would leave
             // something completable that nobody means to complete.
@@ -2809,7 +2774,10 @@ impl Service {
             // A name is checked where it enters: refused before anything is made or
             // sent when it is not one a resolver can answer, and lowered when it is.
             Command::Join { relay, name } => match crate::names::usable(&name) {
-                Ok(name) => self.begin_joining(&relay, &name).await,
+                Ok(name) => match crate::relay::Given::read(&relay) {
+                    Ok(given) => self.begin_joining(given, &name).await,
+                    Err(refusal) => Outcome::Failed { message: refusal, left_behind: Vec::new() },
+                },
                 Err(unusable) => {
                     Outcome::Failed { message: unusable.to_string(), left_behind: Vec::new() }
                 }
@@ -2817,7 +2785,7 @@ impl Service {
             Command::Replace => self.confirm_replacing().await,
             Command::Forget { label, last_admin } => self.forget(&label, last_admin).await,
             Command::Waiting => self.waiting_on().await,
-            Command::Found { label, name, suffix, relay, rendezvous, certificate, ipv4_range } => {
+            Command::Found { label, name, suffix, relay, ipv4_range } => {
                 let name = match crate::names::usable(&name) {
                     Ok(name) => name,
                     Err(unusable) => {
@@ -2827,29 +2795,25 @@ impl Service {
                         };
                     }
                 };
-                let fetch = certificate == crate::control::Certificate::FromTheRelay;
-                // Before anything else, and before any certificate is fetched: a
-                // range that is not allowed is refused with nothing signed.
+                // A relay is given written out, `key@host:port`, or as the host
+                // of its relay container, which is asked for its key.
+                let given = match relay.as_deref().map(crate::relay::Given::read).transpose() {
+                    Ok(given) => given,
+                    Err(refusal) => {
+                        return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                    }
+                };
+                // Before anything else, and before any host is asked: a range
+                // that is not allowed is refused with nothing signed.
                 let ipv4_range = match crate::founding::ipv4_range(ipv4_range.as_deref()) {
                     Ok(range) => range,
                     Err(refusal) => {
                         return Outcome::Failed { message: refusal, left_behind: Vec::new() };
                     }
                 };
-                let wanted = crate::founding::Founding {
-                    ipv4_range,
-                    name,
-                    suffix,
-                    relay,
-                    rendezvous,
-                    certificate: match certificate {
-                        crate::control::Certificate::Given(bytes) => Some(bytes),
-                        crate::control::Certificate::None
-                        | crate::control::Certificate::FromTheRelay => None,
-                    },
-                };
+                let wanted = crate::founding::Founding { ipv4_range, name, suffix, relay: None };
                 match Label::new(&label) {
-                    Ok(label) => self.found(label, wanted, fetch).await,
+                    Ok(label) => self.found(label, wanted, given).await,
                     Err(cause) => {
                         Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
                     }
@@ -3150,8 +3114,8 @@ impl Service {
             Some(Pending::Founding { label, wanted, for_whom }) => {
                 self.finish_founding(label, wanted, &for_whom).await
             }
-            Some(Pending::ChangingRelay { label, relay, certificate, immediately, .. }) => {
-                self.finish_changing_relay(&label, &relay, certificate, immediately).await
+            Some(Pending::ChangingRelay { label, relay, immediately, .. }) => {
+                self.finish_changing_relay(&label, &relay, immediately).await
             }
             Some(Pending::Joining { label, underway, task, for_whom }) => {
                 *self.pending.lock().await =
@@ -3201,7 +3165,7 @@ impl Service {
     /// command, so the roster it receives is the one this daemon is using. It
     /// answers as soon as there is a payload to carry to an admin, and the rest
     /// of the conversation is asked for with `Waiting`.
-    async fn begin_joining(&self, relay: &str, name: &str) -> Outcome {
+    async fn begin_joining(&self, given: crate::relay::Given, name: &str) -> Outcome {
         // The daemon names the directory, because nobody else can. A person
         // starting a join has not seen the network, does not know its suffix, and
         // would be inventing a name for something that has not arrived — a
@@ -3223,6 +3187,11 @@ impl Service {
                 left_behind: Vec::new(),
             };
         }
+        let relay = match self.joining_relay(given).await {
+            Ok(relay) => relay,
+            Err(refused) => return refused,
+        };
+        let relay = relay.as_str();
 
         // **Before the endpoint is opened, not after.** A join that reached a
         // relay and then stopped to ask for a key would have spoken on behalf of
@@ -3243,6 +3212,26 @@ impl Service {
         }
 
         self.join_under(label, relay, name).await
+    }
+
+    /// The relay a join waits at: as written, or asked of the host given.
+    ///
+    /// **Asked, it is not confirmed.** A founding signs the relay it is given,
+    /// so its person confirms the key first. A join signs nothing with it: the
+    /// join is proved between the two devices by the digits, the relay only
+    /// carries it, and the network's own relay arrives in the signed roster. A
+    /// wrong key leaves the join waiting where no admin comes, which is a join
+    /// that does not happen, not one that goes wrong.
+    async fn joining_relay(
+        &self,
+        given: crate::relay::Given,
+    ) -> core::result::Result<String, Outcome> {
+        match given {
+            crate::relay::Given::Written(relay) => Ok(relay),
+            crate::relay::Given::Asked { host, written, port } => {
+                self.asked_relay(host, written, port).await
+            }
+        }
     }
 
     /// The join itself, once this device has an identity to join with.
@@ -3607,41 +3596,24 @@ impl Service {
                 taken: taken_name(pending),
                 accepted: pending.accepted(),
             },
-            // A founding waiting on a certificate is waiting. Answering that
-            // nothing was would be a lie with a consequence: it is a pending like
-            // any other, it refuses the next enrolment like any other, and a
-            // surface told there is nothing there has nothing to offer a person
-            // but the refusal.
-            Some(Pending::ChangingRelay { label, relay, certificate, .. }) => match certificate {
-                Some(certificate) => Outcome::Pinning {
-                    relay: relay.clone(),
-                    fingerprint: crate::relay::fingerprint(certificate),
-                    der_len: certificate.len(),
-                    moving: Some(label.to_string()),
-                },
-                // Only ever pending on a certificate, as a founding is; answered
-                // as waiting for the reason given below.
-                None => Outcome::Failed {
-                    message: "a relay change is waiting to be confirmed".to_owned(),
-                    left_behind: Vec::new(),
-                },
+            // A founding or a move waiting on a relay's key is waiting.
+            // Answering that nothing was would be a lie with a consequence: it is
+            // a pending like any other, it refuses the next enrolment like any
+            // other, and a surface told there is nothing there has nothing to
+            // offer a person but the refusal.
+            Some(Pending::ChangingRelay { label, relay, .. }) => Outcome::ConfirmingRelay {
+                relay: relay.clone(),
+                key: crate::relay::grouped_key(relay),
+                moving: Some(label.to_string()),
             },
-            Some(Pending::Founding { wanted, .. }) => match &wanted.certificate {
-                Some(certificate) => Outcome::Pinning {
-                    relay: wanted.relay.clone().unwrap_or_default(),
-                    fingerprint: crate::relay::fingerprint(certificate),
-                    der_len: certificate.len(),
+            Some(Pending::Founding { wanted, .. }) => {
+                let relay = wanted.relay.clone().unwrap_or_default();
+                Outcome::ConfirmingRelay {
+                    key: crate::relay::grouped_key(&relay),
+                    relay,
                     moving: None,
-                },
-                // A founding is only ever pending on a certificate, so this is
-                // unreachable — and it is still answered as something waiting,
-                // because what a surface must not be told is that the thing
-                // blocking it is not there.
-                None => Outcome::Failed {
-                    message: "a founding is waiting to be confirmed".to_owned(),
-                    left_behind: Vec::new(),
-                },
-            },
+                }
+            }
             // Nothing waiting is not a failure, and it must not arrive looking
             // like one. A surface asking what is open needs to tell "nothing" from
             // "an enrolment that ended badly and is still held" — the second is
@@ -3752,9 +3724,7 @@ impl Service {
             }
             return Outcome::Reported(self.report().await);
         };
-        let crate::joining::Progress::Joined { suffix, devices, relay_confirmed } =
-            underway.progress()
-        else {
+        let crate::joining::Progress::Joined { suffix, devices } = underway.progress() else {
             *self.pending.lock().await = Some(Pending::Joining { label, underway, task, for_whom });
             return Outcome::Failed {
                 message: "that join has not finished".to_owned(),
@@ -3782,7 +3752,7 @@ impl Service {
 
         let carrying = self.raise_if_chosen(&label).await;
 
-        Outcome::Adopted { suffix, devices, relay_confirmed, carrying }
+        Outcome::Adopted { suffix, devices, carrying }
     }
 
     /// Raises a network this device has just taken on, where a standing
@@ -3982,10 +3952,15 @@ impl Service {
 
     /// Creates a network on this device.
     ///
-    /// Where a certificate has to be looked at first, this stops and says so; the
-    /// signing happens on confirmation. Where there is nothing to look at, it
+    /// Where a relay's key has to be looked at first, this stops and says so;
+    /// the signing happens on confirmation. Where there is nothing to look at, it
     /// founds and takes the network on at once.
-    async fn found(&self, label: Label, wanted: crate::founding::Founding, fetch: bool) -> Outcome {
+    async fn found(
+        &self,
+        label: Label,
+        wanted: crate::founding::Founding,
+        given: Option<crate::relay::Given>,
+    ) -> Outcome {
         if let Err(refusal) = self.free(&label).await {
             return refusal;
         }
@@ -4001,33 +3976,32 @@ impl Service {
             };
         }
 
-        if !fetch {
-            let for_whom = self.asking.lock().await.clone();
-            return self.finish_founding(label, wanted, &for_whom).await;
-        }
+        let (host, written, port) = match given {
+            None => {
+                let for_whom = self.asking.lock().await.clone();
+                return self.finish_founding(label, wanted, &for_whom).await;
+            }
+            Some(crate::relay::Given::Written(relay)) => {
+                let wanted = crate::founding::Founding { relay: Some(relay), ..wanted };
+                let for_whom = self.asking.lock().await.clone();
+                return self.finish_founding(label, wanted, &for_whom).await;
+            }
+            Some(crate::relay::Given::Asked { host, written, port }) => (host, written, port),
+        };
 
-        // Fetched here because this is the process that will use it, and only
+        // Asked here because this is the process that will use it, and only
         // after a person asked — which is one of the two things that license the
         // daemon to reach anything.
-        let Some(address) = wanted.relay.clone() else {
-            return Outcome::Failed {
-                message: "fetching a relay certificate needs a relay to fetch it from".to_owned(),
-                left_behind: Vec::new(),
-            };
-        };
-
-        let certificate = match self.fetched_certificate(&address).await {
-            Ok(certificate) => certificate,
+        let relay = match self.asked_relay(host, written, port).await {
+            Ok(relay) => relay,
             Err(refused) => return refused,
         };
-
-        let fingerprint = crate::relay::fingerprint(&certificate);
-        let der_len = certificate.len();
-        let waiting = crate::founding::Founding { certificate: Some(certificate), ..wanted };
+        let key = crate::relay::grouped_key(&relay);
+        let waiting = crate::founding::Founding { relay: Some(relay.clone()), ..wanted };
         let for_whom = self.asking.lock().await.clone();
         *self.pending.lock().await = Some(Pending::Founding { label, wanted: waiting, for_whom });
 
-        Outcome::Pinning { fingerprint, der_len, relay: address, moving: None }
+        Outcome::ConfirmingRelay { relay, key, moving: None }
     }
 
     /// Signs the founding and takes the network on.
@@ -4571,6 +4545,12 @@ impl Service {
     }
 }
 
+/// Whether any interface in `listed` can carry traffic: up, running, and not
+/// the loopback.
+fn carries_traffic(listed: &[crate::connectivity::LocalInterface]) -> bool {
+    listed.iter().any(|interface| interface.up && interface.running && !interface.loopback)
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
@@ -4931,7 +4911,6 @@ mod tests {
         // it is printed. "relay: none — direct paths only" would describe a
         // network that does not exist.
         assert!(!said.contains("relay"), "no relay line: {said}");
-        assert!(!said.contains("meet"), "no rendezvous line: {said}");
 
         // And the two are not merely worded differently: the one that has a
         // network still reports the things a network has.
@@ -4971,8 +4950,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -4995,6 +4972,106 @@ mod tests {
         assert!(!machine.installed().adapters.is_empty());
     }
 
+    /// A relay in none of the forms founds nothing, and the refusal shows the
+    /// forms; a relay written out is signed as written, with nothing asked.
+    #[tokio::test]
+    async fn founding_on_a_relay_in_no_form_founds_nothing() {
+        let (service, _machine, _scratch) = unjoined().await;
+        let founding = |relay: &str| Command::Found {
+            label: "test".to_owned(),
+            name: "nas".to_owned(),
+            suffix: "example.internal".to_owned(),
+            relay: Some(relay.to_owned()),
+            ipv4_range: None,
+        };
+
+        for refused in [founding("relay.example:7400"), founding("ftp://relay.example")] {
+            let Outcome::Failed { message, .. } = service.handle(refused).await else {
+                panic!("a relay in no form must be refused");
+            };
+            assert!(message.contains("relay container"), "{message}");
+            assert!(service.node().await.is_none(), "nothing was founded");
+        }
+
+        let founded = service.handle(founding(&at("relay.example:7400"))).await;
+        assert!(matches!(founded, Outcome::Reported(_)), "{founded:?}");
+        let node = service.node().await.expect("a network");
+        let params = node.state().await.expect("a roster").params;
+        assert_eq!(params.relay, Some(at("relay.example:7400")), "the string, as written");
+    }
+
+    /// A join at a host and a port with no key sends nothing, and names the
+    /// forms a relay can be given in.
+    #[tokio::test]
+    async fn joining_at_a_host_and_port_without_a_key_sends_nothing() {
+        let (service, _machine, _scratch) = unjoined().await;
+        let outcome = service
+            .handle(Command::Join {
+                relay: "relay.example:8443".to_owned(),
+                name: "laptop".to_owned(),
+            })
+            .await;
+        let Outcome::Failed { message, .. } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(message.contains("is not a relay"), "{message}");
+        assert!(service.pending.lock().await.is_none(), "nothing waits");
+    }
+
+    /// **A join given the relay's host asks it**, as a founding does, and waits
+    /// at the relay it is told, with no confirmation: a join signs nothing with
+    /// it.
+    #[tokio::test]
+    async fn a_join_at_a_relays_host_waits_at_the_relay_it_serves() {
+        let (service, _machine, _scratch) = unjoined().await;
+        let port = a_relay_container(5);
+        let given = crate::relay::Given::read(&format!("https://127.0.0.1:{port}")).unwrap();
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[5; 32]).unwrap();
+        assert_eq!(
+            service.joining_relay(given).await.ok(),
+            Some(transport_convesso::relay::written(
+                key.address().as_bytes(),
+                "127.0.0.1:8443",
+                false
+            )),
+        );
+
+        let written = at("relay.example:7400");
+        let given = crate::relay::Given::read(&written).unwrap();
+        assert_eq!(service.joining_relay(given).await.ok(), Some(written), "and asks nothing");
+    }
+
+    /// A join at a host that is not a relay container is refused, saying so,
+    /// and nothing waits.
+    #[tokio::test]
+    async fn a_join_at_a_host_that_is_not_a_relay_container_sends_nothing() {
+        let port = crate::relay::answering_once(crate::relay::http_response("404 Not Found", ""));
+        let (service, _machine, _scratch) = unjoined().await;
+        let outcome = service
+            .handle(Command::Join {
+                relay: format!("https://127.0.0.1:{port}"),
+                name: "laptop".to_owned(),
+            })
+            .await;
+        let Outcome::Failed { message, .. } = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(message.contains("serves no relay key"), "{message}");
+        assert!(service.pending.lock().await.is_none(), "nothing waits");
+    }
+
+    /// A relay change to a string that is not a relay signs nothing.
+    #[tokio::test]
+    async fn a_relay_change_to_something_else_is_refused() {
+        let fixture = fixture(None).await;
+        let before = params_of(&fixture).await;
+        for refused in ["https://relay.example:443", "relay.example:7400"] {
+            let answered = fixture.service.handle(change(refused, false)).await;
+            assert!(matches!(answered, Outcome::Failed { .. }), "{answered:?}");
+        }
+        assert_eq!(before, params_of(&fixture).await, "nothing changed");
+    }
+
     /// A device's name is kept in lower case: `NAS` founds a network whose first
     /// device is `nas`, which is what a resolver answers anyway.
     #[tokio::test]
@@ -5007,8 +5084,6 @@ mod tests {
                 name: "NAS".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -5032,8 +5107,6 @@ mod tests {
                 name: "PC di Giovanni".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -5054,10 +5127,7 @@ mod tests {
         let (service, _machine, _scratch) = unjoined().await;
 
         let outcome = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "nas.casa".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "nas.casa".to_owned() })
             .await;
 
         match outcome {
@@ -5084,8 +5154,6 @@ mod tests {
                 name: "second".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -5098,44 +5166,20 @@ mod tests {
         }
     }
 
-    /// A fetched certificate is shown before it is pinned, and nothing is signed
-    /// until a person has confirmed it.
+    /// A relay's key, asked of its host, is shown before it is signed, and
+    /// nothing is signed until a person has confirmed it.
     ///
-    /// Nothing has vouched for what the relay presents — anyone in the path could
-    /// have answered — so the fingerprint goes to a person first. Against a real
-    /// TLS server, because a fetch that returned anything other than the bytes
-    /// presented would pin a certificate nobody has.
+    /// Nothing has vouched for what the host answers — anyone in the path could
+    /// have answered — so the key goes to a person first. Against a real TLS
+    /// server, so the request and the reading of the answer are the real ones.
     #[tokio::test]
-    async fn a_fetched_certificate_is_confirmed_before_anything_is_signed() {
-        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-            .expect("a certificate");
-        let presented = issued.cert.der().to_vec();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der());
-
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("protocols supported by ring")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(presented.clone())],
-            key.into(),
-        )
-        .expect("a usable key pair");
-
-        let listener =
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("binds");
-        let port = listener.local_addr().expect("bound").port();
-        std::thread::spawn(move || {
-            let Ok((mut socket, _)) = listener.accept() else {
-                return;
-            };
-            let Ok(mut server) = rustls::ServerConnection::new(Arc::new(config)) else {
-                return;
-            };
-            let _ = server.complete_io(&mut socket);
-        });
+    async fn a_relays_key_is_confirmed_before_anything_is_signed() {
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[6; 32]).unwrap();
+        let hex: String = key.address().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let body = format!(r#"{{"key":"{hex}","port":8443,"tls":false}}"#);
+        let port = crate::relay::answering_once(crate::relay::http_response("200 OK", &body));
+        let expected =
+            transport_convesso::relay::written(key.address().as_bytes(), "127.0.0.1:8443", false);
 
         let (service, _machine, _scratch) = unjoined().await;
         let found = Command::Found {
@@ -5143,33 +5187,77 @@ mod tests {
             name: "nas".to_owned(),
             suffix: "example.internal".to_owned(),
             relay: Some(format!("https://127.0.0.1:{port}")),
-            rendezvous: None,
-            certificate: crate::control::Certificate::FromTheRelay,
             ipv4_range: None,
         };
 
-        let outcome = service.handle(found).await;
-
-        match outcome {
-            Outcome::Pinning { fingerprint, der_len, relay, .. } => {
-                assert_eq!(fingerprint, crate::relay::fingerprint(&presented));
-                assert_eq!(der_len, presented.len());
-                assert!(relay.contains(&port.to_string()));
+        match service.handle(found).await {
+            Outcome::ConfirmingRelay { relay, key, moving } => {
+                assert_eq!(relay, expected, "the key and port answered, on the host given");
+                assert_eq!(key.replace(' ', ""), hex, "the key, grouped for reading");
+                assert_eq!(moving, None, "a founding, not a move");
             }
-            other => panic!("expected a certificate to confirm, got {other:?}"),
+            other => panic!("expected a key to confirm, got {other:?}"),
         }
 
         // The whole point: it is waiting, not done.
         assert!(
             !service.has_network().await,
-            "nothing may be signed before a person has compared the fingerprint"
+            "nothing may be signed before a person has compared the key"
         );
 
         match service.handle(Command::Confirm).await {
             Outcome::Reported(report) => assert!(report.holds_a_network()),
             other => panic!("expected the founding to complete, got {other:?}"),
         }
-        assert!(service.has_network().await, "and only then does the network exist");
+        let node = service.node().await.expect("and only then does the network exist");
+        assert_eq!(node.state().await.unwrap().params.relay, Some(expected));
+    }
+
+    /// A key declined signs nothing, and leaves nothing waiting.
+    #[tokio::test]
+    async fn a_relays_key_declined_signs_nothing() {
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[7; 32]).unwrap();
+        let hex: String = key.address().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let body = format!(r#"{{"key":"{hex}","port":8443}}"#);
+        let port = crate::relay::answering_once(crate::relay::http_response("200 OK", &body));
+
+        let (service, _machine, _scratch) = unjoined().await;
+        let found = Command::Found {
+            label: "test".to_owned(),
+            name: "nas".to_owned(),
+            suffix: "example.internal".to_owned(),
+            relay: Some(format!("https://127.0.0.1:{port}")),
+            ipv4_range: None,
+        };
+        assert!(matches!(service.handle(found).await, Outcome::ConfirmingRelay { .. }));
+        let _ = service.handle(Command::Abandon).await;
+        assert!(!service.has_network().await, "nothing was signed");
+        assert!(
+            !matches!(service.handle(Command::Waiting).await, Outcome::ConfirmingRelay { .. }),
+            "and nothing is left waiting"
+        );
+    }
+
+    /// A host that is not a relay container is refused, saying what it did, and
+    /// nothing waits.
+    #[tokio::test]
+    async fn a_host_that_is_not_a_relay_container_founds_nothing() {
+        let port = crate::relay::answering_once(crate::relay::http_response("404 Not Found", ""));
+        let (service, _machine, _scratch) = unjoined().await;
+        let found = Command::Found {
+            label: "test".to_owned(),
+            name: "nas".to_owned(),
+            suffix: "example.internal".to_owned(),
+            relay: Some(format!("https://127.0.0.1:{port}")),
+            ipv4_range: None,
+        };
+        match service.handle(found).await {
+            Outcome::Failed { message, .. } => {
+                assert!(message.contains("serves no relay key"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!service.has_network().await);
     }
 
     /// A join that is abandoned closes what it opened and leaves nothing.
@@ -5185,10 +5273,7 @@ mod tests {
         // A relay nobody is listening on: the join gets no further than trying,
         // which is all this needs — what is asserted is what abandoning leaves.
         let outcome = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "laptop".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
         assert!(
             matches!(outcome, Outcome::Failed { .. } | Outcome::Joining { .. }),
@@ -5238,8 +5323,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: None,
                 ipv4_range: None,
             },
             &crate::keys::PlatformKeys,
@@ -5899,8 +5982,6 @@ mod tests {
                 name: "phone".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: None,
                 ipv4_range: None,
             },
             &crate::keys::PlatformKeys,
@@ -5941,8 +6022,6 @@ mod tests {
                 name: "laptop".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: None,
                 ipv4_range: None,
             },
             &crate::keys::PlatformKeys,
@@ -5953,7 +6032,6 @@ mod tests {
         person.reached(crate::joining::Progress::Joined {
             suffix: "casa.internal".to_owned(),
             devices: 2,
-            relay_confirmed: true,
         });
         let alice = crate::control::Caller::Identified {
             name: "1000".to_owned(),
@@ -5995,36 +6073,32 @@ mod tests {
         }
     }
 
-    /// A founding waiting on a certificate is waiting, and is named.
+    /// A founding waiting on a relay's key is waiting, and is named.
     ///
     /// It occupies the daemon's one pending slot and refuses the next enrolment
     /// like any other. Answering that nothing was waiting left a surface with a
     /// refusal it could not explain and no way to clear what caused it.
     #[tokio::test]
-    async fn a_founding_waiting_on_a_certificate_is_reported_as_waiting() {
+    async fn a_founding_waiting_on_a_relays_key_is_reported_as_waiting() {
         let (service, _machine, _scratch) = unjoined().await;
 
-        // Any bytes: what is under test is that the pending is named at all, and
-        // the fingerprint is of whatever it holds.
-        let der = b"not a certificate, and this answer does not verify one".to_vec();
+        let relay = at("relay.example:8443");
         *service.pending.lock().await = Some(Pending::Founding {
             label: only_label(),
             wanted: crate::founding::Founding {
                 name: "nas".to_owned(),
                 suffix: "example.internal".to_owned(),
-                relay: Some("https://relay.example:443".to_owned()),
-                rendezvous: None,
-                certificate: Some(der.clone()),
+                relay: Some(relay.clone()),
                 ipv4_range: None,
             },
             for_whom: crate::control::Caller::Unattributed,
         });
 
         match service.handle(Command::Waiting).await {
-            Outcome::Pinning { relay, fingerprint, der_len, .. } => {
-                assert_eq!("https://relay.example:443", relay, "it says which relay");
-                assert_eq!(der.len(), der_len, "and how much certificate there is");
-                assert_eq!(crate::relay::fingerprint(&der), fingerprint, "and of what");
+            Outcome::ConfirmingRelay { relay: waiting, key, moving } => {
+                assert_eq!(relay, waiting, "it says which relay");
+                assert_eq!(crate::relay::grouped_key(&relay), key, "and which key");
+                assert_eq!(None, moving, "and that it is a founding");
             }
             other => panic!("expected the founding to be named, got {other:?}"),
         }
@@ -6038,25 +6112,20 @@ mod tests {
     async fn a_second_enrolment_is_refused_while_one_is_pending() {
         let (service, _machine, _scratch) = unjoined().await;
 
-        // A founding waiting on a certificate occupies the slot.
+        // A founding waiting on a relay's key occupies the slot.
         *service.pending.lock().await = Some(Pending::Founding {
             label: only_label(),
             wanted: crate::founding::Founding {
                 name: "nas".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: None,
                 ipv4_range: None,
             },
             for_whom: crate::control::Caller::Unattributed,
         });
 
         let outcome = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "laptop".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
 
         match outcome {
@@ -6475,6 +6544,151 @@ mod tests {
         }
     }
 
+    /// Interfaces a test can change while the daemon watches them.
+    struct Moving(std::sync::Mutex<Vec<crate::connectivity::LocalInterface>>);
+
+    impl crate::connectivity::Interfaces for Moving {
+        fn list(&self) -> Vec<crate::connectivity::LocalInterface> {
+            self.0.lock().expect("not poisoned").clone()
+        }
+    }
+
+    fn wifi(index: u32, address: [u8; 4]) -> crate::connectivity::LocalInterface {
+        crate::connectivity::LocalInterface {
+            index,
+            ipv4: vec![std::net::Ipv4Addr::from(address)],
+            subnets: Vec::new(),
+            gateways: Vec::new(),
+            resolvers: Vec::new(),
+            up: true,
+            running: true,
+            multicast: true,
+            loopback: false,
+        }
+    }
+
+    /// **A change of network reaches the connectivity layer at once**, before it
+    /// has settled: a device that left Wi-Fi is unreachable until its layer
+    /// stops waiting on the network it left (Android `VERIFICATION.md`, C3).
+    #[tokio::test]
+    async fn a_change_of_network_is_told_to_the_transport_at_once() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let handed = watching.handed();
+        let casa = handed.first().expect("a transport");
+        assert_eq!(casa.moved(), 0, "nothing moved yet");
+
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wi-Fi gone, mobile data in its place.
+        *interfaces.0.lock().expect("not poisoned") = vec![wifi(17, [10, 64, 3, 9])];
+        let within = crate::limits::NETWORK_CHECK + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + within;
+        while casa.moved() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        running.abort();
+        assert_eq!(casa.moved(), 1, "told once, within one check, not after it settled");
+    }
+
+    /// **This daemon's own tunnel appearing is no change of network.** Told as
+    /// one, the layer stopped trusting the direct paths it had just found, and
+    /// with no relay to fall back on the LAN was lost (`convesso-reach` 9.2).
+    #[tokio::test]
+    async fn the_daemons_own_tunnel_appearing_is_not_told() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let handed = watching.handed();
+        let casa = handed.first().expect("a transport");
+        let adapter = service.own_adapters().await.into_iter().next().expect("casa's adapter");
+
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The tunnel shows up in the platform's list beside the Wi-Fi.
+        interfaces.0.lock().expect("not poisoned").push(wifi(adapter, [100, 64, 0, 1]));
+        tokio::time::sleep(crate::limits::NETWORK_CHECK + std::time::Duration::from_secs(2)).await;
+        running.abort();
+        assert_eq!(casa.moved(), 0, "the daemon's own adapter is not a network it moved to");
+    }
+
+    /// **A moment with no network at all is not told**: told then, the layer
+    /// tries what cannot work and backs off. The next change, to a network that
+    /// is there, is.
+    #[tokio::test]
+    async fn a_moment_with_no_network_is_not_told_and_the_next_is() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let casa = watching.handed().into_iter().next().expect("a transport");
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Wi-Fi gone, and nothing yet in its place.
+        *interfaces.0.lock().expect("not poisoned") = Vec::new();
+        service.interfaces_may_have_changed();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(casa.moved(), 0, "nothing to carry traffic: not told");
+
+        // The mobile network appears.
+        *interfaces.0.lock().expect("not poisoned") = vec![wifi(17, [10, 64, 3, 9])];
+        service.interfaces_may_have_changed();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while casa.moved() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert_eq!(casa.moved(), 1, "told once, when there was a network to move to");
+    }
+
+    /// **Told by the platform, the change is seen at once**, not at the next
+    /// check: Android says when its network changes.
+    #[tokio::test]
+    async fn a_change_the_platform_reports_is_told_at_once() {
+        let watching = Arc::new(crate::connectivity::testing::Watching::new());
+        let (service, _machine, _scratch) =
+            two_networks_over(Arc::clone(&watching) as Arc<dyn Connectivity>).await;
+        let interfaces = Arc::new(Moving(std::sync::Mutex::new(vec![wifi(3, [192, 168, 1, 5])])));
+        let service =
+            Arc::new(service.with_interfaces(
+                Arc::clone(&interfaces) as Arc<dyn crate::connectivity::Interfaces>
+            ));
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let casa = watching.handed().into_iter().next().expect("a transport");
+
+        let running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        // Just after a check, so the next one is a whole interval away.
+        tokio::time::sleep(crate::limits::NETWORK_CHECK + std::time::Duration::from_millis(50))
+            .await;
+        *interfaces.0.lock().expect("not poisoned") = vec![wifi(17, [10, 64, 3, 9])];
+        service.interfaces_may_have_changed();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while casa.moved() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert_eq!(casa.moved(), 1, "told within 300 ms of the platform saying so");
+    }
+
     /// A path through any tunnel of this device is the machine's own traffic
     /// asked to travel over a tunnel the machine is carrying, so every network's
     /// connectivity layer is told what every tunnel carries — not only its own.
@@ -6603,8 +6817,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "cliente.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -6668,8 +6880,6 @@ mod tests {
             name: "nas".to_owned(),
             suffix: format!("{label}.internal"),
             relay: None,
-            rendezvous: None,
-            certificate: crate::control::Certificate::None,
             ipv4_range: range.map(str::to_owned),
         };
 
@@ -6731,8 +6941,6 @@ mod tests {
                     name: "nas".to_owned(),
                     suffix: format!("{name}.internal"),
                     relay: None,
-                    rendezvous: None,
-                    certificate: crate::control::Certificate::None,
                     ipv4_range: None,
                 })
                 .await;
@@ -7444,8 +7652,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -7477,8 +7683,6 @@ mod tests {
                     name: "nas".to_owned(),
                     suffix: overlapping.to_owned(),
                     relay: None,
-                    rendezvous: None,
-                    certificate: crate::control::Certificate::None,
                     ipv4_range: None,
                 })
                 .await;
@@ -7506,8 +7710,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "cliente.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -7528,8 +7730,6 @@ mod tests {
                 name: "nas".to_owned(),
                 suffix: "altro.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -7715,7 +7915,7 @@ mod tests {
     }
 
     /// §2.6c: with the network off there is no transport, so there is nothing to
-    /// reach the rendezvous or the relay with. The property holds by
+    /// reach the relay with. The property holds by
     /// construction rather than by a check somebody has to remember.
     #[tokio::test]
     async fn a_down_daemon_has_no_transport_at_all() {
@@ -8131,40 +8331,25 @@ mod tests {
 
     // ---- changing a network's relay ----------------------------------------
 
-    /// A TLS server on this machine that presents one certificate to one client.
-    ///
-    /// Its port, and the certificate — the same arrangement the founding test
-    /// uses, because a fetch that returned anything but the presented bytes would
-    /// pin a certificate nobody has.
-    fn a_relay_presenting_a_certificate() -> (u16, Vec<u8>) {
-        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-            .expect("a certificate");
-        let presented = issued.cert.der().to_vec();
-        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der());
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("protocols supported by ring")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(presented.clone())],
-            key.into(),
-        )
-        .expect("a usable key pair");
-        let listener =
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("binds");
-        let port = listener.local_addr().expect("bound").port();
-        std::thread::spawn(move || {
-            let Ok((mut socket, _)) = listener.accept() else { return };
-            let Ok(mut server) = rustls::ServerConnection::new(Arc::new(config)) else { return };
-            let _ = server.complete_io(&mut socket);
-        });
-        (port, presented)
+    /// A relay container on this machine that answers one request with the key
+    /// of `seed` and port 8443, and its port.
+    fn a_relay_container(seed: u8) -> u16 {
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[seed; 32])
+            .expect("a seed is an identity");
+        let hex: String = key.address().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let body = format!(r#"{{"key":"{hex}","port":8443,"tls":false}}"#);
+        crate::relay::answering_once(crate::relay::http_response("200 OK", &body))
     }
 
-    fn change(relay: &str, pin: bool, immediately: bool) -> Command {
-        Command::ChangeRelay { network: None, relay: relay.to_owned(), pin, immediately }
+    /// A relay as it is written, `key@host:port`, with one fixed key.
+    fn at(host: &str) -> String {
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[7; 32])
+            .expect("a seed is an identity");
+        transport_convesso::relay::written(key.address().as_bytes(), host, false)
+    }
+
+    fn change(relay: &str, immediately: bool) -> Command {
+        Command::ChangeRelay { network: None, relay: relay.to_owned(), immediately }
     }
 
     async fn params_of(fixture: &Fixture) -> NetworkParams {
@@ -8175,11 +8360,11 @@ mod tests {
     #[tokio::test]
     async fn a_network_with_no_relay_is_given_one() {
         let fixture = fixture(None).await;
-        let done = fixture.service.handle(change("https://a.example:443", false, false)).await;
+        let done = fixture.service.handle(change(&at("a.example:443"), false)).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
 
         let params = params_of(&fixture).await;
-        assert_eq!(Some("https://a.example:443"), params.relay.as_deref());
+        assert_eq!(Some(at("a.example:443").as_str()), params.relay.as_deref());
         assert!(params.leaving.is_none(), "there was nothing to leave");
     }
 
@@ -8187,14 +8372,14 @@ mod tests {
     #[tokio::test]
     async fn a_change_of_relay_is_a_move_that_leaves_the_old_one() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
-        let done = fixture.service.handle(change("https://b.example:443", false, false)).await;
+        fixture.service.handle(change(&at("a.example:443"), false)).await;
+        let done = fixture.service.handle(change(&at("b.example:443"), false)).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
 
         let params = params_of(&fixture).await;
-        assert_eq!(Some("https://b.example:443"), params.relay.as_deref());
+        assert_eq!(Some(at("b.example:443").as_str()), params.relay.as_deref());
         let leaving = params.leaving.expect("leaving the one it was on");
-        assert_eq!("https://a.example:443", leaving.relay);
+        assert_eq!(at("a.example:443"), leaving.relay);
         assert!(leaving.until > crate::clock::now_ms(), "for a while yet");
     }
 
@@ -8202,11 +8387,11 @@ mod tests {
     #[tokio::test]
     async fn an_immediate_change_leaves_nothing_behind() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
-        fixture.service.handle(change("https://b.example:443", false, true)).await;
+        fixture.service.handle(change(&at("a.example:443"), false)).await;
+        fixture.service.handle(change(&at("b.example:443"), true)).await;
 
         let params = params_of(&fixture).await;
-        assert_eq!(Some("https://b.example:443"), params.relay.as_deref());
+        assert_eq!(Some(at("b.example:443").as_str()), params.relay.as_deref());
         assert!(params.leaving.is_none(), "nobody waits on the old one");
     }
 
@@ -8214,82 +8399,27 @@ mod tests {
     #[tokio::test]
     async fn the_same_relay_is_not_a_move() {
         let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
+        fixture.service.handle(change(&at("a.example:443"), false)).await;
         let before = params_of(&fixture).await;
 
-        let refused = fixture.service.handle(change("https://A.example", false, false)).await;
+        let refused = fixture.service.handle(change(&at("A.example:443"), false)).await;
         assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
         assert_eq!(before, params_of(&fixture).await, "nothing changed");
     }
 
-    fn meeting(rendezvous: Option<&str>) -> Command {
-        Command::ChangeRendezvous { network: None, rendezvous: rendezvous.map(str::to_owned) }
-    }
-
-    /// **A rendezvous is set and removed by a signed parameter change**, and the
-    /// relay is untouched by either.
+    /// **Nothing is signed before the key is confirmed, and a declined one
+    /// changes nothing.**
     #[tokio::test]
-    async fn a_rendezvous_is_set_and_removed() {
-        let fixture = fixture(None).await;
-        fixture.service.handle(change("https://a.example:443", false, false)).await;
-
-        let set = fixture.service.handle(meeting(Some("https://a.example:8444"))).await;
-        assert!(matches!(set, Outcome::Reported(_)), "{set:?}");
-        let params = params_of(&fixture).await;
-        assert_eq!(Some("https://a.example:8444"), params.rendezvous.as_deref());
-        assert_eq!(Some("https://a.example:443"), params.relay.as_deref(), "the relay stays");
-
-        let removed = fixture.service.handle(meeting(None)).await;
-        assert!(matches!(removed, Outcome::Reported(_)), "{removed:?}");
-        assert_eq!(None, params_of(&fixture).await.rendezvous);
-    }
-
-    /// **Not HTTPS, or the one it already has: refused, and nothing signed.**
-    /// The daemon checks it too: whoever sent the command need not have.
-    #[tokio::test]
-    async fn a_rendezvous_that_is_not_https_or_unchanged_is_refused() {
-        let fixture = fixture(None).await;
-        fixture.service.handle(meeting(Some("https://a.example:8444"))).await;
-        let before = params_of(&fixture).await;
-
-        for refused in
-            [meeting(Some("http://a.example:8444")), meeting(Some("https://a.example:8444"))]
-        {
-            let answered = fixture.service.handle(refused).await;
-            assert!(matches!(answered, Outcome::Failed { .. }), "{answered:?}");
-        }
-        assert_eq!(before, params_of(&fixture).await, "nothing changed");
-    }
-
-    /// **Somebody who does not own the network is refused for want of
-    /// authority**, and nothing is signed.
-    #[tokio::test]
-    async fn a_rendezvous_is_the_owners_to_change() {
-        let fixture = fixture(None).await;
-        let before = params_of(&fixture).await;
-        let bob = crate::control::Caller::Identified {
-            name: "S-1-5-21-bob".to_owned(),
-            privileged: true,
-            could_be_privileged: false,
-        };
-
-        let refused =
-            fixture.service.handle_for(&bob, meeting(Some("https://a.example:8444"))).await;
-        assert!(matches!(refused, Outcome::NotAllowed { .. }), "{refused:?}");
-        assert_eq!(before, params_of(&fixture).await, "nothing changed");
-    }
-
-    /// **Nothing is signed before the certificate is confirmed, and a declined
-    /// one changes nothing.**
-    #[tokio::test]
-    async fn nothing_is_signed_before_the_certificate_is_confirmed() {
+    async fn nothing_is_signed_before_the_key_is_confirmed() {
         let fixture = fixture(None).await;
         let before = params_of(&fixture).await;
 
-        let (port, _) = a_relay_presenting_a_certificate();
+        let port = a_relay_container(8);
         let asked =
-            fixture.service.handle(change(&format!("https://127.0.0.1:{port}"), true, false)).await;
-        let Outcome::Pinning { moving, .. } = &asked else { panic!("it asks first: {asked:?}") };
+            fixture.service.handle(change(&format!("https://127.0.0.1:{port}"), false)).await;
+        let Outcome::ConfirmingRelay { moving, .. } = &asked else {
+            panic!("it asks first: {asked:?}")
+        };
         assert_eq!(Some("test"), moving.as_deref(), "and says it is a move, not a founding");
         let resumed = fixture.service.handle(Command::Waiting).await;
         assert_eq!(format!("{asked:?}"), format!("{resumed:?}"), "the same when resumed");
@@ -8298,15 +8428,15 @@ mod tests {
         fixture.service.handle(Command::Abandon).await;
         assert_eq!(before, params_of(&fixture).await, "and declining changes nothing");
 
-        let (port, presented) = a_relay_presenting_a_certificate();
-        let relay = format!("https://127.0.0.1:{port}");
-        fixture.service.handle(change(&relay, true, false)).await;
+        let port = a_relay_container(9);
+        fixture.service.handle(change(&format!("https://127.0.0.1:{port}"), false)).await;
         let done = fixture.service.handle(Command::Confirm).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
 
-        let params = params_of(&fixture).await;
-        assert_eq!(Some(relay.as_str()), params.relay.as_deref());
-        assert_eq!(Some(presented), params.relay_cert, "pinned: the bytes it presented");
+        let key = convesso_core::identity::Identity::from_ed25519_seed(&[9; 32]).unwrap();
+        let expected =
+            transport_convesso::relay::written(key.address().as_bytes(), "127.0.0.1:8443", false);
+        assert_eq!(Some(expected), params_of(&fixture).await.relay, "the relay it answered with");
     }
 
     /// Changing a relay is the network's owner's.
@@ -8317,7 +8447,6 @@ mod tests {
             Command::ChangeRelay {
                 network: Some("casa".to_owned()),
                 relay: String::new(),
-                pin: true,
                 immediately: false,
             }
             .needs()
@@ -8327,11 +8456,7 @@ mod tests {
     // ---- a relay that moves ------------------------------------------------
 
     fn elsewhere() -> RelayPlan {
-        RelayPlan {
-            relay: Some("https://elsewhere.example:443".to_owned()),
-            pinned: None,
-            leaving: None,
-        }
+        RelayPlan { relay: Some("https://elsewhere.example:443".to_owned()), leaving: None }
     }
 
     /// **A relay that moved rebuilds the transport, and not the tunnel.**
@@ -8427,7 +8552,7 @@ mod tests {
             600,
         )
         .expect("valid")
-        .moving_to("https://new.example:443", None, 1_000)
+        .moving_to("https://new.example:443", 1_000)
         .expect("moves");
         let end = 1_000 + 600 * 1_000;
 
@@ -8780,8 +8905,6 @@ mod tests {
                 name: "desktop".to_owned(),
                 suffix: "home.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: None,
                 ipv4_range: None,
             },
             for_whom: alice,
@@ -8833,8 +8956,6 @@ mod tests {
                     name: "desktop".to_owned(),
                     suffix: "home.internal".to_owned(),
                     relay: None,
-                    rendezvous: None,
-                    certificate: None,
                     ipv4_range: None,
                 },
                 &alice,
@@ -9083,8 +9204,6 @@ mod tests {
                 name: "desktop".to_owned(),
                 suffix: "work.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -9384,10 +9503,7 @@ mod tests {
         let service = service.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
 
         let asked = service
-            .handle(Command::Join {
-                relay: "https://127.0.0.1:1".to_owned(),
-                name: "laptop".to_owned(),
-            })
+            .handle(Command::Join { relay: at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
         let Outcome::NeedsKey(wanted) = asked else {
             panic!("it must stop and ask for a key: {asked:?}");
@@ -10005,8 +10121,6 @@ mod tests {
             name: "desktop".to_owned(),
             suffix: "home.internal".to_owned(),
             relay: None,
-            rendezvous: None,
-            certificate: crate::control::Certificate::None,
             ipv4_range: None,
         }
     }
@@ -10081,9 +10195,10 @@ mod tests {
         let paths = owed_a_snapshot(&service, &custodian).await;
 
         let asked = service
-            .handle(Command::ChangeRendezvous {
+            .handle(Command::ChangeRelay {
                 network: None,
-                rendezvous: Some("https://meet.example:8444".to_owned()),
+                relay: at("moved.example:8443"),
+                immediately: false,
             })
             .await;
         let Outcome::NeedsSignatures(wanted) = asked else { panic!("must ask: {asked:?}") };
@@ -10100,14 +10215,14 @@ mod tests {
         let roster::types::OperationBody::SetNetwork(params) = change.body else {
             panic!("a change of the settings: {change:?}");
         };
-        assert_eq!(Some("https://meet.example:8444"), params.rendezvous.as_deref());
+        assert_eq!(Some(at("moved.example:8443")), params.relay);
 
         let done = answer_batch(&service, wanted, &custodian).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
         let node = service.node().await.expect("the fixture holds a network");
         assert_eq!(
-            Some("https://meet.example:8444"),
-            node.state().await.expect("derives").params.rendezvous.as_deref()
+            Some(at("moved.example:8443")),
+            node.state().await.expect("derives").params.relay
         );
         assert!(crate::state::read_snapshot(&paths).is_some(), "and the snapshot is kept");
     }
@@ -10299,8 +10414,6 @@ mod tests {
                 name: "pixel".to_owned(),
                 suffix: "work.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;
@@ -10369,8 +10482,6 @@ mod tests {
                     name: "pixel".to_owned(),
                     suffix: suffix.to_owned(),
                     relay: None,
-                    rendezvous: None,
-                    certificate: crate::control::Certificate::None,
                     ipv4_range: None,
                 })
                 .await;
@@ -10434,8 +10545,6 @@ mod tests {
                 name: "pixel".to_owned(),
                 suffix: "home.internal".to_owned(),
                 relay: None,
-                rendezvous: None,
-                certificate: crate::control::Certificate::None,
                 ipv4_range: None,
             })
             .await;

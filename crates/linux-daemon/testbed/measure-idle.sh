@@ -20,18 +20,16 @@
 # there is none. Each destination is counted in both directions:
 #
 #   peer      the peer's container address, IPv4 — the direct path
-#   ipv6      link-local IPv6 — the direct path again, on the addresses iroh
-#             also tries; in the testbed only the nodes are on that link
-#   rendezvous the rendezvous, on the relay's host: TCP port 8444
-#   relay-quic UDP to the relay's host: the address discovery of iroh's net
-#             report, a QUIC connection of its own
-#   relay     the rest to the relay's host: the relay connection, which is TCP
+#   ipv6      link-local IPv6 — the direct path again, on the other addresses a
+#             device announces; in the testbed only the nodes are on that link
+#   relay-udp UDP to the relay's host: the relay connection
+#   relay-tcp TCP to the relay's host: the relay connection where UDP does not
+#             pass, and the relay's key when a device asks for it
 #   multicast local-discovery announcements
 #   rest      everything else on eth0
 #
-# `relay host` sums `relay` and `relay-quic`, what the transport spends on the
-# relay. `not relay` is everything else, the rendezvous included. Until
-# `quiet-iroh`, `relay` counted all three.
+# `relay host` sums `relay-udp` and `relay-tcp`, what the transport spends on the
+# relay. `not relay` is everything else.
 #
 # Bytes are what the kernel counts for the packets, IP header included, which is
 # what a data plan counts.
@@ -77,9 +75,8 @@ table inet probe {
     oifname \"eth0\" ip6 daddr ff00::/8 counter accept comment \"multicast\"
     oifname \"eth0\" ip daddr $peer_ip counter accept comment \"peer\"
     oifname \"eth0\" ip6 daddr fe80::/10 counter accept comment \"ipv6\"
-    oifname \"eth0\" ip daddr $relay tcp dport 8444 counter accept comment \"rendezvous\"
-    oifname \"eth0\" ip daddr $relay meta l4proto udp counter accept comment \"relay-quic\"
-    oifname \"eth0\" ip daddr $relay counter accept comment \"relay\"
+    oifname \"eth0\" ip daddr $relay meta l4proto udp counter accept comment \"relay-udp\"
+    oifname \"eth0\" ip daddr $relay counter accept comment \"relay-tcp\"
   }
   chain in { type filter hook input priority -300; policy accept;
     iifname \"eth0\" counter comment \"total\"
@@ -87,9 +84,8 @@ table inet probe {
     iifname \"eth0\" ip6 daddr ff00::/8 counter accept comment \"multicast\"
     iifname \"eth0\" ip saddr $peer_ip counter accept comment \"peer\"
     iifname \"eth0\" ip6 saddr fe80::/10 counter accept comment \"ipv6\"
-    iifname \"eth0\" ip saddr $relay tcp sport 8444 counter accept comment \"rendezvous\"
-    iifname \"eth0\" ip saddr $relay meta l4proto udp counter accept comment \"relay-quic\"
-    iifname \"eth0\" ip saddr $relay counter accept comment \"relay\"
+    iifname \"eth0\" ip saddr $relay meta l4proto udp counter accept comment \"relay-udp\"
+    iifname \"eth0\" ip saddr $relay counter accept comment \"relay-tcp\"
   }
 }
 EOF"
@@ -105,17 +101,17 @@ compose exec -T "$node" nft list table inet probe \
         { packets[$1] += $2; bytes[$1] += $3 }
         END {
             rest_p = packets["total"]; rest_b = bytes["total"]
-            split("peer ipv6 rendezvous relay-quic relay multicast", order, " ")
-            for (i = 1; i <= 6; i++) { rest_p -= packets[order[i]]; rest_b -= bytes[order[i]] }
+            split("peer ipv6 relay-udp relay-tcp multicast", order, " ")
+            for (i = 1; i <= 5; i++) { rest_p -= packets[order[i]]; rest_b -= bytes[order[i]] }
             packets["rest"] = rest_p; bytes["rest"] = rest_b
             month = 30 * 24 * 60 * 60 / seconds
             printf "%-11s %10s %12s %14s\n", "", "packets", "bytes", "per month"
-            split("peer ipv6 rendezvous relay-quic relay multicast rest total", shown, " ")
-            for (i = 1; i <= 8; i++) {
+            split("peer ipv6 relay-udp relay-tcp multicast rest total", shown, " ")
+            for (i = 1; i <= 7; i++) {
                 k = shown[i]
                 printf "%-11s %10d %12d %11.1f MB\n", k, packets[k], bytes[k], bytes[k] * month / 1e6
             }
-            relay_b = bytes["relay"] + bytes["relay-quic"]
+            relay_b = bytes["relay-udp"] + bytes["relay-tcp"]
             printf "%-11s %10s %12s %11.1f MB\n", "relay host", "", "", relay_b * month / 1e6
             printf "%-11s %10s %12s %11.1f MB\n", "not relay", "", "", (bytes["total"] - relay_b) * month / 1e6
         }'

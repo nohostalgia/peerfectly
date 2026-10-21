@@ -37,9 +37,8 @@
 //!
 //! # Deliberately elsewhere
 //!
-//! - Dialling, addressing, NAT and relays — the transport. This crate is handed
-//!   sessions.
-//! - The relay path that lets two nodes meet at all — `rendezvous-service`.
+//! - Dialling, addressing, NAT and relays — `transport-convesso`. This crate is
+//!   handed sessions.
 //! - Multicast announcement on a LAN — `local-discovery`.
 //! - Detecting that an author equivocated across peers —
 //!   `equivocation-detection`. This crate must preserve that evidence, not act

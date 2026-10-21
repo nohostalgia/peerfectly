@@ -9,8 +9,8 @@
 //! # The `roster` crate is not disturbed
 //!
 //! Identity depends on `roster`; roster never depends on identity. That keeps
-//! roster's audited dependency list — no networking, no async runtime, no
-//! `iroh` — exactly as it is, while this crate is free to touch the filesystem
+//! roster's audited dependency list — no networking, no async runtime —
+//! exactly as it is, while this crate is free to touch the filesystem
 //! and, later, a platform keystore.
 //!
 //! The types a caller needs from roster are re-exported here, so an ordinary

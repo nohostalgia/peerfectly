@@ -32,6 +32,12 @@ Encoding is RFC 8949 §4.2.1 core deterministic encoding, narrowed:
 - **No unknown keys, no repeated keys, no missing keys.** Every map has exactly
   the fields its schema names, in schema order. The optional keys are `ipv4`
   and `leaving` in `NetworkParams`; see §7.
+
+  A decoder reads each map against its schema, key by key. A key the schema does
+  not name is `unknown_field`, and so is a map declaring more entries than its
+  schema has keys, refused before any key is read. A key of the schema in the
+  wrong place is `key_ordering`, the same key twice `duplicate_key`, and a map
+  with fewer entries than its required keys `missing_field`.
 - **No trailing bytes** after the top-level item.
 
 A decoder must *reject* input that breaks any of these, with an error. It must
@@ -137,7 +143,7 @@ DeviceSpec = { "keys": [ KeyEntry ... ], "name": tstr, "role": tstr,
 KeyEntry = { "alg": tstr, "value": bstr, "purpose": tstr }
 ```
 
-`purpose` is `"signing"` or `"transport"`.
+`purpose` is `"signing"`, `"transport"` or `"attestation"`.
 
 ### DeviceRecord
 
@@ -162,37 +168,37 @@ NetworkParams = {
   "relay": [] / [tstr],
   "suffix": tstr,
   ? "leaving": Leaving,
-  "relay_cert": [] / [bstr],
-  "rendezvous": [] / [tstr],
   "snapshot_window": uint
 }
 
 Leaving = {
   "relay": tstr,
-  "until": uint,
-  "relay_cert": [] / [bstr]
+  "until": uint
 }
 ```
 
-Key order is length-first, so `relay` (5 bytes) sits between `ula` (3) and
-`suffix` (6), and the two ten-byte keys between `suffix` and `snapshot_window`
-(15). `relay_cert` precedes `rendezvous` because equal lengths are settled by
-bytes and `l` precedes `n`. Alphabetical order would put `relay_cert` next to
-`relay` and produce bytes a conforming decoder refuses.
+Key order is length-first: `ula` (3 bytes), `ipv4` (4), `relay` (5), `suffix`
+(6), `leaving` (7), `snapshot_window` (15). Alphabetical order would put `ipv4`
+and `leaving` first and produce bytes a conforming decoder refuses.
+
+These six are the whole of `NetworkParams`. A map carrying any other key is
+refused as `unknown_field` (§1), never read past: one declaring more than six
+entries before any key is read, and one that fits the count where the foreign
+key is met. Four entries are required; each optional key present adds one.
 
 `ipv4` is the IPv4 range the network's devices derive their IPv4 addresses in:
 four address bytes, then the prefix length. It is one of the **two optional
-keys** in the format, with `leaving` below. It sorts after `ula` (three bytes against its four) and before
-`relay` (five). A map without it has six entries and is byte for byte what
-parameters were before the key existed; a map with it has seven. Absence has
-exactly one spelling, the key left out: an empty byte string is refused
+keys** in the format, with `leaving` below. It sorts after `ula` (three bytes
+against its four) and before `relay` (five). A map without it is byte for byte
+what parameters were before the key existed; a map with it has one entry more.
+Absence has exactly one spelling, the key left out: an empty byte string is refused
 (`invalid_value`), as is any other length, a repeated key (`duplicate_key`), and
 a range with host bits set, a prefix length outside 8 to 28, or a range not
 wholly inside `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`
 or `198.18.0.0/15` (all `invalid_value`). Parameters without it use
 `100.64.0.0/10`.
 
-Software predating the key refuses a seven-entry map, so a network that sets a
+Software predating the key refuses a map carrying it, so a network that sets a
 range cannot be read by it. A network that does not is unaffected.
 
 `leaving` is the relay a network is **moving away from**, and when the move
@@ -201,21 +207,21 @@ change by synchronising, they synchronise through the relay, and a device
 switched off during the change wakes knowing only the old one. Until `until` the
 devices that already moved stay reachable on the relay being left too.
 
-It sorts after `suffix` (six bytes against its seven) and before the ten-byte
-keys. It is **one key holding all three fields**, so a relay being left without
-an end, or an end without a relay, is not something the encoding can say — a
-`Leaving` map missing a field is `missing_field`. Its own keys are ordered as
-every map's are: `relay` before `until` (equal lengths, `r` before `u`), then
-`relay_cert`.
+It sorts after `suffix` (six bytes against its seven) and before
+`snapshot_window`. It is **one key holding both fields**, so a relay being left
+without an end, or an end without a relay, is not something the encoding can
+say — a `Leaving` map missing a field is `missing_field`, and one carrying any
+other key `unknown_field`. Its own keys are ordered as every map's are: `relay`
+before `until` (equal lengths, `r` before `u`).
 
 `until` is milliseconds since the epoch, the clock operations are dated by.
-Past it the relay being left is no longer used, with nothing signed to say so.
-`relay_cert` is an array of nothing or one, as the relay's own is.
+Past it the relay being left is not used, with nothing signed to say so. Its
+`relay` is written as the network's own is, below, under the same bound.
 
 `leaving` is refused (`invalid_value`) where it cannot mean anything: when the
 parameters name no relay to move to, when it names the relay itself, and when
-its relay is empty or its certificate empty. Parameters without it are byte for
-byte what they were before the key existed — the rule `ipv4` set.
+its relay is empty. Parameters without it are byte for byte what they were
+before the key existed — the rule `ipv4` set.
 
 `snapshot_window` is in seconds. The suffix is a roster parameter rather than a
 compile-time constant, so changing it does not require replacing every client.
@@ -260,33 +266,26 @@ being set up — and an empty *string* inside the array is refused, so no byte
 sequence means "a relay whose address is nothing". Two addresses are refused as
 well: a network with two answers to one question is not a network with a relay.
 
-`relay_cert` is the certificate that relay presents, DER, as an array of zero or
-one byte strings — absence encoded the same way as for `relay`, and an empty byte
-string refused for the same reason.
+The address names the relay's key as well as where it is:
 
-It is here because the relay is the one service in this design a node speaks to
-before it has authenticated anything, and the ordinary answer to "is this the
-right server" — a public certificate authority — is exactly the third party this
-network is built to do without. A network that pins its relay trusts the
-certificate its own signed parameters name and nothing else: not a public
-authority, and so not anyone who can persuade one to issue a certificate for that
-address. It also makes a relay you run yourself, on an address with no domain
-name, an ordinary arrangement rather than a workaround.
+```text
+<64 hexadecimal digits>@host:port
+tls://<64 hexadecimal digits>@host:port     a link wrapped in TLS
+```
 
-A pin is optional. A network whose relay presents a publicly signed certificate
-may leave it empty and be verified the usual way.
+To this format the string is opaque text, at most 128 bytes: it checks
+presence, emptiness and length, and the transport reads the key and the address
+out of it. The `tls://` form wraps the link to the relay in TLS for networks that
+let only TLS out; it authenticates nothing.
 
-`rendezvous` is where devices publish the addresses they believe they can be
-reached at, and where they look for a peer's. Zero or one text strings, absence
-encoded as for `relay`, empty refused for the same reason.
-
-It is signed for the reason the relay's address is signed: whoever answers it
-learns which devices are looking for which others and when. Less than the relay
-learns, and still more than a third party should decide for itself. What it
-cannot do is lie — the records it stores are signed and sequence-numbered by the
-devices themselves, so a hostile rendezvous can withhold and delay but cannot
-forge an address or roll one back. That is why an address suffices here while
-the relay also needs a pinned certificate.
+The key is here because the relay is the one service in this design a node
+speaks to before it has authenticated anything, and the ordinary answer to "is
+this the right server" — a public certificate authority — is exactly the third
+party this network is built to do without. A node dials the relay under the key
+its own signed parameters name and accepts no other in its place, so the roster
+authenticates the relay with nothing beside it. It also makes a relay you run
+yourself, on an address with no domain name, an ordinary arrangement rather than
+a workaround.
 
 The same argument that keeps the suffix out of the code applies with a sharper
 edge here. Whoever supplies a relay address learns who talks to whom and when,
@@ -306,7 +305,8 @@ reinstallation.
 - **No key value appears twice.** This is what enforces the rule that a
   device's signing key and transport key are different keys: one value serving
   two protocols invites cross-protocol attacks.
-- At least one entry must have `purpose = "signing"`.
+- At least one entry must have `purpose = "signing"`, and at least one
+  `purpose = "attestation"`.
 - The **identifying signing key** is the first signing entry in that canonical
   order, and the device id is its key id. A device's key set never changes —
   none of the seven operations adds a key to an existing device — so this is
@@ -410,8 +410,6 @@ its peers reject, which is a fork. They change only with the domain tag.
 | Revocation reason | 256 bytes |
 | Network suffix | 64 bytes |
 | Relay address | 128 bytes |
-| Relay certificate | 4096 bytes |
-| Rendezvous address | 128 bytes |
 | Identifier | 32 bytes |
 | Signature | 64 bytes |
 | Map key | 23 bytes |
@@ -762,8 +760,8 @@ of a claim it could not check.
 ## 25. Monotone sequence, and conflict
 
 A snapshot's sequence must be **strictly greater** than the highest accepted, or
-it is refused. This is what stops a compromised rendezvous serving an old
-roster.
+it is refused. This is what stops anyone who kept an old snapshot serving it
+as the current roster.
 
 Two snapshots sharing a sequence number and differing in content cause **both to
 be refused**, and the number is closed permanently. Considered and rejected:

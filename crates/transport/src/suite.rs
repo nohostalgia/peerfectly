@@ -3,7 +3,7 @@
 //! Written against [`Transport`] and [`Session`], never against a concrete type.
 //! That is what stops the interface drifting into describing whichever
 //! implementation happens to exist: a behaviour only one of them has fails the
-//! moment a second appears, and `transport-iroh` inherits a check of its
+//! moment a second appears, and `transport-convesso` inherits a check of its
 //! semantics rather than having to invent one.
 //!
 //! A harness supplies a pair of connected nodes and a way to change the roster

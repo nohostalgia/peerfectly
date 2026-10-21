@@ -2,8 +2,7 @@
 
 What a device puts on a local network to say it is there, and the rules a second
 implementation must follow. Roster's `FORMAT.md` defines the canonical encoding
-and the framing convention; rendezvous's defines the record. Neither is restated
-here beyond what a reader needs.
+and the framing convention, and is not restated here beyond what a reader needs.
 
 ## 1. Scope
 
@@ -48,8 +47,7 @@ both hear.
 
 ## 4. The payload
 
-The announcement body is a **rendezvous record**, exactly as
-`crates/rendezvous/FORMAT.md` §4 defines it:
+The announcement body is a **record** (`src/record.rs`):
 
 ```text
 Record = {
@@ -60,9 +58,7 @@ Record = {
 }
 ```
 
-Same struct, same canonical encoding, same length-first key ordering. A second
-format for one thing would drift, which this project has already had to correct
-once.
+Roster's canonical encoding, with its length-first key ordering.
 
 ### Bounds
 
@@ -87,18 +83,10 @@ signing input = framed("local-announce/v1")
 
 `framed(x)` is `len(x)` as a big-endian `u16` followed by `x`.
 
-**`local-announce/v1`, never `rendezvous-record/v1`.** This is the fifth signing
-context in the system, and the separation is not cosmetic.
-
-Without it an announcement *is* a valid rendezvous record. Anyone sharing a café
-network could capture one and publish it, and because the device itself signed it
-at a sequence above whatever it last published globally, it would **replace that
-device's published addresses with LAN-only ones**. Peers elsewhere would fetch
-`192.168.x` and fail until the device published again — reachability destroyed by
-an observer holding no key at all.
-
-An implementation MUST reject an announcement that verifies only under the
-rendezvous tag, and vice versa.
+**`local-announce/v1`**, a signing context no other signature in the system
+uses, so an announcement cannot be presented as anything else the same
+transport key signs. An implementation MUST reject an announcement that
+verifies only under another tag.
 
 ## 6. The packet
 
@@ -151,7 +139,7 @@ alongside it.
 
 ## 9. Ordering candidates
 
-§2.9's order: local, then globally routable, then the rendezvous. An address on
+§2.9's order: local, then globally routable. An address on
 an interface the node currently holds ranks first whatever it was labelled when
 it was learned.
 

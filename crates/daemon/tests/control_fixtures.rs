@@ -49,8 +49,6 @@ fn report() -> Report {
         // A network confirmed within the time it allows.
         confirmation: None,
         relay: Some("https://relay.example:443".to_owned()),
-        rendezvous: Some("https://meet.example".to_owned()),
-        relay_pinned: true,
         // A network in the middle of moving relay, so a renderer has one to draw.
         relay_leaving: Some(daemon::control::RelayLeaving {
             relay: "https://old-relay.example:443".to_owned(),
@@ -166,8 +164,6 @@ fn report() -> Report {
         // the report has both to draw.
         confirmation: Some(daemon::control::Unconfirmed::Stale),
         relay: None,
-        rendezvous: None,
-        relay_pinned: false,
         relay_leaving: None,
         accused: vec![Accused {
             device: named(Some("build-box"), "5f6a-7b8c-9d0e-1f2a"),
@@ -253,10 +249,15 @@ fn outcomes() -> Vec<Outcome> {
         Outcome::Adopted {
             suffix: "studio.internal".to_owned(),
             devices: 3,
-            relay_confirmed: true,
             carrying: false,
         },
-        Outcome::Pinning { relay: "https://relay.example:443".to_owned(), fingerprint: "D4:1E".to_owned(), der_len: 812, moving: Some("home".to_owned()) },
+        Outcome::ConfirmingRelay {
+            relay: "1c23b31d465a430ab24cc9e7990dd18ed67800950f7c3d035c3f6cb7747e5a89@relay.example:8443"
+                .to_owned(),
+            key: "1c23 b31d 465a 430a b24c c9e7 990d d18e d678 0095 0f7c 3d03 5c3f 6cb7 747e 5a89"
+                .to_owned(),
+            moving: Some("home".to_owned()),
+        },
         Outcome::Declined { message: "nothing was signed: signing was declined".to_owned() },
         // A key the daemon cannot reach. Never produced on a phone — the
         // keystore answers on the call — but the mirror must be able to read it,

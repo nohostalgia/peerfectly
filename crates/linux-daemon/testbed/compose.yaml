@@ -42,6 +42,19 @@ services:
     <<: *node
     hostname: c
 
+  # The relay container a server runs (`deploy/server`). Its key is in its log:
+  #   docker compose -f crates/linux-daemon/testbed/compose.yaml logs relay
+  # and a node founds on `https://relay:8444`, which asks it for its key; the
+  # relay itself is on 8443. Its identity is kept in a volume, so the key
+  # survives a restart.
+  relay:
+    build:
+      context: ../../..
+      dockerfile: deploy/server/Dockerfile
+    image: peerfectly-testbed-relay
+    volumes:
+      - relay-data:/data
+
   # The `#[ignore]`d tests, which need a kernel, a TPM and root.
   tests:
     build:
@@ -59,5 +72,6 @@ services:
       - tests-registry:/usr/local/cargo/registry
 
 volumes:
+  relay-data:
   tests-target:
   tests-registry:

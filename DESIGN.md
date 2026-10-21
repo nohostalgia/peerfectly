@@ -49,10 +49,16 @@ trust model, not more features.
 
 ### 2.1 Transport
 
-[iroh](https://github.com/n0-computer/iroh) provides connectivity: QUIC with TLS 1.3, an endpoint
-identity per key, hole punching, relays and discovery. It removes the hardest part of the project
-(NAT traversal, relays, path migration), leaves the UDP socket under control for hole punching, and
-QUIC migrates connections natively, which a phone changing networks needs.
+Sessions between devices open with a **Noise IK handshake over UDP**, from convesso. A device is
+known by its transport key, and the dialler must know the key it dials before its first packet.
+There is no certificate authority and no name service: the roster decides which keys are let in,
+inside the handshake. The link to the relay is TCP, which keeps a resting device reachable and
+carries traffic where UDP does not get through; it can be wrapped in TLS where only TLS gets out.
+
+This removes the hardest part of the project: NAT traversal, relaying, and following a device that
+moves. One UDP socket serves the relay and peers alike, so the address the relay sees is the one
+peers will reach, and a peer that moved is followed through the relay within about a second, which
+a phone changing networks needs.
 
 Considered and set aside: userspace WireGuard, which is more conservative cryptographically but does
 no NAT traversal and is hostile to hole punching; WebRTC, kept in mind only for a future
@@ -103,7 +109,7 @@ correctness, because nothing promised continuity. It also removes the most fragi
 
 Binding consequences:
 - **Fast restore is the main performance metric.** From switching on to the first useful session:
-  under 500 ms, from cached endpoints, without waiting for the rendezvous.
+  under 500 ms, from cached endpoints, without waiting for the relay.
 - **Switching on is reachable outside the app:** a Quick Settings tile, a shortcut.
 - **"Always-on" stays an advanced option,** never a requirement.
 
@@ -125,14 +131,25 @@ Binding consequences:
   presumed current one.
 - **Operations not yet synchronised are shown,** clearly and persistently.
 
-### 2.8 Rendezvous and relay
+### 2.8 Relay
 
-- **Rendezvous:** written here, deliberately small. A device publishes a signed, sealed record of
-  where it can be reached, with a sequence number; anyone can fetch it. There is no authentication:
-  the signatures do all of it. A record whose sequence does not increase is refused.
-- **Relay:** `iroh-relay`, self-hosted. Don't write a relay.
-- **Address discovery** runs on the relay's own host, so production depends on no public service.
-- **Limits per key** (bandwidth, concurrent sessions) from the first day.
+- **Relay:** convesso's relay, self-hosted, run as one container, `peerfectly-relay`. Don't write
+  a relay.
+- **Pinned by its key.** The roster signs a relay as `key@host:port`, or `tls://key@host:port` for
+  a link wrapped in TLS, so it authenticates the relay with nothing beside it. A node accepts no
+  other relay in its place, and an impostor fails the handshake.
+- **Its key is asked of its host, and confirmed by a person.** Beside the relay, the container
+  answers `GET /relay` over HTTPS with the key and port it serves. A device founding a network on
+  that host, or moving a network to it, asks, shows the key, and signs nothing until its person
+  confirms it against the line the container printed when it started. That is trust on first use:
+  TLS there hides the request and authenticates nothing. A join asks the same way and confirms
+  nothing, because it signs nothing with the answer: what the device uses afterwards is the relay
+  in the signed roster.
+- **No address service.** Devices hear each other's addresses on the local network (§8).
+  Elsewhere, the two ends of a session swap theirs through the relay and probe them at once.
+- **Address discovery** runs on the relay itself: it tells each device the address it sees it at,
+  inside their session, so production depends on no public service.
+- **Limits per key** from the first day.
 - **An admin only reaches its own network's relay.** A join payload that names another relay is
   refused before any endpoint exists.
 - **Changing a network's relay is a signed admin act.** It carries the new relay and, for a window,
@@ -141,32 +158,35 @@ Binding consequences:
 ### 2.9 Path selection
 
 In order:
-1. Direct on the LAN: local candidates, multicast discovery, the last LAN address known.
+1. Direct on the LAN: the addresses local discovery heard (§8), and the last LAN address known.
 2. Direct over global IPv6, when there is one.
-3. A UDP hole, punched with simultaneous open.
+3. Direct over IPv4, through a hole both sides open by probing each other at the same moment.
 4. The relay.
 
-**The relay is opened at once, in parallel with the direct attempt.** Nobody waits for hole
-punching: the session migrates when a direct path succeeds. Realistically some connections stay on
-the relay for good, since carrier-grade NAT is common on mobile and fixed-wireless networks. **The
-relay is permanent infrastructure, not an edge case.**
+**Nobody waits for a direct path.** A dial tries every address it knows at once, and the relay a
+quarter of a second later. A session that opens through the relay moves to a direct path as soon as
+one has been seen to work both ways. No ports are guessed: behind a NAT that gives each destination
+a port of its own, the session stays on the relay. Realistically some connections stay on the relay
+for good, since carrier-grade NAT is common on mobile and fixed-wireless networks. **The relay is
+permanent infrastructure, not an edge case.**
 
 **Sessions exist while something uses them.** The first packet for a member opens one, and what
 arrives while it opens waits rather than being dropped. A session that carries nothing for ten
-minutes is closed. While open, a path is kept alive every three seconds and left after about nine
-seconds of silence. Nobody is dialled for merely being in the roster.
+minutes is closed. A direct path is trusted for fifteen seconds after its last packet; after a
+longer pause the next packet takes the relay while one probe checks the path. Nobody is dialled for
+merely being in the roster.
 
 The cost is a pause of tens to hundreds of milliseconds before the first packet after ten idle
 minutes, and a `peers` report that looks when asked rather than remembering.
 
-**With no session open, the transport sends one thing: the relay keep-alive, once a minute,** with
-the relay set to match. Finding this device's public address pauses until a session opens, and runs
-alongside its handshake. iroh's defaults spend about a gigabyte a month on those two things, an
-address probe every twenty-odd seconds and a ping every fifteen, whatever the network's size.
-Neither could be configured up to iroh 1.3, so they come from the project's fork of iroh until a
-release carries them (`deny.toml` names it and its exit condition). The cost is a dead relay
-connection noticed within a minute instead of fifteen seconds, and a direct path found a moment
-later after a rest.
+**One session per peer.** When two devices dial each other at once, both keep the session the
+device with the lower id dialled, and close the other.
+
+**With no session open, the transport sends one thing: the relay keep-alive,** one packet when the
+link to the relay has been silent for a minute, about 4.6 MB a month. Addresses, probes and the
+search for a direct path are all caused by a session in use, and a device learns its public address
+from the relay, inside their session, rather than by probing for it. The cost is a dead relay link
+noticed within about eighty seconds, and a direct path found a moment later after a rest.
 
 ## 3. The product surface
 
@@ -218,8 +238,9 @@ Seven kinds, and resist adding more, since each new kind multiplies against ever
 `create_network`, `add_device`, `revoke_device`, `promote`, `demote`, `rename`, `set_network`.
 
 **What is not in the roster:** current addresses, online state, exposed ports. Those are ephemeral
-facts a device knows about itself. It signs them itself and distributes them through the rendezvous.
-The roster holds only what needs authority.
+facts a device knows about itself. It signs them itself and announces them on the local network
+(§8); between networks, two devices swap them through the relay, inside their own session. The
+roster holds only what needs authority.
 
 ### 4.2 An operation
 
@@ -235,7 +256,7 @@ operations before it.
 
 **A snapshot is not authoritative in a strong sense:** operations an isolated node holds that the
 snapshot does not include are still merged. Snapshots carry a **monotone number**, and a node refuses
-to go backwards, which blocks a rollback through a compromised rendezvous.
+to go backwards, which blocks a rollback by anyone replaying an old snapshot.
 
 How long a roster stays valid without news is a signed network parameter, `snapshot_window`, 7 days
 by default. What dates a roster is an *attestation*, which carries no state: see
@@ -245,8 +266,8 @@ by default. What dates a roster is an *attestation*, which carries no state: see
 
 No privileged channel. Whenever two nodes connect, they exchange a digest of the operations they
 hold, and only where the digests differ the ids, and they pass each other what is missing. On a LAN
-that happens by itself. Elsewhere it happens through any peer, and a rendezvous could hold the roster
-without being able to alter it.
+that happens by itself. Elsewhere it happens through any peer, and whoever carries the roster can
+withhold it but never alter it.
 
 **Every operation is pushed the moment it is admitted**, to the open sessions and to the device's
 **neighbours**. These are three members chosen by rendezvous hashing over the ids of their admission
@@ -270,8 +291,10 @@ These are documented publicly rather than left for a researcher to find.
 
 ### 6.1 What the model guarantees
 
-- A compromised rendezvous **cannot inject a device**. It can censor, delay, and see metadata.
-- The relay sees only bytes encrypted end to end.
+- A compromised relay **cannot inject a device**. It sees only bytes encrypted end to end, and can
+  censor, delay, and see metadata: which keys use it, and which pairs talk.
+- A relay key confirmed wrongly, at founding or at a move, costs availability and metadata, never
+  content or membership.
 - **The signing key is not extractable, and how much that's worth depends on the platform:**
   - **Android:** made in the keystore, not exportable.
   - **Windows with a TPM:** made in the TPM through CNG, not exportable. **Consent is enforced by the
@@ -325,8 +348,8 @@ than for an always-on client.
 ## 8. Local discovery
 
 Requirement: **the network works with the internet off.** If LAN candidates came only through the
-rendezvous, failing to connect half a metre from the device would be an absurd failure for a product
-that sells itself on not depending on anyone.
+relay, failing to connect half a metre from the device would be an absurd failure for a product that
+sells itself on not depending on anyone.
 
 - **A signed multicast announcement on a dedicated UDP port:** a public key and its endpoints. **Not
   mDNS with names.** The name is already in the roster; what's needed is only that a key is present,
@@ -334,6 +357,9 @@ that sells itself on not depending on anyone.
 - **Multicast on Wi-Fi is unreliable,** filtered or sent at low bitrates. So announcements repeat, and
   **the last known LAN addresses are tried first.**
 - Paths are re-evaluated at every interface change, or a device stays on the relay while at home.
+- **The LAN does not wait for the relay.** A member's fresh announcement ends the wait a failed
+  attempt put it on, and every attempt of a dial tries the announced addresses. Two devices on one
+  LAN reach each other with the relay unreachable, and with its name unresolvable.
 - **A discovered device proves nothing.** Anyone on the LAN can announce a key. Discovery proposes;
   an admin's signature authorises.
 
@@ -354,8 +380,8 @@ that sells itself on not depending on anyone.
 
 Before anything else: two daemons on different networks, and **one number, the share of connections
 that go direct versus through the relay**, including from mobile data. If real networks almost never
-let a direct path through, the whole plan changes. `crates/transport-iroh`'s `natprobe` exists to
-take that measurement.
+let a direct path through, the whole plan changes. `peerfectly peers` says, for each device it
+reaches, whether the path is direct or through the relay: that is where the number is read.
 
 ## 13. Decisions that were open
 

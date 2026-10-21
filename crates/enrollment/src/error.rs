@@ -57,12 +57,6 @@ pub enum Error {
     /// The delivered roster does not derive to a usable state.
     RosterUnusable(roster::Error),
 
-    /// The network pins a relay certificate other than the one already accepted.
-    ///
-    /// A relay substituted while this device had no roster to check it against
-    /// can prevent an enrolment; it must not survive into membership.
-    RelayCertificateChanged,
-
     /// The exchange did not finish within its deadline.
     ExchangeTimedOut,
 
@@ -103,13 +97,14 @@ impl fmt::Display for Error {
             Self::NotSignedByAdmin => {
                 f.write_str("the admission was not signed by an admin of that network")
             }
+            // A field this build does not read: the network was made by a build
+            // whose roster carried it, and is founded again rather than read half.
+            Self::RosterUnusable(roster::Error::UnknownField) => f.write_str(
+                "the delivered network was made by an older build, whose roster this one does                  not read: found it again with this build",
+            ),
             Self::RosterUnusable(cause) => {
                 write!(f, "the delivered network is not usable: {cause}")
             }
-            Self::RelayCertificateChanged => f.write_str(
-                "the network pins a relay certificate other than the one this device accepted to \
-                 reach the exchange",
-            ),
             Self::ExchangeTimedOut => {
                 f.write_str("the exchange took too long and was abandoned; the wait continues")
             }
@@ -136,6 +131,16 @@ impl From<roster::Error> for Error {
 mod tests {
     use super::*;
 
+    /// A roster from a build whose format carried more says so, and says what
+    /// to do: found the network again.
+    #[test]
+    fn a_roster_of_an_older_build_says_to_found_again() {
+        let said = Error::RosterUnusable(roster::Error::UnknownField).to_string();
+        assert!(said.contains("older build") && said.contains("found it again"), "{said}");
+        let other = Error::RosterUnusable(roster::Error::MissingField).to_string();
+        assert!(!other.contains("older build"), "only a field it does not read: {other}");
+    }
+
     /// Each of these sends a person somewhere different. A single failure would
     /// send them to the wrong place, and at this moment that is expensive.
     #[test]
@@ -148,7 +153,6 @@ mod tests {
             Error::CodeMismatch,
             Error::NotAdmitted,
             Error::NotSignedByAdmin,
-            Error::RelayCertificateChanged,
             Error::ExchangeTimedOut,
             Error::TooManyAttempts { limit: 10 },
         ];

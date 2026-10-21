@@ -27,8 +27,8 @@
 //! untestable requirement to a testable one leaves the testable part unverified
 //! in practice.
 //!
-//! The same split that worked for `transport-session` and then `transport-iroh`,
-//! which inherited its behavioural suite unchanged.
+//! The same split as `transport` and `transport-convesso`, which runs the
+//! transport's behavioural suite unchanged.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

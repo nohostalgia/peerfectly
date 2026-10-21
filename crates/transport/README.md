@@ -9,18 +9,17 @@ key the roster knows"* into a channel you can send bytes over — and refuses to
 when it does not. A session established with a peer the roster does not name is a
 device in the network that no admin added.
 
-## `iroh` is not here, on purpose
+## No network code here, on purpose
 
 `DESIGN.md` §0 forbids merging network code without a test against a real-world NAT
-edge case, and that test cannot run in CI. The binding is **`transport-iroh`**,
-which carries that obligation.
+edge case, and that test cannot run in CI. The binding to the real network is
+**`transport-convesso`**, which carries that obligation.
 
-That deferral serves DESIGN.md §2.1 rather than compromising it. §2.1 asks for the
-transport to sit behind an interface of about four methods *"so that replacing it
-touches nothing else"* — and an interface with one implementation is an untested
-claim. This crate ships **two**, and runs one behavioural suite against both. The
-iroh binding inherits that suite, so its remaining job is connectivity rather
-than semantics.
+The split serves DESIGN.md §2.1. §2.1 asks for the transport to sit behind an
+interface of about four methods *"so that replacing it touches nothing else"* — and
+an interface with one implementation is an untested claim. This crate ships **two**,
+and runs one behavioural suite against both. `transport-convesso` runs the same
+suite, so its job is connectivity rather than semantics.
 
 ## The interface
 
@@ -45,8 +44,8 @@ pub trait Session: Send + Sync {
 
 The last two carry addresses and default to doing nothing. `addresses` says
 where this node believes it can be reached; `learned` offers addresses where a
-peer was seen. Both exist because §2.9 puts the local network and the rendezvous
-ahead of the relay, and something above the transport has to be able to say what
+peer was seen. Both exist because §2.9 puts the local network ahead of the
+relay, and something above the transport has to be able to say what
 it heard — but an address means whatever the implementation that produced it says
 it means, so they are opaque strings and the layer above never parses one.
 
@@ -62,7 +61,7 @@ fifth and is not padding — a transport that can only dial is half a transport,
 and giving the in-memory implementation a private back channel the real one lacks
 is how an interface stops describing reality.
 
-**Async, and dyn-compatible.** QUIC, hole punching and connection migration are
+**Async, and dyn-compatible.** Handshakes, hole punching and path changes are
 asynchronous; a synchronous facade would hide a runtime behind blocking calls,
 and blocking a phone's UI thread on a relay handshake is a failure mode worth
 designing out. `async-trait` boxes the futures, which buys the dyn-compatibility
@@ -79,8 +78,8 @@ state this node derived names, and that device is not revoked.
 **Does not prove authority.** Roles, admin rights and founder status are derived
 state. Asking the transport about them would make it a second authority.
 
-**Promises no confidentiality.** A real transport gets that from QUIC and
-TLS 1.3 (§2.1); the in-memory ones have no wire to protect. This is stated in the
+**Promises no confidentiality.** `transport-convesso` gets that from Noise
+(§2.1); the in-memory ones have no wire to protect. This is stated in the
 interface itself, because *"it goes through the transport"* is exactly the phrase
 a later reader takes to mean *"it is encrypted"*. Anything needing
 confidentiality independent of the connectivity layer must arrange it above this
@@ -164,7 +163,7 @@ from *"the network failed"*.
 ## Payload boundaries are part of the contract
 
 What is sent as one payload arrives as one payload; the interface neither splits
-nor joins. QUIC offers both datagrams and streams, so this is a real choice:
+nor joins. A connectivity layer can offer both datagrams and streams, so this is a real choice:
 message boundaries are what `roster-sync` needs to frame an operation, and
 pushing framing above the interface would mean every implementation reinventing
 it slightly differently.
@@ -173,7 +172,7 @@ An oversized payload is refused **at the sender**. A truncated payload becomes a
 decoding failure at the far end, blamed on the sender, and diagnosed nowhere near
 where it went wrong.
 
-## What `transport-iroh` must satisfy
+## What a binding must satisfy
 
 Implement `Transport` and `Session`, then run the behavioural suite:
 
@@ -190,6 +189,6 @@ of whichever was written first.
 
 | Deferred | To | Why |
 |---|---|---|
-| The iroh binding, path selection (§2.9) | `transport-iroh` | needs a real-world NAT test |
+| The binding to the real network, path selection (§2.9) | `transport-convesso` | needs a real-world NAT test |
 | §4.7's operation gossip, and the **per-peer quota** on the roster's pending set | `roster-sync` | bounding that set fairly needs the authenticated peer identity established here — see roster's `FORMAT.md` §19 |
 | Packet-level source validation (§2.5) | `tunnel` | happens at the TUN interface; this crate establishes the session-level equivalent that makes it meaningful |

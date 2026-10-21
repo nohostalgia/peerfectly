@@ -292,26 +292,6 @@ impl Cli<'_> {
             return runtime.block_on(self.move_relay(command));
         }
 
-        // Setting a network's rendezvous: a signed parameter change, like the relay's.
-        if word == "rendezvous" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
-            let command = match daemon::control::Command::rendezvous_change(&rest) {
-                Ok(command) => command,
-                Err(refusal) => {
-                    eprintln!("{refusal}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(cause) => {
-                    eprintln!("could not start: {cause}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            return runtime.block_on(self.change_rendezvous(command));
-        }
-
         // Revoking takes arguments, so it is not one of the single words `parse`
         // knows. It still goes through the daemon: the daemon holds the roster, and
         // a revocation appended by another process would leave the running node
@@ -672,42 +652,10 @@ impl Cli<'_> {
         }
     }
 
-    /// Sets or removes a network's rendezvous, signing as the network's admin.
-    async fn change_rendezvous(&self, command: daemon::control::Command) -> std::process::ExitCode {
-        use std::process::ExitCode;
-
-        use daemon::control::Outcome;
-
-        match self.ask_and_sign(command).await {
-            Ok(Outcome::Reported(report)) => {
-                print!("{report}");
-                println!();
-                println!("the rendezvous was changed. The other devices follow once they hold it.");
-                ExitCode::SUCCESS
-            }
-            Ok(
-                Outcome::Declined { message }
-                | Outcome::Failed { message, .. }
-                | Outcome::NotAllowed { message },
-            ) => {
-                eprintln!("{message}");
-                ExitCode::FAILURE
-            }
-            Ok(other) => {
-                eprintln!("unexpected answer from the daemon: {other:?}");
-                ExitCode::FAILURE
-            }
-            Err(cause) => {
-                eprintln!("{cause}");
-                ExitCode::FAILURE
-            }
-        }
-    }
-
     /// Moves a network to another relay, with a person confirming what it costs.
     ///
     /// An immediate move is confirmed **before anything is sent**, and separately
-    /// from the certificate: it loses every device switched off right now, and a
+    /// from the relay's key: it loses every device switched off right now, and a
     /// person must say yes to that as its own question rather than as part of
     /// another one.
     async fn move_relay(&self, command: daemon::control::Command) -> std::process::ExitCode {
@@ -735,8 +683,8 @@ impl Cli<'_> {
 
         let expected = command.clone();
         let answered = match self.ask_and_sign(command).await {
-            Ok(Outcome::Pinning { relay, fingerprint, der_len, .. }) => {
-                if !pin_confirmed(&relay, &fingerprint, der_len) {
+            Ok(Outcome::ConfirmingRelay { relay, key, .. }) => {
+                if !key_confirmed(&relay, &key) {
                     let _ = self.ask(Command::Abandon).await;
                     println!("nothing was signed.");
                     return ExitCode::FAILURE;
@@ -809,9 +757,9 @@ impl Cli<'_> {
                 ExitCode::SUCCESS
             }
 
-            // A certificate nobody has vouched for, waiting on a person.
-            Outcome::Pinning { relay, fingerprint, der_len, .. } => {
-                if !pin_confirmed(&relay, &fingerprint, der_len) {
+            // A relay key nobody has vouched for, waiting on a person.
+            Outcome::ConfirmingRelay { relay, key, .. } => {
+                if !key_confirmed(&relay, &key) {
                     let _ = self.ask(Command::Abandon).await;
                     println!("nothing was signed.");
                     return ExitCode::FAILURE;
@@ -929,14 +877,9 @@ impl Cli<'_> {
         use daemon::control::{Command, Outcome};
 
         match self.ask_and_sign(Command::ConfirmJoin { code }).await {
-            Ok(Outcome::Adopted { suffix, devices, relay_confirmed, carrying }) => {
+            Ok(Outcome::Adopted { suffix, devices, carrying }) => {
                 println!();
                 println!("joined. this device is a member of a network with {devices} devices.");
-                if !relay_confirmed {
-                    println!();
-                    println!("note: that relay was accepted on sight and the network pins no");
-                    println!("      certificate, so nothing has ever vouched for it.");
-                }
                 println!();
                 // What is offered is what is left to do. A join that replaced this
                 // device's membership in a network that was up comes back up, so
@@ -987,14 +930,9 @@ impl Cli<'_> {
                 println!("founded. this device is an admin of its own network.");
                 ExitCode::SUCCESS
             }
-            Ok(Outcome::Adopted { suffix, devices, relay_confirmed, carrying }) => {
+            Ok(Outcome::Adopted { suffix, devices, carrying }) => {
                 println!();
                 println!("joined. this device is a member of a network with {devices} devices.");
-                if !relay_confirmed {
-                    println!();
-                    println!("note: that relay was accepted on sight and the network pins no");
-                    println!("      certificate, so nothing has ever vouched for it.");
-                }
                 println!();
                 // What is offered is what is left to do. A join that replaced this
                 // device's membership in a network that was up comes back up, so
@@ -1184,13 +1122,11 @@ impl Cli<'_> {
 /// Builds the founding command from what a person typed.
 ///
 /// The parsing stays here — it is what a terminal is for — and the work goes to
-/// the daemon. A certificate read from a file is read here, because the path is
-/// the person's; one fetched from a relay is fetched there, because that is the
-/// process that will use it and because doing it here would mean two processes
-/// talking to the relay about the same thing.
+/// the daemon. A relay given as its host is asked for its key there, because
+/// that is the process that will use it and because doing it here would mean
+/// two processes talking to the relay's host about the same thing.
 fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
-    use daemon::control::{Certificate, Command};
-    use daemon::relay;
+    use daemon::control::Command;
 
     // The network's name, which is this machine's own name for it. The device's
     // own name is separate and has a sensible default; the network's does not,
@@ -1202,75 +1138,21 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         .clone();
     let name = device_name(rest)?;
 
-    let relay_address = option(rest, "--relay");
-
-    // The relay's certificate is fetched **by default** where there is a relay to
-    // fetch it from.
-    //
-    // # Why this is not a flag a person has to know about
-    //
-    // An admitting side pins the relay's certificate only where the network does:
-    // `transport-iroh`'s enrolment endpoint adds `ca_tls_config` under `if let
-    // Some(certificate) = state.params.relay_cert`, and otherwise verifies against
-    // the system's roots. So a network founded against a relay whose certificate
-    // no public authority vouches for — a self-signed one on a bare address is the
-    // ordinary case — and **not** pinned can never admit anybody: the admitting
-    // side cannot reach the relay at all.
-    //
-    // The joining side has no such trouble. It accepts on sight when ordinary
-    // verification fails, registers, and shows its payload exactly as it should,
-    // then waits out its ten minutes. So the failure appears on the machine that
-    // is working, and nothing anywhere mentions a certificate. That cost an
-    // evening of two-machine testing; it is written down in `VERIFICATION.md` §29.
-    //
-    // Nothing about the pause changes. The fingerprint is still shown and still
-    // confirmed before anything is signed — what changes is which way round the
-    // question is put, and which answer a person gets by not thinking about it.
-    let declining = rest.iter().any(|word| word == "--no-relay-cert");
-    let given = option(rest, "--relay-cert");
-    if given.is_some() && declining {
-        return Err("--relay-cert and --no-relay-cert disagree; use one or the other".to_owned());
+    // An option found does not take is refused, rather than ignored and found
+    // out later.
+    if let Some(unknown) =
+        rest.iter().find(|word| word.starts_with("--") && !FOUND_OPTIONS.contains(&word.as_str()))
+    {
+        return Err(format!("`{unknown}` is not an option of found.\nusage: {FOUND_USAGE}"));
     }
-    let certificate = match given {
-        Some(path) => {
-            let certificate = relay::read_certificate(&path)?;
-            // A file may legitimately be a certificate authority's certificate
-            // that signs the one the relay presents, and this cannot tell the two
-            // apart — so this is said and not enforced. The fetch, which knows it
-            // holds the relay's own certificate, does enforce it.
-            if let Some(address) = relay_address.as_deref() {
-                let (host, _) = relay::host_and_port(address)?;
-                if let Err(reason) = relay::usable_as_a_server_certificate(&certificate, &host) {
-                    println!("warning: {address} cannot present this certificate itself:");
-                    println!("{reason}");
-                    println!(
-                        "pinning it anyway — right only if it signs the one the relay serves."
-                    );
-                    println!();
-                }
-            }
-            Certificate::Given(certificate)
-        }
-        // A relay and no objection: fetch it, show the fingerprint, and pin it
-        // only once a person says it matches.
-        None if !declining && relay_address.is_some() => Certificate::FromTheRelay,
-        // No relay to fetch from, or a person who said not to — and who is
-        // told what that costs before the founding is signed.
-        None => {
-            if declining && relay_address.is_some() {
-                println!();
-                println!("Founding without pinning that relay's certificate.");
-                println!();
-                println!("If it presents one no public authority vouches for, this network will");
-                println!("never be able to admit another device: admitting verifies against the");
-                println!("system's roots when the network pins nothing, and cannot reach the");
-                println!("relay at all. The device trying to join will wait and time out, and");
-                println!("nothing will mention a certificate.");
-                println!();
-            }
-            Certificate::None
-        }
-    };
+
+    // Read here as the daemon will read it, so a form it would refuse is refused
+    // before it is asked anything. The daemon reads it again: the Android app is
+    // held to the same.
+    let relay_address = option(rest, "--relay");
+    if let Some(relay) = relay_address.as_deref() {
+        daemon::relay::Given::read(relay)?;
+    }
 
     // Read here as well as in the daemon, so a range that is not allowed is
     // refused before the daemon is asked anything, and a range that is allowed
@@ -1305,8 +1187,6 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
             })?,
         },
         relay: relay_address,
-        rendezvous: option(rest, "--rendezvous"),
-        certificate,
         ipv4_range,
     })
 }
@@ -1332,21 +1212,22 @@ fn joining_from(rest: &[String]) -> Result<daemon::control::Command, String> {
     Ok(daemon::control::Command::Join { relay, name: device_name(rest)? })
 }
 
-/// Shows a relay's certificate and asks whether to pin it.
+/// Shows the key a relay's host answered with, and asks whether to sign it.
 ///
 /// Founding and moving a relay ask with the same words, because they are asking
 /// the same question: is this the relay you mean, or whatever answered first.
-fn pin_confirmed(relay: &str, fingerprint: &str, der_len: usize) -> bool {
+fn key_confirmed(relay: &str, key: &str) -> bool {
     println!();
-    println!("  SHA-256  {fingerprint}");
-    println!("  {der_len} bytes of DER");
+    println!("  relay  {}", daemon::control::shown(relay));
+    println!("  key    {key}");
     println!();
     println!("Nothing has checked that this is your relay. Anyone in the path could");
-    println!("have answered. On the relay host, the same certificate prints as:");
+    println!("have answered. On the relay host, its container printed the same key when");
+    println!("it started:");
     println!();
-    println!("  openssl x509 -in <the relay's cert file> -noout -fingerprint -sha256");
+    println!("  docker logs <the relay container>");
     println!();
-    print!("Pin this certificate for {relay}? [yes/no] ");
+    print!("Sign this relay into the network? [yes/no] ");
     said_yes()
 }
 
@@ -1386,10 +1267,13 @@ fn option(rest: &[String], flag: &str) -> Option<String> {
     rest.get(at.checked_add(1)?).cloned()
 }
 
+/// The options `found` takes, each followed by its value.
+const FOUND_OPTIONS: [&str; 4] = ["--name", "--suffix", "--relay", "--ipv4-range"];
+
 /// How `found` is spelled, in one place so the usage and the refusal agree.
-const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] [--relay URL] \
-     [--rendezvous URL] \
-                           [--relay-cert FILE | --no-relay-cert] [--ipv4-range A.B.C.D/N]";
+const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] \
+                           [--relay HOST | https://HOST:PORT | KEY@HOST:PORT] \
+                           [--ipv4-range A.B.C.D/N]";
 
 /// This device's name: the one a person gave, or one made from the machine's.
 ///
@@ -1434,7 +1318,8 @@ fn machine_name() -> Option<String> {
 }
 
 /// How `join` is spelled, in one place so the usage and the refusal agree.
-const JOIN_USAGE: &str = "peerfectly join --relay URL [--name NAME]";
+const JOIN_USAGE: &str =
+    "peerfectly join --relay <HOST | https://HOST:PORT | KEY@HOST:PORT> [--name NAME]";
 
 /// How `admit` is spelled, in one place so the usage and the refusal agree.
 const ADMIT_USAGE: &str = "peerfectly admit <the payload the joining device printed>";
@@ -1486,7 +1371,6 @@ fn usage(privileged: &str) -> String {
 "
     ));
     out.push_str(&format!("  {}{needs}\n", daemon::control::Command::RELAY_USAGE));
-    out.push_str(&format!("  {}\n", daemon::control::Command::RENDEZVOUS_USAGE));
     out.push_str(&format!("  peerfectly expose <network> tcp|udp <port>{needs}\n"));
     out.push_str(&format!("  peerfectly unexpose <network> tcp|udp <port>{needs}\n"));
     out.push_str("  peerfectly exposed [network]\n");
@@ -1555,77 +1439,59 @@ mod tests {
         assert!(super::FOUND_USAGE.contains("--ipv4-range"));
     }
 
-    /// `peerfectly rendezvous` is listed, and reads what a person types.
+    /// The usage names the platform's own word for an administrator.
     #[test]
-    fn the_rendezvous_command_is_listed_and_read() {
-        let usage = super::usage("Administrator");
-        assert!(usage.contains("peerfectly rendezvous"), "{usage}");
+    fn the_usage_names_the_platforms_word_for_an_administrator() {
         assert!(
             super::usage("sudo")
                 .contains("peerfectly expose <network> tcp|udp <port>  (needs sudo)")
         );
         assert!(!super::usage("sudo").contains("Administrator"), "the platform's own word, only");
-        assert_eq!(
-            Ok(Command::ChangeRendezvous {
-                network: Some("casa".to_owned()),
-                rendezvous: Some("https://203.0.113.10:8444".to_owned()),
-            }),
-            Command::rendezvous_change(&words("https://203.0.113.10:8444 --network casa"))
-        );
     }
 
-    fn certificate_of(command: &Command) -> daemon::control::Certificate {
+    fn relay_of(command: &Command) -> Option<String> {
         match command {
-            Command::Found { certificate, .. } => certificate.clone(),
+            Command::Found { relay, .. } => relay.clone(),
             other => panic!("expected a founding, got {other:?}"),
         }
     }
 
-    /// A relay and no argument about it: the certificate is fetched.
-    ///
-    /// The other way round produces a network that can never admit anybody —
-    /// admitting verifies against the system's roots when the network pins
-    /// nothing, and cannot reach a relay whose certificate they refuse. A person
-    /// who has not thought about it must not land there by default.
+    /// Each form of a relay reaches the daemon as typed; a host and a port with
+    /// no key is refused here, naming the forms.
     #[test]
-    fn a_relay_has_its_certificate_fetched_without_being_asked_for() {
-        let command = founding_from(&words("casa --relay https://relay.example:443")).unwrap();
-        assert_eq!(daemon::control::Certificate::FromTheRelay, certificate_of(&command));
+    fn a_relay_is_read_in_each_form_and_refused_without_one() {
+        // A key a convesso relay really printed: every byte string is not a key.
+        let written =
+            "1c23b31d465a430ab24cc9e7990dd18ed67800950f7c3d035c3f6cb7747e5a89@relay.example:8443";
+        for relay in [written, "relay.example", "https://relay.example:9443"] {
+            let command = founding_from(&words(&format!("casa --relay {relay}"))).unwrap();
+            assert_eq!(Some(relay.to_owned()), relay_of(&command));
+        }
+        let refusal = founding_from(&words("casa --relay relay.example:8443")).unwrap_err();
+        assert!(refusal.contains("host of its peerfectly relay container"), "{refusal}");
+        assert_eq!(None, relay_of(&founding_from(&words("casa")).unwrap()));
     }
 
-    /// And without a relay there is nothing to fetch, so nothing is asked for.
+    /// An option found does not take is refused, rather than ignored and found
+    /// out later.
     #[test]
-    fn no_relay_fetches_nothing() {
-        let command = founding_from(&words("casa")).unwrap();
-        assert_eq!(daemon::control::Certificate::None, certificate_of(&command));
-    }
-
-    /// A person can still say no, and it takes saying so.
-    #[test]
-    fn declining_is_possible_and_explicit() {
-        let command =
-            founding_from(&words("casa --relay https://relay.example:443 --no-relay-cert"))
-                .unwrap();
-        assert_eq!(daemon::control::Certificate::None, certificate_of(&command));
-    }
-
-    /// Naming a certificate and refusing one at the same time is a mistake, not
-    /// a precedence puzzle to resolve quietly.
-    #[test]
-    fn a_certificate_and_a_refusal_together_are_refused() {
-        let refusal =
-            founding_from(&words("casa --relay https://r:443 --relay-cert c.pem --no-relay-cert"))
-                .unwrap_err();
-        assert!(refusal.contains("one or the other"), "{refusal}");
+    fn an_option_found_does_not_take_is_refused() {
+        for flags in ["--relays r.example", "--colour blue", "--now"] {
+            let refusal =
+                founding_from(&words(&format!("casa --relay relay.example {flags}"))).unwrap_err();
+            assert!(refusal.contains("is not an option of found"), "{refusal}");
+        }
+        for option in super::FOUND_OPTIONS {
+            assert!(super::FOUND_USAGE.contains(option), "{option} is in the usage");
+        }
     }
 
     #[test]
-    fn the_usage_names_the_way_to_decline() {
-        assert!(super::FOUND_USAGE.contains("--no-relay-cert"));
-        assert!(
-            !super::FOUND_USAGE.contains("--fetch-relay-cert"),
-            "fetching is no longer something to ask for"
-        );
+    fn the_usage_shows_the_form_of_a_relay() {
+        assert!(super::FOUND_USAGE.contains("KEY@HOST:PORT"));
+        assert!(super::FOUND_USAGE.contains("--relay HOST"), "the host alone is enough");
+        assert!(super::JOIN_USAGE.contains("KEY@HOST:PORT"));
+        assert!(super::JOIN_USAGE.contains("--relay <HOST"), "a join takes the host alone too");
     }
 }
 
@@ -1968,8 +1834,6 @@ mod custody {
             name: "desktop".to_owned(),
             suffix: "home.internal".to_owned(),
             relay: None,
-            rendezvous: None,
-            certificate: daemon::control::Certificate::None,
             ipv4_range: None,
         };
 

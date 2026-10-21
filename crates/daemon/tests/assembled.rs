@@ -14,6 +14,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use daemon::node::Opening;
+
 use daemon::gateway::{Departure, Gateway};
 use daemon::node::Node;
 use daemon::router::Router;
@@ -409,7 +411,7 @@ async fn register(assembled: &Assembled, session: &Arc<dyn Session>) {
         }
     }
 
-    assembled.node.opened(Box::new(Shared(Arc::clone(session)))).await;
+    assembled.node.opened(Box::new(Shared(Arc::clone(session))), Opening::Accepted).await;
 }
 
 /// A session that says whether it was closed, and carries nothing.
@@ -459,8 +461,7 @@ impl Session for WatchedHandle {
 /// Two devices that dial each other at the same moment open two connections, and
 /// each side keeps whichever it registered last. Where both kept the same one, the
 /// other was dropped from both tables and closed by neither: its own reader kept it
-/// alive in the transport, both paths and the net report with it, at rest and for
-/// good. Found in the testbed, in two runs out of six (Linux `VERIFICATION.md`,
+/// alive in the transport, both its paths with it, at rest and for good. Found in the testbed, in two runs out of six (Linux `VERIFICATION.md`,
 /// step 35).
 #[tokio::test]
 async fn a_session_replaced_by_another_to_the_same_device_is_closed() {
@@ -469,12 +470,78 @@ async fn a_session_replaced_by_another_to_the_same_device_is_closed() {
     let first = Watched::to(peer);
     let second = Watched::to(peer);
 
-    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&first)))).await;
-    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&second)))).await;
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&first))), Opening::Dialled).await;
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&second))), Opening::Dialled).await;
 
     assert!(first.closed(), "the session replaced is closed");
     assert!(!second.closed(), "the session that replaced it is kept");
     assert_eq!(founder.node.session_count().await, 1);
+}
+
+/// **Two sessions opened in opposite directions: the same one is kept,
+/// whichever arrived first.** The one the device with the lower id dialled,
+/// so that two devices dialling each other at once keep the same session
+/// rather than each closing the one the other kept.
+#[tokio::test]
+async fn crossing_sessions_keep_the_one_the_lower_id_dialled_in_either_order() {
+    let (fixture, founder, _joiner, dialled, _accepted) = pair().await;
+    let peer = dialled.peer();
+    let lower_dials_here = fixture.founder.device_id() < peer;
+    let kept = if lower_dials_here { Opening::Dialled } else { Opening::Accepted };
+
+    for order in [[Opening::Dialled, Opening::Accepted], [Opening::Accepted, Opening::Dialled]] {
+        founder.node.closed(&peer).await;
+        let sessions = [Watched::to(peer), Watched::to(peer)];
+        for (session, opening) in sessions.iter().zip(order) {
+            founder.node.opened(Box::new(WatchedHandle(Arc::clone(session))), opening).await;
+        }
+        for (session, opening) in sessions.iter().zip(order) {
+            assert_eq!(
+                opening != kept,
+                session.closed(),
+                "in the order {order:?}, the {opening:?} session is {} closed",
+                if opening == kept { "not" } else { "" }
+            );
+        }
+        assert_eq!(founder.node.session_count().await, 1);
+    }
+}
+
+/// **A dial that returns has registered its session**: whoever asks next
+/// finds it, rather than dialling a second session in the same direction
+/// (`convesso-reach` 5.4).
+#[tokio::test]
+async fn a_dial_that_returns_has_registered_its_session() {
+    let (fixture, founder, joiner) = apart().await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    founder.node.connect(&fixture.joiner.transport_key().public_key()).await.expect("dials");
+    assert!(founder.node.has_session(&fixture.joiner.device_id()).await);
+}
+
+/// Two nodes that dial each other at the same moment are left with a session
+/// both use: a packet crosses each way afterwards.
+#[tokio::test]
+async fn two_nodes_dialling_each_other_at_once_keep_a_session() {
+    let (fixture, founder, joiner) = apart().await;
+    tokio::spawn(Arc::clone(&founder.node).accept_forever());
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    let to_joiner = fixture.joiner.transport_key().public_key();
+    let to_founder = fixture.founder.transport_key().public_key();
+
+    let (one, other) =
+        tokio::join!(founder.node.connect(&to_joiner), joiner.node.connect(&to_founder));
+    one.expect("dials");
+    other.expect("dials");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let peer = fixture.joiner.device_id();
+    assert!(founder.node.has_session(&peer).await, "the founder keeps a session");
+    assert!(joiner.node.has_session(&fixture.founder.device_id()).await, "and so does the joiner");
+
+    founder.machine.queue(marked(&fixture, 7)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    let delivered = delivered(&joiner.machine, 1).await;
+    assert_eq!(1, delivered.len(), "a packet crosses on the session both kept");
 }
 
 /// A device is dated the moment it can talk to an admin, which is what makes it
@@ -612,7 +679,9 @@ async fn a_waiting_payload_receive_does_not_hold_up_packets() {
             self.0.close().await
         }
     }
-    let serving = tokio::spawn(Arc::clone(&joiner.node).serve(Box::new(Owned(accepted))));
+    let serving = tokio::spawn(
+        Arc::clone(&joiner.node).serve(Box::new(Owned(accepted)), daemon::node::Opening::Accepted),
+    );
 
     let to_joiner = Tunnel::new(fixture.prefix(), fixture.founder.device_id())
         .address_of(&fixture.joiner.device_id());
@@ -753,7 +822,7 @@ async fn a_packet_for_a_device_not_connected_is_not_a_problem() {
 }
 
 /// A failure in one part is recorded and the rest keeps working. A node that
-/// stopped carrying packets because the rendezvous was unreachable would be
+/// stopped carrying packets because discovery could not listen would be
 /// least available exactly when a person most wanted it.
 #[tokio::test]
 async fn one_subsystem_failing_does_not_stop_the_others() {
@@ -764,7 +833,7 @@ async fn one_subsystem_failing_does_not_stop_the_others() {
 
     founder
         .node
-        .record(daemon::node::Severity::Problem, "rendezvous", "unreachable on this network")
+        .record(daemon::node::Severity::Problem, "discovery", "unreachable on this network")
         .await;
 
     // Packets still cross.
@@ -778,7 +847,7 @@ async fn one_subsystem_failing_does_not_stop_the_others() {
 
     let fault = founder.node.fault().await;
     assert!(
-        fault.as_ref().is_some_and(|fault| fault.subsystem == "rendezvous"),
+        fault.as_ref().is_some_and(|fault| fault.subsystem == "discovery"),
         "the failure is visible rather than swallowed: {fault:?}"
     );
 }
@@ -1423,4 +1492,58 @@ async fn a_member_a_packet_failed_to_reach_is_rested() {
         Some(first.at),
         "no further attempt was made, so nothing further failed"
     );
+}
+
+/// **A rested member that announces itself is tried at once.** The rest is for
+/// not hammering a member nothing is known about; an announcement on the local
+/// network is news of where it is, and the next packet opens the session.
+#[tokio::test]
+async fn a_rested_member_that_announces_itself_is_tried_by_the_next_packet() {
+    let fixture = Fixture::found();
+    let fabric = MemoryFabric::new();
+    let founder_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
+    );
+    let founder =
+        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+    founder.node.attest_change().await;
+    let peer = fixture.joiner.device_id();
+
+    // The joiner is not there: the first packet fails, and rests it.
+    founder.machine.queue(marked(&fixture, 1)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    let mut failed = false;
+    for _ in 0..100 {
+        if founder.node.event().await.is_some_and(|event| event.cause.contains("were dropped")) {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(failed, "the first attempt failed and said so");
+
+    // It comes up. Packets alone do not reach it while the rest lasts.
+    let joiner_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.joiner), fixture.state.clone()).await,
+    );
+    let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    founder.machine.queue(marked(&fixture, 2)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!founder.node.has_session(&peer).await, "still resting");
+
+    // It announces itself, and the next packet goes.
+    founder.node.announced(peer);
+    founder.machine.queue(marked(&fixture, 3)).await;
+    let _ = founder.node.carry_one().await.expect("takes");
+    let mut opened = false;
+    for _ in 0..100 {
+        if founder.node.has_session(&peer).await {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(opened, "the packet after the announcement opened the session");
 }

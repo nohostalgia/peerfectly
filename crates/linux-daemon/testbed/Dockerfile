@@ -13,9 +13,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-# The cache mounts keep the registry and the build between runs, so a rebuild
-# after an edit costs minutes rather than the whole tree.
+# The cache mounts keep the registry, the git checkouts and the build between
+# runs, so a rebuild after an edit costs minutes rather than the whole tree.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     cargo build --locked --release -p programs \
     && cp target/release/peerfectlyd target/release/peerfectly /usr/local/bin/

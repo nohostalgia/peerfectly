@@ -13,7 +13,6 @@ blake3.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 p256.workspace = true
 signature.workspace = true
-rand_core.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

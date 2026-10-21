@@ -81,20 +81,6 @@ pub const MAX_PUBLIC_KEY_LEN: usize = 64;
 /// an operation whose own size is bounded.
 pub const MAX_RELAY_LEN: usize = 128;
 
-/// The longest relay certificate a network may pin, in bytes of DER.
-///
-/// A certificate is the relay's identity, carried in the signed parameters so
-/// the roster authenticates the relay rather than a certificate authority
-/// doing it. Ordinary certificates are one to two kilobytes; this leaves room
-/// for a chain without letting a parameter become an attachment.
-pub const MAX_RELAY_CERT_LEN: usize = 4096;
-
-/// The longest rendezvous address a network may carry, in bytes.
-///
-/// The same bound as the relay's, for the same reason: it is a URL somebody
-/// types once, not a place to hide a payload.
-pub const MAX_RENDEZVOUS_LEN: usize = 128;
-
 /// Maximum length in bytes of the ULA prefix carried in the network parameters.
 ///
 /// An IPv6 address is 16 bytes; the prefix is at most that.

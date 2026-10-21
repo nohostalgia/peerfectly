@@ -113,7 +113,7 @@ pub enum Error {
     StaleOperation,
     /// A snapshot's sequence number did not advance past the highest accepted.
     /// Refusing it is what blocks a rollback served by a compromised
-    /// rendezvous.
+    /// peer.
     SnapshotSequenceRegressed,
     /// Two snapshots share a sequence number and disagree. Both are refused:
     /// this is either two admins acting at once or an author equivocating, and

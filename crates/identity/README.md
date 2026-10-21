@@ -8,9 +8,10 @@ seed, which exists so the shared vector corpus stays reproducible and which no
 real device may use. This crate closes that gap.
 
 It depends on `roster`; roster never depends on it. That keeps roster's audited
-dependency list — no networking, no async runtime, no `iroh` — exactly as it is,
+dependency list — no networking, no async runtime, no transport — exactly as it is,
 while this crate is free to touch the filesystem and, on Windows, the platform's
-secret store.
+secret store. It has no networking dependency either: it makes and keeps keys, and
+the transport that uses them is another crate's.
 
 ## Generating an identity
 
@@ -40,8 +41,9 @@ asserts that warning survives edits.
 ## Three keys, kept apart
 
 A node holds a **signing key** (roster operations and snapshots), a **transport
-key** (session establishment; `transport-iroh` turns it into an iroh `NodeId`)
-and an **attestation key** (attestations, which date a roster and describe none).
+key** (session establishment; the transport knows a device by its public half,
+which `transport-convesso` uses as the device's address and derives its peer id
+from) and an **attestation key** (attestations, which date a roster and describe none).
 They are drawn separately and no two are ever equal.
 
 Deriving one from another would make a single compromise into two, and would make

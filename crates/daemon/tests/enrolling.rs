@@ -27,26 +27,13 @@ use daemon::state::{Log, Paths};
 use daemon::{admitting, relay as relay_module};
 use enrollment::code::Confirmation;
 use tokio::sync::{Mutex, oneshot};
+use transport_convesso::fixture::TestRelay;
 
-/// A relay in this process, and the certificate it presents.
-async fn relay() -> (iroh_relay::server::Server, String, Vec<u8>) {
-    use std::net::Ipv4Addr;
-
-    use iroh_relay::server::{CertConfig, QuicConfig, RelayConfig, ServerConfig, TlsConfig};
-
-    let (certs, server_config) = iroh_relay::server::testing::self_signed_tls_certs_and_config();
-    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
-    relay.tls =
-        Some(TlsConfig::new((Ipv4Addr::LOCALHOST, 0), CertConfig::Manual { server_config }));
-
-    let mut config = ServerConfig::default();
-    config.relay = Some(relay);
-    config.quic = Some(QuicConfig::new((Ipv4Addr::LOCALHOST, 0)));
-    let server = iroh_relay::server::Server::spawn(config).await.expect("a relay in this process");
-
-    let url = format!("https://{}", server.https_addr().expect("configured"));
-    let certificate = certs.first().expect("one certificate").to_vec();
-    (server, url, certificate)
+/// A convesso relay in this process, and how a network writes it.
+async fn relay() -> (TestRelay, String) {
+    let relay = TestRelay::start().await;
+    let written = relay.written();
+    (relay, written)
 }
 
 /// How long a scripted person will stand there before giving up.
@@ -272,15 +259,13 @@ async fn until_accepted(pending: &admitting::Pending) {
 }
 
 /// A founder, and the state it holds.
-fn founded(paths: &Paths, relay: &str, certificate: Vec<u8>) -> roster::state::RosterState {
+fn founded(paths: &Paths, relay: &str) -> roster::state::RosterState {
     found(
         paths,
         &Founding {
             name: "nas".to_owned(),
             suffix: "peerfectly.internal".to_owned(),
             relay: Some(relay.to_owned()),
-            rendezvous: None,
-            certificate: Some(certificate),
             ipv4_range: None,
         },
     )
@@ -296,11 +281,11 @@ fn founded(paths: &Paths, relay: &str, certificate: Vec<u8>) -> roster::state::R
 /// The whole ceremony: a device with nothing ends up holding the network.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
 
@@ -363,7 +348,6 @@ async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
 
     assert_eq!(joined.devices, 2, "every device appears together, not only the admin");
     assert_eq!(joined.suffix, "peerfectly.internal");
-    assert!(joined.relay_confirmed, "the network pins the certificate that was accepted");
     assert!(said.contains("adopted"), "{said}");
 
     // The joining device wrote the network, and it is the same network.
@@ -450,11 +434,11 @@ async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
 /// Declining signs nothing and writes nothing, on either machine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abandoning_leaves_both_machines_as_they_were() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
     let before = Log::at(admin_paths.roster()).read().expect("reads");
@@ -517,11 +501,11 @@ fn the_fingerprint_shown_is_the_signing_key() {
 /// until a person confirms there is no such operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opening_an_exchange_changes_nothing_until_a_person_confirms() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
     let before = Log::at(admin_paths.roster()).read().expect("reads");
@@ -557,11 +541,11 @@ async fn opening_an_exchange_changes_nothing_until_a_person_confirms() {
 /// admission of a device id, that binding could never be corrected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_payload_wearing_another_devices_identity_is_refused() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
 
@@ -600,11 +584,11 @@ async fn a_payload_wearing_another_devices_identity_is_refused() {
 /// the person comparing two screens sees a mismatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_substituted_payload_shows_a_different_code() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
 
@@ -654,12 +638,12 @@ async fn a_substituted_payload_shows_a_different_code() {
 /// stays open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stranger_offering_its_own_network_is_refused_at_the_code() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     // The stranger has a perfectly good network of its own.
     let stranger_home = tempfile::tempdir().expect("a scratch directory");
     let stranger_paths = Paths::under(stranger_home.path());
-    let stranger_state = founded(&stranger_paths, &url, certificate);
+    let stranger_state = founded(&stranger_paths, &url);
     let stranger =
         identity::store::load(&stranger_paths.identity()).expect("the stranger's identity");
 
@@ -702,11 +686,11 @@ async fn a_stranger_offering_its_own_network_is_refused_at_the_code() {
 /// signed and nothing delivered.
 #[tokio::test]
 async fn nothing_is_signed_while_the_other_side_has_not_confirmed() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin = identity::store::load(&admin_paths.identity()).expect("the admin's identity");
     let before = Log::at(admin_paths.roster()).read().expect("reads").len();
 
@@ -756,11 +740,11 @@ async fn nothing_is_signed_while_the_other_side_has_not_confirmed() {
 async fn a_wrong_code_is_answered_at_once_and_the_wait_stays_open() {
     use daemon::joining::{AcrossTheChannel, join_with};
 
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin = identity::store::load(&admin_paths.identity()).expect("the admin's identity");
 
     // The daemon's own person, not the scripted one: what is under test is the
@@ -870,11 +854,11 @@ fn enrolment_keeps_no_membership_of_its_own() {
 /// afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_admission_signed_out_of_reach_still_reaches_the_joining_device() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
 
@@ -953,11 +937,11 @@ async fn an_admission_signed_out_of_reach_still_reaches_the_joining_device() {
 /// presented before a single byte of it is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_whose_key_is_out_of_reach_still_proves_it_holds_it() {
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url, certificate);
+    let state = founded(&admin_paths, &url);
     let admin_identity =
         identity::store::load(&admin_paths.identity()).expect("the founder's identity");
 
@@ -1032,11 +1016,11 @@ async fn a_device_whose_key_is_out_of_reach_still_proves_it_holds_it() {
 async fn a_replacement_is_one_batch_built_on_its_revocation() {
     use roster::types::{OperationBody, OperationCore, Role};
 
-    let (_server, url, certificate) = relay().await;
+    let (_server, url) = relay().await;
 
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
-    founded(&admin_paths, &url, certificate);
+    founded(&admin_paths, &url);
     let admin = identity::store::load(&admin_paths.identity()).expect("the founder's identity");
 
     // A device already answering to `laptop`, which the joining device will

@@ -10,7 +10,7 @@
 //! one that has already spoken.
 
 /// The connectivity this edge uses, which is the portable one.
-pub use daemon::connectivity::Iroh;
+pub use daemon::connectivity::Convesso;
 
 #[cfg(test)]
 mod tests {
@@ -20,7 +20,7 @@ mod tests {
     fn connectivity_is_only_ever_started_on_request() {
         let daemon = crate::code_of(include_str!("../programs/daemon.rs"));
         assert!(
-            !daemon.contains("IrohTransport::bind"),
+            !daemon.contains("ConvessoTransport::bind"),
             "the daemon must not bind a transport itself; that is the service's, at bring-up"
         );
         assert!(

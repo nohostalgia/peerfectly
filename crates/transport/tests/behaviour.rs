@@ -2,8 +2,8 @@
 //!
 //! The test bodies never name a concrete transport: they take a harness and
 //! drive the trait. That is what proves the suite describes the interface rather
-//! than one implementation's habits — and it is what `transport-iroh` will run
-//! unchanged, so its remaining job is connectivity rather than semantics.
+//! than one implementation's habits — and it is what `transport-convesso` runs
+//! unchanged, so its job is connectivity rather than semantics.
 
 #![allow(clippy::panic, reason = "a test reports failure by panicking")]
 
