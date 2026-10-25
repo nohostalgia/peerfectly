@@ -355,6 +355,7 @@ mod tests {
             .expect("valid"),
             devices: BTreeMap::new(),
             revoked: BTreeSet::new(),
+            settings: Default::default(),
         }
     }
 
@@ -432,6 +433,7 @@ mod tests {
             .expect("valid"),
             devices: std::collections::BTreeMap::new(),
             revoked: std::collections::BTreeSet::new(),
+            settings: Default::default(),
         }
     }
 

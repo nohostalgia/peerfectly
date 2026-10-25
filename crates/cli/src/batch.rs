@@ -36,7 +36,7 @@ pub(crate) enum Read {
     /// A roster operation.
     Operation(Box<OperationCore>),
     /// A roster snapshot.
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     /// A joining device's proof that it holds the key it presented.
     Possession,
 }
@@ -57,7 +57,9 @@ pub(crate) fn read(item: &ToSign) -> Option<Read> {
         SigningKind::Operation => {
             OperationCore::decode(&item.payload).ok().map(|core| Read::Operation(Box::new(core)))
         }
-        SigningKind::Snapshot => Snapshot::decode(&item.payload).ok().map(Read::Snapshot),
+        SigningKind::Snapshot => {
+            Snapshot::decode(&item.payload).ok().map(|body| Read::Snapshot(Box::new(body)))
+        }
         // A proof of possession carries no artifact: its signature is the whole
         // of it. One that carries something is not one.
         SigningKind::Possession => item.payload.is_empty().then_some(Read::Possession),
@@ -84,7 +86,7 @@ fn typed_label(asked: &Command) -> Option<&str> {
         Command::Revoke { network, .. }
         | Command::ChangeRelay { network, .. }
         | Command::Rename { network, .. }
-        | Command::Admit { network, .. } => network.as_deref(),
+        | Command::Invite { network, .. } => network.as_deref(),
         _ => None,
     }
 }
@@ -129,6 +131,17 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
         ),
         _ => true,
     }
+}
+
+/// Whether `settings` sets the device `admission` admits, and nothing beyond
+/// what an invite chooses: its mode, groups and address.
+fn settles(admission: &OperationCore, settings: &OperationCore) -> bool {
+    let (OperationBody::AddDevice(spec), OperationBody::SetDevice { device, change }) =
+        (&admission.body, &settings.body)
+    else {
+        return false;
+    };
+    change.relay.is_none() && spec.device_id().is_ok_and(|admitted| admitted == *device)
 }
 
 /// Whether a signed name is the one typed, as the daemon keeps names.
@@ -185,7 +198,7 @@ pub(crate) fn holds_together(
     let snapshots: Vec<&Snapshot> = read
         .iter()
         .filter_map(|item| match item {
-            Read::Snapshot(body) => Some(body),
+            Read::Snapshot(body) => Some(body.as_ref()),
             _ => None,
         })
         .collect();
@@ -218,7 +231,20 @@ pub(crate) fn holds_together(
             return Err("the acts to sign do not follow one another".to_owned());
         }
     }
-    match operations.as_slice() {
+    // The settings an invite chose follow its admission, for the device it
+    // admits: part of the same act.
+    let acts = match operations.as_slice() {
+        [acts @ .., admission, settings]
+            if matches!(asked, Command::Confirm | Command::Replace)
+                && settles(admission, settings) =>
+        {
+            let mut acts = acts.to_vec();
+            acts.push(admission);
+            acts
+        }
+        all => all.to_vec(),
+    };
+    match acts.as_slice() {
         [_] => {}
         [before, after] => {
             let replacing = matches!(before.body, OperationBody::RevokeDevice { .. })
@@ -257,7 +283,7 @@ pub(crate) fn describe(item: &Read, network: &str, asked: &Command) -> Described
             consequence: "no roster changes".to_owned(),
         },
         Read::Snapshot(body) => Described {
-            act: format!("record {network}'s current membership (snapshot {})", body.seq),
+            act: format!("record {network}'s current membership (snapshot {})", body.generation),
             consequence: "routine: the other devices confirm the roster against it; nobody's \
                           access changes"
                 .to_owned(),
@@ -303,8 +329,8 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
                     short(device),
                     daemon::control::shown(reason)
                 ),
-                consequence: "permanent: a revoked device never comes back under the same \
-                              identity"
+                consequence: "it leaves the network; it can come back only if invited again, \
+                              with new keys"
                     .to_owned(),
             }
         }
@@ -342,7 +368,48 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
             act: format!("change {network}'s settings to: {}", settings(params)),
             consequence: format!("every device in {network} follows this"),
         },
+        OperationBody::SetDevice { device, change } => Described {
+            act: format!("change the settings of ({}): {}", short(device), changes(change)),
+            consequence: "every device in the network follows this from the next root".to_owned(),
+        },
+        OperationBody::AdmitBatch(header) => Described {
+            act: format!(
+                "admit a batch of {} devices, `{}`, as {}",
+                header.count,
+                daemon::control::shown(&header.label),
+                header.mode.as_str()
+            ),
+            consequence: format!(
+                "they will reach the devices in {network}, and they will reach them"
+            ),
+        },
     }
+}
+
+/// What a settings change sets, as a person would read it.
+fn changes(change: &roster::leaf::SettingsChange) -> String {
+    let mut said = Vec::new();
+    if let Some(mode) = change.mode {
+        said.push(format!("mode {}", mode.as_str()));
+    }
+    if let Some(groups) = &change.groups {
+        let names: Vec<&str> = groups.iter().map(roster::leaf::Group::as_str).collect();
+        said.push(format!("groups [{}]", names.join(", ")));
+    }
+    if let Some(ipv4) = change.ipv4 {
+        said.push(ipv4.map_or_else(
+            || "no assigned IPv4 address".to_owned(),
+            |[a, b, c, d]| format!("IPv4 address {a}.{b}.{c}.{d}"),
+        ));
+    }
+    if let Some(relay) = change.relay {
+        said.push(if relay.is_some() {
+            "a relay of its own".to_owned()
+        } else {
+            "the network's relay".to_owned()
+        });
+    }
+    said.join(", ")
 }
 
 /// A network's settings, as a person would want them read out.

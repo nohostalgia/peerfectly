@@ -200,6 +200,7 @@ mod tests {
             params,
             devices: BTreeMap::new(),
             revoked: BTreeSet::new(),
+            settings: Default::default(),
         }
     }
 

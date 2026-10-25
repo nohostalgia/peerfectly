@@ -44,6 +44,10 @@ const UNCOVERABLE_KINDS: &[&str] = &[
     // in a shared corpus would be wrong. Every gate is covered directly in
     // `snapshots.rs` instead.
     "compaction_refused",
+    // Only attestations have a sequence that must advance now, and attestations
+    // have no shared corpus: they are dated by each node's own clock, which no
+    // vector can pin. `snapshots.rs` covers the regression directly.
+    "snapshot_sequence_regressed",
 ];
 
 /// Loads one corpus file.
@@ -322,9 +326,25 @@ fn every_merge_vector_derives_its_stated_state_in_every_order() {
             })
             .collect();
 
+        // Batch pieces, offered once every operation is: a piece is refused
+        // before its header.
+        let pieces: Vec<Vec<u8>> = vector
+            .get("pieces")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|value| {
+                hex::decode(value.as_str().unwrap_or_default())
+                    .unwrap_or_else(|| panic!("vector `{name}` has a malformed piece"))
+            })
+            .collect();
+
         let outcome = field(vector, "outcome");
         for order in orders(operations.len()) {
-            let roster = load_in_order(&operations, &order);
+            let mut roster = load_in_order(&operations, &order);
+            for piece in &pieces {
+                let _ = roster.offer_piece(piece);
+            }
             match outcome {
                 "state" => {
                     let expected = hex::decode(field(vector, "state"))
@@ -342,6 +362,14 @@ fn every_merge_vector_derives_its_stated_state_in_every_order() {
                     let expected_fingerprint = hex::decode(field(vector, "fingerprint"))
                         .unwrap_or_else(|| panic!("vector `{name}` has a malformed fingerprint"));
                     assert_eq!(state.fingerprint().to_vec(), expected_fingerprint);
+
+                    let expected_root = hex::decode(field(vector, "root"))
+                        .unwrap_or_else(|| panic!("vector `{name}` has a malformed root"));
+                    assert_eq!(
+                        state.root().to_vec(),
+                        expected_root,
+                        "vector `{name}` committed to a different root in order {order:?}"
+                    );
 
                     // The operations the vector says must be disregarded, and why.
                     let mut actual: Vec<(String, String)> = Vec::new();
@@ -452,6 +480,7 @@ fn the_merge_corpus_covers_every_rule() {
         "demote-beats-promote",
         "last-writer-wins",
         "ancestor-relative-validity",
+        "batch-skip",
         "causal-authorship",
         "founder-protection",
         "network-identity",
@@ -677,8 +706,6 @@ fn the_snapshot_corpus_covers_acceptance_and_refusal() {
         "signature_invalid",
         "snapshot_state_mismatch",
         "unauthorized_author",
-        "snapshot_sequence_regressed",
-        "snapshot_sequence_conflict",
         "foreign_network",
         "snapshot_unverified",
     ] {
@@ -767,12 +794,37 @@ fn the_merge_vectors_say_what_the_requirements_say() {
     // derived state, whatever the causal relationship.
     let revoked = state_of("revocation beats a concurrent promotion");
     assert!(
-        revoked.revoked.contains(&support::device_id(2)),
+        !revoked.devices.contains_key(&support::device_id(2)),
         "a concurrent promotion must not save a revoked device"
     );
+    let concurrent = state_of("an admission concurrent with a revocation loses");
     assert!(
-        !revoked.devices.contains_key(&support::device_id(2)),
-        "and it is gone from the roster"
+        !concurrent.devices.contains_key(&support::device_id(2)),
+        "an admission concurrent with the revocation does not save it either"
+    );
+    // A revocation removes the device; an admission that follows it admits it
+    // again, as a deliberate act.
+    let again = state_of("a later admission admits again");
+    assert_eq!(
+        again.devices.get(&support::device_id(2)).map(|record| record.name.as_str()),
+        Some("laptop-again"),
+        "the later admission stands"
+    );
+
+    // Settings and parameters resolve one field, one leaf, at a time.
+    let settings = state_of("concurrent settings of one device both stand");
+    let both = settings.settings_of(&support::device_id(2));
+    assert_eq!(both.ipv4, Some([100, 70, 0, 2]), "the assigned address stands");
+    assert_eq!(both.groups.len(), 1, "and so do the groups");
+    let parameters = state_of("concurrent changes to different parameters both stand");
+    assert_eq!(parameters.params.anchors, vec![support::device_id(9)]);
+    assert_eq!(parameters.params.policy.len(), 1);
+
+    // Admins are full.
+    let light = state_of("a light device is not made an admin");
+    assert_eq!(
+        light.devices.get(&support::device_id(2)).map(|record| record.role),
+        Some(Role::Member)
     );
 
     // "Demote beats promote among concurrent branches": the derived role is member.

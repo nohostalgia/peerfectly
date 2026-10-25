@@ -50,6 +50,103 @@ impl KeyCustodian for FileCustodian {
     }
 }
 
+/// This machine's own key, in the TPM: what signs its checkpoints.
+///
+/// Its public half is what the TPM reports once it has loaded the key — which
+/// only this TPM can — never what the file says.
+struct TpmMachineKey {
+    tpm: Tpm,
+    stored: Stored,
+    public: PublicKey,
+}
+
+impl daemon::checkpoint::MachineKey for TpmMachineKey {
+    fn public(&self) -> PublicKey {
+        self.public.clone()
+    }
+
+    fn sign(&self, message: &[u8]) -> core::result::Result<Vec<u8>, String> {
+        self.tpm.sign_unattended(&self.stored, message)
+    }
+}
+
+/// The TPM, as the place this machine's own key lives: wrapped by this TPM, in
+/// a file only this TPM can load.
+struct TpmHardware<'tpm> {
+    tpm: &'tpm Tpm,
+    file: PathBuf,
+}
+
+impl TpmHardware<'_> {
+    fn key(
+        &self,
+        stored: Stored,
+    ) -> core::result::Result<Arc<dyn daemon::checkpoint::MachineKey>, String> {
+        if !stored.unattended_attributes_hold()? {
+            return Err("this machine's key file does not hold a key this TPM made".to_owned());
+        }
+        let public = self.tpm.load_check(&stored)?;
+        let public = PublicKey::new(Algorithm::P256, public).map_err(|cause| cause.to_string())?;
+        Ok(Arc::new(TpmMachineKey { tpm: self.tpm.clone(), stored, public }))
+    }
+}
+
+impl daemon::checkpoint::HardwareKeys for TpmHardware<'_> {
+    fn open(
+        &self,
+    ) -> core::result::Result<Option<Arc<dyn daemon::checkpoint::MachineKey>>, String> {
+        let bytes = match std::fs::read(&self.file) {
+            Ok(bytes) => bytes,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(cause) => return Err(format!("{}: {cause}", self.file.display())),
+        };
+        self.key(Stored::from_bytes(&bytes)?).map(Some)
+    }
+
+    fn create(&self) -> core::result::Result<Arc<dyn daemon::checkpoint::MachineKey>, String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let stored = self.tpm.create_unattended()?;
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.file)
+            .and_then(|mut file| {
+                file.write_all(&stored.to_bytes())?;
+                file.sync_all()
+            });
+        written.map_err(|cause| format!("{}: {cause}", self.file.display()))?;
+        self.key(stored)
+    }
+}
+
+/// The TPM, as what the transport and attestation keys are sealed under: each
+/// identity file carries its file key sealed to this TPM, and opens nowhere
+/// else.
+struct TpmWrap {
+    tpm: Tpm,
+}
+
+impl identity::wrapped::KeyWrap for TpmWrap {
+    fn wrap(&self, key: &[u8; 32]) -> identity::Result<Vec<u8>> {
+        self.tpm
+            .seal_secret(key)
+            .map(|stored| stored.to_bytes())
+            .map_err(|detail| identity::Error::Storage { detail })
+    }
+
+    fn unwrap(&self, wrapped: &[u8]) -> identity::Result<identity::wrapped::Zeroizing<[u8; 32]>> {
+        let failed = |detail: String| identity::Error::Storage { detail };
+        let stored = Stored::from_bytes(wrapped).map_err(failed)?;
+        let opened = self.tpm.unseal_secret(&stored).map_err(failed)?;
+        let key: [u8; 32] =
+            opened.as_slice().try_into().map_err(|_| identity::Error::CorruptIdentity)?;
+        Ok(identity::wrapped::Zeroizing::new(key))
+    }
+}
+
 /// This machine's keys.
 pub struct LinuxKeys {
     /// Where the key files are.
@@ -97,6 +194,19 @@ impl LinuxKeys {
         self.tpm.is_some()
     }
 
+    /// What the transport and attestation keys are sealed with: under a key the
+    /// TPM seals where there is one, opening what the file mode protected
+    /// before; the file mode alone where there is none.
+    fn sealer(&self) -> Box<dyn identity::store::Sealer> {
+        match &self.tpm {
+            Some(tpm) => Box::new(identity::wrapped::WrappedSealer::new(
+                TpmWrap { tpm: tpm.clone() },
+                Box::new(identity::store::PlatformSealer),
+            )),
+            None => Box::new(identity::store::PlatformSealer),
+        }
+    }
+
     /// Opens the key called `name`, if there is one.
     fn open_key(&self, name: &str) -> identity::Result<Option<FileCustodian>> {
         let failed = |detail: String| identity::Error::CustodianFailed { detail };
@@ -134,8 +244,8 @@ impl LinuxKeys {
         if !path.exists() {
             return Ok(None);
         }
-        let held = identity::store::load_with(&path, &identity::store::PlatformSealer, self)
-            .map_err(failed)?;
+        let held =
+            identity::store::load_with(&path, self.sealer().as_ref(), self).map_err(failed)?;
 
         // A signing key in a plain file: nothing on Linux makes one, and a
         // device that can sign as an admin with a key any root process can read
@@ -184,6 +294,16 @@ impl Custodians for LinuxKeys {
 }
 
 impl Keys for LinuxKeys {
+    fn machine_key(&self, home: &Path) -> Result<(Arc<dyn daemon::checkpoint::MachineKey>, bool)> {
+        match &self.tpm {
+            Some(tpm) => daemon::checkpoint::machine_key(
+                home,
+                Some(&TpmHardware { tpm, file: home.join("machine.tpm") }),
+            ),
+            None => daemon::checkpoint::machine_key(home, None),
+        }
+    }
+
     fn identity(&self, paths: &Paths) -> Result<NodeIdentity> {
         if let Some(held) = self.existing(paths)? {
             return Ok(held);
@@ -249,8 +369,7 @@ impl Keys for LinuxKeys {
             attestation,
         )
         .map_err(failed)?;
-        identity::store::save_with(&identity, &path, &identity::store::PlatformSealer)
-            .map_err(failed)?;
+        identity::store::save_with(&identity, &path, self.sealer().as_ref()).map_err(failed)?;
         Ok(identity)
     }
 

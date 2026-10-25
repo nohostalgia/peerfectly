@@ -66,6 +66,11 @@ use windows_sys::Win32::Security::Cryptography::{
     NCryptDeleteKey, NCryptExportKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
     NCryptOpenStorageProvider, NCryptSetProperty, NCryptSignHash,
 };
+use windows_sys::Win32::Security::Cryptography::{
+    BCRYPT_OAEP_PADDING_INFO, BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM,
+    NCRYPT_ALLOW_DECRYPT_FLAG, NCRYPT_KEY_USAGE_PROPERTY, NCRYPT_LENGTH_PROPERTY,
+    NCRYPT_PAD_OAEP_FLAG, NCryptDecrypt, NCryptEncrypt,
+};
 
 /// What went wrong, in words a person can act on.
 pub type Refusal = String;
@@ -232,6 +237,127 @@ impl Store {
     pub fn create(&self, name: &str, network: &str) -> Result<Vec<u8>, Refusal> {
         let key = self.create_key(name, Some(network))?;
         self.public_key_of(&key)
+    }
+
+    /// Creates a key the daemon uses with nobody present, and returns its public
+    /// half: non-exportable like every key here, with **no** consent prompt and
+    /// no binding to boot measurements. For this machine's own key, which signs
+    /// its checkpoints and nothing a network sees.
+    ///
+    /// # Errors
+    ///
+    /// When the key cannot be created, or its public half cannot be read.
+    pub fn create_unattended(&self, name: &str) -> Result<Vec<u8>, Refusal> {
+        let key = self.create_key(name, None)?;
+        self.public_key_of(&key)
+    }
+
+    /// Creates a key that wraps other keys for this machine: RSA-2048 in the
+    /// TPM, non-exportable, allowed to decrypt and nothing else, with no prompt.
+    /// What the transport and attestation keys are sealed under.
+    ///
+    /// # Errors
+    ///
+    /// When the key cannot be created.
+    pub fn create_wrapping(&self, name: &str) -> Result<(), Refusal> {
+        let wide_name = Wide::new(name);
+        let mut handle: NCRYPT_KEY_HANDLE = 0;
+        let status = unsafe {
+            NCryptCreatePersistedKey(
+                self.provider,
+                &raw mut handle,
+                BCRYPT_RSA_ALGORITHM,
+                wide_name.as_ptr(),
+                0,
+                NCRYPT_MACHINE_KEY_FLAG,
+            )
+        };
+        checked(status, "creating a wrapping key in the machine's key store")?;
+        let key = Key { handle };
+        for (property, value, doing) in [
+            (NCRYPT_LENGTH_PROPERTY, 2048_u32, "sizing the wrapping key"),
+            (
+                NCRYPT_KEY_USAGE_PROPERTY,
+                NCRYPT_ALLOW_DECRYPT_FLAG,
+                "limiting the wrapping key to unwrapping",
+            ),
+            (NCRYPT_EXPORT_POLICY_PROPERTY, 0, "marking the wrapping key non-exportable"),
+        ] {
+            let status = unsafe {
+                NCryptSetProperty(
+                    key.handle,
+                    property,
+                    (&raw const value).cast::<u8>(),
+                    4,
+                    NCRYPT_PERSIST_FLAG,
+                )
+            };
+            checked(status, doing)?;
+        }
+        let status = unsafe { NCryptFinalizeKey(key.handle, 0) };
+        checked(status, "finishing the wrapping key")
+    }
+
+    /// Wraps `secret` under the key called `name`: RSA-OAEP with SHA-256.
+    ///
+    /// # Errors
+    ///
+    /// When there is no such key, or it will not encrypt.
+    pub fn wrap(&self, name: &str, secret: &[u8]) -> Result<Vec<u8>, Refusal> {
+        let key = self.open_key(name)?;
+        Self::oaep(&key, secret, true)
+    }
+
+    /// Reverses [`Self::wrap`], inside the TPM.
+    ///
+    /// # Errors
+    ///
+    /// When there is no such key, or it will not decrypt what it was given.
+    pub fn unwrap(&self, name: &str, wrapped: &[u8]) -> Result<Vec<u8>, Refusal> {
+        let key = self.open_key(name)?;
+        Self::oaep(&key, wrapped, false)
+    }
+
+    /// Encrypts or decrypts with RSA-OAEP over SHA-256.
+    fn oaep(key: &Key, input: &[u8], encrypting: bool) -> Result<Vec<u8>, Refusal> {
+        let padding = BCRYPT_OAEP_PADDING_INFO {
+            pszAlgId: BCRYPT_SHA256_ALGORITHM,
+            pbLabel: core::ptr::null_mut(),
+            cbLabel: 0,
+        };
+        let length = u32::try_from(input.len()).map_err(|_| "too long to wrap".to_owned())?;
+        let call = |output: *mut u8, room: u32, written: &mut u32| unsafe {
+            if encrypting {
+                NCryptEncrypt(
+                    key.handle,
+                    input.as_ptr(),
+                    length,
+                    (&raw const padding).cast(),
+                    output,
+                    room,
+                    written,
+                    NCRYPT_PAD_OAEP_FLAG,
+                )
+            } else {
+                NCryptDecrypt(
+                    key.handle,
+                    input.as_ptr(),
+                    length,
+                    (&raw const padding).cast(),
+                    output,
+                    room,
+                    written,
+                    NCRYPT_PAD_OAEP_FLAG,
+                )
+            }
+        };
+        let doing = if encrypting { "wrapping a key" } else { "unwrapping a key" };
+        let mut written: u32 = 0;
+        checked(call(core::ptr::null_mut(), 0, &mut written), doing)?;
+        let mut output = vec![0_u8; written as usize];
+        checked(call(output.as_mut_ptr(), written, &mut written), doing)?;
+        output.truncate(written as usize);
+        Ok(output)
     }
 
     /// The compressed public point of the key called `name`.

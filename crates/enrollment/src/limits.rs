@@ -1,10 +1,9 @@
 //! Bounds on an enrolment, and why each one is where it is.
 //!
-//! Two of these are security parameters rather than sizes. The joining payload
-//! is public — it is on a screen, it gets photographed, it gets pasted into a
-//! chat — so anybody who has seen one can open an exchange with the device that
-//! produced it. [`EXCHANGE_DEADLINE_SECS`] and [`ATTEMPTS_PER_WAIT`] are what
-//! stop that being free.
+//! Two of these are security parameters rather than sizes. An invite travels by
+//! message and gets photographed, so anybody who has seen one can open an
+//! exchange with the device waiting behind it. [`EXCHANGE_DEADLINE_SECS`] and
+//! [`ATTEMPTS_PER_WAIT`] are what stop that being free.
 
 /// The longest name a joining device may propose for itself, in bytes.
 ///
@@ -13,18 +12,11 @@
 /// would be told about it at the wrong moment.
 pub const MAX_PROPOSED_NAME_LEN: usize = roster::limits::MAX_NAME_LEN;
 
-/// The longest relay address a payload may carry, in bytes.
+/// The longest relay address an invite may carry, in bytes.
 ///
-/// The same bound the roster puts on the relay it names, so a payload cannot
+/// The same bound the roster puts on the relay it names, so an invite cannot
 /// describe a relay the network could never adopt.
 pub const MAX_RELAY_LEN: usize = roster::limits::MAX_RELAY_LEN;
-
-/// The largest a joining payload may be, encoded, in bytes.
-///
-/// Two keys, a short name and a URL. Generous enough for a P-256 key pair and a
-/// long relay address together, and small enough to stay inside a scannable code
-/// without the person having to hold a camera still for a long time.
-pub const MAX_PAYLOAD_SIZE: usize = 512;
 
 /// The largest a single exchange message may be, in bytes.
 ///
@@ -35,7 +27,7 @@ pub const MAX_EXCHANGE_MESSAGE_SIZE: usize = 1024 * 1024;
 
 /// How long a device waits to be admitted, in seconds.
 ///
-/// Long enough for a person to walk to another machine, read a payload, and type
+/// Long enough for a person to walk to another machine, read its code, and type
 /// six digits back. Short enough that a device left waiting by accident stops
 /// answering strangers the same afternoon.
 pub const WAIT_SECS: u64 = 10 * 60;
@@ -43,7 +35,7 @@ pub const WAIT_SECS: u64 = 10 * 60;
 /// How long one exchange may take before it is abandoned, in seconds.
 ///
 /// Well short of [`WAIT_SECS`], and that gap is the point. Only one exchange runs
-/// at a time, so without a deadline of its own anybody who had seen the payload
+/// at a time, so without a deadline of its own anybody who had seen the invite
 /// could open an exchange, say nothing, and keep the admin out for the whole
 /// wait while the person watched nothing happen.
 pub const EXCHANGE_DEADLINE_SECS: u64 = 60;
@@ -69,7 +61,6 @@ mod tests {
 
     #[test]
     fn stated_bounds_are_pinned() {
-        assert_eq!(MAX_PAYLOAD_SIZE, 512);
         assert_eq!(MAX_EXCHANGE_MESSAGE_SIZE, 1024 * 1024);
         assert_eq!(WAIT_SECS, 600);
         assert_eq!(EXCHANGE_DEADLINE_SECS, 60);
@@ -99,10 +90,10 @@ mod tests {
         );
     }
 
-    /// A payload the roster could never act on would be refused far from where
-    /// the person typed it.
+    /// A name or relay the roster could never act on would be refused far from
+    /// where the person gave it.
     #[test]
-    fn the_payload_bounds_match_the_rosters() {
+    fn the_bounds_match_the_rosters() {
         assert_eq!(MAX_PROPOSED_NAME_LEN, roster::limits::MAX_NAME_LEN);
         assert_eq!(MAX_RELAY_LEN, roster::limits::MAX_RELAY_LEN);
     }

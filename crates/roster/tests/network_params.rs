@@ -71,7 +71,7 @@ fn the_schema_is_in_canonical_key_order() {
     assert!(is_canonical_schema(NETWORK_PARAMS_SCHEMA), "{NETWORK_PARAMS_SCHEMA:?}");
     assert_eq!(
         NETWORK_PARAMS_SCHEMA,
-        &["ula", "ipv4", "relay", "suffix", "leaving", "snapshot_window"]
+        &["ula", "ipv4", "relay", "policy", "suffix", "anchors", "leaving", "snapshot_window"]
     );
 }
 
@@ -396,4 +396,146 @@ fn a_range_can_be_removed_again() {
         OperationBody::SetNetwork(params_with_relay(RELAY)).encode(),
         OperationBody::SetNetwork(state.params).encode()
     );
+}
+
+// ---------------------------------------------------------------------------
+// One leaf at a time
+// ---------------------------------------------------------------------------
+
+/// Two admins each change a different parameter, neither having seen the other:
+/// both changes stand, because a change sets only the leaves it differs in.
+#[test]
+fn concurrent_changes_to_different_parameters_both_stand() {
+    use roster::leaf::Group;
+    use roster::parameters::Rule;
+
+    let mut history = History::new();
+    history.genesis_with("g", 1, device(1, "phone", Role::Admin, true), params_with_relay(RELAY));
+    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+
+    let mut with_anchors = params_with_relay(RELAY);
+    with_anchors.anchors = vec![device_id(2)];
+    history.op("anchors", 1, &["admin2"], OperationBody::SetNetwork(with_anchors));
+
+    let mut with_policy = params_with_relay(RELAY);
+    with_policy.policy =
+        vec![Rule { from: Group::new("sensori").unwrap(), to: Group::new("controller").unwrap() }];
+    history.op("policy", 2, &["admin2"], OperationBody::SetNetwork(with_policy));
+
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    let state = roster.state().unwrap();
+    assert_eq!(state.params.anchors, vec![device_id(2)], "the anchors stand");
+    assert_eq!(state.params.policy.len(), 1, "and so does the policy");
+    assert_eq!(state.params.relay.as_deref(), Some(RELAY), "and nothing else moved");
+
+    // The same in the other order of arrival.
+    let mut reversed = Roster::new();
+    for entry in history.entries().iter().rev() {
+        let _ = reversed.offer_bytes(&entry.bytes);
+    }
+    assert_eq!(reversed.state().unwrap().params, state.params);
+}
+
+/// A change that carries a parameter as it already was does not set it: a
+/// concurrent change of that parameter is not undone by it.
+#[test]
+fn a_parameter_carried_unchanged_is_not_set() {
+    let mut history = History::new();
+    history.genesis_with("g", 1, device(1, "phone", Role::Admin, true), params_with_relay(RELAY));
+    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    // Admin 1 moves the relay; admin 2, concurrently and deeper, changes only
+    // the anchors and carries the old relay unchanged.
+    history.op(
+        "moved",
+        1,
+        &["admin2"],
+        OperationBody::SetNetwork(params_with_relay("https://other.example.com:4433")),
+    );
+    let mut anchors = params_with_relay(RELAY);
+    anchors.anchors = vec![device_id(1)];
+    history.op("a1", 2, &["admin2"], OperationBody::SetNetwork(anchors.clone()));
+    let mut more = anchors;
+    more.anchors.push(device_id(2));
+    more.anchors.sort();
+    history.op("a2", 2, &["a1"], OperationBody::SetNetwork(more));
+
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    let state = roster.state().unwrap();
+    assert_eq!(state.params.relay.as_deref(), Some("https://other.example.com:4433"));
+    assert_eq!(state.params.anchors.len(), 2);
+}
+
+/// An anchor that is revoked drops out of the list on every node, with no
+/// admin removing it.
+#[test]
+fn a_revoked_anchor_is_ignored() {
+    let mut history = founded_with_relay();
+    let mut with_anchor = params_with_relay(RELAY);
+    let last = history.labels().last().cloned().unwrap();
+    with_anchor.anchors = vec![device_id(2)];
+    history.op("anchor", 1, &[last.as_str()], OperationBody::SetNetwork(with_anchor));
+    history.op(
+        "revoke",
+        1,
+        &["anchor"],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "retired".into() },
+    );
+
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        let _ = roster.offer_bytes(&entry.bytes);
+        if entry.label == "anchor" {
+            assert_eq!(roster.state().unwrap().params.anchors, vec![device_id(2)]);
+        }
+    }
+    let state = roster.state().unwrap();
+    assert!(state.params.anchors.is_empty(), "the revoked anchor is gone");
+    assert_eq!(roster::state::derive(&history.dag()).unwrap(), state, "derivation agrees");
+}
+
+/// An anchor naming a device that is not a member is ignored from the start.
+#[test]
+fn an_anchor_naming_no_member_is_ignored() {
+    let mut history = founded_with_relay();
+    let last = history.labels().last().cloned().unwrap();
+    let mut with_stranger = params_with_relay(RELAY);
+    with_stranger.anchors = vec![roster::id::DeviceId::from_bytes([0xee; 32])];
+    history.op("stranger", 1, &[last.as_str()], OperationBody::SetNetwork(with_stranger));
+    let state = roster::state::derive(&history.dag()).unwrap();
+    assert!(state.params.anchors.is_empty());
+}
+
+/// A long run of parameter changes derives in time proportional to its length.
+///
+/// Each change is judged against what its ancestors imply. Computed afresh at
+/// every level, that cost doubles with each change before it.
+#[test]
+fn a_chain_of_parameter_changes_derives_quickly() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let mut parent = "g".to_owned();
+    for index in 0..200_u32 {
+        let label = format!("set{index}");
+        let relay = format!("https://relay{index}.example.com:4433");
+        history.op(
+            &label,
+            1,
+            &[parent.as_str()],
+            OperationBody::SetNetwork(params_with_relay(&relay)),
+        );
+        parent = label;
+    }
+    let started = std::time::Instant::now();
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        let _ = roster.offer_bytes(&entry.bytes);
+    }
+    let _ = roster::state::derive(roster.dag()).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
 }

@@ -45,7 +45,20 @@ pub enum Foundation {
     /// operations naming them as parents can still be placed; they are marked
     /// covered so their effects are not applied twice, being already inside the
     /// snapshot's state.
-    Snapshot(Box<SignedSnapshot>),
+    Snapshot(Box<Footing>),
+}
+
+/// A snapshot, and the state it commits to.
+///
+/// A snapshot carries only the root of its state, so the state a compacted
+/// graph rests on is held beside it: the one this node derived when it verified
+/// the snapshot, or the one it received as leaves and checked against the root.
+#[derive(Debug, Clone)]
+pub struct Footing {
+    /// The snapshot.
+    pub snapshot: SignedSnapshot,
+    /// The state whose root it signs.
+    pub state: crate::state::RosterState,
 }
 
 /// A fixed set of operation indices.
@@ -118,7 +131,7 @@ pub struct Dag {
     /// Index of the founding operation, once present.
     genesis: Option<usize>,
     /// The snapshot this graph rests on, once it has compacted.
-    base: Option<Box<SignedSnapshot>>,
+    base: Option<Box<Footing>>,
     /// Whether each operation is already accounted for by the base snapshot.
     ///
     /// A covered operation is retained only as an anchor for its children. Its
@@ -127,6 +140,11 @@ pub struct Dag {
     covered: Vec<bool>,
     /// The network this graph belongs to, derived from the founding operation.
     network: Option<NetworkId>,
+    /// The entries of each batch the graph holds, by the header's id.
+    ///
+    /// A header is inserted only once every entry is in, so every batch here
+    /// is whole.
+    batch_entries: HashMap<OperationId, Vec<crate::batch::BatchEntry>>,
     /// Forks whose operations compaction would otherwise have discarded.
     ///
     /// Kept whole — body, signature and all — because they are the evidence of an
@@ -370,16 +388,45 @@ impl Dag {
     /// What this graph rests on.
     #[must_use]
     pub fn foundation(&self) -> Option<Foundation> {
-        if let Some(snapshot) = &self.base {
-            return Some(Foundation::Snapshot(snapshot.clone()));
+        if let Some(footing) = &self.base {
+            return Some(Foundation::Snapshot(footing.clone()));
         }
         self.genesis.map(Foundation::Genesis)
+    }
+
+    /// Inserts a batch's header with its entries, which are what it admits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::insert`].
+    pub fn insert_batch(
+        &mut self,
+        operation: VerifiedOperation,
+        entries: Vec<crate::batch::BatchEntry>,
+    ) -> Result<()> {
+        let id = operation.id();
+        self.insert(operation)?;
+        self.batch_entries.insert(id, entries);
+        Ok(())
+    }
+
+    /// The entries of a batch this graph holds.
+    #[must_use]
+    pub fn entries_of(&self, batch: &OperationId) -> Option<&[crate::batch::BatchEntry]> {
+        self.batch_entries.get(batch).map(Vec::as_slice)
     }
 
     /// The snapshot this graph rests on, if it has compacted.
     #[must_use]
     pub fn base_snapshot(&self) -> Option<&SignedSnapshot> {
-        self.base.as_deref()
+        self.base.as_deref().map(|footing| &footing.snapshot)
+    }
+
+    /// The state the snapshot this graph rests on commits to, if it has
+    /// compacted.
+    #[must_use]
+    pub fn base_state(&self) -> Option<&crate::state::RosterState> {
+        self.base.as_deref().map(|footing| &footing.state)
     }
 
     /// Whether an operation is already accounted for by the base snapshot.
@@ -396,8 +443,15 @@ impl Dag {
     /// operations name them as parents; everything beneath them is gone. Their
     /// depths come from the snapshot, which is why it carries them: guessing
     /// them would change the last-writer-wins tie-break across the boundary.
-    pub fn from_snapshot(snapshot: SignedSnapshot, heads: Vec<VerifiedOperation>) -> Result<Self> {
+    pub fn from_snapshot(
+        snapshot: SignedSnapshot,
+        state: crate::state::RosterState,
+        heads: Vec<VerifiedOperation>,
+    ) -> Result<Self> {
         let body = snapshot.body().clone();
+        if state.root() != body.root {
+            return Err(Error::SnapshotStateMismatch);
+        }
         if heads.len() != body.heads.len() {
             return Err(Error::SnapshotUnverified);
         }
@@ -419,7 +473,7 @@ impl Dag {
             dag.depths.push(depth);
             dag.covered.push(true);
         }
-        dag.base = Some(Box::new(snapshot));
+        dag.base = Some(Box::new(Footing { snapshot, state }));
         Ok(dag)
     }
 
@@ -429,8 +483,15 @@ impl Dag {
     /// as complete signed operations, so their children remain placeable. The
     /// caller is responsible for the preconditions; see
     /// [`crate::roster::Roster::compact`], which checks them.
-    pub fn compact(&mut self, snapshot: SignedSnapshot) -> Result<usize> {
+    pub fn compact(
+        &mut self,
+        snapshot: SignedSnapshot,
+        state: crate::state::RosterState,
+    ) -> Result<usize> {
         let body = snapshot.body().clone();
+        if state.root() != body.root {
+            return Err(Error::CompactionRefused("the state is not the one the snapshot signs"));
+        }
 
         // Every head must be held, or the graph would lose its anchors.
         let mut head_indices = Vec::with_capacity(body.heads.len());
@@ -512,6 +573,9 @@ impl Dag {
             let depth = self.depths.get(old_index).copied().unwrap_or(0);
 
             rebuilt.positions.insert(operation.id(), index);
+            if let Some(entries) = self.batch_entries.get(&operation.id()) {
+                rebuilt.batch_entries.insert(operation.id(), entries.clone());
+            }
             if !matches!(operation.core().body, OperationBody::RevokeDevice { .. }) {
                 rebuilt.non_revocations = rebuilt.non_revocations.saturating_add(1);
             }
@@ -521,7 +585,7 @@ impl Dag {
             rebuilt.covered.push(is_head);
         }
 
-        rebuilt.base = Some(Box::new(snapshot));
+        rebuilt.base = Some(Box::new(Footing { snapshot, state }));
         *self = rebuilt;
         Ok(discarded)
     }
@@ -608,17 +672,19 @@ impl Dag {
             .collect()
     }
 
-    /// The device a `revoke_device`, `demote`, `promote` or `rename` targets.
+    /// The device a `revoke_device`, `demote`, `promote`, `rename` or `set_device` targets.
     #[must_use]
     pub(crate) fn target_of(body: &OperationBody) -> Option<crate::id::DeviceId> {
         match body {
             OperationBody::RevokeDevice { device, .. }
             | OperationBody::Promote { device, .. }
             | OperationBody::Demote { device }
-            | OperationBody::Rename { device, .. } => Some(*device),
+            | OperationBody::Rename { device, .. }
+            | OperationBody::SetDevice { device, .. } => Some(*device),
             OperationBody::CreateNetwork { .. }
             | OperationBody::AddDevice(_)
-            | OperationBody::SetNetwork(_) => None,
+            | OperationBody::SetNetwork(_)
+            | OperationBody::AdmitBatch(_) => None,
         }
     }
 }

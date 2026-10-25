@@ -24,7 +24,7 @@
 //! Discarding an operation because its parents have not arrived is not an
 //! option. The operation that cannot yet be placed may be a revocation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::attestation::{RawAttestation, SignedAttestation};
 use crate::dag::Dag;
@@ -35,8 +35,88 @@ use crate::id::OperationId;
 use crate::limits;
 use crate::sign::{PublicKey, RawOperation, VerifiedOperation};
 use crate::snapshot::{RawSnapshot, SignedSnapshot};
+
+/// How many verified roots a roster remembers as places to compact.
+const MAX_CHECKPOINTS: usize = 256;
+
+/// How many batches a roster holds incomplete at once.
+///
+/// Each may declare up to `MAX_BATCH_ENTRIES` entries, so this bounds what a
+/// node stores for batches that never finish arriving.
+pub const MAX_INCOMPLETE_BATCHES: usize = 8;
+
+/// How many entries the incomplete batches a roster holds may declare between
+/// them: two whole batches' worth, whatever their number.
+pub const MAX_INCOMPLETE_ENTRIES: u64 = 2 * limits::MAX_BATCH_ENTRIES;
+
+/// How young a batch must be, in milliseconds, for an urgent act to be anchored
+/// off it.
+///
+/// A node can still be fetching the pieces of a batch this young. A revocation
+/// naming it as an ancestor would wait there, pending, for as long as the
+/// pieces take.
+pub const URGENT_BATCH_AGE_MS: u64 = 5 * 60 * 1000;
+
+/// Where an urgent act — a revocation or a demotion — should hang, and what it
+/// would void.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrgentAnchor {
+    /// The heads to name as parents: every head, less any recent batch and
+    /// what rests on one.
+    pub heads: Vec<OperationId>,
+    /// The target's own acts the act would be concurrent with, and so void:
+    /// when the target is an admin, what it signed that these heads leave
+    /// out, and its batches this node holds only the header of.
+    pub voided: Vec<(OperationId, OperationBody)>,
+}
+
+/// A batch's header, verified, waiting for the rest of its entries.
+#[derive(Debug, Clone)]
+struct Incomplete {
+    /// The header operation, verified and authorised.
+    operation: VerifiedOperation,
+    /// Its header.
+    header: crate::batch::BatchHeader,
+    /// The pieces in so far, by index, as they arrived: each checked against
+    /// the header's layout, and passed on as it is.
+    pieces: std::collections::BTreeMap<u64, Vec<u8>>,
+}
+
+/// A batch whose header a roster holds and whose pieces it does not all hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialBatch {
+    /// The batch.
+    pub batch: OperationId,
+    /// How many pieces it has.
+    pub pieces: u64,
+    /// The indices of those held.
+    pub held: Vec<u64>,
+}
+
+/// What became of an offered batch piece.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PieceAdmission {
+    /// Taken, and worth passing on; `complete` when it was the last and the
+    /// batch is now in the graph.
+    Taken {
+        /// The batch it belongs to.
+        batch: OperationId,
+        /// Whether the batch is now whole and in the graph.
+        complete: bool,
+    },
+    /// The piece, or the whole batch, is already held; nothing changed.
+    AlreadyHeld {
+        /// The batch.
+        batch: OperationId,
+    },
+    /// Refused, with the reason.
+    Refused {
+        /// Why.
+        reason: Error,
+    },
+}
 use crate::state::{RosterState, derive};
-use crate::types::{OperationCore, Role};
+use crate::types::{OperationBody, OperationCore, Role};
 
 /// A source of local elapsed time.
 ///
@@ -162,6 +242,15 @@ pub enum SnapshotAdmission {
         /// Its sequence number.
         seq: u64,
     },
+    /// Valid, but lighter than the root held: a sibling, or an older root.
+    ///
+    /// Not an error. Roots from admins acting at once are siblings by design,
+    /// and every node keeps the heavier of two — the higher generation, then
+    /// the greater root hash — so all of them converge without talking.
+    Lighter {
+        /// Its generation.
+        seq: u64,
+    },
     /// Refused, with the reason.
     Refused {
         /// Why.
@@ -242,6 +331,9 @@ pub enum Admission {
         /// Why.
         reason: Error,
     },
+    /// A batch's header, verified and authorised, held until every entry has
+    /// arrived in its pieces. It takes effect then, and not before.
+    AwaitingPieces(OperationId),
 }
 
 impl Admission {
@@ -303,6 +395,22 @@ pub struct Roster {
     /// Whether that snapshot was verified against operations this node holds.
     /// Only a verified snapshot may be compacted against.
     snapshot_verified: bool,
+    /// The state the accepted snapshot commits to, where this node derived it
+    /// when verifying the snapshot. What a compaction rests on: a snapshot
+    /// carries only the root of its state.
+    snapshot_state: Option<RosterState>,
+    /// Roots verified here and held in turn, oldest first: what compaction may
+    /// rest on.
+    ///
+    /// The root held is always at the frontier, inside the staleness horizon,
+    /// so compaction never rests on it; it rests on the newest of these that
+    /// lies far enough behind.
+    checkpoints: VecDeque<SignedSnapshot>,
+    /// The latest roots this roster took, oldest first, whatever compaction
+    /// did: what it serves a light member that missed some.
+    recent_roots: VecDeque<SignedSnapshot>,
+    /// Batches whose header is in and whose entries are not all in yet.
+    incomplete: HashMap<OperationId, Incomplete>,
     /// Local time at which the snapshot was accepted.
     ///
     /// Kept because a restored snapshot is still dated, and because a caller
@@ -329,14 +437,6 @@ pub struct Roster {
     own_device: Option<DeviceId>,
     /// The highest attestation sequence accepted, which never decreases.
     attestation_seq: Option<u64>,
-    /// The highest sequence number accepted, which never decreases.
-    highest_seq: Option<u64>,
-    /// Sequence numbers found to carry conflicting snapshots.
-    ///
-    /// Once a number is here, no snapshot at that number is ever accepted:
-    /// choosing between two claims when one may be a forgery is exactly what
-    /// this refuses to do.
-    conflicting_seqs: Vec<u64>,
     /// The last clock reading, for spotting a backwards jump.
     last_reading: Option<u64>,
     /// The local clock.
@@ -419,14 +519,16 @@ impl Roster {
             refusals: Vec::new(),
             snapshot: None,
             snapshot_verified: false,
+            snapshot_state: None,
+            checkpoints: VecDeque::new(),
+            recent_roots: VecDeque::new(),
+            incomplete: HashMap::new(),
             snapshot_received_at: None,
             attestation: None,
             attestation_received_at: None,
             freshness_since: None,
             own_device: None,
             attestation_seq: None,
-            highest_seq: None,
-            conflicting_seqs: Vec::new(),
             last_reading: None,
             clock,
         }
@@ -454,6 +556,16 @@ impl Roster {
         self.snapshot.as_ref()
     }
 
+    /// The state the accepted snapshot commits to, where this node derived it
+    /// while verifying the snapshot.
+    ///
+    /// What the next root's signer is proved in: a root names the one before it
+    /// and proves its signer against that one's state.
+    #[must_use]
+    pub const fn snapshot_state(&self) -> Option<&RosterState> {
+        self.snapshot_state.as_ref()
+    }
+
     /// Whether the accepted snapshot was verified against held operations.
     #[must_use]
     pub const fn snapshot_is_verified(&self) -> bool {
@@ -462,8 +574,8 @@ impl Roster {
 
     /// The highest snapshot sequence number accepted.
     #[must_use]
-    pub const fn highest_sequence(&self) -> Option<u64> {
-        self.highest_seq
+    pub fn highest_sequence(&self) -> Option<u64> {
+        self.snapshot.as_ref().map(|held| held.body().generation)
     }
 
     /// Every fork this roster holds evidence of, with the evidence.
@@ -549,16 +661,6 @@ impl Roster {
         found
     }
 
-    /// Sequence numbers at which conflicting snapshots were seen.
-    ///
-    /// A non-empty list is the signal equivocation detection consumes: either
-    /// two admins acted at once, or one is showing different branches to
-    /// different peers.
-    #[must_use]
-    pub fn conflicting_sequences(&self) -> &[u64] {
-        &self.conflicting_seqs
-    }
-
     /// Offers a snapshot as bytes, received now.
     ///
     /// The order of checks is deliberate: signature first, because an unsigned
@@ -618,41 +720,25 @@ impl Roster {
             return SnapshotAdmission::Refused { reason: Error::UnauthorizedAuthor };
         }
 
-        let seq = signed.body().seq;
+        let seq = signed.body().generation;
 
-        // A number already known to carry conflicting claims is closed for
-        // good; recovery is a higher number, not a re-run of the same one.
-        if self.conflicting_seqs.contains(&seq) {
-            return SnapshotAdmission::Refused { reason: Error::SnapshotSequenceConflict };
-        }
-
+        // The root already held, re-signed or re-sent: nothing changes.
         if let Some(held) = &self.snapshot
-            && held.body().seq == seq
+            && held.body().root == signed.body().root
         {
-            if held.same_content(&signed) {
-                return SnapshotAdmission::AlreadyHeld { seq };
-            }
-            // Two claims at one number. Refuse both, drop the one held, and
-            // record the number: picking a winner would hide an author
-            // showing different histories to different peers.
-            self.conflicting_seqs.push(seq);
-            self.conflicting_seqs.sort_unstable();
-            self.snapshot = None;
-            self.snapshot_verified = false;
-            self.snapshot_received_at = None;
-            return SnapshotAdmission::Refused { reason: Error::SnapshotSequenceConflict };
-        }
-
-        if self.highest_seq.is_some_and(|highest| seq <= highest) {
-            return SnapshotAdmission::Refused { reason: Error::SnapshotSequenceRegressed };
+            return SnapshotAdmission::AlreadyHeld { seq };
         }
 
         // Verification before trust: where this node holds what the snapshot
         // covers, its own derivation is authoritative.
         let coverage = self.coverage_of(&signed);
+        let mut derived = None;
         let verified = match coverage {
             Coverage::Full => match self.derive_covered_state(&signed) {
-                Some(expected) if expected == signed.body().state => true,
+                Some(expected) if expected.root() == signed.body().root => {
+                    derived = Some(expected);
+                    true
+                }
                 Some(_) => {
                     return SnapshotAdmission::Refused { reason: Error::SnapshotStateMismatch };
                 }
@@ -665,10 +751,30 @@ impl Roster {
             Coverage::Partial | Coverage::None => false,
         };
 
+        // Of two valid roots the heavier is held: the higher generation, then
+        // the greater root hash. The same rule everywhere, so every node holds
+        // the same one once it has seen both.
+        let weight = (seq, signed.body().root);
+        if let Some(held) = &self.snapshot
+            && weight < (held.body().generation, held.body().root)
+        {
+            return SnapshotAdmission::Lighter { seq };
+        }
+
+        if verified {
+            self.checkpoints.push_back(signed.clone());
+            while self.checkpoints.len() > MAX_CHECKPOINTS {
+                self.checkpoints.pop_front();
+            }
+        }
+        self.recent_roots.push_back(signed.clone());
+        while self.recent_roots.len() > MAX_CHECKPOINTS {
+            self.recent_roots.pop_front();
+        }
         self.snapshot = Some(signed);
         self.snapshot_verified = verified;
+        self.snapshot_state = derived;
         self.snapshot_received_at = Some(received_at);
-        self.highest_seq = Some(seq);
         if verified {
             SnapshotAdmission::Accepted { seq }
         } else {
@@ -689,71 +795,223 @@ impl Roster {
     }
 
     /// Derives the state a snapshot claims, from operations this node holds.
-    fn derive_covered_state(&self, snapshot: &SignedSnapshot) -> Option<Vec<u8>> {
+    fn derive_covered_state(&self, snapshot: &SignedSnapshot) -> Option<RosterState> {
         let region = self.dag.covered_region(snapshot)?;
-        let mut covered = Dag::new();
-        // Rebuilding in topological order is safe: the region is downward
-        // closed, so every parent of a member is a member.
-        for index in region {
-            let operation = self.dag.operation(index)?;
-            covered.insert(operation.clone()).ok()?;
-        }
-        derive(&covered).ok().map(|state| state.to_bytes())
+        crate::state::derive_region(&self.dag, &region).ok()
     }
 
     /// The public key that signed a snapshot, if this node can name it.
     ///
     /// Tried against this node's own derived state first. A node with no
-    /// operations falls back to the state the snapshot itself claims — which is
-    /// circular, and is exactly the bootstrapping limit: such a node trusts the
-    /// admin's signature and has no way to check the claim.
+    /// operations falls back to the signer's leaf the snapshot itself carries —
+    /// which is circular, and is exactly the bootstrapping limit: such a node
+    /// trusts the admin's signature and has no way to check the claim.
     fn resolve_snapshot_signer(&self, raw: &RawSnapshot) -> Option<PublicKey> {
         let author = raw.body().author;
         if let Ok(state) = self.state()
-            && let Some(key) = signing_key_of(&state, &author)
+            && let Some(key) = root_key_of(&state, &author)
         {
             return Some(key);
         }
-        let claimed = RosterState::from_bytes(&raw.body().state).ok()?;
-        signing_key_of(&claimed, &author)
+        raw.body()
+            .signer
+            .record
+            .keys
+            .iter()
+            .find(|entry| entry.key_id() == author)
+            .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok())
     }
 
     /// Whether a snapshot's signer holds the admin role.
     fn signer_is_admin(&self, snapshot: &SignedSnapshot) -> bool {
         let signer = snapshot.signer();
+        // A root is signed with the admin's attestation key, which asks nobody;
+        // a key of either purpose names its device.
         if let Ok(state) = self.state()
-            && let Some(record) = state.device_for_key(&signer)
+            && let Some(device) = state.device_holding(&signer)
         {
-            return record.role == Role::Admin && !state.revoked.contains(&record.id);
+            return state.is_admin(&device) && !state.revoked.contains(&device);
         }
-        let Ok(claimed) = RosterState::from_bytes(&snapshot.body().state) else {
-            return false;
-        };
-        claimed.device_for_key(&signer).is_some_and(|record| {
-            record.role == Role::Admin && !claimed.revoked.contains(&record.id)
+        let body = snapshot.body();
+        body.signer_proved(&body.proved_against())
+    }
+
+    /// Every operation the graph holds, as bytes, in an order they can be
+    /// offered back in: what a node keeps on disk once it has compacted.
+    #[must_use]
+    pub fn retained_operations(&self) -> Vec<Vec<u8>> {
+        self.dag.operations().iter().map(VerifiedOperation::to_bytes).collect()
+    }
+
+    /// Rests an empty roster on a root and the state it commits to — a base a
+    /// node kept when it last compacted — with the root's covered heads.
+    ///
+    /// The state is checked against the root, the root's signature against its
+    /// author in that state, and each head's signature against its author: what
+    /// is kept on disk is believed only as far as signatures cover it.
+    /// Operations after the heads are offered afterwards, as any are.
+    ///
+    /// # Errors
+    ///
+    /// When this roster already holds operations, or anything above does not
+    /// check out.
+    pub fn rest_on(
+        &mut self,
+        snapshot: &[u8],
+        state: RosterState,
+        heads: &[Vec<u8>],
+    ) -> Result<()> {
+        if !self.dag.is_empty() {
+            return Err(Error::CompactionRefused("a roster resting on a base starts empty"));
+        }
+        let raw = RawSnapshot::decode(snapshot)?;
+        if state.root() != raw.body().root {
+            return Err(Error::SnapshotStateMismatch);
+        }
+        let key = root_key_of(&state, &raw.body().author).ok_or(Error::UnauthorizedAuthor)?;
+        let signed = raw.verify(&key)?;
+        let mut verified = Vec::with_capacity(heads.len());
+        for bytes in heads {
+            let operation = RawOperation::decode(bytes)?;
+            let author =
+                root_key_of(&state, &operation.core().author).ok_or(Error::UnauthorizedAuthor)?;
+            verified.push(operation.verify(&author)?);
+        }
+        // The root this node already holds, when it is this one: checked now
+        // against the state it commits to, which is what it lacked.
+        if self.snapshot.as_ref().is_some_and(|held| held.body().root == signed.body().root) {
+            self.snapshot_verified = true;
+            self.snapshot_state = Some(state.clone());
+        }
+        self.dag = Dag::from_snapshot(signed, state, verified)?;
+        self.at_heads = None;
+        // What waited on the base can be placed now, and what the base holds
+        // waits no longer.
+        let dag = &self.dag;
+        self.pending.retain(|id, _| !dag.contains(id));
+        self.integrate_pending();
+        Ok(())
+    }
+
+    /// The state behind `root`, where this node holds it: the current state,
+    /// the base it rests on, or the one its held root was checked against.
+    ///
+    /// What a full member serves a peer that holds nothing and was given the
+    /// root, so that it can rest on it.
+    #[must_use]
+    pub fn state_for_root(
+        &self,
+        root: &crate::merkle::Hash,
+    ) -> Option<(SignedSnapshot, RosterState)> {
+        if let Some(held) = &self.snapshot
+            && held.body().root == *root
+        {
+            if let Some(state) = &self.snapshot_state {
+                return Some((held.clone(), state.clone()));
+            }
+            if let Ok(state) = self.state()
+                && state.root() == *root
+            {
+                return Some((held.clone(), state));
+            }
+        }
+        match (self.dag.base_snapshot(), self.dag.base_state()) {
+            (Some(base), Some(state)) if base.body().root == *root => {
+                Some((base.clone(), state.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// What `device` shows a peer as a session opens: its leaf and proof against
+    /// the root this roster holds, with that root.
+    ///
+    /// `None` where no root is held, the state behind it is not, or the device
+    /// is not a member under it.
+    #[must_use]
+    pub fn evidence_for(&self, device: &DeviceId) -> Option<crate::membership::Evidence> {
+        let held = self.snapshot.as_ref()?;
+        let (root, state) = self.state_for_root(&held.body().root)?;
+        Some(crate::membership::Evidence {
+            leaf: state.leaf(device)?,
+            proof: crate::membership::MembershipProof::of(&state, device)?,
+            root: root.to_bytes(),
         })
     }
 
-    /// Discards the operations the accepted snapshot covers.
+    /// The roots this roster took after `since`, oldest first, as bytes: the
+    /// chain a light member that remembers `since` needs to reach the current
+    /// one. Every root remembered, where `since` is not among them.
+    #[must_use]
+    pub fn roots_after(&self, since: &crate::merkle::Hash) -> Vec<Vec<u8>> {
+        let start = self
+            .recent_roots
+            .iter()
+            .position(|root| root.body().root == *since)
+            .map_or(0, |at| at.saturating_add(1));
+        self.recent_roots.iter().skip(start).map(SignedSnapshot::to_bytes).collect()
+    }
+
+    /// The bytes of an operation held pending, as they arrived.
+    #[must_use]
+    pub fn pending_bytes(&self, id: &OperationId) -> Option<Vec<u8>> {
+        self.pending.get(id).map(|entry| entry.bytes.clone())
+    }
+
+    /// Discards the operations beneath the newest verified root that may be
+    /// compacted against.
     ///
     /// Deliberate rather than a side effect of accepting a snapshot: nothing is
-    /// ever thrown away because a message arrived.
+    /// ever thrown away because a message arrived. The roots tried are the ones
+    /// this node verified and held, newest first; the first that passes every
+    /// gate is the one compacted against, and the roots beneath it are dropped.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of the newest root tried, when none may be compacted
+    /// against.
     pub fn compact(&mut self) -> Result<usize> {
-        let Some(snapshot) = self.snapshot.clone() else {
+        if self.snapshot.is_none() {
             return Err(Error::CompactionRefused("no snapshot accepted"));
-        };
-
-        // Gate 3. Discarding on an unverified snapshot would throw away the
-        // evidence needed to notice it lied.
-        if !self.snapshot_verified {
-            return Err(Error::CompactionRefused("snapshot was not verified locally"));
         }
+        let mut newest_refusal = None;
+        for position in (0..self.checkpoints.len()).rev() {
+            let Some(candidate) = self.checkpoints.get(position).cloned() else { continue };
+            match self.compaction_gates(&candidate) {
+                Ok(state) => {
+                    let discarded = self.dag.compact(candidate, state)?;
+                    self.checkpoints.drain(..=position);
+                    return Ok(discarded);
+                }
+                Err(refusal) => {
+                    newest_refusal.get_or_insert(refusal);
+                }
+            }
+        }
+        Err(newest_refusal.unwrap_or(Error::CompactionRefused("snapshot was not verified locally")))
+    }
 
-        let Some(region) = self.dag.covered_region(&snapshot) else {
+    /// Whether the graph may be compacted against `snapshot`, and the state it
+    /// would rest on.
+    fn compaction_gates(&self, snapshot: &SignedSnapshot) -> Result<RosterState> {
+        let Some(region) = self.dag.covered_region(snapshot) else {
             return Err(Error::CompactionRefused("a covered head is not held"));
         };
         let in_region: Vec<bool> =
             (0..self.dag.len()).map(|index| region.binary_search(&index).is_ok()).collect();
+
+        // Gate 2 first, being one subtraction: most roots tried are recent, and
+        // fail it at once. Anything anchoring into the region later would already be
+        // refused as stale, and the frontier only advances. Without this, a
+        // divergent history defeats gate 1: an operation deep on one branch is
+        // genuinely concurrent with a shallow one on another.
+        let frontier = self.dag.frontier_depth();
+        let deepest = region.iter().map(|index| self.dag.depth(*index)).max().unwrap_or(0);
+        if frontier.saturating_sub(deepest) <= self.staleness_depth {
+            return Err(Error::CompactionRefused(
+                "the covered region is within the staleness horizon",
+            ));
+        }
 
         // Gate 1. A held operation concurrent with the region still needs the
         // ancestry that discarding would destroy.
@@ -770,19 +1028,15 @@ impl Roster {
             }
         }
 
-        // Gate 2. Anything anchoring into the region later would already be
-        // refused as stale, and the frontier only advances. Without this, a
-        // divergent history defeats gate 1: an operation deep on one branch is
-        // genuinely concurrent with a shallow one on another.
-        let frontier = self.dag.frontier_depth();
-        let deepest = region.iter().map(|index| self.dag.depth(*index)).max().unwrap_or(0);
-        if frontier.saturating_sub(deepest) <= self.staleness_depth {
-            return Err(Error::CompactionRefused(
-                "the covered region is within the staleness horizon",
-            ));
+        // Gate 3. Only roots verified here are checkpoints at all; the state is
+        // derived again from what is held, which is what the root was checked
+        // against.
+        let state = crate::state::derive_region(&self.dag, &region)
+            .map_err(|_| Error::CompactionRefused("snapshot was not verified locally"))?;
+        if state.root() != snapshot.body().root {
+            return Err(Error::CompactionRefused("snapshot was not verified locally"));
         }
-
-        self.dag.compact(snapshot)
+        Ok(state)
     }
 
     /// When the accepted snapshot was received, on this roster's own clock.
@@ -959,6 +1213,11 @@ impl Roster {
     /// window, because it would look like a protection. A signed time that can
     /// only make a roster older cannot do that.
     pub fn freshness(&mut self) -> Freshness {
+        // A network that sets no window is never stale: there is nothing for
+        // an island to wait out, and nothing to be cautious about.
+        if self.state().is_ok_and(|state| state.params.snapshot_window == 0) {
+            return Freshness::Fresh;
+        }
         let Some(received_at) = self.freshness_since else {
             return Freshness::Unknown;
         };
@@ -1002,6 +1261,22 @@ impl Roster {
         match &self.at_heads {
             Some(state) => Ok(state.clone()),
             None => derive(&self.dag),
+        }
+    }
+
+    /// The mode a member runs in, or `None` for a device that is not one.
+    ///
+    /// Read from the kept state without copying it: asked for every message a
+    /// node sends, and a copy of a large roster per message would cost more
+    /// than the message.
+    #[must_use]
+    pub fn mode_of(&self, device: &DeviceId) -> Option<crate::leaf::Mode> {
+        let of = |state: &RosterState| {
+            state.devices.contains_key(device).then(|| state.settings_of(device).mode)
+        };
+        match &self.at_heads {
+            Some(state) => of(state),
+            None => derive(&self.dag).ok().as_ref().and_then(of),
         }
     }
 
@@ -1176,6 +1451,9 @@ impl Roster {
             return self.refuse(id, Error::UnauthorizedAuthor);
         };
         match raw.verify(&key) {
+            Ok(verified) if matches!(verified.body(), OperationBody::AdmitBatch(_)) => {
+                self.park_batch(verified)
+            }
             Ok(verified) => match self.dag.insert(verified) {
                 Ok(()) => {
                     self.follow(extends_every_head);
@@ -1186,6 +1464,235 @@ impl Roster {
             },
             Err(reason) => self.refuse(id, reason),
         }
+    }
+
+    /// Holds a verified batch header until its pieces arrive.
+    fn park_batch(&mut self, operation: VerifiedOperation) -> Admission {
+        let id = operation.id();
+        if self.incomplete.contains_key(&id) {
+            return Admission::AwaitingPieces(id);
+        }
+        let OperationBody::AdmitBatch(header) = operation.body() else {
+            return self.refuse(id, Error::BodySchema);
+        };
+        if self.incomplete.len() >= MAX_INCOMPLETE_BATCHES {
+            return self.refuse(id, Error::LimitExceeded("incomplete batches"));
+        }
+        let declared: u64 = self.incomplete.values().map(|waiting| waiting.header.count).sum();
+        if declared.saturating_add(header.count) > MAX_INCOMPLETE_ENTRIES {
+            return self.refuse(id, Error::LimitExceeded("entries of incomplete batches"));
+        }
+        let header = header.clone();
+        self.incomplete.insert(
+            id,
+            Incomplete { operation, header, pieces: std::collections::BTreeMap::new() },
+        );
+        Admission::AwaitingPieces(id)
+    }
+
+    /// The heads an urgent act against `target` should name, at local time
+    /// `now_ms`.
+    ///
+    /// Anchored off batches younger than [`URGENT_BATCH_AGE_MS`], so a node
+    /// still completing one is not held back from the act. Nothing is lost by
+    /// it: a revocation wins over what it is concurrent with.
+    ///
+    /// Where the target is an admin, its own batches stay as ancestors. Left
+    /// out, they would be concurrent with its removal, and void; held whole
+    /// here, they are its acts from before the removal, and stand. What is
+    /// voided anyway is reported, for the person to see before signing.
+    #[must_use]
+    pub fn urgent_anchor(&self, target: &DeviceId, now_ms: u64) -> UrgentAnchor {
+        let heads = self.dag.heads();
+        let Ok(state) = self.state() else {
+            return UrgentAnchor { heads, voided: Vec::new() };
+        };
+        let target_is_admin = state.is_admin(target);
+        let by_target = |author: &KeyId| state.device_holding(author).as_ref() == Some(target);
+
+        let operations = self.dag.operations();
+        let recent: Vec<usize> = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| {
+                matches!(operation.body(), OperationBody::AdmitBatch(_))
+                    && operation.core().ts.saturating_add(URGENT_BATCH_AGE_MS) > now_ms
+                    && !(target_is_admin && by_target(&operation.core().author))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let left_out: Vec<bool> = (0..operations.len())
+            .map(|index| {
+                recent.iter().any(|batch| *batch == index || self.dag.is_ancestor(*batch, index))
+            })
+            .collect();
+
+        // The kept operations are closed under ancestry, so their heads are
+        // those no kept operation names as a parent.
+        let mut named: std::collections::HashSet<OperationId> = std::collections::HashSet::new();
+        for (index, operation) in operations.iter().enumerate() {
+            if !left_out.get(index).copied().unwrap_or(true) {
+                named.extend(operation.core().parents.iter().copied());
+            }
+        }
+        let mut kept: Vec<OperationId> = operations
+            .iter()
+            .enumerate()
+            .filter(|(index, operation)| {
+                !left_out.get(*index).copied().unwrap_or(true) && !named.contains(&operation.id())
+            })
+            .map(|(_, operation)| operation.id())
+            .collect();
+        kept.sort_unstable();
+        if kept.is_empty() {
+            kept = heads;
+        }
+
+        let mut voided = Vec::new();
+        if target_is_admin {
+            for (index, operation) in operations.iter().enumerate() {
+                if left_out.get(index).copied().unwrap_or(false)
+                    && by_target(&operation.core().author)
+                {
+                    voided.push((operation.id(), operation.body().clone()));
+                }
+            }
+            let mut waiting: Vec<&Incomplete> = self
+                .incomplete
+                .values()
+                .filter(|waiting| by_target(&waiting.operation.core().author))
+                .collect();
+            waiting.sort_by_key(|waiting| waiting.operation.id());
+            for waiting in waiting {
+                voided.push((waiting.operation.id(), waiting.operation.body().clone()));
+            }
+        }
+        UrgentAnchor { heads: kept, voided }
+    }
+
+    /// The batches whose header is in and whose entries are not all in yet.
+    #[must_use]
+    pub fn awaiting_pieces(&self) -> Vec<OperationId> {
+        let mut ids: Vec<OperationId> = self.incomplete.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Offers one piece of a batch.
+    ///
+    /// A piece is taken only after its header: before it, nothing could check
+    /// it, and holding what cannot be checked is what a flood would use. Each
+    /// piece proves against the header's layout as it arrives, and is worth
+    /// passing on from then; once the last is in, the batch enters the graph as
+    /// one operation and takes effect.
+    pub fn offer_piece(&mut self, piece: &[u8]) -> PieceAdmission {
+        let batch = match crate::batch::BatchPiece::batch_of(piece) {
+            Ok(batch) => batch,
+            Err(reason) => return PieceAdmission::Refused { reason },
+        };
+        if self.dag.contains(&batch) {
+            return PieceAdmission::AlreadyHeld { batch };
+        }
+        let Some(waiting) = self.incomplete.get_mut(&batch) else {
+            return PieceAdmission::Refused {
+                reason: Error::InvalidValue("a piece of a batch whose header is not held"),
+            };
+        };
+        let index = match crate::batch::BatchPiece::verified(piece, &batch, &waiting.header) {
+            Ok(checked) => checked.index,
+            Err(reason) => return PieceAdmission::Refused { reason },
+        };
+        if waiting.pieces.contains_key(&index) {
+            return PieceAdmission::AlreadyHeld { batch };
+        }
+        waiting.pieces.insert(index, piece.to_vec());
+        if (waiting.pieces.len() as u64) < waiting.header.pieces {
+            return PieceAdmission::Taken { batch, complete: false };
+        }
+        let Some(whole) = self.incomplete.remove(&batch) else {
+            return PieceAdmission::Taken { batch, complete: false };
+        };
+        let mut entries: Vec<crate::batch::BatchEntry> = Vec::new();
+        for bytes in whole.pieces.values() {
+            if let Ok(checked) = crate::batch::BatchPiece::verified(bytes, &batch, &whole.header) {
+                entries.extend(checked.entries);
+            }
+        }
+        if !crate::batch::matches(&whole.header, &entries) {
+            let reason = Error::InvalidValue("a batch whose pieces do not hold its entries");
+            self.refusals.push((batch, reason.clone()));
+            return PieceAdmission::Refused { reason };
+        }
+        match self.dag.insert_batch(whole.operation, entries) {
+            Ok(()) => {
+                // Derived again rather than followed: what a batch does depends on
+                // its entries, which the one-step path does not read.
+                self.follow(false);
+                self.integrate_pending();
+                PieceAdmission::Taken { batch, complete: true }
+            }
+            Err(reason) => PieceAdmission::Refused { reason },
+        }
+    }
+
+    /// The batches this roster holds the header of and not every piece.
+    #[must_use]
+    pub fn partial_batches(&self) -> Vec<PartialBatch> {
+        let mut out: Vec<PartialBatch> = self
+            .incomplete
+            .iter()
+            .map(|(batch, waiting)| PartialBatch {
+                batch: *batch,
+                pieces: waiting.header.pieces,
+                held: waiting.pieces.keys().copied().collect(),
+            })
+            .collect();
+        out.sort_by_key(|partial| partial.batch);
+        out
+    }
+
+    /// The headers waiting for their pieces, as their verified bytes.
+    ///
+    /// Offered and passed on like any verified operation: a peer needs the
+    /// header before it can take a piece, and a node passing on pieces before
+    /// the batch is whole must pass on the header first.
+    #[must_use]
+    pub fn waiting_headers(&self) -> Vec<(OperationId, Vec<u8>)> {
+        let mut out: Vec<(OperationId, Vec<u8>)> = self
+            .incomplete
+            .iter()
+            .map(|(batch, waiting)| (*batch, waiting.operation.to_bytes()))
+            .collect();
+        out.sort_by_key(|(batch, _)| *batch);
+        out
+    }
+
+    /// The batches this roster holds whole.
+    #[must_use]
+    pub fn whole_batches(&self) -> Vec<OperationId> {
+        self.dag
+            .operations()
+            .iter()
+            .filter(|operation| matches!(operation.body(), OperationBody::AdmitBatch(_)))
+            .map(VerifiedOperation::id)
+            .collect()
+    }
+
+    /// The pieces of a batch this roster holds, by index.
+    ///
+    /// All of them for a batch in the graph, cut again from its entries: the
+    /// cut is canonical, so they are the bytes its author sent. Those that have
+    /// arrived for one still incomplete.
+    #[must_use]
+    pub fn pieces_held(&self, batch: &OperationId) -> Vec<(u64, Vec<u8>)> {
+        if let Some(entries) = self.dag.entries_of(batch) {
+            return crate::batch::pieces_of(batch, entries)
+                .map(|pieces| (0_u64..).zip(pieces).collect())
+                .unwrap_or_default();
+        }
+        self.incomplete.get(batch).map_or_else(Vec::new, |waiting| {
+            waiting.pieces.iter().map(|(index, bytes)| (*index, bytes.clone())).collect()
+        })
     }
 
     /// Offers an already-verified operation, for callers that hold one.
@@ -1445,6 +1952,11 @@ impl Roster {
                     continue;
                 };
                 match raw.verify(&key) {
+                    Ok(verified) if matches!(verified.body(), OperationBody::AdmitBatch(_)) => {
+                        // A header waits for its pieces here too; a refusal is
+                        // recorded by the park itself.
+                        let _parked = self.park_batch(verified);
+                    }
                     Ok(verified) => {
                         // Integration is never the simple case: the operation
                         // waited, so the graph moved on around it.
@@ -1484,19 +1996,21 @@ fn attestation_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<
 }
 
 /// The signing key a device record names, by its key id.
-fn signing_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<PublicKey> {
-    for record in state.devices.values() {
-        for entry in &record.keys {
-            if entry.purpose != crate::types::KeyPurpose::Signing {
-                continue;
-            }
-            if entry.key_id() != *author {
-                continue;
-            }
-            return PublicKey::new(entry.alg, entry.value.clone()).ok();
-        }
-    }
-    None
+/// The public key a root names as its author: a signing or attestation key of
+/// some device in `state`.
+fn root_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<PublicKey> {
+    state
+        .devices
+        .values()
+        .flat_map(|record| record.keys.iter())
+        .find(|entry| {
+            entry.key_id() == *author
+                && matches!(
+                    entry.purpose,
+                    crate::types::KeyPurpose::Signing | crate::types::KeyPurpose::Attestation
+                )
+        })
+        .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok())
 }
 
 /// An operation held until its parents arrive.

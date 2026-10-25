@@ -1171,3 +1171,50 @@ this branch. The nodes are rebuilt with the change and started fresh (`down -v`,
   other, 4 of 4.
 - The fixture `daemon/tests/fixtures/stranded-join/roster.log` was replaced with `a`'s roster from
   step 1.
+
+# Branch `scalable-membership`: what binds a network's folder to this machine
+
+## S1. The machine key and the sealed identities, against a software TPM
+
+`local-integrity`, `identity`. In the testbed:
+
+```powershell
+docker compose -f crates\linux-daemon\testbed\compose.yaml run --build --rm tests
+```
+
+**Expect**: in `tests/tpm.rs`, `the_machine_key_signs_with_nobody_present`,
+`the_daemon_keeps_its_machine_key_in_the_tpm` and `a_sealed_secret_opens_only_on_its_tpm` pass: the
+machine key is made once with no authorisation and no lockout, signs what the roster verifies, and
+does not load on another TPM; once its file is gone, or with no TPM, it is reported lost and not
+replaced; a sealed secret opens only on its own TPM.
+
+**Result**: run, 2026-10-25, in the testbed, passed.
+- `tests/tpm.rs`: 10 passed, the three above among them. The esys `TPM Error` lines are the second
+  TPM refusing to load the first's key and secret, as expected.
+- The library tests: 64 passed, with `tun`'s interface renamed `pftest00001`. It was
+  `peerfectlytest00001`, longer than the kernel's fifteen characters, since the rename.
+- `cargo clippy -p linux-daemon -p identity --all-targets -- -D warnings`: clean.
+
+## S2. On a machine with a hardware TPM
+
+On a Linux machine with `/dev/tpmrm0`, the archive of this branch installed:
+
+```powershell
+sudo peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+sudo cat /var/lib/peerfectly/machine.kind
+```
+```powershell
+sudo head -c 22 /var/lib/peerfectly/networks/prova/identity
+```
+
+Then with the daemon stopped, copy another network's `roster.log` over `prova`'s, start it, and run
+`peerfectly status`; put the original back, and start it once more.
+
+**Expect**: `machine.kind` reads `hardware`, `machine.tpm` is there and `machine.key` is not; the
+identity begins with `peerfectly wrapped v1`; the boot asks for no passphrase; with the other roster
+`status` reports `prova` as changed outside the program and does not carry it, and with the original
+back it is carried.
+
+**Result**: not run.

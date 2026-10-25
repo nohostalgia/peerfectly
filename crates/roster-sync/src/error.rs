@@ -56,18 +56,6 @@ pub enum Error {
         available: usize,
     },
 
-    /// The peer offered a snapshot sequence lower than the one held.
-    ///
-    /// Seen in the offer, so no snapshot bytes are transferred for it. The
-    /// roster refuses a regression on its own; this is the same refusal one
-    /// exchange earlier.
-    SnapshotWouldRegress {
-        /// What the peer offered.
-        offered: u64,
-        /// What this node holds.
-        held: u64,
-    },
-
     /// The roster refused something received.
     ///
     /// The reason is the roster's, unchanged. "The roster refused this
@@ -76,6 +64,16 @@ pub enum Error {
 
     /// The transport failed, or the session ended.
     Transport(transport::Error),
+
+    /// A light member offered or sent operations, which it does not exchange.
+    ///
+    /// A light member holds one root and its own proof, and is given roots and
+    /// answers. Taking operations from it would make it a source of the graph it
+    /// was chosen not to hold.
+    FromLightMember {
+        /// The light member.
+        peer: roster::id::DeviceId,
+    },
 }
 
 impl Error {
@@ -86,7 +84,7 @@ impl Error {
     /// do not verify is worth reporting. Neither ends a session.
     #[must_use]
     pub const fn is_about_the_sender(&self) -> bool {
-        matches!(self, Self::OverQuota { .. })
+        matches!(self, Self::OverQuota { .. } | Self::FromLightMember { .. })
     }
 
     /// Whether the content was refused, rather than the sender throttled.
@@ -98,7 +96,6 @@ impl Error {
                 | Self::CountExceedsPayload { .. }
                 | Self::OfferTooLarge { .. }
                 | Self::Roster(_)
-                | Self::SnapshotWouldRegress { .. }
         )
     }
 
@@ -137,11 +134,11 @@ impl fmt::Display for Error {
             Self::CountExceedsPayload { declared, available } => {
                 write!(f, "message declares {declared} entries but only {available} can follow")
             }
-            Self::SnapshotWouldRegress { offered, held } => {
-                write!(f, "peer offers snapshot {offered}, behind the {held} held")
-            }
             Self::Roster(reason) => write!(f, "the roster refused it: {reason}"),
             Self::Transport(reason) => write!(f, "the session: {reason}"),
+            Self::FromLightMember { peer } => {
+                write!(f, "{peer:?} is a light member, and exchanges roots, not operations")
+            }
         }
     }
 }
@@ -166,9 +163,9 @@ mod tests {
             Error::OfferTooLarge { declared: 9000, limit: 4096 },
             Error::Malformed(roster::Error::TrailingData),
             Error::CountExceedsPayload { declared: 4096, available: 3 },
-            Error::SnapshotWouldRegress { offered: 1, held: 4 },
             Error::Roster(roster::Error::SignatureInvalid),
             Error::Transport(transport::Error::ClosedByPeer),
+            Error::FromLightMember { peer: device() },
         ];
         for (i, left) in all.iter().enumerate() {
             for (j, right) in all.iter().enumerate() {

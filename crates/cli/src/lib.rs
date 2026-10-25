@@ -222,14 +222,19 @@ impl Cli<'_> {
             return runtime.block_on(self.enrol_through_the_daemon(command));
         }
 
-        // Admitting goes through the daemon, because the daemon holds the roster: an
+        // Inviting goes through the daemon, because the daemon holds the roster: an
         // operation appended by another process would be invisible to it until it
         // restarted, and a device admitted into a roster nobody is using cannot
-        // connect.
-        if word == "admit" {
-            let Some(payload) = std::env::args().nth(2) else {
-                eprintln!("usage: {ADMIT_USAGE}");
-                return ExitCode::FAILURE;
+        // connect. And the daemon is what goes on dialling the invited device
+        // once this command has ended.
+        if word == "invite" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let command = match inviting_from(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
             };
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
@@ -238,7 +243,7 @@ impl Cli<'_> {
                     return ExitCode::FAILURE;
                 }
             };
-            return runtime.block_on(self.admit_through_the_daemon(payload));
+            return runtime.block_on(self.invite_through_the_daemon(command));
         }
 
         // Opening a port to one network, closing it, and listing what is open.
@@ -752,8 +757,7 @@ impl Cli<'_> {
                 println!("founded. this device is an admin of its own network.");
                 println!();
                 println!("next:");
-                println!("  on the device joining:  peerfectly join --relay <the relay>");
-                println!("  back here:              peerfectly admit <what it printed>");
+                println!("  invite a device:  peerfectly invite <its name>");
                 ExitCode::SUCCESS
             }
 
@@ -767,11 +771,11 @@ impl Cli<'_> {
                 self.finish(&expected).await
             }
 
-            // A join. The daemon answers before it has reached the relay, so the
-            // payload is asked for rather than returned: it is the same asking the
+            // A join. The daemon answers before it has reached the relay, so what
+            // follows is asked for rather than returned: it is the same asking the
             // code needs later, and it keeps the daemon free to answer other
             // commands while a relay takes its time.
-            Outcome::Joining { .. } => {
+            Outcome::Joining => {
                 println!("registering at the relay...");
                 self.wait_for_the_code().await
             }
@@ -813,18 +817,10 @@ impl Cli<'_> {
             // Asked plainly, the request came back as an answer this loop did
             // not know, and a join from the command line could not finish.
             match self.ask_and_sign(Command::Waiting).await {
-                Ok(Outcome::Joining { payload, scannable }) => {
-                    if !shown && !payload.is_empty() {
+                Ok(Outcome::Joining) => {
+                    if !shown {
                         shown = true;
-                        println!();
-                        println!("{scannable}");
-                        println!(
-                            "waiting to be admitted. On the machine that admits this one, run:"
-                        );
-                        println!();
-                        println!("  peerfectly admit {payload}");
-                        println!();
-                        println!("or scan the code above.");
+                        println!("waiting for the admin that invited this device to reach it...");
                     }
                 }
                 Ok(Outcome::Enrolling) => {
@@ -964,20 +960,81 @@ impl Cli<'_> {
         }
     }
 
-    /// Admits a device, with a person comparing two screens in the middle.
-    async fn admit_through_the_daemon(&self, payload: String) -> std::process::ExitCode {
+    /// Invites a device and admits it when it arrives, with a person comparing
+    /// two screens in the middle.
+    ///
+    /// One command up to the signature. Where the person stops waiting, the
+    /// invite stays open in the daemon, which goes on dialling the device.
+    async fn invite_through_the_daemon(
+        &self,
+        command: daemon::control::Command,
+    ) -> std::process::ExitCode {
         use std::io::Write as _;
         use std::process::ExitCode;
 
         use daemon::control::{Command, Outcome};
 
-        let opened = match self.ask(Command::Admit { network: network_option(), payload }).await {
+        let issued = match self.ask(command).await {
             Ok(outcome) => outcome,
             Err(cause) => {
                 eprintln!("{cause}");
                 return ExitCode::FAILURE;
             }
         };
+        let (name, expires_at) = match issued {
+            Outcome::Invited { invite, scannable, name, expires_at } => {
+                println!();
+                println!("{scannable}");
+                println!("an invite for {}. On that device, run:", daemon::control::shown(&name));
+                println!();
+                println!("  peerfectly join {invite}");
+                println!();
+                println!("or scan the code above. Anyone holding the invite can reach the device");
+                println!("it brings, so send it only to that device's person.");
+                println!();
+                print!("waiting for the device");
+                let _ = std::io::stdout().flush();
+                (name, expires_at)
+            }
+            Outcome::Declined { message } | Outcome::Failed { message, .. } => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+            other => {
+                eprintln!("unexpected answer from the daemon: {other:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // The daemon dials the device on its own. This waits for it to arrive,
+        // and a person who stops waiting leaves the invite open.
+        let opened = loop {
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    println!();
+                    println!(
+                        "stopped waiting. The invite for {} stays open {}, and this machine",
+                        daemon::control::shown(&name),
+                        open_for(expires_at)
+                    );
+                    println!("goes on dialling the device: when it arrives, the daemon says so.");
+                    return ExitCode::SUCCESS;
+                }
+            }
+            match self.ask(Command::Waiting).await {
+                Ok(Outcome::Done) => {
+                    print!(".");
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(outcome) => break outcome,
+                Err(cause) => {
+                    eprintln!("{cause}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        println!();
 
         let Outcome::Admitting { proposed_name, fingerprint, code, taken, .. } = opened else {
             return match opened {
@@ -999,8 +1056,8 @@ impl Cli<'_> {
         println!("      {code}");
         println!();
         // Naming the screen is the whole point. A prompt that asked about a number
-        // on this screen would defend nothing against a payload substituted on its
-        // way here — the person has to look at the other machine.
+        // on this screen would defend nothing against an invite that reached
+        // another machine — the person has to look at the one they meant.
         println!("Now go to the device you are enrolling and type those six digits into it.");
         println!("Nothing has been signed, and nothing will be until it says they matched.");
         println!();
@@ -1168,6 +1225,20 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         println!();
     }
 
+    // None unless asked for, and said what it buys when it is.
+    let window_days = match option(rest, "--window") {
+        Some(days) => {
+            let days: u32 =
+                days.parse().ok().filter(|days| *days > 0).ok_or_else(|| {
+                    format!("`{days}` is not a number of days. Nothing was signed.")
+                })?;
+            println!("a freshness window of {days} days: {WINDOW_SENTENCE}");
+            println!();
+            Some(days)
+        }
+        None => None,
+    };
+
     Ok(Command::Found {
         label: label.clone(),
         name,
@@ -1188,17 +1259,8 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         },
         relay: relay_address,
         ipv4_range,
+        window_days,
     })
-}
-
-/// The network an option named, where one was given.
-///
-/// Read from the arguments rather than passed down, because the commands that
-/// take one are reached by several paths and every one of them would otherwise
-/// have to thread it.
-fn network_option() -> Option<String> {
-    let rest: Vec<String> = std::env::args().skip(2).collect();
-    option(&rest, "--network")
 }
 
 /// Builds the joining command from what a person typed.
@@ -1206,10 +1268,51 @@ fn joining_from(rest: &[String]) -> Result<daemon::control::Command, String> {
     // No name for the network. A person starting a join has not seen it and does
     // not know its suffix; the daemon writes under a name of its own and keeps the
     // network under one taken from the network itself once it arrives.
-    let relay = option(rest, "--relay")
-        .or_else(|| rest.first().filter(|word| !word.starts_with("--")).cloned())
+    let invite = rest
+        .first()
+        .filter(|word| !word.starts_with("--"))
+        .cloned()
         .ok_or_else(|| format!("usage: {JOIN_USAGE}"))?;
-    Ok(daemon::control::Command::Join { relay, name: device_name(rest)? })
+    Ok(daemon::control::Command::Join { invite, name: device_name(rest)? })
+}
+
+/// Builds the inviting command from what a person typed.
+fn inviting_from(rest: &[String]) -> Result<daemon::control::Command, String> {
+    let name = rest
+        .first()
+        .filter(|word| !word.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| format!("usage: {INVITE_USAGE}"))?;
+    let groups = rest
+        .windows(2)
+        .filter(|pair| pair.first().is_some_and(|flag| flag == "--group"))
+        .filter_map(|pair| pair.get(1).cloned())
+        .collect();
+    let hours =
+        match option(rest, "--hours") {
+            None => None,
+            Some(text) => Some(text.parse::<u32>().map_err(|_| {
+                format!("`{text}` is not a number of hours.\nusage: {INVITE_USAGE}")
+            })?),
+        };
+    Ok(daemon::control::Command::Invite {
+        network: option(rest, "--network"),
+        name,
+        admin: rest.iter().any(|word| word == "--admin"),
+        light: rest.iter().any(|word| word == "--light"),
+        groups,
+        ipv4: option(rest, "--ipv4"),
+        hours,
+    })
+}
+
+/// How long an invite still stays open, in words.
+fn open_for(expires_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let hours = expires_at.saturating_sub(now).div_ceil(60 * 60);
+    if hours <= 1 { "for up to an hour".to_owned() } else { format!("for up to {hours} hours") }
 }
 
 /// Shows the key a relay's host answered with, and asks whether to sign it.
@@ -1268,12 +1371,15 @@ fn option(rest: &[String], flag: &str) -> Option<String> {
 }
 
 /// The options `found` takes, each followed by its value.
-const FOUND_OPTIONS: [&str; 4] = ["--name", "--suffix", "--relay", "--ipv4-range"];
+const FOUND_OPTIONS: [&str; 5] = ["--name", "--suffix", "--relay", "--ipv4-range", "--window"];
 
 /// How `found` is spelled, in one place so the usage and the refusal agree.
 const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] \
                            [--relay HOST | https://HOST:PORT | KEY@HOST:PORT] \
-                           [--ipv4-range A.B.C.D/N]";
+                           [--ipv4-range A.B.C.D/N] [--window DAYS]";
+
+/// What a freshness window buys, said when one is asked for.
+const WINDOW_SENTENCE: &str = "with a window, a device that hears nothing signed by an admin for                                that long turns cautious: a cut-off island stops trusting a                                device revoked elsewhere, and stops working until it hears                                again. A network with an admin on every island wants none,                                which is the default.";
 
 /// This device's name: the one a person gave, or one made from the machine's.
 ///
@@ -1318,11 +1424,11 @@ fn machine_name() -> Option<String> {
 }
 
 /// How `join` is spelled, in one place so the usage and the refusal agree.
-const JOIN_USAGE: &str =
-    "peerfectly join --relay <HOST | https://HOST:PORT | KEY@HOST:PORT> [--name NAME]";
+const JOIN_USAGE: &str = "peerfectly join <the invite an admin sent> [--name NAME]";
 
-/// How `admit` is spelled, in one place so the usage and the refusal agree.
-const ADMIT_USAGE: &str = "peerfectly admit <the payload the joining device printed>";
+/// How `invite` is spelled, in one place so the usage and the refusal agree.
+const INVITE_USAGE: &str = "peerfectly invite <name> [--network N] [--admin] [--light] \
+                            [--group G]... [--ipv4 A.B.C.D] [--hours H]";
 
 const REVOKE_USAGE: &str = daemon::control::Command::REVOKE_USAGE;
 
@@ -1357,7 +1463,7 @@ fn usage(privileged: &str) -> String {
     // anywhere else.
     out.push_str(&format!("\n  {FOUND_USAGE}{needs}\n"));
     out.push_str(&format!("  {JOIN_USAGE}{needs}\n"));
-    out.push_str(&format!("  {ADMIT_USAGE}\n"));
+    out.push_str(&format!("  {INVITE_USAGE}\n"));
     out.push_str(&format!(
         "  {REVOKE_USAGE}{needs}
 "
@@ -1437,6 +1543,24 @@ mod tests {
     #[test]
     fn the_usage_names_the_flag() {
         assert!(super::FOUND_USAGE.contains("--ipv4-range"));
+        assert!(super::FOUND_USAGE.contains("--window"));
+    }
+
+    fn window_of(command: &Command) -> Option<u32> {
+        match command {
+            Command::Found { window_days, .. } => *window_days,
+            other => panic!("expected a founding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_default_founding_sets_no_window_and_one_is_taken_when_asked() {
+        assert_eq!(window_of(&founding_from(&words("casa")).unwrap()), None);
+        assert_eq!(window_of(&founding_from(&words("casa --window 7")).unwrap()), Some(7));
+        assert!(
+            founding_from(&words("casa --window 0")).is_err(),
+            "zero is no window, said as none"
+        );
     }
 
     /// The usage names the platform's own word for an administrator.
@@ -1490,8 +1614,36 @@ mod tests {
     fn the_usage_shows_the_form_of_a_relay() {
         assert!(super::FOUND_USAGE.contains("KEY@HOST:PORT"));
         assert!(super::FOUND_USAGE.contains("--relay HOST"), "the host alone is enough");
-        assert!(super::JOIN_USAGE.contains("KEY@HOST:PORT"));
-        assert!(super::JOIN_USAGE.contains("--relay <HOST"), "a join takes the host alone too");
+        assert!(!super::JOIN_USAGE.contains("--relay"), "a join takes its relay from the invite");
+    }
+
+    /// An invite asks for what the device will be, and a join for the invite.
+    #[test]
+    fn invite_and_join_read_what_was_typed() {
+        let Ok(Command::Invite { network, name, admin, light, groups, ipv4, hours }) =
+            super::inviting_from(&words(
+                "sensor --network casa --light --group sensori --group cucina --ipv4 100.64.0.9 --hours 3",
+            ))
+        else {
+            panic!("an invite");
+        };
+        assert_eq!(network.as_deref(), Some("casa"));
+        assert_eq!(name, "sensor");
+        assert!(!admin && light);
+        assert_eq!(groups, vec!["sensori".to_owned(), "cucina".to_owned()]);
+        assert_eq!(ipv4.as_deref(), Some("100.64.0.9"));
+        assert_eq!(hours, Some(3));
+        assert!(super::inviting_from(&words("--light")).is_err(), "a name first");
+        assert!(super::inviting_from(&words("sensor --hours many")).is_err());
+
+        let Ok(Command::Join { invite, name }) =
+            super::joining_from(&words("peerfectly-invite-v1:00 --name board"))
+        else {
+            panic!("a join");
+        };
+        assert_eq!(invite, "peerfectly-invite-v1:00");
+        assert_eq!(name, "board");
+        assert!(super::joining_from(&words("--name board")).is_err(), "an invite first");
     }
 }
 
@@ -1605,9 +1757,22 @@ mod custody {
         let depths = vec![1; heads.len()];
         let body = roster::snapshot::Snapshot::new(
             1,
-            vec![0xa0],
-            heads,
-            depths,
+            Vec::new(),
+            [0xa0; 32],
+            roster::snapshot::Covering { heads, depths },
+            Vec::new(),
+            roster::leaf::DeviceLeaf {
+                record: identity
+                    .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+                    .unwrap()
+                    .into_record(roster::id::OperationId::from_bytes([1; 32]))
+                    .unwrap(),
+                settings: roster::leaf::DeviceSettings::default(),
+            },
+            roster::membership::MembershipProof {
+                devices: roster::merkle::Proof { siblings: Vec::new() },
+                parameters: [0; 32],
+            },
             identity.signing_key().key_id(),
             network,
         )
@@ -1835,6 +2000,7 @@ mod custody {
             suffix: "home.internal".to_owned(),
             relay: None,
             ipv4_range: None,
+            window_days: None,
         };
 
         let outcome = cli.ask_and_sign(founding).await.unwrap();

@@ -13,6 +13,8 @@ identity = { path = "../identity" }
 # The domain-separated derivations: the confirmation code, and the input the
 # joining device signs to prove it holds the key its identity comes from.
 blake3.workspace = true
+# The invite's secret.
+getrandom.workspace = true
 
 [lints]
 workspace = true

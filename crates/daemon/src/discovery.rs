@@ -239,10 +239,39 @@ impl Discovery {
         let identity = self.node.identity();
         let key = identity.transport_key().public_key();
 
-        let record = Record::new(key, state.network, sequence_now(), addresses.to_vec())
-            .map_err(|cause| format!("the announcement could not be built: {cause}"))?;
-        let announcement = Announcement::sign(record, identity.transport_key().signer())
-            .map_err(|cause| format!("the announcement could not be signed: {cause}"))?;
+        // What it shows of its membership goes along where it fits, so a member
+        // holding no roster recognises it: addresses give way first, then it.
+        let shown = self.node.shown().await;
+        let sequence = sequence_now();
+        let mut announcement = None;
+        'fitting: for show in [true, false] {
+            for kept in (0..=addresses.len()).rev() {
+                let shown = if show { shown.clone() } else { Vec::new() };
+                if show && shown.is_empty() {
+                    continue 'fitting;
+                }
+                let Some(listed) = addresses.get(..kept) else { continue };
+                let record = Record::new(key.clone(), state.network, sequence, listed.to_vec())
+                    .and_then(|record| record.showing(shown))
+                    .map_err(|cause| format!("the announcement could not be built: {cause}"))?;
+                let signed = Announcement::sign(record, identity.transport_key().signer())
+                    .map_err(|cause| format!("the announcement could not be signed: {cause}"))?;
+                let fits = local_discovery::announce::seal(&signed, &state.network)
+                    .is_ok_and(|packet| packet.len() <= local_discovery::limits::MAX_PACKET_SIZE);
+                if fits {
+                    announcement = Some(signed);
+                    break 'fitting;
+                }
+                // Without the evidence, every address that fits before: one
+                // with all of them is the one that went out before it existed.
+                if !show {
+                    announcement = Some(signed);
+                    break 'fitting;
+                }
+            }
+        }
+        let announcement =
+            announcement.ok_or_else(|| "the announcement could not be built".to_owned())?;
 
         // Chosen now, not at startup: an interface that has appeared since is
         // announced on, and one that has gone is not.
@@ -326,9 +355,17 @@ impl Discovery {
         // belongs to a member. A key it does not name is not an attack, it is a
         // device from another network on the same wire, or one this node has
         // not yet learned about.
-        if record.network != state.network || !member_holds(&state, &record.key) {
+        if record.network != state.network {
             return;
         }
+        // A member holding no roster recognises one it has not met by what it
+        // shows, and learns it.
+        if !member_holds(&state, &record.key)
+            && (record.shown.is_empty() || !self.node.learn_shown(&record.key, &record.shown).await)
+        {
+            return;
+        }
+        let Ok(state) = self.node.state().await else { return };
         if record.key.as_bytes() == self.node.identity().transport_key().public_key().as_bytes() {
             return;
         }
@@ -992,6 +1029,122 @@ mod over_the_wire {
         assert!(
             transport.heard.lock().expect("not poisoned").is_empty(),
             "a key the roster does not name is not a peer"
+        );
+    }
+
+    /// Two light members, and no full member anywhere: each knows only itself
+    /// and the admin whose root it holds, and recognises the other by what it
+    /// shows in its announcement.
+    #[tokio::test]
+    async fn two_light_members_find_each_other_on_a_lan_with_no_full_member() {
+        let founder = Arc::new(NodeIdentity::generate().expect("generates"));
+        let left = Arc::new(NodeIdentity::generate().expect("generates"));
+        let right = Arc::new(NodeIdentity::generate().expect("generates"));
+        let impostor = Arc::new(NodeIdentity::generate().expect("generates"));
+        let params =
+            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                .expect("valid");
+        let mut roster = Roster::new();
+        let mut parents = Vec::new();
+        let mut network = NetworkId::from_bytes([0; 32]);
+        let bodies = [
+            OperationBody::CreateNetwork {
+                device: founder.device_spec("a", Role::Admin, true, vec![]).expect("spec"),
+                params,
+            },
+            OperationBody::AddDevice(
+                left.device_spec("left", Role::Member, false, vec![]).expect("spec"),
+            ),
+            OperationBody::AddDevice(
+                right.device_spec("right", Role::Member, false, vec![]).expect("spec"),
+            ),
+            OperationBody::AddDevice(
+                impostor.device_spec("impostor", Role::Member, false, vec![]).expect("spec"),
+            ),
+        ];
+        for (ts, body) in (1_u64..).zip(bodies) {
+            let core = OperationCore::new(
+                ts,
+                founder.signing_key().algorithm(),
+                body,
+                parents.clone(),
+                founder.signing_key().key_id(),
+                network,
+            )
+            .expect("well-formed");
+            if ts == 1 {
+                network = NetworkId::from_bytes(*core.id().as_bytes());
+            }
+            parents = vec![core.id()];
+            assert!(
+                roster
+                    .offer_bytes(&sign_operation(&core, founder.signer()).expect("signs"))
+                    .is_accepted()
+            );
+        }
+        let root = crate::snapshots::sign_over_heads(&roster, &founder).expect("a root");
+        assert!(roster.offer_snapshot(&root).is_accepted());
+
+        let mut scratches = Vec::new();
+        let mut light = |identity: &Arc<NodeIdentity>| {
+            let scratch = tempfile::tempdir().expect("a scratch directory");
+            let paths = Paths::under(scratch.path());
+            let member = roster::member::LightMember::new(
+                roster.evidence_for(&identity.device_id()).expect("a member"),
+                roster.state().expect("derives").params,
+                roster::member::DEFAULT_BUDGET,
+            )
+            .expect("a light member");
+            crate::state::write_light(&paths, &member).expect("kept");
+            let node =
+                Node::from_light(Arc::clone(identity), &paths).expect("reads").expect("light");
+            scratches.push(scratch);
+            node
+        };
+        let (left_node, right_node, impostor_node) =
+            (light(&left), light(&right), light(&impostor));
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let hearing = Discovery::resume(
+            Arc::clone(&right_node),
+            Endpoints::at(scratch.path().join("right.json")),
+            None,
+        )
+        .await;
+        assert!(!right_node.state().await.expect("state").devices.contains_key(&left.device_id()));
+
+        let shown = left_node.shown().await;
+        assert!(!shown.is_empty());
+        // The impostor announces under its own key, showing the left member's
+        // membership: not its own, and not learned.
+        let forged = Record::new(
+            impostor.transport_key().public_key(),
+            network,
+            1,
+            vec!["192.168.1.9:41641".to_owned()],
+        )
+        .and_then(|record| record.showing(shown.clone()))
+        .expect("a record");
+        hearing
+            .heard(Announcement::sign(forged, impostor.transport_key().signer()).expect("signs"))
+            .await;
+        assert!(!right_node.state().await.expect("state").devices.contains_key(&left.device_id()));
+        let _ = impostor_node;
+
+        // The left member announces itself, and is recognised.
+        let honest = Record::new(
+            left.transport_key().public_key(),
+            network,
+            2,
+            vec!["192.168.1.7:41641".to_owned()],
+        )
+        .and_then(|record| record.showing(shown.clone()))
+        .expect("a record");
+        hearing
+            .heard(Announcement::sign(honest, left.transport_key().signer()).expect("signs"))
+            .await;
+        assert!(
+            right_node.state().await.expect("state").devices.contains_key(&left.device_id()),
+            "the right member now knows the left one, with no full member involved"
         );
     }
 }

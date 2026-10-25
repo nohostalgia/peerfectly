@@ -357,6 +357,55 @@ pub fn load_with(
     decode_with(&plain, custodians)
 }
 
+/// The version of a single stored key.
+const STORED_KEY_VERSION: u64 = 1;
+
+/// Writes one private key to `path`, protected as an identity is.
+///
+/// For a key a machine keeps for itself rather than for a network — the key a
+/// daemon signs its own bookkeeping with where no hardware holds one. The
+/// same sealing and the same file protection as [`save_with`], so a key kept
+/// alone is never kept worse than the keys beside it.
+///
+/// # Errors
+///
+/// When sealing or writing fails.
+pub fn save_key(key: &PrivateKey, path: &Path, sealer: &dyn Sealer) -> Result<()> {
+    let mut plain = Vec::new();
+    let mut encoder = minicbor::Encoder::new(&mut plain);
+    let _ = encoder.array(3);
+    let _ = encoder.u64(STORED_KEY_VERSION);
+    let _ = encoder.u8(algorithm_tag(key.algorithm()));
+    let _ = encoder.bytes(key.material().expose());
+    let protected = sealer.seal(&plain)?;
+    let mut file = create_protected(path)?;
+    file.write_all(&protected)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Reads one private key written by [`save_key`].
+///
+/// # Errors
+///
+/// When the file cannot be read or unsealed, or does not decode to a key.
+pub fn load_key(path: &Path, sealer: &dyn Sealer) -> Result<PrivateKey> {
+    check_permissions(path)?;
+    let stored = fs::read(path)?;
+    let plain = sealer.unseal(&stored)?;
+    let mut decoder = minicbor::Decoder::new(&plain);
+    if decoder.array().map_err(|_| Error::CorruptIdentity)? != Some(3)
+        || decoder.u64().map_err(|_| Error::CorruptIdentity)? != STORED_KEY_VERSION
+    {
+        return Err(Error::CorruptIdentity);
+    }
+    let key = read_key(&mut decoder)?;
+    if decoder.position() != plain.len() {
+        return Err(Error::CorruptIdentity);
+    }
+    Ok(key)
+}
+
 #[cfg(unix)]
 /// Creates the file with owner-only permissions from the start.
 fn create_protected(path: &Path) -> Result<fs::File> {
@@ -544,5 +593,22 @@ mod tests {
             matches!(refused, Err(Error::PermissiveKeyFile { mode }) if mode & 0o077 == 0o044),
             "expected a refusal naming the permissions, got {refused:?}"
         );
+    }
+
+    #[test]
+    fn a_single_key_round_trips_and_a_damaged_one_is_refused() {
+        use super::{PlatformSealer, load_key, save_key};
+        let scratch = tempfile::tempdir().expect("the test's own setup");
+        let path = scratch.path().join("machine.key");
+        let key = crate::identity::PrivateKey::generate(roster::types::Algorithm::Ed25519)
+            .expect("the test's own setup");
+        save_key(&key, &path, &PlatformSealer).expect("the test's own setup");
+        let back = load_key(&path, &PlatformSealer).expect("the test's own setup");
+        assert_eq!(back.public_key(), key.public_key());
+
+        let mut bytes = std::fs::read(&path).expect("the test's own setup");
+        bytes.pop();
+        std::fs::write(&path, &bytes).expect("the test's own setup");
+        assert!(load_key(&path, &PlatformSealer).is_err());
     }
 }

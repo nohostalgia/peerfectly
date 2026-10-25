@@ -191,9 +191,7 @@ proptest! {
         let tunnel = tunnel().with_holdings(Ipv4Holdings::from(
             &NetworkId::from_bytes([1; 32]),
             Ipv4Range::DEFAULT,
-            &[session],
-            &[],
-        ));
+            &[session]));
         let mut bytes = bytes;
         if let Some(first) = bytes.first_mut() {
             *first = 0x40 | (*first & 0x0f);
@@ -244,9 +242,7 @@ proptest! {
         let holdings = Ipv4Holdings::from(
             &NetworkId::from_bytes([1; 32]),
             Ipv4Range::DEFAULT,
-            &[holder],
-            &[],
-        );
+            &[holder]);
         let tunnel = tunnel().with_holdings(holdings.clone());
         let destination = Ipv4Addr::from(destination);
         let mut packet = vec![0x45, 0, 0, 20];
@@ -300,9 +296,7 @@ proptest! {
         let tunnel = tunnel().with_holdings(Ipv4Holdings::from(
             &NetworkId::from_bytes([1; 32]),
             Ipv4Range::DEFAULT,
-            &[me(), session],
-            &[],
-        ));
+            &[me(), session]));
         let (Some(source), Some(mine)) = (tunnel.ipv4_of(&session), tunnel.own_ipv4()) else {
             // The generated device collides with this one and holds nothing;
             // that case is `a_device_holding_no_ipv4_accepts_no_ipv4_packet`.

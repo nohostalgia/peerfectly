@@ -379,20 +379,22 @@ impl History {
         self.snapshot_with_state(seq, signer_seed, head_labels, None)
     }
 
-    /// Builds a snapshot, optionally overriding the state it claims.
+    /// Builds a snapshot, optionally overriding the root it claims.
     ///
-    /// The override exists so a test can produce the lying-admin case.
+    /// The override exists so a test can produce the lying-admin case. The
+    /// signer is proved against the covered state — or, past the first
+    /// generation, against that same state named as the root it follows.
     #[must_use]
     pub fn snapshot_with_state(
         &self,
         seq: u64,
         signer_seed: u8,
         head_labels: &[&str],
-        state_override: Option<Vec<u8>>,
+        root_override: Option<[u8; 32]>,
     ) -> Vec<u8> {
         let covered = self.covered_dag(head_labels);
-        let state = state_override
-            .unwrap_or_else(|| derive(&covered).expect("the covered sub-graph derives").to_bytes());
+        let state = derive(&covered).expect("the covered sub-graph derives");
+        let root = root_override.unwrap_or_else(|| state.root());
         let heads: Vec<_> = head_labels.iter().map(|label| self.id(label)).collect();
         let depths: Vec<u64> = head_labels
             .iter()
@@ -401,9 +403,23 @@ impl History {
                 covered.depth(index)
             })
             .collect();
-        let body =
-            Snapshot::new(seq, state, heads, depths, signer(signer_seed).key_id(), self.network())
-                .expect("well-formed snapshot");
+        let author = signer(signer_seed).key_id();
+        let device = state.device_holding(&author).expect("the signer is in the covered state");
+        let leaf = state.leaf(&device).expect("a member");
+        let proof = roster::membership::MembershipProof::of(&state, &device).expect("proves");
+        let previous = if seq == 1 { Vec::new() } else { vec![state.root()] };
+        let body = Snapshot::new(
+            seq,
+            previous,
+            root,
+            roster::snapshot::Covering { heads, depths },
+            Vec::new(),
+            leaf,
+            proof,
+            author,
+            self.network(),
+        )
+        .expect("well-formed snapshot");
         sign_snapshot(&body, &signer(signer_seed)).expect("signs")
     }
 

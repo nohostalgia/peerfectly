@@ -49,9 +49,9 @@ use tss_esapi::interface_types::ecc::EccCurve;
 use tss_esapi::interface_types::resource_handles::Hierarchy;
 use tss_esapi::interface_types::session_handles::AuthSession;
 use tss_esapi::structures::{
-    Auth, Digest, EccPoint, EccScheme, HashScheme, HashcheckTicket, Private, Public, PublicBuilder,
-    PublicEccParametersBuilder, Signature, SignatureScheme, SymmetricDefinition,
-    SymmetricDefinitionObject,
+    Auth, Digest, EccPoint, EccScheme, HashScheme, HashcheckTicket, KeyedHashScheme, Private,
+    Public, PublicBuilder, PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData,
+    Signature, SignatureScheme, SymmetricDefinition, SymmetricDefinitionObject,
 };
 use tss_esapi::tcti_ldr::{DeviceConfig, TctiNameConf};
 use tss_esapi::traits::{Marshall as _, UnMarshall as _};
@@ -148,6 +148,25 @@ impl Stored {
             && attributes.user_with_auth()
             && attributes.sign_encrypt()
             && !attributes.no_da())
+    }
+
+    /// Whether the key's attributes are the ones a key used with nobody present
+    /// is made with: bound to the TPM, made inside it, and with no
+    /// authorisation to guess, so exempt from dictionary-attack protection —
+    /// which would otherwise let a lockout caused by anything else stop it.
+    ///
+    /// # Errors
+    ///
+    /// When the public area does not read.
+    pub fn unattended_attributes_hold(&self) -> Result<bool, Refusal> {
+        let public = Public::unmarshall(&self.public).map_err(|cause| cause.to_string())?;
+        let attributes = public.object_attributes();
+        Ok(attributes.fixed_tpm()
+            && attributes.fixed_parent()
+            && attributes.sensitive_data_origin()
+            && attributes.user_with_auth()
+            && attributes.sign_encrypt()
+            && attributes.no_da())
     }
 }
 
@@ -296,6 +315,90 @@ impl Tpm {
         })
     }
 
+    /// Makes a key the daemon uses with nobody present — this machine's own
+    /// key, which signs its checkpoints and nothing a network sees. No
+    /// authorisation, so no passphrase and nothing to lock out.
+    ///
+    /// # Errors
+    ///
+    /// When the TPM will not make it.
+    pub fn create_unattended(&self) -> Result<Stored, Refusal> {
+        let mut context = self.context()?;
+        let parent = parent(&mut context)?;
+        let session = salted_session(&mut context, parent)?;
+        let made = context.execute_with_session(Some(session), |context| {
+            context.create(parent, signing_template_with(true)?, None, None, None, None)
+        });
+        let _ = context.flush_context(session_handle(session));
+        let _ = context.flush_context(parent.into());
+        let made = made.map_err(|cause| format!("the TPM would not make the key: {cause}"))?;
+        Ok(Stored {
+            public: made.out_public.marshall().map_err(|cause| cause.to_string())?,
+            private: made.out_private.value().to_vec(),
+        })
+    }
+
+    /// Signs `message` with a key made by [`Self::create_unattended`].
+    ///
+    /// # Errors
+    ///
+    /// When the TPM will not load the key or sign.
+    pub fn sign_unattended(&self, stored: &Stored, message: &[u8]) -> Result<Vec<u8>, Refusal> {
+        let mut signed = self.sign_with_auth(stored, Auth::default(), &[message])?;
+        signed.pop().ok_or_else(|| "the TPM signed nothing".to_owned())
+    }
+
+    /// Seals `secret` to this TPM: a data object only it can load, opened with
+    /// no authorisation and nobody present. What the transport and attestation
+    /// keys' file key is kept under.
+    ///
+    /// # Errors
+    ///
+    /// When the TPM will not seal it.
+    pub fn seal_secret(&self, secret: &[u8]) -> Result<Stored, Refusal> {
+        let sensitive =
+            SensitiveData::try_from(secret.to_vec()).map_err(|cause| cause.to_string())?;
+        let mut context = self.context()?;
+        let parent = parent(&mut context)?;
+        let session = salted_session(&mut context, parent)?;
+        let made = context.execute_with_session(Some(session), |context| {
+            context.create(parent, sealed_template()?, None, Some(sensitive), None, None)
+        });
+        let _ = context.flush_context(session_handle(session));
+        let _ = context.flush_context(parent.into());
+        let made = made.map_err(|cause| format!("the TPM would not seal: {cause}"))?;
+        Ok(Stored {
+            public: made.out_public.marshall().map_err(|cause| cause.to_string())?,
+            private: made.out_private.value().to_vec(),
+        })
+    }
+
+    /// Opens what [`Self::seal_secret`] sealed: only this TPM can.
+    ///
+    /// # Errors
+    ///
+    /// When this TPM cannot load or unseal it.
+    pub fn unseal_secret(&self, stored: &Stored) -> Result<zeroize::Zeroizing<Vec<u8>>, Refusal> {
+        let mut context = self.context()?;
+        let parent = parent(&mut context)?;
+        let session = salted_session(&mut context, parent)?;
+        let result = load(&mut context, session, parent, stored).and_then(|item| {
+            let opened = context
+                .tr_set_auth(item.into(), Auth::default())
+                .map_err(|cause| cause.to_string())
+                .and_then(|()| {
+                    context
+                        .execute_with_session(Some(session), |context| context.unseal(item.into()))
+                        .map_err(|cause| format!("the TPM would not unseal: {cause}"))
+                });
+            let _ = context.flush_context(item.into());
+            opened
+        });
+        let _ = context.flush_context(session_handle(session));
+        let _ = context.flush_context(parent.into());
+        Ok(zeroize::Zeroizing::new(result?.value().to_vec()))
+    }
+
     /// Loads a stored key into this TPM and reads its public half back:
     /// **proof that the file is this TPM's**, since no other TPM's storage key
     /// can unwrap it. Needs no passphrase.
@@ -352,7 +455,17 @@ impl Tpm {
         authorisation: &Authorisation,
         messages: &[&[u8]],
     ) -> Result<Vec<Vec<u8>>, Refusal> {
-        let auth = authorisation.auth()?;
+        self.sign_with_auth(stored, authorisation.auth()?, messages)
+    }
+
+    /// Signs every message with a stored key, given the authorisation as the
+    /// TPM takes it.
+    fn sign_with_auth(
+        &self,
+        stored: &Stored,
+        auth: Auth,
+        messages: &[&[u8]],
+    ) -> Result<Vec<Vec<u8>>, Refusal> {
         let mut context = self.context()?;
         let parent = parent(&mut context)?;
         let session = salted_session(&mut context, parent)?;
@@ -494,13 +607,19 @@ fn storage_template() -> Result<Public, Refusal> {
 /// The signing key: P-256, ECDSA with SHA-256, used only with its
 /// authorisation, and **not** exempt from dictionary-attack protection.
 fn signing_template() -> tss_esapi::Result<Public> {
+    signing_template_with(false)
+}
+
+/// The same key, exempt from dictionary-attack protection where `no_da`: for a
+/// key with no authorisation, which has nothing to guess.
+fn signing_template_with(no_da: bool) -> tss_esapi::Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
         .with_sign_encrypt(true)
-        .with_no_da(false)
+        .with_no_da(no_da)
         .build()?;
     PublicBuilder::new()
         .with_public_algorithm(PublicAlgorithm::Ecc)
@@ -514,6 +633,25 @@ fn signing_template() -> tss_esapi::Result<Public> {
             .build()?,
         )
         .with_ecc_unique_identifier(EccPoint::default())
+        .build()
+}
+
+/// A sealed data object: bound to this TPM and its storage key, opened with no
+/// authorisation, and exempt from dictionary-attack protection, having nothing
+/// to guess.
+fn sealed_template() -> tss_esapi::Result<Public> {
+    let attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_user_with_auth(true)
+        .with_no_da(true)
+        .build()?;
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::KeyedHash)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(attributes)
+        .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+        .with_keyed_hash_unique_identifier(Digest::default())
         .build()
 }
 

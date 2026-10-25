@@ -538,7 +538,7 @@ fn the_kept_state_equals_derivation_after_every_admission() {
         &["params"],
         OperationBody::RevokeDevice { device: device_id(3), reason: "sold".to_owned() },
     );
-    // A re-add of a revoked device, which must change nothing.
+    // A re-add after the revocation: a deliberate act, which admits it again.
     history.op(
         "readd3",
         1,
@@ -560,8 +560,11 @@ fn the_kept_state_equals_derivation_after_every_admission() {
 
     let state = roster.state().expect("derives");
     assert_eq!(state.params.suffix, "altro.internal");
-    assert!(state.revoked.contains(&device_id(3)));
-    assert!(!state.devices.contains_key(&device_id(3)), "a revoked device does not come back");
+    assert!(!state.revoked.contains(&device_id(3)));
+    assert!(
+        state.devices.contains_key(&device_id(3)),
+        "an admission that follows the revocation admits the device again"
+    );
 }
 
 /// The same, where the graph is not a chain: a merge, and an operation offered

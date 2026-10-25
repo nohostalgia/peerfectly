@@ -246,19 +246,15 @@ pub struct Waiting {
 }
 
 impl Waiting {
-    /// Starts a node at the relay a person named, under this device's transport
-    /// key, open to anyone in the enrolment context.
+    /// Starts a node at an invite's relay, under the rendezvous identity the
+    /// invite's secret derives: the key the inviting admin dials, used once and
+    /// telling the relay nothing else.
     ///
     /// # Errors
     ///
-    /// When the transport key is not ed25519, the relay is not `key@host:port`,
-    /// or the node cannot start.
-    pub async fn listen(identity: &NodeIdentity, relay: &str) -> Result<Self> {
-        let key = identity.transport_key();
-        if key.algorithm() != Algorithm::Ed25519 {
-            return Err(BuildError::NotEd25519 { algorithm: key.algorithm() });
-        }
-        let own = Identity::from_ed25519_seed(key.material().expose())
+    /// When the relay is not `key@host:port`, or the node cannot start.
+    pub async fn at_rendezvous(seed: &[u8; 32], relay: &str) -> Result<Self> {
+        let own = Identity::from_ed25519_seed(seed)
             .map_err(|cause| BuildError::Start(cause.to_string()))?;
         let endpoint = Endpoint::start(own, Some(relay), Access::Everyone, true).await?;
         Ok(Self { endpoint, relay: relay.to_owned() })
@@ -270,13 +266,13 @@ impl Waiting {
         let _ = online.wait_for(|online| *online).await;
     }
 
-    /// The relay this node registered at, for the payload to carry.
+    /// The relay this node registered at.
     #[must_use]
     pub fn relay(&self) -> &str {
         &self.relay
     }
 
-    /// This device's transport key.
+    /// The key this node waits under: the rendezvous key.
     #[must_use]
     pub fn transport_key(&self) -> PublicKey {
         self.endpoint.own()
@@ -403,6 +399,19 @@ impl Admitting {
     pub async fn close(self) {
         drop(self);
     }
+}
+
+/// The key a device waiting at the rendezvous `seed` derives is reached at:
+/// what the inviting admin dials.
+///
+/// # Errors
+///
+/// When the seed makes no key.
+pub fn rendezvous_key(seed: &[u8; 32]) -> Result<PublicKey> {
+    let own =
+        Identity::from_ed25519_seed(seed).map_err(|cause| BuildError::Start(cause.to_string()))?;
+    PublicKey::new(Algorithm::Ed25519, own.address().as_bytes().to_vec())
+        .map_err(|cause| BuildError::Start(cause.to_string()))
 }
 
 /// The session's channel binding with `peer`.

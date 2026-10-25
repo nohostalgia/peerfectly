@@ -226,7 +226,7 @@ async fn another_version_is_refused_as_such() {
     let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
 
     let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
-    let open = Frame::Open { version: 99, id: 42 }.encode();
+    let open = Frame::Open { version: 99, id: 42, evidence: Vec::new() }.encode();
     raw.send_message(Address::parse(founder_key).unwrap(), open).await.unwrap();
 
     let answer = tokio::time::timeout(PATIENCE, async {
@@ -295,7 +295,9 @@ async fn an_accept_for_a_dial_given_up_on_is_closed() {
     dialling.abort();
     let _ = dialling.await;
 
-    raw.send_message(to_founder, Frame::Accept { id }.encode()).await.unwrap();
+    raw.send_message(to_founder, Frame::Accept { id, evidence: Vec::new() }.encode())
+        .await
+        .unwrap();
     assert_eq!(next_frame(&mut events).await, Some(Frame::Close { id, reason: Reason::Ordinary }));
 }
 
@@ -733,4 +735,244 @@ async fn a_session_nobody_reads_holds_back_its_peer_alone() {
         .unwrap();
     assert_eq!(received, b"from another peer".to_vec());
     flood.abort();
+}
+
+// ---------------------------------------------------------------------------
+// A node holding no roster
+// ---------------------------------------------------------------------------
+
+/// A judge believing only the network's root.
+fn believing(network: &Network) -> transport_convesso::node::Judge {
+    let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
+    Arc::new(move |shown: &roster::snapshot::RawSnapshot, _: &roster::leaf::DeviceLeaf| {
+        shown.body().root == root
+    })
+}
+
+/// The joiner as a light member, on `relay`, showing `evidence`.
+async fn light(network: &Network, evidence: Vec<u8>) -> ConvessoTransport {
+    ConvessoTransport::bind_light(
+        &network.joiner,
+        network.state.network,
+        network.state.params.clone(),
+        evidence,
+        believing(network),
+    )
+    .await
+    .unwrap()
+}
+
+/// A full member that shows its evidence, as a daemon holding a root does.
+async fn full_showing(network: &Network, who: &Arc<NodeIdentity>) -> ConvessoTransport {
+    let node = ConvessoTransport::bind(who, network.state.clone()).await.unwrap();
+    node.update_evidence(network.evidence.get(&who.device_id()).unwrap().clone());
+    node
+}
+
+#[tokio::test]
+async fn a_light_member_and_a_full_one_authenticate_each_other_both_ways() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let (dialled, accepted) = session(&joiner, &full).await;
+    assert_eq!(dialled.peer(), network.founder.device_id(), "the light one learns who it reached");
+    assert_eq!(accepted.peer(), network.joiner.device_id(), "the full one knows it by its state");
+
+    let (dialled, accepted) = session(&full, &joiner).await;
+    assert_eq!(dialled.peer(), network.joiner.device_id());
+    assert_eq!(accepted.peer(), network.founder.device_id(), "known by its evidence");
+}
+
+#[tokio::test]
+async fn a_light_member_refuses_a_proof_of_another_devices_leaf() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    // The third device shows the founder's evidence: valid, and not its own.
+    let impostor = ConvessoTransport::bind(&network.third, network.state.clone()).await.unwrap();
+    impostor.update_evidence(network.evidence.get(&network.founder.device_id()).unwrap().clone());
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(impostor.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let key = impostor.transport_key();
+    let dialled = tokio::time::timeout(PATIENCE, joiner.connect(&key)).await.unwrap();
+    assert!(
+        matches!(dialled, Err(ref error) if error.is_membership_refusal()),
+        "{:?}",
+        dialled.as_ref().err()
+    );
+
+    // And dialled by it, it refuses the same way.
+    let key = joiner.transport_key();
+    let (dialled, _) = tokio::time::timeout(PATIENCE, async {
+        tokio::join!(
+            impostor.connect(&key),
+            tokio::time::timeout(Duration::from_secs(3), joiner.accept())
+        )
+    })
+    .await
+    .unwrap();
+    assert!(dialled.is_err(), "a light member takes no session on another's proof");
+}
+
+#[tokio::test]
+async fn a_light_member_refuses_a_peer_showing_nothing() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let silent = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(silent.online(), joiner.online()) })
+        .await
+        .unwrap();
+    let key = silent.transport_key();
+    let dialled = tokio::time::timeout(PATIENCE, joiner.connect(&key)).await.unwrap();
+    assert!(dialled.is_err());
+}
+
+#[tokio::test]
+async fn a_light_member_cuts_off_a_peer_its_view_no_longer_believes() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    // A view that believes the founder until told it was invalidated.
+    let invalidated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
+    let judge: transport_convesso::node::Judge = {
+        let invalidated = Arc::clone(&invalidated);
+        Arc::new(move |shown: &roster::snapshot::RawSnapshot, leaf: &roster::leaf::DeviceLeaf| {
+            shown.body().root == root
+                && !(invalidated.load(Ordering::SeqCst) && leaf.record.name == "founder")
+        })
+    };
+    let joiner = ConvessoTransport::bind_light(
+        &network.joiner,
+        network.state.network,
+        network.state.params.clone(),
+        network.evidence.get(&network.joiner.device_id()).unwrap().clone(),
+        judge,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+    let (dialled, _accepted) = session(&joiner, &full).await;
+
+    joiner.reconsider();
+    assert!(dialled.send(b"still").await.is_ok(), "nothing changed, nothing closes");
+
+    invalidated.store(true, Ordering::SeqCst);
+    joiner.reconsider();
+    assert!(
+        matches!(dialled.send(b"gone").await, Err(Error::ClosedOnMembershipLoss)),
+        "a peer the view stopped believing is cut off"
+    );
+}
+
+#[tokio::test]
+async fn a_rotated_transport_key_ends_the_session_it_authenticated() {
+    let (_relay, network, founder, joiner) = pair().await;
+    let (dialled, _accepted) = session(&founder, &joiner).await;
+
+    // The same device, under a new transport key: the record the state holds
+    // for it no longer names the key this session authenticated.
+    let mut rotated = network.state.clone();
+    let fresh = NodeIdentity::generate().unwrap();
+    let record = rotated.devices.get_mut(&network.joiner.device_id()).unwrap();
+    for entry in &mut record.keys {
+        if entry.purpose == roster::types::KeyPurpose::Transport {
+            *entry = roster::types::KeyEntry::new(
+                Algorithm::Ed25519,
+                roster::types::KeyPurpose::Transport,
+                fresh.transport_key().public_key().as_bytes().to_vec(),
+            )
+            .unwrap();
+        }
+    }
+    founder.update_state(rotated).await;
+    assert!(
+        matches!(dialled.send(b"old key").await, Err(Error::ClosedOnMembershipLoss)),
+        "the session under the old key is closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Access groups
+// ---------------------------------------------------------------------------
+
+/// The fixture's state with the founder a controller, the other two sensors,
+/// and, where `policy` says so, sensors allowed to reach controllers only.
+fn grouped(network: &Network, policy: bool) -> roster::state::RosterState {
+    let group = |name: &str| roster::leaf::Group::new(name).unwrap();
+    let mut state = network.state.clone();
+    let in_group = |name: &str| {
+        roster::leaf::DeviceSettings::new(roster::leaf::Mode::Full, vec![group(name)], None, None)
+            .unwrap()
+    };
+    state.set_settings(network.founder.device_id(), in_group("controller"));
+    state.set_settings(network.joiner.device_id(), in_group("sensori"));
+    state.set_settings(network.third.device_id(), in_group("sensori"));
+    if policy {
+        state.params.policy =
+            vec![roster::parameters::Rule { from: group("sensori"), to: group("controller") }];
+    }
+    state
+}
+
+/// The three devices' nodes, each holding `state`.
+async fn three(
+    relay: &TestRelay,
+    network: &Network,
+    state: &roster::state::RosterState,
+) -> (ConvessoTransport, ConvessoTransport, ConvessoTransport) {
+    let _ = relay;
+    let founder = ConvessoTransport::bind(&network.founder, state.clone()).await.unwrap();
+    let joiner = ConvessoTransport::bind(&network.joiner, state.clone()).await.unwrap();
+    let third = ConvessoTransport::bind(&network.third, state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, async {
+        tokio::join!(founder.online(), joiner.online(), third.online())
+    })
+    .await
+    .unwrap();
+    (founder, joiner, third)
+}
+
+#[tokio::test]
+async fn a_sensor_may_reach_its_controller_and_nothing_else() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let state = grouped(&network, true);
+    let (controller, sensor, other) = three(&relay, &network, &state).await;
+
+    let (dialled, accepted) = session(&sensor, &controller).await;
+    assert_eq!(accepted.peer(), network.joiner.device_id(), "the controller accepts");
+    drop((dialled, accepted));
+
+    let key = other.transport_key();
+    let refused = tokio::time::timeout(PATIENCE, sensor.connect(&key)).await.unwrap();
+    assert!(matches!(refused, Err(Error::NotAllowed)), "{:?}", refused.as_ref().err());
+}
+
+#[tokio::test]
+async fn a_changed_policy_closes_what_it_no_longer_allows() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let open = grouped(&network, false);
+    let (_controller, sensor, other) = three(&relay, &network, &open).await;
+    let (_dialled, accepted) = session(&sensor, &other).await;
+
+    other.update_state(grouped(&network, true)).await;
+    assert!(
+        matches!(accepted.send(b"after").await, Err(Error::NotAllowed)),
+        "the receiver closes the session the new policy does not allow"
+    );
 }

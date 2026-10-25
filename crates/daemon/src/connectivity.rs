@@ -32,6 +32,22 @@ pub trait Connectivity: Send + Sync {
         identity: &Arc<NodeIdentity>,
         state: RosterState,
     ) -> Result<Arc<dyn Transport>>;
+
+    /// Starts a transport for a device holding no roster: a light member, which
+    /// judges every peer by the evidence it shows.
+    ///
+    /// The default starts an ordinary one over `state`, which is right for the
+    /// in-process doubles, whose peers are all in their state.
+    async fn start_light(
+        &self,
+        identity: &Arc<NodeIdentity>,
+        state: RosterState,
+        evidence: Vec<u8>,
+        judge: transport_convesso::node::Judge,
+    ) -> Result<Arc<dyn Transport>> {
+        let _ = (evidence, judge);
+        self.start(identity, state).await
+    }
 }
 
 /// One network interface this device is on, as far as discovery and IPv4
@@ -162,6 +178,29 @@ impl Connectivity for Convesso {
                 cause: cause.to_string(),
                 left: Vec::new(),
             })?;
+        Ok(Arc::new(transport))
+    }
+
+    async fn start_light(
+        &self,
+        identity: &Arc<NodeIdentity>,
+        state: RosterState,
+        evidence: Vec<u8>,
+        judge: transport_convesso::node::Judge,
+    ) -> Result<Arc<dyn Transport>> {
+        let transport = transport_convesso::ConvessoTransport::bind_light(
+            identity,
+            state.network,
+            state.params,
+            evidence,
+            judge,
+        )
+        .await
+        .map_err(|cause| crate::error::Error::BringUp {
+            step: crate::error::Step::StartingTransport,
+            cause: cause.to_string(),
+            left: Vec::new(),
+        })?;
         Ok(Arc::new(transport))
     }
 }
@@ -313,6 +352,10 @@ pub(crate) mod testing {
 
         async fn update_state(&self, state: RosterState) {
             self.inner.update_state(state).await;
+        }
+
+        fn update_evidence(&self, evidence: Vec<u8>) {
+            self.inner.update_evidence(evidence);
         }
 
         fn avoid(&self, ranges: &[transport::Range]) {

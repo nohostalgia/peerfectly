@@ -55,10 +55,21 @@ Record = {
   "net":   bstr .size 32,   ; the network id
   "seq":   uint,            ; increases with every announcement
   "addrs": [* tstr]         ; addresses, opaque to this format
+  ? "shown": bstr           ; what the device shows of its membership
 }
 ```
 
 Roster's canonical encoding, with its length-first key ordering.
+
+`shown` is the device's leaf, the proof of it and the hash of the root it is
+against (roster's `Shown`), opaque to this format, at most 1024 bytes. It lets a
+member holding no roster recognise a device it has not met: the leaf must name
+the key that signed the announcement, and the proof must hold against a root
+the hearer remembers. It is **left out** when there is nothing to show — never
+written empty — so a record without it encodes exactly as records did before it
+existed. A sender includes it only where the sealed packet still fits: addresses
+give way first, then it. A proof grows with the network, so in a network of some
+tens of thousands it no longer fits beside even one address, and is left out.
 
 ### Bounds
 

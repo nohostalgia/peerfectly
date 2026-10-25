@@ -302,9 +302,15 @@ These are documented publicly rather than left for a researcher to find.
   - **Linux:** in the TPM behind a passphrase where there is one; otherwise a file sealed with a
     passphrase.
   - **A machine that can't protect a signing key is a member, not an admin, and says so.**
-- **The transport key is a software secret,** sealed to the machine and kept where only the system
-  and administrators can read it. A process running as a person can't read it; one running as an
-  administrator can. That is declared, not solved.
+- **The transport key is a software secret,** because sessions are Noise over Curve25519, which no
+  TPM computes. It is in memory while the daemon runs. On disk it is sealed to the TPM where there is
+  one, so a copied disk is not the key; elsewhere to the machine, behind an access control. A process
+  running as the daemon can use it; that is declared, not solved.
+- **What a network's folder says is believed only through a checkpoint this machine signed,** with a
+  key that lives in the TPM (Windows, Linux) or the hardware keystore (Android), needs nobody, and
+  signs nothing a network sees. A roster swapped for another network's, a folder dropped in, a light
+  member's state edited, freshness times moved, an invite planted: each leaves the network down and
+  reported, and nothing is removed. Nothing is trusted for being there, not even on a first start.
 - Causal order does not depend on clocks.
 - No operation can be replayed: its id is the hash of its content, and its parents fix its place.
 
@@ -313,7 +319,11 @@ These are documented publicly rather than left for a researcher to find.
 | Limit | Mitigation |
 |---|---|
 | **Equivocation:** a compromised admin can show different branches to different nodes | **Detection.** Every node tracks the last head seen from each author and compares at every meeting. Incompatible heads from one author raise a strong alarm. It doesn't prevent it, it makes it visible |
-| **Revocation window:** an isolated node accepts a revoked key until its roster stops being fresh | Bounded by `snapshot_window` (7 days by default). Past it, a node carries no traffic to or from non-admins, and keeps syncing to catch up |
+| **Revocation window:** an isolated node accepts a revoked key until it hears of the revocation | None by default: an island keeps working. A network may set a freshness window when it is founded; past it, a node carries no traffic to or from non-admins, and keeps syncing to catch up |
+| **Someone holding a disk, on a machine without a TPM**, can read the transport key and the software machine key, and forge a checkpoint for what they plant | Disk encryption. With a TPM, the keys open only on that TPM and a checkpoint cannot be forged off it |
+| **A genuine older copy of a network's folder** can be put back, moving that network back to an earlier state of its own | Never to another network. Peers bring it forward at the next sync; only an isolated device stays behind, as in the revocation window |
+| **A cleared TPM or replaced hardware** loses every network on the machine | Said, never papered over with a fresh key: each network is joined again, under fresh keys. A network's only admin loses its network, as it would with its signing key |
+| **Someone running as the daemon** (SYSTEM, root) can use every key the daemon can | none: no design stops the code that holds the keys |
 | **Any admin can expel the others** | open: whether the founder should be irremovable |
 | **A person doesn't check the fingerprint when pairing** | pairing in both directions, with a short code derived from both keys shown on both screens (as Signal and Bluetooth do) |
 | **No access list per peer:** every member reaches every exposed service | known, not yet built. Nothing is open until the person opens it: `expose` opens a port to **one** network, through its interface only. What is exposed to a network is reachable by all its members. On Windows, `expose` *opens*, it does not close: a program Windows' own prompt allowed stays reachable from the LAN regardless |

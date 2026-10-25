@@ -2,7 +2,7 @@
 //!
 //! Enrolment is the moment a person is most likely to be attacked and least
 //! likely to be reading carefully. A single "enrolment failed" would leave them
-//! unable to tell a mistyped code from a substituted payload, so every refusal
+//! unable to tell a mistyped code from a substituted invite, so every refusal
 //! here names what was wrong and what a person should do about it.
 
 use core::fmt;
@@ -14,9 +14,9 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// The bytes are not a payload this version can read.
+    /// The bytes are not an invite or a message this version can read.
     ///
-    /// Never repaired. A payload that does not decode exactly is refused, so a
+    /// Never repaired. Bytes that do not decode exactly are refused, so a
     /// person retypes it rather than enrolling on a guess.
     Malformed(&'static str),
 
@@ -33,10 +33,11 @@ pub enum Error {
     /// A field that must not be empty was.
     Empty(&'static str),
 
-    /// The joining device did not prove it holds the signing key it presented.
+    /// The joining device did not prove it holds a key it presented.
     ///
-    /// The channel proves the transport key; this is the other half. A payload
-    /// pairing one device's signing key with another's transport key fails here,
+    /// The channel of an invite proves neither of the device's keys. An
+    /// introduction pairing one device's signing key with another's transport
+    /// key fails here,
     /// which matters because a device's identity comes from its signing key and
     /// a roster keeps the first admission of a device id for ever.
     PossessionUnproved,
@@ -76,14 +77,14 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Malformed(what) => {
-                write!(f, "this is not a joining payload: {what}. Copy it again, whole")
+                write!(f, "this is not something this build reads: {what}. Copy it again, whole")
             }
             Self::TooLong { field, len, limit } => {
                 write!(f, "the {field} is {len} bytes, and at most {limit} are allowed")
             }
             Self::Empty(field) => write!(f, "the {field} is empty, and must not be"),
             Self::PossessionUnproved => f.write_str(
-                "the device did not prove it holds the signing key it presented, so the payload \
+                "the device did not prove it holds the keys it presented, so what it presented \
                  did not come from the device that answered — do not admit it",
             ),
             Self::CodeMismatch => f.write_str(

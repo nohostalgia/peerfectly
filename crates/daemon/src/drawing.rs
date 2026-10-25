@@ -436,9 +436,9 @@ mod tests {
     #[test]
     fn a_word_longer_than_the_line_is_not_broken() {
         let long =
-            "peerfectly-join-v1:aGVsbG8gdGhlcmUgdGhpcyBpcyBhIHZlcnkgbG9uZyBwYXlsb2FkIGluZGVlZA";
+            "peerfectly-invite-v1:aGVsbG8gdGhlcmUgdGhpcyBpcyBhIHZlcnkgbG9uZyBwYXlsb2FkIGluZGVlZA";
         let mut block = Block::headed("casa");
-        block.line("payload", long);
+        block.line("invite", long);
 
         let drawn = lines(&block);
         assert_eq!(drawn.len(), 2, "one line, however long: {drawn:?}");

@@ -131,6 +131,35 @@ pub fn authorize(state: &RosterState, key: &KeyId) -> Result<DeviceId> {
     Ok(record.id)
 }
 
+/// Resolves a peer that holds no roster here to judge by: from the evidence it
+/// showed — its leaf, the proof of it and the root — for a key whose
+/// possession the connection's handshake already established.
+///
+/// The leaf must name `key` for the transport purpose, and the proof must lead
+/// to the root: a valid proof of another device's leaf shows nothing about
+/// this peer. Whether the root is one to believe, and the leaf still the
+/// device's word under it, is `accept`'s to say, against what the caller
+/// holds: a root it does not believe, or a leaf a later root changed or
+/// revoked, is not evidence.
+///
+/// # Errors
+///
+/// [`Error::NotAMember`] for evidence that does not read, does not prove, is
+/// another device's, or that `accept` refuses.
+pub fn authenticate_by_evidence(
+    evidence: &[u8],
+    key: &KeyId,
+    accept: &dyn Fn(&roster::snapshot::RawSnapshot, &roster::leaf::DeviceLeaf) -> bool,
+) -> Result<DeviceId> {
+    let evidence =
+        roster::membership::Evidence::from_bytes(evidence).map_err(|_| Error::NotAMember)?;
+    let (device, root) = evidence.shows(key).map_err(|_| Error::NotAMember)?;
+    if !accept(&root, &evidence.leaf) {
+        return Err(Error::NotAMember);
+    }
+    Ok(device)
+}
+
 /// Whether a device is still a member of the network the state describes.
 ///
 /// Asked of state each time rather than remembered. A transport that cached the

@@ -17,7 +17,7 @@ use roster::snapshot::{
     RawSnapshot, SNAPSHOT_DOMAIN_TAG, Snapshot, assemble_snapshot, sign_snapshot,
     snapshot_signing_input,
 };
-use roster::state::{RosterState, derive};
+use roster::state::derive;
 use roster::types::{Algorithm, OperationBody, OperationCore, Role};
 use support::{History, SharedClock, device, device_id, params, signer};
 
@@ -61,7 +61,7 @@ fn a_snapshot_round_trips_through_its_encoding() {
     let bytes = history.snapshot_at(1, 1, &["n2"]);
     let raw = RawSnapshot::decode(&bytes).expect("decodes");
 
-    assert_eq!(raw.body().seq, 1);
+    assert_eq!(raw.body().generation, 1);
     assert_eq!(raw.body().heads, vec![history.id("n2")]);
     assert_eq!(raw.body().network, history.network());
     assert_eq!(raw.to_bytes(), bytes, "re-encoding reproduces the received bytes");
@@ -258,7 +258,7 @@ fn a_snapshot_disagreeing_with_local_derivation_is_refused() {
             &["g"],
             OperationBody::AddDevice(device(9, "ghost", Role::Admin, false)),
         );
-        derive(&fabricated.dag()).expect("derives").to_bytes()
+        derive(&fabricated.dag()).expect("derives").root()
     };
     let bytes = history.snapshot_with_state(1, 1, &["n2"], Some(liar));
 
@@ -304,20 +304,21 @@ fn a_partially_covered_node_does_not_count_as_verified() {
 }
 
 // ---------------------------------------------------------------------------
-// Sequence rules
+// The heavier root
 // ---------------------------------------------------------------------------
 
+/// An older root is valid, and lighter: it is not adopted, and not an error.
 #[test]
-fn an_older_sequence_is_refused() {
+fn an_older_root_is_lighter_and_not_adopted() {
     let history = linear(4);
     let mut roster = Roster::new();
     load(&mut roster, &history);
 
     assert!(roster.offer_snapshot(&history.snapshot_at(7, 1, &["n3"])).is_accepted());
     let outcome = roster.offer_snapshot(&history.snapshot_at(4, 1, &["n2"]));
-    assert_eq!(outcome.refusal(), Some(&Error::SnapshotSequenceRegressed));
-    assert_eq!(roster.highest_sequence(), Some(7), "the accepted snapshot stands");
-    assert_eq!(roster.snapshot().map(|s| s.body().seq), Some(7));
+    assert_eq!(outcome, SnapshotAdmission::Lighter { seq: 4 });
+    assert_eq!(outcome.refusal(), None, "a lighter root is no fault of whoever sent it");
+    assert_eq!(roster.highest_sequence(), Some(7), "the held root stands");
 }
 
 #[test]
@@ -329,66 +330,42 @@ fn re_offering_the_same_snapshot_is_idempotent() {
     let bytes = history.snapshot_at(1, 1, &["n2"]);
     assert!(roster.offer_snapshot(&bytes).is_accepted());
     assert_eq!(roster.offer_snapshot(&bytes), SnapshotAdmission::AlreadyHeld { seq: 1 });
-    assert!(roster.conflicting_sequences().is_empty(), "not a conflict");
 }
 
-/// Two claims at one number: refuse both rather than choose between two things
-/// one of which may be a forgery.
+/// Two valid roots at one generation are siblings, not a conflict: every node
+/// holds the heavier, whichever arrived first.
 #[test]
-fn two_conflicting_snapshots_at_one_sequence_are_both_refused() {
+fn of_two_siblings_the_heavier_is_held_in_either_order() {
     let history = linear(4);
-    let mut roster = Roster::new();
-    load(&mut roster, &history);
-
     let first = history.snapshot_at(5, 1, &["n2"]);
     let second = history.snapshot_at(5, 1, &["n3"]);
     assert_ne!(first, second);
 
-    assert!(roster.offer_snapshot(&first).is_accepted());
-    let outcome = roster.offer_snapshot(&second);
-    assert_eq!(outcome.refusal(), Some(&Error::SnapshotSequenceConflict));
-
-    assert!(roster.snapshot().is_none(), "neither is retained");
-    assert_eq!(roster.conflicting_sequences(), &[5]);
-
-    // And the number stays closed.
-    assert_eq!(roster.offer_snapshot(&first).refusal(), Some(&Error::SnapshotSequenceConflict));
-}
-
-#[test]
-fn the_conflict_verdict_does_not_depend_on_arrival_order() {
-    let history = linear(4);
-    let first = history.snapshot_at(5, 1, &["n2"]);
-    let second = history.snapshot_at(5, 1, &["n3"]);
-
     let mut forward = Roster::new();
     load(&mut forward, &history);
-    forward.offer_snapshot(&first);
-    forward.offer_snapshot(&second);
+    assert!(forward.offer_snapshot(&first).is_accepted());
+    let _ = forward.offer_snapshot(&second);
 
     let mut backward = Roster::new();
     load(&mut backward, &history);
-    backward.offer_snapshot(&second);
-    backward.offer_snapshot(&first);
+    assert!(backward.offer_snapshot(&second).is_accepted());
+    let _ = backward.offer_snapshot(&first);
 
-    assert!(forward.snapshot().is_none());
-    assert!(backward.snapshot().is_none());
-    assert_eq!(forward.conflicting_sequences(), backward.conflicting_sequences());
+    let held = |roster: &Roster| roster.snapshot().map(|held| held.body().root);
+    assert!(held(&forward).is_some(), "a sibling never empties what is held");
+    assert_eq!(held(&forward), held(&backward), "both hold the same one");
 }
 
 #[test]
-fn a_higher_sequence_restores_progress_after_a_conflict() {
+fn a_heavier_root_replaces_the_one_held() {
     let history = linear(5);
     let mut roster = Roster::new();
     load(&mut roster, &history);
 
-    roster.offer_snapshot(&history.snapshot_at(5, 1, &["n2"]));
-    roster.offer_snapshot(&history.snapshot_at(5, 1, &["n3"]));
-    assert!(roster.snapshot().is_none());
-
-    let recovery = history.snapshot_at(6, 1, &["n4"]);
-    assert!(roster.offer_snapshot(&recovery).is_accepted(), "the network is not wedged");
-    assert_eq!(roster.snapshot().map(|s| s.body().seq), Some(6));
+    assert!(roster.offer_snapshot(&history.snapshot_at(5, 1, &["n2"])).is_accepted());
+    let later = history.snapshot_at(6, 1, &["n4"]);
+    assert!(roster.offer_snapshot(&later).is_accepted());
+    assert_eq!(roster.snapshot().map(|s| s.body().generation), Some(6));
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +505,52 @@ fn a_compacted_node_derives_the_same_roster() {
         whole.state().expect("derives").to_bytes(),
         "compaction must not be observable in derived state"
     );
+    assert_eq!(
+        compacted.state().expect("derives").root(),
+        whole.state().expect("derives").root(),
+        "nor in the root committing to it"
+    );
+}
+
+/// The root is a function of the state, not of the order operations arrived in.
+#[test]
+fn admissions_arriving_in_any_order_give_one_root() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let mut previous = "g".to_owned();
+    for index in 2..12_u8 {
+        let label = format!("add{index}");
+        history.op(
+            &label,
+            1,
+            &[previous.as_str()],
+            OperationBody::AddDevice(device(index, &format!("d{index}"), Role::Member, false)),
+        );
+        previous = label;
+    }
+    let mut forward = Roster::with_staleness_depth(2);
+    load(&mut forward, &history);
+    // Last first: each waits for its parent, and all land once the first does.
+    let mut backward = Roster::with_staleness_depth(2);
+    for entry in history.entries().iter().rev() {
+        let _ = backward.offer_bytes(&entry.bytes);
+    }
+    let forward = forward.state().expect("derives");
+    let backward = backward.state().expect("derives");
+    assert_eq!(forward.devices.len(), 11);
+    assert_eq!(forward.root(), backward.root());
+    for device in forward.devices.keys() {
+        let leaf = forward.leaf(device).expect("member");
+        let proof = forward.devices_tree().prove(&roster::leaf::DeviceLeaf::position(device));
+        assert!(
+            proof.expect("proves").verifies(
+                &forward.devices_tree().root(),
+                &roster::leaf::DeviceLeaf::position(device),
+                &leaf.value_hash()
+            ),
+            "every member proves against the devices tree"
+        );
+    }
 }
 
 #[test]
@@ -604,11 +627,12 @@ fn a_snapshot_seeded_graph_derives_the_snapshot_state() {
     let raw = RawSnapshot::decode(&bytes).expect("decodes");
     let signed = raw.verify(&signer(1).public_key()).expect("verifies");
 
-    let seeded = Dag::from_snapshot(signed, history.head_operations(&["n3"]))
+    let state = derive(&history.covered_dag(&["n3"])).expect("derives");
+    let seeded = Dag::from_snapshot(signed, state.clone(), history.head_operations(&["n3"]))
         .expect("seeds from the snapshot");
     let derived = derive(&seeded).expect("derives");
-    let expected = RosterState::from_bytes(&raw.body().state).expect("state decodes");
-    assert_eq!(derived.to_bytes(), expected.to_bytes());
+    assert_eq!(derived.to_bytes(), state.to_bytes());
+    assert_eq!(derived.root(), raw.body().root, "and it is the state the snapshot signs");
 }
 
 // ---------------------------------------------------------------------------
@@ -994,14 +1018,20 @@ fn a_backwards_clock_jump_is_reported() {
 
 #[test]
 fn a_snapshot_with_no_heads_is_rejected() {
+    let history = linear(1);
+    let state = derive(&history.dag()).expect("derives");
+    let device = state.device_holding(&signer(1).key_id()).expect("the founder");
     assert!(
         Snapshot::new(
             1,
             vec![],
+            state.root(),
+            roster::snapshot::Covering { heads: vec![], depths: vec![] },
             vec![],
-            vec![],
+            state.leaf(&device).expect("a member"),
+            roster::membership::MembershipProof::of(&state, &device).expect("proves"),
             signer(1).key_id(),
-            roster::id::NetworkId::from_bytes([1; 32]),
+            history.network(),
         )
         .is_err()
     );
@@ -1020,13 +1050,22 @@ fn an_oversized_snapshot_is_refused_on_sight() {
 fn signing_a_snapshot_works_under_both_algorithms() {
     let history = linear(2);
     let covered = history.covered_dag(&["n1"]);
-    let state = derive(&covered).expect("derives").to_bytes();
+    let state = derive(&covered).expect("derives");
     let index = covered.position(&history.id("n1")).expect("held");
+    let covering = || roster::snapshot::Covering {
+        heads: vec![history.id("n1")],
+        depths: vec![covered.depth(index)],
+    };
+    let device = state.device_holding(&signer(1).key_id()).expect("the founder");
+    let proof = roster::membership::MembershipProof::of(&state, &device).expect("proves");
     let ed_body = Snapshot::new(
         1,
-        state.clone(),
-        vec![history.id("n1")],
-        vec![covered.depth(index)],
+        vec![],
+        state.root(),
+        covering(),
+        vec![],
+        state.leaf(&device).expect("a member"),
+        proof.clone(),
         signer(1).key_id(),
         history.network(),
     )
@@ -1034,12 +1073,38 @@ fn signing_a_snapshot_works_under_both_algorithms() {
     let ed = sign_snapshot(&ed_body, &signer(1)).expect("signs");
     assert!(RawSnapshot::decode(&ed).expect("decodes").verify(&signer(1).public_key()).is_ok());
 
+    // A device whose signing key is P-256, as a phone's keystore makes one.
     let p256 = roster::sign::P256Signer::from_scalar([0x22; 32]).expect("in range");
+    let mut keys = vec![
+        roster::types::KeyEntry::new(
+            roster::types::Algorithm::P256,
+            roster::types::KeyPurpose::Signing,
+            p256.public_key().as_bytes().to_vec(),
+        )
+        .expect("a key"),
+        roster::types::KeyEntry::new(
+            roster::types::Algorithm::Ed25519,
+            roster::types::KeyPurpose::Attestation,
+            signer(77).public_key().as_bytes().to_vec(),
+        )
+        .expect("a key"),
+    ];
+    keys.sort_by_key(roster::types::KeyEntry::order_key);
+    let phone = roster::types::DeviceSpec::new(keys, "phone", Role::Admin, false, vec![])
+        .expect("a device")
+        .into_record(history.id("n1"))
+        .expect("a record");
     let p256_body = Snapshot::new(
         1,
-        state,
-        vec![history.id("n1")],
-        vec![covered.depth(index)],
+        vec![],
+        state.root(),
+        covering(),
+        vec![],
+        roster::leaf::DeviceLeaf {
+            record: phone,
+            settings: roster::leaf::DeviceSettings::default(),
+        },
+        proof,
         p256.key_id(),
         history.network(),
     )
@@ -1396,4 +1461,228 @@ fn a_sole_admin_is_kept_fresh_by_its_own_attestation() {
         elapsed += DAY / 2;
     }
     assert_eq!(roster.freshness(), Freshness::Fresh);
+}
+
+// ---------------------------------------------------------------------------
+// Roots
+// ---------------------------------------------------------------------------
+
+/// A root that follows another names it, and proves its signer against it.
+#[test]
+fn a_root_follows_the_one_before_and_proves_its_signer_there() {
+    let history = linear(6);
+    let before_dag = history.covered_dag(&["n2"]);
+    let before_state = derive(&before_dag).expect("derives");
+    let covering = |dag: &Dag, label: &str| roster::snapshot::Covering {
+        heads: vec![history.id(label)],
+        depths: vec![dag.depth(dag.position(&history.id(label)).expect("held"))],
+    };
+    let first =
+        Snapshot::over(&before_state, covering(&before_dag, "n2"), signer(1).key_id(), None)
+            .expect("the founder signs the first root");
+    assert_eq!(first.generation, 1);
+    assert!(first.previous.is_empty());
+    assert!(first.signer_proved(&first.proved_against()), "proved against itself");
+
+    let after_dag = history.covered_dag(&["n5"]);
+    let after_state = derive(&after_dag).expect("derives");
+    let second = Snapshot::over(
+        &after_state,
+        covering(&after_dag, "n5"),
+        signer(1).key_id(),
+        Some((&first, &before_state)),
+    )
+    .expect("follows the first");
+    assert_eq!(second.generation, 2);
+    assert_eq!(second.previous, vec![first.root]);
+    assert_eq!(second.root, after_state.root());
+    assert!(second.signer_proved(&first.root), "the signer is proved in the root it follows");
+
+    let decoded = Snapshot::decode(&second.encode()).expect("round-trips");
+    assert_eq!(decoded, second);
+}
+
+/// A first root names nothing before it, and a later one names something.
+#[test]
+fn a_generation_inconsistent_with_what_it_follows_is_refused() {
+    let history = linear(2);
+    let state = derive(&history.dag()).expect("derives");
+    let device = state.device_holding(&signer(1).key_id()).expect("the founder");
+    let build = |generation: u64, previous: Vec<[u8; 32]>| {
+        Snapshot::new(
+            generation,
+            previous,
+            state.root(),
+            roster::snapshot::Covering { heads: vec![history.id("n1")], depths: vec![2] },
+            vec![],
+            state.leaf(&device).expect("a member"),
+            roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            signer(1).key_id(),
+            history.network(),
+        )
+    };
+    assert!(build(1, vec![]).is_ok());
+    assert!(build(2, vec![]).is_err(), "a later root follows something");
+    assert!(build(1, vec![[7; 32]]).is_err(), "a first root follows nothing");
+    assert!(build(0, vec![]).is_err());
+    assert_eq!(
+        build(2, vec![[9; 32], [7; 32]]).map(|_| ()),
+        Err(Error::NonCanonical),
+        "the roots it follows are sorted"
+    );
+}
+
+/// A body whose keys are out of canonical order is refused.
+#[test]
+fn a_non_canonical_root_is_refused() {
+    let history = linear(2);
+    let bytes = history.snapshot_at(1, 1, &["n1"]);
+    let raw = RawSnapshot::decode(&bytes).expect("decodes");
+    let body = raw.body_bytes().to_vec();
+    // Swap the first key, `root`, for a longer one in its place: the map is
+    // then no longer in length-first order.
+    let mut tampered = body.clone();
+    let at = tampered.windows(4).position(|window| window == b"root").expect("a root key");
+    tampered
+        .splice(at.saturating_sub(1)..at.saturating_add(4), [0x65, b'r', b'o', b'o', b't', b's']);
+    assert!(Snapshot::decode(&tampered).is_err());
+}
+
+/// An attestation's sequence must advance: an older one is a regression.
+#[test]
+fn an_older_attestation_is_refused_as_a_regression() {
+    let history = linear(4);
+    let mut roster = Roster::new();
+    load(&mut roster, &history);
+    assert!(matches!(
+        roster.offer_attestation(&history.attestation_at(5, 1, &["n3"])),
+        AttestationAdmission::Accepted { .. }
+    ));
+    assert_eq!(
+        roster.offer_attestation(&history.attestation_at(4, 1, &["n3"])),
+        AttestationAdmission::Refused { reason: Error::SnapshotSequenceRegressed }
+    );
+}
+
+/// A network long past its ceiling, compacting as it goes: the graph stays the
+/// size of the window, every root is still verified after each compaction, and
+/// the state is the one a node holding everything derives.
+#[test]
+fn compaction_as_roots_arrive_keeps_the_graph_to_the_window() {
+    compacting_chain(300);
+}
+
+/// The same, ten thousand operations long: well past the ceiling a graph that
+/// never compacted would reach.
+#[test]
+#[ignore = "long: ten thousand operations, run deliberately"]
+fn ten_thousand_operations_pass_without_reaching_the_ceiling() {
+    compacting_chain(10_000);
+}
+
+/// A chain of `acts` renames, a root after each and a compaction after each
+/// root.
+fn compacting_chain(acts: usize) {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op(
+        "add2",
+        1,
+        &["g"],
+        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+    );
+    let mut compacted = Roster::with_staleness_depth(8);
+    for entry in history.entries() {
+        assert!(compacted.offer_bytes(&entry.bytes).is_accepted());
+    }
+    let mut parent = "add2".to_owned();
+    let mut most_held = 0;
+    for step in 0..acts {
+        let label = format!("r{step}");
+        history.op(
+            &label,
+            1,
+            &[parent.as_str()],
+            OperationBody::Rename { device: device_id(2), name: format!("n{step}") },
+        );
+        assert!(compacted.offer_bytes(&history.bytes(&label)).is_accepted(), "{label}");
+        parent = label;
+
+        // The root over what is held now, following the one held.
+        let state = compacted.state().expect("derives");
+        let heads = compacted.heads();
+        let depths = heads
+            .iter()
+            .map(|head| compacted.dag().depth(compacted.dag().position(head).expect("held")))
+            .collect();
+        let previous = compacted.snapshot().map(|held| held.body().clone());
+        let previous_state = compacted.snapshot_state().cloned();
+        let body = Snapshot::over(
+            &state,
+            roster::snapshot::Covering { heads, depths },
+            signer(1).key_id(),
+            previous.as_ref().zip(previous_state.as_ref()),
+        )
+        .expect("a root");
+        let bytes = sign_snapshot(&body, &signer(1)).expect("signs");
+        assert!(compacted.offer_snapshot(&bytes).is_accepted(), "root {step} is verified");
+        let _ = compacted.compact();
+        most_held = most_held.max(compacted.dag().len());
+    }
+
+    assert!(most_held < 64, "the graph held at most {most_held} operations");
+    let kept = compacted.state().expect("derives");
+    assert_eq!(
+        kept.devices.get(&device_id(2)).map(|record| record.name.clone()),
+        Some(format!("n{}", acts.saturating_sub(1))),
+        "the last rename stands"
+    );
+    // A node holding everything can be compared with only below the ceiling:
+    // past it, such a node could not hold the history at all.
+    if acts < roster::limits::MAX_NON_REVOCATION_OPERATIONS.saturating_sub(4) {
+        let whole = derive(&history.dag()).expect("derives");
+        assert_eq!(kept.to_bytes(), whole.to_bytes(), "the state a node holding everything has");
+        assert_eq!(kept.root(), whole.root());
+    }
+}
+
+// ---- No window ----------------------------------------------------------------
+
+/// A network founded with no freshness window: nothing for it to grow stale
+/// against.
+fn windowless() -> History {
+    let mut history = History::new();
+    history.genesis_with(
+        "g",
+        1,
+        device(1, "phone", Role::Admin, true),
+        roster::types::NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0)
+            .expect("well-formed"),
+    );
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history
+}
+
+/// An island with no window keeps working: a year without a single
+/// attestation, and the roster is not stale.
+#[test]
+fn a_network_with_no_window_is_fresh_after_a_year_without_attestations() {
+    let history = windowless();
+    let (mut roster, clock) = on_clock(&history, 64);
+    assert_eq!(roster.freshness(), Freshness::Fresh);
+    clock.advance(365 * DAY);
+    assert_eq!(roster.freshness(), Freshness::Fresh, "nothing to be cautious about");
+}
+
+/// No window has one spelling: no key and no leaf. The parameters read back as
+/// they were written, whichever way they travel.
+#[test]
+fn no_window_is_the_key_and_the_leaf_left_out() {
+    let params =
+        roster::types::NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0)
+            .expect("well-formed");
+    assert!(params.leaves().iter().all(|leaf| leaf.name() != "window"));
+    let back = roster::types::NetworkParams::from_leaves(params.leaves()).expect("reads back");
+    assert_eq!(back, params);
+    assert_eq!(back.snapshot_window, 0);
 }

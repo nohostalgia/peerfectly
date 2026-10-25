@@ -36,6 +36,8 @@ pub struct Founding {
     /// The IPv4 range the network's devices derive their addresses in, if one
     /// other than the default was chosen.
     pub ipv4_range: Option<roster::types::Ipv4Range>,
+    /// The freshness window, in seconds, or `None` for none — the default.
+    pub window: Option<u64>,
 }
 
 /// Reads the IPv4 range a person asked a founding for.
@@ -235,18 +237,8 @@ fn first_snapshot(
         let _dated = crate::state::write_attestation(paths, &dated, crate::state::wall_seconds());
     }
 
-    // The snapshot needs the signing key, which may be behind a person or out of
-    // reach entirely. When it is out of reach the request goes back to the caller,
-    // who asks: a network with no snapshot has nothing for freshness to be
-    // measured from, so it is worth a second prompt rather than a gap.
-    if !identity.signing_key().answers_here() {
-        let body = crate::snapshots::body_over_heads(&roster, identity).ok()?;
-        return Some(identity::detached::prepare_snapshot(
-            &body,
-            &identity.signing_key().public_key(),
-        ));
-    }
-
+    // The first root is signed with the attestation key, which asks nobody, so
+    // a founding never asks twice whatever holds the signing key.
     let bytes = crate::snapshots::sign_over_heads(&roster, identity).ok()?;
     // Offered to a roster of its own before it is kept, so that what is written
     // is a snapshot this build can verify rather than one it merely produced.
@@ -254,51 +246,6 @@ fn first_snapshot(
         let _kept = crate::state::write_snapshot(paths, &bytes, crate::state::wall_seconds());
     }
     None
-}
-
-/// The body of a network's first snapshot, prepared **before** its genesis is
-/// signed.
-///
-/// Where the signing key is somewhere this process cannot reach, founding is one
-/// batch — the genesis and this — shown to a person together and signed at once.
-/// The genesis has no signature yet, so the snapshot is built over a preview of
-/// it; the body is exactly what [`first_snapshot`] would build over a roster
-/// holding the signed genesis, and the roster that is later offered it checks
-/// that by deriving it again.
-///
-/// `None` only where no body can be built, which leaves a founding with no
-/// snapshot — the state a declined second prompt used to leave, and one an
-/// admin's next act repairs.
-#[must_use]
-pub fn first_snapshot_body(
-    genesis: &OperationCore,
-    identity: &NodeIdentity,
-) -> Option<roster::snapshot::Snapshot> {
-    let nothing_yet = roster::roster::Roster::new();
-    crate::snapshots::after(
-        &nothing_yet,
-        core::slice::from_ref(genesis),
-        identity,
-        crate::state::wall_seconds(),
-    )
-    .ok()
-    .flatten()
-}
-
-/// Keeps a first snapshot that was signed somewhere this process could not sign.
-///
-/// Offered to a roster of its own before it is kept, exactly as one signed here
-/// is: what is written must be a snapshot this build can verify rather than one
-/// it merely received.
-pub fn keep_first_snapshot(paths: &Paths, genesis: &[u8], snapshot: &[u8]) -> bool {
-    let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
-    if !roster.offer_bytes(genesis).is_accepted() {
-        return false;
-    }
-    if !roster.offer_snapshot(snapshot).is_accepted() {
-        return false;
-    }
-    crate::state::write_snapshot(paths, snapshot, crate::state::wall_seconds()).is_ok()
 }
 
 /// The parameters a founding carries, checked by the roster's own rules.
@@ -315,11 +262,9 @@ fn parameters(identity: &NodeIdentity, wanted: &Founding) -> Result<NetworkParam
         derived_prefix(identity),
         wanted.relay.clone(),
         wanted.suffix.clone(),
-        // Seven days: the roster's own starting point for how long an
-        // attestation stands. Not a founding decision worth asking a person
-        // about yet, and named there rather than written here so the reason it
-        // is no longer thirty sits with the number.
-        roster::limits::DEFAULT_SNAPSHOT_WINDOW,
+        // None unless asked for: an island with an admin of its own keeps
+        // working for as long as it is cut off. Zero is how none is written.
+        wanted.window.unwrap_or(0),
     )
     .map_err(|cause| cause.to_string())?;
 
@@ -396,6 +341,7 @@ mod tests {
             suffix: "peerfectly.internal".to_owned(),
             relay: Some("https://relay.example:443".to_owned()),
             ipv4_range: None,
+            window: None,
         }
     }
 
@@ -425,6 +371,16 @@ mod tests {
         assert_eq!(state.params.relay.as_deref(), Some("https://relay.example:443"));
     }
 
+    /// A founding that asks for nothing sets no window: an island with an admin
+    /// of its own keeps working for as long as it is cut off.
+    #[test]
+    fn a_default_founding_sets_no_window() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let paths = Paths::under(scratch.path());
+        found(&paths, &wanted()).expect("founds");
+        assert_eq!(state_at(&paths).params.snapshot_window, 0);
+    }
+
     /// A network with no snapshot has nothing for freshness to measure from, so
     /// its own founder would begin unable to confirm the roster it just made.
     #[test]
@@ -432,7 +388,10 @@ mod tests {
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let paths = Paths::under(scratch.path());
 
-        found(&paths, &wanted()).expect("founds");
+        // A network that asked for a window: one with none is never stale.
+        let windowed =
+            Founding { window: Some(roster::limits::DEFAULT_SNAPSHOT_WINDOW), ..wanted() };
+        found(&paths, &windowed).expect("founds");
 
         let (bytes, at) = crate::state::read_snapshot(&paths).expect("a snapshot was kept");
         assert!(at > 0, "dated on this device's wall clock, not left at the epoch");

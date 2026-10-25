@@ -245,7 +245,27 @@ fn outcomes() -> Vec<Outcome> {
         // The joining side's answer, which carries nothing at all: a client it
         // reached cannot show a person the digits they must read elsewhere.
         Outcome::Enrolling,
-        Outcome::Joining { payload: "peerfectly-join:abc".to_owned(), scannable: "▀▄".to_owned() },
+        Outcome::Joining,
+        // An invite issued, which the daemon goes on dialling once the command
+        // that issued it has closed.
+        Outcome::Invited {
+            invite: "peerfectly-invite-v1:abc".to_owned(),
+            scannable: "▀▄".to_owned(),
+            name: "sensor".to_owned(),
+            expires_at: 1_758_300_000,
+        },
+        Outcome::InvitesHeld(vec![
+            daemon::control::InviteLine {
+                name: "sensor".to_owned(),
+                standing: "open".to_owned(),
+                expires_at: 1_758_300_000,
+            },
+            daemon::control::InviteLine {
+                name: "laptop".to_owned(),
+                standing: "used".to_owned(),
+                expires_at: 1_758_200_000,
+            },
+        ]),
         Outcome::Adopted {
             suffix: "studio.internal".to_owned(),
             devices: 3,

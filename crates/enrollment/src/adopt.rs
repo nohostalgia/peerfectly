@@ -28,6 +28,19 @@ use crate::error::{Error, Result};
 pub struct Adopted {
     /// The state derived from what was delivered.
     pub state: RosterState,
+    /// The root and state the delivered roster rests on, where the admitting
+    /// side had compacted: what the joining device keeps as its own base.
+    pub base: Option<(roster::snapshot::SignedSnapshot, RosterState)>,
+}
+
+/// The base a delivered network rests on, where the admitting side's roster
+/// was compacted: the signed root, and the state it commits to.
+#[derive(Debug, Clone)]
+pub struct Base {
+    /// The root, as its author signed it.
+    pub root: Vec<u8>,
+    /// The state, as assembled from its pieces.
+    pub state: RosterState,
 }
 
 /// Decides whether a delivered network may be adopted.
@@ -39,14 +52,29 @@ pub struct Adopted {
 /// not sign, and [`Error::RosterUnusable`] when what arrived does not derive to
 /// a state at all.
 pub fn adopt(operations: &[Vec<u8>], identity: &NodeIdentity) -> Result<Adopted> {
+    adopt_on(None, operations, identity)
+}
+
+/// As [`adopt`], for a network delivered resting on `base`: the roster rests
+/// on the root and its state, checked against each other and against the
+/// root's author, and takes the operations that follow the root's heads.
+///
+/// # Errors
+///
+/// As [`adopt`], and [`Error::RosterUnusable`] when the base does not check
+/// out.
+pub fn adopt_on(
+    base: Option<Base>,
+    operations: &[Vec<u8>],
+    identity: &NodeIdentity,
+) -> Result<Adopted> {
     let signing = identity.signing_key().public_key();
     let transport = identity.transport_key().public_key();
 
     let mut roster = Roster::new();
-    for operation in operations {
-        roster.offer_bytes(operation);
-    }
+    fill(&mut roster, base, operations)?;
     let state = roster.state()?;
+    let base = roster.dag().base_snapshot().cloned().zip(roster.dag().base_state().cloned());
 
     let me = DeviceId::of_signing_key(signing.as_bytes());
     let Some(record) = state.devices.get(&me) else {
@@ -73,7 +101,54 @@ pub fn adopt(operations: &[Vec<u8>], identity: &NodeIdentity) -> Result<Adopted>
         return Err(Error::NotAdmitted);
     }
 
-    Ok(Adopted { state })
+    Ok(Adopted { state, base })
+}
+
+/// Offers a delivered network to `roster`: resting it on `base` first, where
+/// there is one, and then the operations that follow.
+///
+/// # Errors
+///
+/// When the base does not check out.
+pub fn fill(roster: &mut Roster, base: Option<Base>, operations: &[Vec<u8>]) -> Result<()> {
+    let offered = match base {
+        None => operations.to_vec(),
+        Some(base) => resting_on(roster, base, operations)?,
+    };
+    for operation in &offered {
+        roster.offer_bytes(operation);
+    }
+    Ok(())
+}
+
+/// Rests `roster` on `base` and returns the operations that follow its heads,
+/// in the order delivered. An operation follows when every parent is a head or
+/// follows; anything else is beneath the base, which already covers it.
+fn resting_on(roster: &mut Roster, base: Base, operations: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    let raw = roster::snapshot::RawSnapshot::decode(&base.root)?;
+    let mut known: std::collections::BTreeSet<roster::id::OperationId> =
+        raw.body().heads.iter().copied().collect();
+    let mut heads = Vec::new();
+    let mut after = Vec::new();
+    for bytes in operations {
+        let Ok(operation) = RawOperation::decode(bytes) else { continue };
+        if known.contains(&operation.id()) {
+            heads.push(bytes.clone());
+        }
+    }
+    roster.rest_on(&base.root, base.state, &heads)?;
+    for bytes in operations {
+        let Ok(operation) = RawOperation::decode(bytes) else { continue };
+        let id = operation.id();
+        if known.contains(&id) {
+            continue;
+        }
+        if operation.core().parents.iter().all(|parent| known.contains(parent)) {
+            known.insert(id);
+            after.push(bytes.clone());
+        }
+    }
+    Ok(after)
 }
 
 /// Whether what arrived contains an admission of this device that the roster

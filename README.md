@@ -117,20 +117,22 @@ It asks the relay's host which key its relay has and asks you to confirm it, the
 network's signing key. On Windows that key goes in the TPM, behind Windows Hello. On Linux it goes in the TPM,
 or a sealed file where there is none, behind a passphrase.
 
-On the second device:
+Invite the second device from the admin:
 
 ```sh
-peerfectly join --relay https://relay.example --name nas
+peerfectly invite nas
 ```
 
-It asks the relay's host the same way, with nothing to confirm, since a join signs nothing with it.
-Then it prints a QR code and a payload. Back on the admin:
+It prints a QR code and an invite, and waits. On the second device:
 
 ```sh
-peerfectly admit peerfectly-join-v1:…
+peerfectly join peerfectly-invite-v1:… --name nas
 ```
 
-Compare the six digits on both screens, confirm on both, and you're in:
+The device waits at the relay the invite names, and the admin's daemon reaches it there; if you stop
+waiting on the admin, the invite stays open and the daemon goes on dialling.
+
+Type the six digits the admin shows into the second device, confirm on the admin, and you're in:
 
 ```sh
 peerfectly up home

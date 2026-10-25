@@ -513,6 +513,7 @@ mod tests {
             .expect("valid"),
             devices: devices.into_iter().map(|record| (record.id, record)).collect(),
             revoked: BTreeSet::new(),
+            settings: Default::default(),
         }
     }
 

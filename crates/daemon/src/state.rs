@@ -97,10 +97,34 @@ impl Paths {
         self.root.join("identity")
     }
 
+    /// Where this network's state stood the last time this daemon changed it,
+    /// signed by this machine (`crate::checkpoint`).
+    #[must_use]
+    pub fn checkpoint(&self) -> PathBuf {
+        self.root.join("checkpoint")
+    }
+
     /// The operation log the roster is rebuilt from.
     #[must_use]
     pub fn roster(&self) -> PathBuf {
         self.root.join("roster.log")
+    }
+
+    /// What a light member holds, in place of a roster: its own evidence, its
+    /// view of the roots, the parameters it uses and the peers it checked.
+    #[must_use]
+    pub fn light(&self) -> PathBuf {
+        self.root.join("light.member")
+    }
+
+    /// The pieces of the batches the roster holds, beside its log.
+    ///
+    /// Not in the log itself: a piece is not an operation, and the log is
+    /// replayed one operation at a time. Replayed after it, since a piece is
+    /// taken only once its header is held.
+    #[must_use]
+    pub fn pieces(&self) -> PathBuf {
+        self.root.join("pieces.log")
     }
 
     /// The endpoints last known to work.
@@ -123,6 +147,21 @@ impl Paths {
     #[must_use]
     pub fn snapshot(&self) -> PathBuf {
         self.root.join("snapshot")
+    }
+
+    /// The root the log rests on once it has been compacted.
+    ///
+    /// Not the root held: the one beneath the window, whose covered
+    /// operations the log no longer carries.
+    #[must_use]
+    pub fn base_snapshot(&self) -> PathBuf {
+        self.root.join("base.snapshot")
+    }
+
+    /// The state that root commits to, as bytes.
+    #[must_use]
+    pub fn base_state(&self) -> PathBuf {
+        self.root.join("base.state")
     }
 
     /// When that snapshot was accepted, on this device's wall clock.
@@ -287,6 +326,29 @@ impl Log {
         file.flush().map_err(|cause| self.failure(&cause))
     }
 
+    /// Replaces the whole log with `operations`, all at once.
+    ///
+    /// Written beside the log and moved over it, so a process stopped half way
+    /// leaves the old log or the new one and never a mixture. For compaction,
+    /// which is the one time the log loses operations: those beneath the base
+    /// it now rests on.
+    ///
+    /// # Errors
+    ///
+    /// When either file cannot be written.
+    pub fn rewrite(&self, operations: &[Vec<u8>]) -> Result<()> {
+        let mut bytes = Vec::new();
+        for operation in operations {
+            let len = u32::try_from(operation.len()).map_err(|_| Error::State {
+                path: self.path.clone(),
+                cause: "an operation larger than the log frames".to_owned(),
+            })?;
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(operation);
+        }
+        replace_file(&self.path, &bytes)
+    }
+
     /// Every operation in the log, in the order it was written.
     ///
     /// A missing file is an empty log: a daemon starting for the first time has
@@ -418,6 +480,47 @@ pub fn read_snapshot(paths: &Paths) -> Option<(Vec<u8>, u64)> {
     let bytes = fs::read(paths.snapshot()).ok()?;
     let at = fs::read_to_string(paths.snapshot_at()).ok()?.trim().parse::<u64>().ok()?;
     (!bytes.is_empty()).then_some((bytes, at))
+}
+
+/// Writes `bytes` beside `path` and moves them over it.
+pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".new");
+    let beside = PathBuf::from(beside);
+    fs::write(&beside, bytes)
+        .map_err(|cause| Error::State { path: beside.clone(), cause: cause.to_string() })?;
+    fs::rename(&beside, path)
+        .map_err(|cause| Error::State { path: path.to_path_buf(), cause: cause.to_string() })
+}
+
+/// Keeps the base a compacted log rests on: its root and that root's state.
+///
+/// Written before the log is rewritten, so that a log which no longer carries
+/// the operations beneath the base is never left without the base.
+///
+/// The root is written as the bytes it was signed over, which is what its
+/// encoding reproduces. The state is not signed at all: it is derived, written
+/// canonically, and believed on reading only because its root is the one the
+/// signed root names.
+///
+/// # Errors
+///
+/// When either file cannot be written.
+pub fn write_base(
+    paths: &Paths,
+    snapshot: &roster::snapshot::SignedSnapshot,
+    state: &roster::state::RosterState,
+) -> Result<()> {
+    replace_file(&paths.base_state(), &state.to_bytes())?;
+    replace_file(&paths.base_snapshot(), &snapshot.to_bytes())
+}
+
+/// The base a compacted log rests on, where both halves are readable.
+#[must_use]
+pub fn read_base(paths: &Paths) -> Option<(Vec<u8>, Vec<u8>)> {
+    let snapshot = fs::read(paths.base_snapshot()).ok()?;
+    let state = fs::read(paths.base_state()).ok()?;
+    (!snapshot.is_empty() && !state.is_empty()).then_some((snapshot, state))
 }
 
 /// Records the snapshot a network has accepted, and when.
@@ -609,6 +712,22 @@ impl roster::roster::Clock for WallClock {
     fn unix_seconds(&self) -> Option<u64> {
         Some(wall_seconds())
     }
+}
+
+/// The light member kept beside an identity, if this device is one here.
+#[must_use]
+pub fn read_light(paths: &Paths) -> Option<roster::member::LightMember> {
+    let bytes = fs::read(paths.light()).ok()?;
+    roster::member::LightMember::from_bytes(&bytes).ok()
+}
+
+/// Keeps a light member, whole, in place of what was kept before.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn write_light(paths: &Paths, member: &roster::member::LightMember) -> Result<()> {
+    replace_file(&paths.light(), &member.to_bytes())
 }
 
 #[cfg(test)]

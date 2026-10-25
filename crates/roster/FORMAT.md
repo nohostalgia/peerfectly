@@ -74,7 +74,7 @@ Key order: `ts`, `alg`, `body`, `type`, `author`, `network`, `parents`.
 | `ts` | Milliseconds since the Unix epoch, unsigned 64-bit. **Display only** — see §8 |
 | `alg` | `"ed25519"` or `"p256"`. Inside the signed bytes, so it cannot be swapped after signing |
 | `body` | Embedded canonical CBOR of the body, decoded only once `type` is known |
-| `type` | One of the seven names in §5 |
+| `type` | One of the nine names in §5 |
 | `author` | The key id (§4) of the key that produced `sig` |
 | `network` | The network id. Present so a signature cannot be replayed into another network |
 | `parents` | Ids of operations the author knew when authoring this one. At most 32 |
@@ -107,8 +107,8 @@ whose stated id disagrees. The id is therefore redundant on the wire; it costs
 
 ## 5. Operation types and bodies
 
-The set is closed at seven. Adding an eighth means deciding how it merges
-against all seven existing types, so it is a change to the roster's semantics,
+The set is closed at nine. Adding a tenth means deciding how it merges
+against all nine existing types, so it is a change to the roster's semantics,
 not an additive one. An unrecognized `type` is an error — never a skip, because
 the operation you cannot read might be a revocation.
 
@@ -121,6 +121,8 @@ the operation you cannot read might be a revocation.
 | `demote` | `{ "device": bstr(32) }` |
 | `rename` | `{ "name": tstr, "device": bstr(32) }` |
 | `set_network` | A `NetworkParams` map directly |
+| `set_device` | A `SettingsChange` map (below) |
+| `admit_batch` | A `BatchHeader` map (§37) |
 
 Note `rename`'s key order: `name` (4) precedes `device` (6), by length.
 
@@ -159,6 +161,19 @@ A `DeviceSpec` in a body carries neither `id` nor `added_by`: both are derived,
 and `added_by` would be the enclosing operation's own id, which cannot be known
 before that operation is encoded.
 
+### SettingsChange
+
+```text
+SettingsChange = { "ipv4": [] / [bstr], "mode": [] / [tstr],
+                   "relay": [] / [bstr], "device": bstr(32),
+                   "groups": [] / [[ tstr ... ]] }
+```
+
+What an admin changes about a device after admitting it, one field at a time.
+Each field is an array of **zero or one** values: empty leaves the field alone,
+one value sets it. A value of the empty byte string clears an address or a
+relay. At least one field must be set. The settings themselves are §33's.
+
 ### NetworkParams
 
 ```text
@@ -166,10 +181,14 @@ NetworkParams = {
   "ula": bstr,
   ? "ipv4": bstr(5),
   "relay": [] / [tstr],
+  ? "policy": [ Rule ... ],
   "suffix": tstr,
+  ? "anchors": [ bstr(32) ... ],
   ? "leaving": Leaving,
-  "snapshot_window": uint
+  ? "snapshot_window": uint
 }
+
+Rule = { "to": tstr, "from": tstr }
 
 Leaving = {
   "relay": tstr,
@@ -177,14 +196,25 @@ Leaving = {
 }
 ```
 
-Key order is length-first: `ula` (3 bytes), `ipv4` (4), `relay` (5), `suffix`
-(6), `leaving` (7), `snapshot_window` (15). Alphabetical order would put `ipv4`
-and `leaving` first and produce bytes a conforming decoder refuses.
+Key order is length-first: `ula` (3 bytes), `ipv4` (4), `relay` (5), `policy`
+and `suffix` (6, `p` first), `anchors` and `leaving` (7, `a` first),
+`snapshot_window` (15). Alphabetical order would produce bytes a conforming
+decoder refuses.
 
-These six are the whole of `NetworkParams`. A map carrying any other key is
-refused as `unknown_field` (§1), never read past: one declaring more than six
-entries before any key is read, and one that fits the count where the foreign
-key is met. Four entries are required; each optional key present adds one.
+These eight are the whole of `NetworkParams`. A map carrying any other key is
+refused as `unknown_field` (§1), never read past. Three entries are required —
+`ula`, `relay`, `suffix` — and each optional key present adds one. Each optional key is left out when absent,
+never written empty, so parameters without it encode as they did before it
+existed.
+
+`anchors` names the full members light members fall back to: device ids, sorted,
+without repeats, at most 32. An entry naming a device that is not a member is
+ignored by derivation. `policy` is the access policy: rules letting members of
+group `from` open sessions to members of group `to`, sorted, without repeats, at
+most 256. With no policy every member may reach every other.
+
+In derived state the parameters are leaves, one per parameter (§33), and a
+`set_network` changes only the leaves it changes (§16).
 
 `ipv4` is the IPv4 range the network's devices derive their IPv4 addresses in:
 four address bytes, then the prefix length. It is one of the **two optional
@@ -223,7 +253,10 @@ parameters name no relay to move to, when it names the relay itself, and when
 its relay is empty. Parameters without it are byte for byte what they were
 before the key existed — the rule `ipv4` set.
 
-`snapshot_window` is in seconds. The suffix is a roster parameter rather than a
+`snapshot_window` is in seconds, and **optional**: a network with no window
+leaves the key out, and its roster never reads as stale (§29). Zero written out
+is refused (`non_canonical`): absence has one spelling. A relay move in a network
+with no window keeps the relay being left for seven days. The suffix is a roster parameter rather than a
 compile-time constant, so changing it does not require replacing every client.
 
 `ula` is the network's overlay prefix: exactly **eight bytes**, the first of
@@ -309,7 +342,7 @@ reinstallation.
   `purpose = "attestation"`.
 - The **identifying signing key** is the first signing entry in that canonical
   order, and the device id is its key id. A device's key set never changes —
-  none of the seven operations adds a key to an existing device — so this is
+  none of the nine operations adds a key to an existing device — so this is
   fixed for the device's lifetime.
 - `author` is a *key id*, not a device id. They coincide for a device holding
   one signing key and differ for a device that also holds an enclave key.
@@ -415,6 +448,16 @@ its peers reject, which is a fork. They change only with the domain tag.
 | Map key | 23 bytes |
 | Operations per roster | 4096 |
 | Of those, operations that are not revocations | 3584 |
+| Groups per device | 16 |
+| Group name | 32 bytes |
+| Anchors | 32 |
+| Access policy rules | 256 |
+| Entries per batch | 65 536 |
+| Batch label | 64 bytes |
+| Batch entry serial | 64 bytes |
+| State piece | 65 536 bytes |
+| Root heads | 32 |
+| Encoded root | 65 536 bytes |
 
 A declared length is checked against its bound *before* any buffer is reserved,
 so a peer cannot make a client allocate merely by claiming a large size.
@@ -533,10 +576,19 @@ keys of the device it declares, and that device must be an admin and a founder.
 
 ## 16. Conflict rules
 
-**Rule 1 — revocation always wins.** A device any valid operation revokes is
-revoked, in either causal direction. Revocation is definitive: a revoked device id
-is never restored, not even by a causally later `add_device` naming it. Returning
-needs a new key, and therefore a new device id.
+**Rule 1 — revocation wins over every admission it does not precede.** An
+admission — an `add_device`, or a batch entry (§38) — stands only if it
+**descends from every valid revocation of its device**. A revocation concurrent
+with the admission, or after it, removes the device, in whichever order the two
+arrived. An admission that causally follows every revocation is a deliberate act
+and admits the device again. In practice a device that returns does so with
+fresh keys and a new id: a join always mints them.
+
+The set of revoked devices is **not** part of the state a root commits to. A node
+knows a device as revoked only while the revocation is among the operations it
+holds; once a checkpoint absorbs it, the device is simply absent, and a node
+holding the window and one holding the whole history agree on everything the
+root commits to.
 
 **Rule 2 — demote beats promote among concurrent branches.** Where a `demote` and
 a `promote` on one device are concurrent, the result is member. Where they are
@@ -548,9 +600,25 @@ revocation is not.
 at equal depth, the greater operation id, compared as bytes. Arbitrary, but
 identical on every node.
 
-Rule 3 governs `rename` and `set_network`. Device **capabilities are immutable**:
-none of the seven operation types changes them, so no capability conflict can
-arise. A later change introducing capability mutability must extend this rule.
+Rule 3 governs `rename`, `set_network` and `set_device`, at the grain of what
+each changes:
+
+- `set_network` **per parameter leaf**. A `set_network` changes the leaves that
+  differ from those its own ancestors' parameters hold, and each leaf takes the
+  latest writer. Two admins changing different parameters at once both take
+  effect. Where merged leaves no longer make valid parameters, the `leaving`
+  leaf is dropped.
+- `set_device` **per field**: mode, groups, address and relay each take their
+  latest writer. A device admitted by a batch starts from the header's mode and
+  groups and its entry's address.
+
+Device **capabilities are immutable**: no operation type changes them.
+
+**Rule 4 — admins are full.** An admin signs roots and must hold the state it
+vouches for. Where a device would be both an admin and light, the later of the
+two decisions stands, by rule 3's order: a promotion after the device went light
+leaves it a member, and a switch to light after it became an admin leaves it
+full.
 
 Where two concurrent `add_device` operations name the same device id — the same
 signing key, a different transport key — the whole record comes from the winner
@@ -670,50 +738,57 @@ operation id covers its parent list).
 
 ---
 
-# Snapshots and compaction
+# Roots and compaction
 
-## 22. The snapshot artifact
+## 22. The root
 
-A snapshot is an admin's signed attestation that the state up to here is X. It
-is **not** an operation: it has no place in the DAG, is never named as a parent,
-and never takes part in merge. That is the structural reason §4.6 can call it
-"not authoritative in a strong sense" without needing a rule to enforce it — a
-snapshot cannot suppress an operation, because it does not live in the graph the
-operations live in. It also keeps the seven operation types closed.
+A root is an admin's signed statement that the state is X, committed to by its
+Merkle root (§34). It is **not** an operation: it has no place in the DAG, is
+never named as a parent, and never takes part in merge. That is the structural
+reason §4.6 can call it "not authoritative in a strong sense" without a rule to
+enforce it — a root cannot suppress an operation, because it does not live in
+the graph the operations live in. The encoded type keeps its old name,
+`Snapshot`.
 
 ```text
-Snapshot     = { "seq": uint, "heads": [ bstr(32) ... ], "state": bstr,
-                 "author": bstr(32), "depths": [ uint ... ],
-                 "network": bstr(32) }
+Snapshot = { "root": bstr(32), "delta": [ bstr(32) ... ],
+             "heads": [ bstr(32) ... ], "proof": MembershipProof,
+             "author": bstr(32), "depths": [ uint ... ],
+             "signer": DeviceLeaf, "network": bstr(32),
+             "previous": [ bstr(32) ... ], "generation": uint }
 SignedSnapshot = { "sig": bstr(64), "body": bstr }
 ```
 
-Key order follows the same length-first rule as everything else: `seq`, `heads`,
-`state`, `author`, `depths`, `network`; and `sig`, `body`.
-
 | Field | Why it is there |
 |---|---|
-| `seq` | Monotone counter; the rollback defence |
-| `heads` | Defines the covered set: everything causally at or beneath these |
-| `state` | `RosterState` canonical bytes for the covered set |
-| `author` | The key id that signed. Lets a verifier check one named key rather than trying every admin, so a bad signature and an unauthorised signer stay distinguishable |
+| `generation` | One more than the highest generation among the roots it follows; `1` for a root that follows nothing |
+| `previous` | The state roots of the roots it follows, sorted, without repeats. Empty exactly when `generation` is 1 |
+| `root` | The state root (§34) |
+| `heads` | The covered set: every causal ancestor of these, with the heads themselves |
 | `depths` | The causal depth of each head |
-| `network` | So a snapshot cannot be lifted between networks |
+| `delta` | The devices whose leaves differ from the first root it follows: what a light member looks at for revocations |
+| `signer` | The signer's device leaf |
+| `proof` | That leaf's membership proof (§35) against the first root in `previous`, or against `root` itself when there is none |
+| `author` | The key id that signed |
+| `network` | So a root cannot be lifted between networks |
+
+A root is the same size for five devices or five million: it carries no state.
+At most 32 heads, and at most 65 536 bytes.
 
 **`depths` is the field most easily thought unnecessary and most damaging to
 omit.** Depth is the primary key of the last-writer-wins rule, so a node that
 compacted and then guessed depths would resolve concurrent renames differently
-from a node that kept its history — a fork appearing only when two admins rename
-the same device at once.
+from a node that kept its history.
 
-The covered set of a snapshot is every causal ancestor of its heads, together
-with the heads themselves.
+**One root per act.** An admin's node publishes a root as soon as an act of its
+takes effect — a batch is one act — and sends it to every open session. Nothing
+is debounced.
 
-## 23. Snapshot signatures
+## 23. Root signatures
 
-Snapshots sign under the tag `"roster-snapshot/v1"`, framed exactly as the
-operation envelope is — each variable-length component preceded by its length as
-a big-endian `u16`:
+Roots sign under the tag `"roster-snapshot/v1"`, framed exactly as the operation
+envelope is — each variable-length component preceded by its length as a
+big-endian `u16`:
 
 ```text
 u16be(len) || "roster-snapshot/v1" ||
@@ -721,179 +796,344 @@ u16be(len) || network_id           ||
 u16be(len) || body_bytes
 ```
 
-Two tags rather than reusing the operation tag: the operation envelope's third
-component is an operation type from a closed set, and smuggling snapshots
-through it would put a value there that no operation may hold. A signature over
-an operation must not verify as one over a snapshot, or the reverse.
+Two tags rather than reusing the operation tag, so a signature over an operation
+never verifies as one over a root, or the reverse.
 
-Verification against a key the snapshot does not name is a **key mismatch**,
-reported distinctly from a signature that fails to verify.
+`author` names a key of the signer's: its **attestation key**, which signs
+without asking anybody, so an admin's node publishes roots unattended. A
+signing key is accepted too. The signer must be an admin, and not revoked, in
+the state the verifier holds; a verifier holding no state checks the signer's
+leaf and proof instead (§24). A key the root does not name is a key mismatch,
+reported apart from a signature that fails.
 
 ## 24. Verification before trust
 
-Where a node holds every operation a snapshot covers, it derives that state
-itself and compares. **Its own derivation is authoritative**; a snapshot that
-disagrees is refused and the disagreement reported. A snapshot can never
-correct, override or replace state a node can derive. That is what stops a
-compromised admin rewriting history.
+Where a node holds every operation a root covers, it derives that state itself —
+over exactly the covered region — and compares roots. **Its own derivation is
+authoritative**; a root that disagrees is refused (`snapshot_state_mismatch`). A
+root can never correct, override or replace state a node can derive. That is
+what stops a compromised admin rewriting history.
 
 Holding *some* of the covered operations counts as holding none: the claimed
 state cannot be reproduced, so nothing has been checked.
 
+A light member holds no operations. It checks a root against the root before
+it: the signer's leaf must prove against that root and name an admin there, and
+no root it holds may have revoked or demoted the signer since. It keeps one
+current root and its own proof against it.
+
 ### The bootstrapping limit — accepted, not mitigated
 
-A device receiving its first roster has nothing to compare against and adopts
-the snapshot **on the admin's signature alone**. A compromised admin can hand it
-a fabricated network.
+A device receiving its first root has nothing to compare against and adopts it
+**on the admin's signature alone**. A compromised admin can hand it a fabricated
+network.
 
-This is a real hole and belongs in the public threat model beside §6.2. It is
-bounded by two things and neither removes it:
+It is bounded by two things and neither removes it: it requires an admin key,
+which is what the whole trust model rests on; and it is **detected on the first
+sync** with a peer holding the underlying operations, which derives the covered
+state and finds it disagrees. A node in this position never compacts on that
+root, so it discards nothing on the strength of a claim it could not check.
 
-- it requires the admin key, which is what the whole trust model rests on; and
-- it is **detected on the first sync** with any peer holding the underlying
-  operations, because the node then derives the covered state and finds it
-  disagrees.
+## 25. The heavier root
 
-A node in this position never compacts, so it discards nothing on the strength
-of a claim it could not check.
+There is no monotone sequence and no conflict rule between roots: the rule that
+refused a sequence not strictly greater, and refused both of two roots sharing
+one, is gone. Admins acting at once publish **siblings** by design.
 
-## 25. Monotone sequence, and conflict
+Of two valid roots a node holds the **heavier**: the higher `generation`, then
+the greater `root` hash, compared bytewise. The same rule on every node, so every
+node holds the same root once it has seen both, without anyone talking. A
+lighter root is not an error (`Lighter`), and it is not passed on.
 
-A snapshot's sequence must be **strictly greater** than the highest accepted, or
-it is refused. This is what stops anyone who kept an old snapshot serving it
-as the current roster.
+Revocations are the exception a light member keeps: a revocation in the `delta`
+of any validly signed root applies at once, even from a sibling that loses, and
+stays until a root that covers it is adopted.
 
-Two snapshots sharing a sequence number and differing in content cause **both to
-be refused**, and the number is closed permanently. Considered and rejected:
-accepting whichever arrived first (order-dependent, so two nodes keep different
-snapshots and compact differently), and picking a winner by `(seq, id)`
-(deterministic, but it quietly chooses between two claims one of which may be a
-forgery — the worst property for an equivocation signal).
-
-Recovery is a higher sequence number, which any admin can issue; the block is
-self-healing and needs no intervention.
-
-Because compaction requires local verification (§26), a node that already
-compacted had verified the state first, so a later conflicting snapshot cannot
-retroactively invalidate what it discarded.
+Rollback is what the old sequence rule was for, and it does not return: an old
+root is lighter than the one a node holds, so it changes nothing there.
 
 ## 26. Compaction
 
-**Whole operations go — body, signature and all.** The covered *heads* are
+**Whole operations go — body, signature and all.** The covered heads are
 retained as complete signed operations, so that later operations naming them as
 parents remain placeable.
 
-Nothing partial is kept. Retaining a skeleton of parent links and depths while
-dropping bodies and signatures would be smaller, and is not allowed: such data
-is **authenticated by nothing**, and a fault or a hostile local process could
-alter it undetected. The invariant is worth more than the bytes:
-
 > Every byte a node retains is covered by a signature — an operation's own, or
-> the snapshot's.
+> the root's.
+
+A node remembers the roots it verified itself (§24) as **checkpoints**, up to
+256. Compaction tries them newest first and discards beneath the first that
+passes every gate; the checkpoints beneath it are dropped. The root a node holds
+is usually at the frontier and fails gate 2, which is why it is not simply
+compacted against: an older verified root is.
 
 ### The three gates
 
-A node discards a covered region only when **all three** hold:
+A node discards a covered region only when **all three** hold, gate 2 checked
+first because it is one subtraction:
 
 1. **Nothing held is concurrent with the region.** Otherwise a held operation's
    ancestor-relative validity still needs what is being discarded.
 2. **The region lies more than `staleness_depth` behind the frontier.** Any
-   later operation anchoring into it has anchor depth below
-   `frontier − staleness_depth` and is already refused as stale (§18). The
-   frontier only advances, so this stays true.
-3. **The snapshot was verified locally.** Discarding on an unverified claim
-   would throw away the evidence needed to notice it lied.
+   later operation anchoring into it is already refused as stale (§18), and the
+   frontier only advances.
+3. **The root was verified locally**, by deriving the region again now.
+   Discarding on an unverified claim would throw away the evidence needed to
+   notice it lied.
 
-**Gate 1 is not sufficient on its own**, and the counterexample matters: on a
-divergent history an operation at depth 100 on one branch is genuinely
-concurrent with one at depth 5 on another, so "held operations are deep" does
-not imply "held operations descend from the region". Gate 2 is what makes the
-region unreachable rather than merely old.
+Gate 1 is not sufficient on its own: on a divergent history an operation deep on
+one branch is genuinely concurrent with a shallow one on another. Gate 2 is what
+makes the region unreachable rather than merely old.
 
-Compaction is deliberate — never a side effect of accepting a snapshot. Nothing
-is discarded because a message arrived.
+Compaction is deliberate — never a side effect of accepting a root. A node that
+compacted keeps its **base**: the root and the state it commits to, with the
+retained heads; restarted, it rests on the base and replays only what follows.
 
 ## 27. Deriving across the boundary
 
-A compacted node derives from its snapshot's state plus the operations it still
+A compacted node derives from its base state plus the operations it still
 holds, and must produce **byte-identical** state to a node that discarded
-nothing.
-
-Every post-snapshot operation descends from a covered head, so its depth
-strictly exceeds every depth in the covered set. Each phase then composes:
+nothing. Every held operation descends from a covered head, so its depth exceeds
+every depth in the covered set, and each phase composes:
 
 | Phase | Composes because |
 |---|---|
-| Revocations | Set union: the snapshot's revoked set ∪ later revocations |
-| Roles | Covered and later operations are causally ordered, never concurrent, so rule 2's concurrency arm cannot fire across the boundary and depth decides |
-| Last-writer-wins | A post-snapshot value always outranks a covered one on depth |
+| Revocations | The base holds no revoked device; a held revocation of a base device follows its admission |
+| Roles | Covered and later operations are causally ordered, never concurrent |
+| Last-writer-wins | A held value always outranks a covered one on depth |
+| Settings | A device starts from the settings its base leaf holds, where that admission still stands |
 | Founders | Monotone union |
-| Ancestor-relative authority | `state(ancestors(O))` = snapshot state + the retained operations between |
+| Ancestor-relative authority | The state of an operation's ancestors is the base plus the held operations between |
 
 Covered heads are retained as anchors and **excluded from derivation**: their
-effects are already inside the snapshot's state, and applying them again would
-count them twice.
+effects are already in the base state.
 
-That composition argument is the kind that convinces and is wrong. It is not the
-guarantee — the property test comparing a compacted and an uncompacted node is.
+That composition argument is the kind that convinces and is wrong. The guarantee
+is the property test comparing a compacted node and an uncompacted one.
 
 ## 28. An operation has no effect before its target exists
 
-A `rename`, `promote` or `demote` that **causally precedes** the `add_device`
-introducing its target changes nothing, and does not apply retroactively when
-the device is later added.
-
-Compaction is what forces this to be pinned. A latent effect waiting for a
-device to appear cannot be represented in a snapshot's state, which holds only
-devices that exist, so a compacted node would lose it and derive a different
-roster. This was found by the compaction property test, not by reasoning.
+A `rename`, `promote`, `demote` or `set_device` that **causally precedes** the
+admission introducing its target changes nothing, and does not apply
+retroactively when the device is later added. A latent effect waiting for a
+device to appear cannot be represented in a root's state, so a compacted node
+would lose it.
 
 Causally concurrent operations still apply: they do not precede the add, and
 compaction is refused for any region a held operation is concurrent with.
-Revocation is exempt and stays a set union — a revoked device id remains revoked
-whenever the revocation was written, and the snapshot carries the revoked set
-explicitly, so nothing is lost.
 
 ## 29. Freshness is local
 
-A node records when it **received** each accepted snapshot, by its own clock,
-and raises a stale-roster indication once `snapshot_window` elapses with nothing
-fresher. §3.3's cautious mode consumes that indication.
+A node records when it **received** each accepted root and attestation, by its
+own clock, and raises a stale-roster indication once `snapshot_window` elapses
+with nothing fresher. A network with no window never raises it: an island with
+an admin of its own keeps working for as long as it is cut off. No timestamp from the data is ever read: freshness is
+liveness — it changes what a node is willing to do, never what the operations
+mean.
 
-**No timestamp from the data is ever read.** `DESIGN.md` §0 forbids timestamps
-influencing validity, and §4.6 asks for a validity window; measuring elapsed
-local time since receipt satisfies both, because freshness is *liveness* — it
-changes what a node is willing to do, never what the operations mean. Two nodes
-disagreeing about staleness derive identical rosters.
+A clock moving backwards is reported, not absorbed. The threshold is not a
+protocol constant.
 
-A signer-chosen expiry would be worse than no window at all: a compromised admin
-sets a far-future value once and the revocation window becomes unbounded on
-every node that accepts it, while still looking like a protection.
+## 30. What compaction gives back
 
-A monotonic source is preferred. A clock moving backwards is **reported**, not
-absorbed: a correction and tampering are indistinguishable from inside, and only
-one is benign.
+The operation ceiling bounds the **window**, not the history. Each compaction
+moves the base forward and the retained heads with it, so a network that keeps
+publishing roots keeps its window under `MAX_OPERATIONS` (§20) indefinitely; a
+history of ten thousand operations derives with the window never passing the
+ceiling.
 
-The threshold is therefore not a protocol constant and is deliberately absent
-from the shared corpus — two conforming implementations may configure it
-differently and both be right.
+What still reaches the ceiling is a window that cannot be compacted: no verified
+root old enough, or an operation held concurrent with the region.
 
-## 30. What compaction does not do
+## 31. Root vectors
 
-Compaction reclaims **bytes, not the operation ceiling**. `MAX_OPERATIONS`
-(§20) still bounds causal history, because the retained heads and everything
-after them still count. Lifting that ceiling needs a rule for retiring the
-retained heads too, which this version does not address.
-
-## 31. Snapshot vectors
-
-[`vectors/snapshot.json`](vectors/snapshot.json) — snapshots and the verdict
-each must receive, given the operations a node holds. An `accepted` vector
-carrying `error_kind: snapshot_unverified` means the node may adopt the state
-but must not treat it as checked.
+[`vectors/snapshot.json`](vectors/snapshot.json) — roots and the verdict each
+must receive, given the operations a node holds. An `accepted` vector carrying
+`error_kind: snapshot_unverified` means the node may adopt the root but must not
+treat it as checked.
 
 Rejection-reason coverage spans `negative.json`, `merge.json` and
-`snapshot.json` together. Three reasons are deliberately outside the corpus and
-named in the runner: `stale_operation` and `compaction_refused` (both local
-policy, where conforming implementations may differ and both be right) and
-`cyclic_history` (not constructible).
+`snapshot.json` together. Reasons deliberately outside the corpus are named in
+the runner: `stale_operation` and `compaction_refused` (local policy),
+`cyclic_history` (not constructible), and `snapshot_sequence_regressed`, which
+only attestations still raise.
+
+---
+
+# The state as a tree
+
+## 32. The tree
+
+The state is committed as a **compressed sparse Merkle tree** over 256-bit keys.
+Every leaf sits at a key that is a hash of what it names, so where it goes
+depends on the leaf alone, never on the order things were added; a node that
+derived the state from history and one that received it as leaves compute the
+same root.
+
+```text
+leaf(key, value)  = BLAKE3-derive("peerfectly membership tree leaf v1",   key || value)
+branch(l, r)      = BLAKE3-derive("peerfectly membership tree branch v1", l || r)
+EMPTY             = 32 zero bytes
+```
+
+A key's bits are read from the most significant bit of its first byte; `0` goes
+left. A subtree holding one leaf **is** that leaf, at the depth where it is
+alone, never padded down to depth 256. A subtree holding nothing is `EMPTY`.
+
+A proof is the siblings on the path from the root to the leaf, top first:
+
+```text
+Proof = { "bits": bstr, "depth": uint, "hashes": [ bstr(32) ... ] }
+```
+
+`depth` is the number of levels; `bits` holds one bit per level, most significant
+first, set where that sibling is not empty, padded with zero bits to whole bytes;
+`hashes` are the non-empty siblings in order. Padding bits set, a count that
+disagrees with the bitmap, or `EMPTY` spelled out as a hash, are refused.
+
+## 33. Leaves
+
+**Devices.** A device's leaf is its record and its settings:
+
+```text
+DeviceLeaf     = { "record": DeviceRecord, "settings": DeviceSettings }
+DeviceSettings = { "ipv4": bstr, "mode": tstr, "relay": bstr, "groups": [ tstr ... ] }
+key   = BLAKE3-derive("peerfectly membership position v1", device_id)
+value = BLAKE3-derive("peerfectly device leaf v1", DeviceLeaf bytes)
+```
+
+`ipv4` is an assigned address, four bytes, or empty; `relay` a relay key, 32
+bytes, or empty; `mode` is `"full"` or `"light"`; groups are sorted, without
+repeats, at most 16 of at most 32 bytes each. Every field is present: an address
+not set is the empty string, which has one spelling.
+
+**Parameters.** Each parameter is a leaf of its own, so it can be proved, fetched
+and changed alone:
+
+```text
+key   = BLAKE3-derive("peerfectly parameter position v1", name)
+value = BLAKE3-derive("peerfectly parameter leaf v1", value bytes)
+```
+
+| Name | Value |
+|---|---|
+| `prefix` | the ULA prefix, `bstr` |
+| `suffix` | the DNS suffix, `tstr` |
+| `ipv4` | the IPv4 range, `bstr(5)` |
+| `relays` | `[ tstr ]`, exactly one in this version |
+| `leaving` | `{ "relay": tstr, "until": uint }` |
+| `anchors` | device ids, sorted, without repeats, at most 32 |
+| `policy` | rules `{ "to": tstr, "from": tstr }`, sorted, without repeats, at most 256 |
+| `window` | the freshness window in seconds, `uint` |
+
+**A leaf is absent when its parameter has its default** — no IPv4 range, no
+relay, not moving, no anchors, no policy — and a present leaf must carry
+something else: an empty anchor list written out would be a second spelling of
+none, and so a second root for one state. A leaf whose name this format does not
+know is refused, never skipped.
+
+## 34. The state root
+
+```text
+state root = BLAKE3-derive("peerfectly state root v1",
+                           network_id || devices tree root || parameters tree root)
+```
+
+A function of the state alone, so a node holding the whole history and one
+holding only the window compute the same root. The set of revoked devices is not
+in it (§16).
+
+## 35. Membership proofs
+
+```text
+MembershipProof = { "devices": Proof, "parameters": bstr(32) }
+```
+
+The device leaf's proof in the devices tree, and the parameters tree's root
+beside it: with the network id they recompute the state root, and nothing else
+does. A member holding no roster checks one with a handful of hashes.
+
+## 36. Moving a state
+
+A root commits to its state by hash, so the state itself travels apart to a full
+member that holds nothing yet: as its leaves, in pieces of at most 65 536 bytes.
+
+```text
+StatePiece = { "devices": [ bstr ... ], "parameters": [ { "name": tstr, "value": bstr } ... ] }
+```
+
+`devices` are encoded device leaves, in the order of their ids; `parameters` are
+present in the first piece only. **Nothing is believed until the last piece is
+in**: the receiver rebuilds both trees, and takes the state only if it makes the
+root asked for. A device or a parameter given twice is refused. A piece that lies
+costs the receiver the download, never a wrong state. How pieces cross a session
+is `roster-sync`'s `FORMAT.md` §19.
+
+---
+
+# Batches
+
+## 37. A signed header, unsigned pieces
+
+An `admit_batch` operation is a batch's **header**. It commits to two roots: one
+over its entries, by device, and one over the pieces those entries travel in, by
+index — the **layout**.
+
+```text
+BatchHeader = { "mode": tstr, "block": bstr, "count": uint, "label": tstr,
+                "groups": [ tstr ... ], "layout": bstr(32), "pieces": uint,
+                "entries": bstr(32) }
+BatchEntry  = { "ipv4": bstr, "keys": [ KeyEntry ... ], "name": tstr, "serial": bstr }
+BatchPiece  = { "batch": bstr(32), "index": uint, "proof": Proof,
+                "entries": [ BatchEntry ... ] }
+```
+
+- `count` is 1 to 65 536; `pieces` is 1 to `count`. `block` is an IPv4 range, or
+  empty. `label` is at most 64 bytes. `mode` and `groups` are what every entry is
+  admitted with; the role is always member.
+- An entry is a device's public keys, name, serial (at most 64 bytes, or empty)
+  and the address assigned from the block, or empty. It carries the rules every
+  device keeps, checked as it arrives.
+- **Entries tree:** each entry at `BLAKE3-derive("peerfectly batch entry position
+  v1", device_id)`, valued `BLAKE3-derive("peerfectly batch entry v1", entry
+  bytes)`. Two entries naming one device are refused.
+- **The cut is canonical:** entries in device order, each piece filled until the
+  next entry would not fit, every piece within 8192 bytes. Every node that holds
+  the whole batch rebuilds the same pieces.
+- **Layout tree:** piece *i* at `BLAKE3-derive("peerfectly batch piece position
+  v1", u64be(i))`, valued `BLAKE3-derive("peerfectly batch piece v1", u64be(i) ||
+  encoded entries array)`.
+- A piece is checked on its own: its batch, an index below `pieces`, and its
+  proof against the layout. It carries no signature: the header's covers it.
+
+**Why the layout is committed.** A node holding part of a batch must say which
+part, and pass on what it holds before it holds everything. With the layout
+signed, a piece proves which piece it is, so a node's holding is a bitmap and no
+peer can make it believe it holds a piece it lacks.
+
+## 38. A batch takes effect only when it is whole
+
+- **A header waits** until every piece is in, as an operation waits for its
+  parents (§19). Until then it changes nothing, and what follows it waits with it.
+- **A piece is refused before its header**: nothing could check it.
+- **At most 8 incomplete batches**, declaring at most 131 072 entries between
+  them; a header past either bound is refused before anything is stored.
+- **Whole means matching.** Once every piece is in, the entries must number
+  `count` and rebuild `entries`; otherwise the batch is refused, on every node
+  alike.
+
+Derivation treats each entry as an `add_device` at the header's depth and id
+(§16), with the header's mode and groups and the entry's address. **An entry
+that collides with what the header's own ancestors hold is skipped, and the rest
+stand**: a device already a member, an address another device holds, or an
+address outside the block or with no block. Of two entries assigned one address
+the smaller device id keeps it. The same function decides this on an admin's
+device before signing and in derivation, so the preview and the outcome agree.
+
+**An urgent act never waits for a batch.** An admin's device names as parents of
+a revocation or demotion every head except batches younger than five minutes and
+what rests on them: a node still fetching such a batch takes the revocation at
+once. Revoking an admin keeps that admin's whole batches as ancestors, so they
+stand; what the revocation is concurrent with — the admin's batches held only by
+their header, and its acts resting on another's recent batch — is voided, and is
+reported before signing.

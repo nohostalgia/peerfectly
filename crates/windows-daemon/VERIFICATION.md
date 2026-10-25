@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 55 of 87. Every other result reads `not run`. That is the honest
+**Run so far**: 55 of 88. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2447,3 +2447,49 @@ the other by name.
 - `ping` to the phone's address, and to `phone.prova.internal`: 4 of 4 each, 14 to 118 ms.
 - The PC's icon, from `core/branding`, is on the programs, in the Start menu and in the
   installer's pictures.
+
+## C3. This machine's own key is in the TPM, and a changed folder is not carried
+
+`local-integrity`. Each network's state is believed only through a checkpoint signed by this
+machine's own key, which lives in the TPM with no prompt. Networks founded before this build have
+no checkpoint and are reported as changed outside the program: forget them and found or join them
+again first.
+
+From an elevated console, in `core`:
+
+```powershell
+cargo test -p windows-daemon --test machine_key -- --ignored --test-threads=1
+```
+
+Then with the MSI of this branch installed, found a network, and look:
+
+```powershell
+peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+certutil -csp "Microsoft Platform Crypto Provider" -key
+```
+```powershell
+Get-Content $env:PROGRAMDATA\peerfectly\machine.kind
+```
+```powershell
+Get-ChildItem $env:PROGRAMDATA\peerfectly\networks\prova\checkpoint
+```
+
+Then the folder changed while the daemon is stopped: copy `roster.log` from another network's folder
+over `prova`'s, start the daemon again, and run `peerfectly status`. Put the original back
+afterwards, and start it once more.
+
+**Expect**:
+- the tests: 2 passed, and no dialog shown at any point;
+- `certutil` lists `peerfectly.machine`, ECDSA nistP256, as a machine key;
+- `machine.kind` reads `hardware`, and there is no `machine.key`;
+- `prova` has a `checkpoint`;
+- `certutil` also lists `peerfectly.seal`, RSA 2048, as a machine key, and `prova\identity` begins
+  with `peerfectly wrapped v1`;
+- with the other roster in place, `status` reports `prova` as changed outside the program and does
+  not carry it; with the original back, it is carried again.
+
+**Result**: partly run, 2026-10-25.
+- The tests, from an elevated console: 2 passed, in 4.29 s (reported by the person who ran them).
+- The rest — `certutil`, `machine.kind`, the checkpoint, and the changed folder — not run yet.

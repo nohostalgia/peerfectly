@@ -243,7 +243,6 @@ mod tests {
             &roster::id::NetworkId::from_bytes([3; 32]),
             roster::types::Ipv4Range::DEFAULT,
             devices,
-            &[],
         )
     }
 

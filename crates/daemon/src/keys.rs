@@ -46,6 +46,23 @@ pub trait Keys: Send + Sync {
     /// answered by creating a new one — or when one cannot be created.
     fn identity(&self, paths: &Paths) -> Result<NodeIdentity>;
 
+    /// This machine's key for signing checkpoints (`crate::checkpoint`), and
+    /// whether it was made just now — which is what tells the first start of a
+    /// build that keeps checkpoints from any start after it.
+    ///
+    /// A key in a file by default. A platform with hardware to hold one says so
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// When a key is there and will not open, or none can be made.
+    fn machine_key(
+        &self,
+        home: &std::path::Path,
+    ) -> Result<(std::sync::Arc<dyn crate::checkpoint::MachineKey>, bool)> {
+        crate::checkpoint::machine_key(home, None)
+    }
+
     /// The signing key this network needs and this process may not make, if any.
     ///
     /// **A question, and nothing more.** It creates nothing, writes nothing and

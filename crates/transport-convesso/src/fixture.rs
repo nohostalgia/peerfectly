@@ -92,6 +92,10 @@ pub struct Network {
     pub third: Arc<NodeIdentity>,
     /// Derived state.
     pub state: RosterState,
+    /// A root over that state, signed by the founder.
+    pub root: Vec<u8>,
+    /// What each device shows a peer, against that root.
+    pub evidence: std::collections::HashMap<roster::id::DeviceId, Vec<u8>>,
 }
 
 impl Network {
@@ -153,7 +157,30 @@ impl Network {
         assert!(node.offer_bytes(&genesis_bytes).is_accepted());
         assert!(node.offer_bytes(&add_bytes).is_accepted());
         assert!(node.offer_bytes(&third_bytes).is_accepted());
-        Self { founder, joiner, third, state: node.state().expect("derives") }
+        let state = node.state().expect("derives");
+
+        let heads = node.heads();
+        let depths = heads
+            .iter()
+            .map(|head| node.dag().depth(node.dag().position(head).expect("held")))
+            .collect();
+        let body = roster::snapshot::Snapshot::over(
+            &state,
+            roster::snapshot::Covering { heads, depths },
+            founder.signing_key().key_id(),
+            None,
+        )
+        .expect("a root");
+        let root = roster::snapshot::sign_snapshot(&body, founder.signer()).expect("signs");
+        assert!(node.offer_snapshot(&root).is_accepted());
+        let evidence = [&founder, &joiner, &third]
+            .iter()
+            .map(|device| {
+                let shown = node.evidence_for(&device.device_id()).expect("a member");
+                (device.device_id(), shown.to_bytes())
+            })
+            .collect();
+        Self { founder, joiner, third, state, root, evidence }
     }
 
     /// Founds a network on `relay`.

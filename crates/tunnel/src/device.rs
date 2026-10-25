@@ -768,7 +768,7 @@ mod tests {
     fn held(devices: &[DeviceId]) -> Tunnel {
         let mut all = vec![me()];
         all.extend_from_slice(devices);
-        let holdings = Ipv4Holdings::from(&network(), Ipv4Range::DEFAULT, &all, &[]);
+        let holdings = Ipv4Holdings::from(&network(), Ipv4Range::DEFAULT, &all);
         for device in &all {
             assert!(holdings.of(device).is_some(), "the fixture devices do not collide");
         }
@@ -863,7 +863,7 @@ mod tests {
     fn a_device_holding_no_ipv4_accepts_no_ipv4_packet() {
         let peer = device(1);
         // The holdings name the peer and not this device.
-        let holdings = Ipv4Holdings::from(&network(), Ipv4Range::DEFAULT, &[peer], &[]);
+        let holdings = Ipv4Holdings::from(&network(), Ipv4Range::DEFAULT, &[peer]);
         let tunnel = tunnel().with_holdings(holdings);
         assert_eq!(tunnel.own_ipv4(), None, "the fixture gives this device none");
         let theirs = tunnel.ipv4_of(&peer).expect("held");
@@ -989,16 +989,10 @@ mod tests {
             &network(),
             Ipv4Range::DEFAULT,
             &[me(), kept, admitted],
-            &[],
         ));
         assert!(tunnel.inbound(admitted, &ipv4_packet(address, here)).is_accepted());
 
-        tunnel.set_holdings(Ipv4Holdings::from(
-            &network(),
-            Ipv4Range::DEFAULT,
-            &[me(), kept],
-            &[admitted],
-        ));
+        tunnel.set_holdings(Ipv4Holdings::from(&network(), Ipv4Range::DEFAULT, &[me(), kept]));
         assert!(!tunnel.inbound(admitted, &ipv4_packet(address, here)).is_accepted());
         assert_eq!(
             tunnel.outbound(&ipv4_packet(Ipv4Addr::UNSPECIFIED, address)),

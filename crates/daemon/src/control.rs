@@ -304,6 +304,15 @@ pub enum Act {
     Renames(Named, String),
     /// Replaces the network's parameters.
     SetsParameters,
+    /// Changes a device's settings: its mode, groups, address or relay.
+    ChangesSettings(Named),
+    /// Admits a batch of devices, with how many and the label it carries.
+    AdmitsBatch {
+        /// How many devices the batch admits.
+        count: u64,
+        /// The label the batch carries, as written by whoever signed it.
+        label: String,
+    },
 }
 
 impl Act {
@@ -334,6 +343,10 @@ impl fmt::Display for Act {
             }
             Self::Renames(device, to) => write!(f, "renaming of {device} to {}", shown(to)),
             Self::SetsParameters => f.write_str("a change to the network's parameters"),
+            Self::ChangesSettings(device) => write!(f, "a change to the settings of {device}"),
+            Self::AdmitsBatch { count, label } => {
+                write!(f, "admission of a batch of {count} devices ({})", shown(label))
+            }
         }
     }
 }
@@ -364,7 +377,10 @@ impl fmt::Display for Ipv4State {
         match self {
             Self::Held(address) => write!(f, "{address}"),
             Self::Collides(other) => {
-                write!(f, "no IPv4: its address collides with {other}")
+                write!(
+                    f,
+                    "no IPv4: its address collides with {other}; an admin can assign it a free one"
+                )
             }
             Self::Withheld { address, with } => {
                 write!(f, "IPv4 {address} withheld here: it conflicts with {}", shown(with))
@@ -759,13 +775,19 @@ pub enum Trouble {
     /// **Not** a fault, and named separately so that it never reads as one: the
     /// network is perfectly good and this person may not use it.
     SomebodyElses,
+    /// Its directory was changed by something other than this daemon, or holds
+    /// no checkpoint this machine signed: what it says is not believed.
+    ChangedOutside,
 }
 
 impl Trouble {
     /// Whether joining again is what fixes it.
     #[must_use]
     pub const fn rejoining_fixes_it(self) -> bool {
-        matches!(self, Self::NoIdentity | Self::NoRoster | Self::IdentityWillNotOpen)
+        matches!(
+            self,
+            Self::NoIdentity | Self::NoRoster | Self::IdentityWillNotOpen | Self::ChangedOutside
+        )
     }
 }
 
@@ -795,6 +817,9 @@ impl fmt::Display for Trouble {
             }
             Self::SomebodyElses => {
                 "that network belongs to somebody else on this machine. Nothing is wrong with it, and it is not yours to use."
+            }
+            Self::ChangedOutside => {
+                "that network's folder was changed by something other than this program, or this machine never vouched for it, so what it holds is not believed. Nothing has been removed. Remove it, or be invited into the network again."
             }
         })
     }
@@ -961,9 +986,9 @@ pub struct SignaturesWanted {
 
 /// The most items one batch may hold.
 ///
-/// The largest act there is — a revocation, the admission replacing it, and the
-/// snapshot over both — is three. One more is room, not an invitation: a batch
-/// is shown to a person whole, and a list nobody reads is not consent.
+/// The largest act there is — a revocation, the admission replacing it, the
+/// settings its invite chose, and the snapshot over them — is four. A batch is
+/// shown to a person whole, and a list nobody reads is not consent.
 pub const MOST_IN_A_BATCH: usize = 4;
 
 /// One thing in a batch to be signed.
@@ -1182,7 +1207,9 @@ impl Command {
             // Changing a tunnel, or acting on a roster.
             Self::Up { network }
             | Self::Down { network }
-            | Self::Admit { network, .. }
+            | Self::Invite { network, .. }
+            | Self::Withdraw { network, .. }
+            | Self::Invites { network }
             | Self::Revoke { network, .. }
             | Self::Rename { network, .. }
             | Self::ChangeRelay { network, .. } => Needs::TheOwnerOf(network.clone()),
@@ -1213,7 +1240,7 @@ impl Command {
 
 /// What a person asked for.
 ///
-/// Not `Copy` any more: enrolment carries a payload, and a command that had to
+/// Not `Copy` any more: enrolment carries an invite, and a command that had to
 /// be cheap to copy would have to keep it somewhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1243,17 +1270,63 @@ pub enum Command {
     /// Stop the daemon, taking every network down.
     Stop,
 
-    /// Begin admitting the device that produced this payload.
+    /// Invite a device into a network.
     ///
-    /// Opens the exchange, checks that the device holds both of the keys it
-    /// presented, and works out the confirmation code — and stops there. Nothing
-    /// is signed, because a person has not compared two screens yet.
-    Admit {
-        /// Which network to admit the device into, or `None` when only one could
-        /// be meant.
+    /// Issues an invite — the network's relay, its id and a secret — and keeps,
+    /// on this device only, what the device it brings will be: its name, role,
+    /// mode, groups and address. From then on the daemon dials the device the
+    /// invite brings, on its own, until the invite is used, withdrawn or
+    /// expires. So the flow outlives the command: when the device arrives, its
+    /// daemon has opened the exchange, checked the keys the device presented and
+    /// worked out the code — and stopped there. The admission waits, reported by
+    /// [`Command::Waiting`] with the code, signed by [`Command::Confirm`].
+    Invite {
+        /// Which network, or `None` when only one could be meant.
         network: Option<String>,
-        /// The joining payload, as the device printed it.
-        payload: String,
+        /// The name the device is admitted under.
+        name: String,
+        /// Whether it is admitted as an admin.
+        admin: bool,
+        /// Whether it is admitted light. An admin cannot be.
+        light: bool,
+        /// The groups it joins.
+        groups: Vec<String>,
+        /// The IPv4 address it is assigned, inside the network's range.
+        ipv4: Option<String>,
+        /// How long the invite stays open, or `None` for a day.
+        hours: Option<u32>,
+    },
+
+    /// Withdraw the open invite for the device to be called `name`.
+    ///
+    /// It admits nobody from then on, and an admission it led to that is still
+    /// waiting for a person is dropped.
+    Withdraw {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The name the invite was issued for.
+        name: String,
+    },
+
+    /// The invites this device issued into a network, open or ended.
+    Invites {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+    },
+
+    /// Join a network from an invite one of its admins issued.
+    ///
+    /// Through the daemon for the same reason founding is: the roster that
+    /// arrives has to be the one the daemon is using. A device that joined in
+    /// another process would hold a network its own daemon could not see until
+    /// it restarted. The device makes fresh keys and waits at the rendezvous the
+    /// invite implies for the admin to dial; the code is typed with
+    /// [`Command::ConfirmJoin`].
+    Join {
+        /// The invite, as text.
+        invite: String,
+        /// The name this device proposes for itself. The admin's record decides.
+        name: String,
     },
 
     /// Confirm whatever is waiting on this device's own person.
@@ -1294,19 +1367,6 @@ pub enum Command {
     /// Drop an enrolment that is waiting, leaving both machines as they were.
     Abandon,
 
-    /// Start waiting to be given a network.
-    ///
-    /// Through the daemon for the same reason founding is: the roster that
-    /// arrives has to be the one the daemon is using. A device that joined in
-    /// another process would hold a network its own daemon could not see until it
-    /// restarted, which is the restart this removes.
-    Join {
-        /// Where to be reachable while waiting.
-        relay: String,
-        /// The name this device proposes for itself.
-        name: String,
-    },
-
     /// Remove a network from this device, carried or not.
     ///
     /// It discards the network's directory and **every key this device keeps
@@ -1330,7 +1390,7 @@ pub enum Command {
 
     /// Ask what a waiting enrolment has got to.
     ///
-    /// A join has two pauses in it — carrying the payload to an admin, and
+    /// A join has two pauses in it — waiting for the admin to dial, and
     /// comparing six digits — and the control channel is one request and one
     /// answer. So the command line asks, rather than being told.
     ///
@@ -1372,6 +1432,13 @@ pub enum Command {
         /// person typed and have the refusal come back in the daemon's words,
         /// before anything is signed.
         ipv4_range: Option<String>,
+        /// The freshness window, in days, or `None` for none: devices that
+        /// hear nothing signed by an admin for that long turn cautious. It
+        /// buys a bound on how long a cut-off island keeps talking to a device
+        /// revoked elsewhere, at the cost of the island stopping; a network
+        /// with an admin of its own wants none, which is the default.
+        #[serde(default)]
+        window_days: Option<u32>,
     },
 
     /// Expel a device from the network.
@@ -1773,21 +1840,22 @@ impl Command {
 
     /// Whether this command is part of enrolling a device.
     ///
-    /// These three are not in [`Self::ALL`]: two of them are meaningless typed
-    /// on their own, and the first carries a payload, so a person reaches them
-    /// through `peerfectly admit` rather than by naming them.
+    /// These are not in [`Self::ALL`]: some are meaningless typed on their own,
+    /// and the others carry an invite or its details, so a person reaches them
+    /// through `peerfectly invite` and `peerfectly join` rather than by naming
+    /// them.
     #[must_use]
     pub const fn is_enrolment(&self) -> bool {
         matches!(
             self,
-            Self::Admit { .. } | Self::Confirm | Self::Abandon | Self::Join { .. } | Self::Waiting
+            Self::Invite { .. } | Self::Confirm | Self::Abandon | Self::Join { .. } | Self::Waiting
         )
     }
 
     /// The word that invokes it.
     ///
     /// The empty string for a command a person does not reach by typing one
-    /// word: the enrolment ones carry a payload, and founding and joining carry
+    /// word: the enrolment ones carry an invite, and founding and joining carry
     /// more than a person would type as a single token.
     #[must_use]
     pub const fn word(&self) -> &'static str {
@@ -1807,7 +1875,7 @@ impl Command {
     /// it names. `None` for a read, which changes nothing and which a tray asks
     /// every two seconds.
     ///
-    /// **Chosen fields, never the command.** Several carry an enrolment payload,
+    /// **Chosen fields, never the command.** Several carry an invite,
     /// a confirmation code, a signature or a public key, and none of those
     /// belongs in a log every administrator of the machine can read. Written out
     /// arm by arm so that a new command has to decide.
@@ -1818,11 +1886,13 @@ impl Command {
             | Self::Peers { .. }
             | Self::Address { .. }
             | Self::Waiting
+            | Self::Invites { .. }
             | Self::Exposed { .. } => return None,
             Self::Up { network } => ("up", network.as_deref()),
             Self::Down { network } => ("down", network.as_deref()),
             Self::Stop => ("stop", None),
-            Self::Admit { network, payload: _ } => ("admit", network.as_deref()),
+            Self::Invite { network, .. } => ("invite", network.as_deref()),
+            Self::Withdraw { network, .. } => ("withdraw", network.as_deref()),
             Self::Confirm => ("confirm", None),
             Self::Replace => ("replace", None),
             Self::ConfirmJoin { code: _ } => ("confirm join", None),
@@ -1853,6 +1923,8 @@ impl Outcome {
             Self::Reported(_) => "reported",
             Self::Done => "done",
             Self::Admitting { .. } => "admitting",
+            Self::Invited { .. } => "invited",
+            Self::InvitesHeld(_) => "invites",
             Self::Enrolling => "enrolling",
             Self::Joining { .. } => "joining",
             Self::Adopted { .. } => "adopted",
@@ -1939,6 +2011,17 @@ pub struct TakenName {
     pub id: String,
 }
 
+/// One invite, as listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteLine {
+    /// The name the device is admitted under.
+    pub name: String,
+    /// `open`, `used`, `expired` or `withdrawn`.
+    pub standing: String,
+    /// When it ends or ended, in seconds since the epoch.
+    pub expires_at: u64,
+}
+
 /// What the daemon sends back over the control channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1985,16 +2068,27 @@ pub enum Outcome {
     /// attacker who dialled first controls. A client cannot display what it is
     /// never given.
     Enrolling,
-    /// A join is waiting for an admin to come to this device.
+    /// A join is waiting, at the rendezvous its invite implies, for the admin
+    /// that issued it to dial.
     ///
-    /// Nothing has been signed and this device is a member of nothing. The
-    /// payload is what a person carries to an admin.
-    Joining {
-        /// The payload as text.
-        payload: String,
-        /// The same payload, drawn.
+    /// Nothing has been signed and this device is a member of nothing.
+    Joining,
+
+    /// An invite was issued, and the daemon dials the device it brings.
+    Invited {
+        /// The invite as text, to send or paste.
+        invite: String,
+        /// The same invite, drawn.
         scannable: String,
+        /// The name the device will be admitted under.
+        name: String,
+        /// When it ends, in seconds since the epoch, unless used or withdrawn
+        /// first.
+        expires_at: u64,
     },
+
+    /// The invites this device issued into a network.
+    InvitesHeld(Vec<InviteLine>),
 
     /// A join ended with a network adopted.
     Adopted {
@@ -2248,6 +2342,7 @@ mod tests {
         let collides = Ipv4State::Collides(named("tablet", 8));
         let said = collides.to_string();
         assert!(said.contains("collides") && said.contains("tablet"), "{said}");
+        assert!(said.contains("assign it a free one"), "and says what fixes it: {said}");
 
         let withheld = Ipv4State::Withheld {
             address: Ipv4Addr::new(192, 168, 1, 9),
@@ -2651,9 +2746,9 @@ mod tests {
 
     /// Every command survives the pipe, the enrolment ones included.
     ///
-    /// Those three carry the only command that has a payload, and they are the
-    /// only ones a person does not type by name — so nothing else would notice
-    /// if they stopped encoding.
+    /// Those carry an invite or its details, and they are the only ones a
+    /// person does not type by name — so nothing else would notice if they
+    /// stopped encoding.
     #[test]
     fn every_command_round_trips() {
         let all = [
@@ -2663,7 +2758,21 @@ mod tests {
             Command::Peers { network: None },
             Command::Address { network: None },
             Command::Stop,
-            Command::Admit { network: None, payload: "peerfectly-join-v1:abcdef".to_owned() },
+            Command::Invite {
+                network: None,
+                name: "sensor".to_owned(),
+                admin: false,
+                light: true,
+                groups: vec!["sensori".to_owned()],
+                ipv4: Some("100.64.0.9".to_owned()),
+                hours: Some(2),
+            },
+            Command::Withdraw { network: None, name: "sensor".to_owned() },
+            Command::Invites { network: None },
+            Command::Join {
+                invite: "peerfectly-invite-v1:abcdef".to_owned(),
+                name: "board".to_owned(),
+            },
             Command::Confirm,
             Command::Abandon,
             Command::Forget { label: "casa".to_owned(), last_admin: true },
@@ -2936,13 +3045,21 @@ mod tests {
         assert_eq!(back, sent);
     }
 
-    /// The three enrolment commands are not among the words a person types, and
-    /// they need no elevation: the daemon is already running as whatever it runs
-    /// as, and enrolling changes nothing on the machine.
+    /// The admitting side's enrolment commands are not among the words a person
+    /// types, and they need no elevation: the daemon is already running as
+    /// whatever it runs as, and admitting changes nothing on the machine.
     #[test]
     fn the_enrolment_commands_are_not_typed_by_name() {
         for command in [
-            Command::Admit { network: None, payload: String::new() },
+            Command::Invite {
+                network: None,
+                name: String::new(),
+                admin: false,
+                light: false,
+                groups: Vec::new(),
+                ipv4: None,
+                hours: None,
+            },
             Command::Confirm,
             Command::Abandon,
         ] {

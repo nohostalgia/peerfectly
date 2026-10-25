@@ -52,13 +52,14 @@ fn the_two_domains_are_distinct_and_specific() {
     }
 }
 
-/// A payload says who is asking. Everything that decides what they may become
-/// lives in the roster, and none of those words belong in this crate's format.
+/// An invite says where to meet. Everything that decides what the device may
+/// become stays in the admin's record and then the roster, and none of those
+/// words belong in the invite's format.
 #[test]
-fn the_payload_format_names_nothing_it_could_grant() {
-    for field in enrollment::payload::JOINING_SCHEMA {
-        for forbidden in ["role", "admin", "founder", "capab", "token", "secret"] {
-            assert!(!field.contains(forbidden), "`{field}` would let a payload ask for something");
+fn the_invite_names_nothing_it_could_grant() {
+    for field in enrollment::invite::INVITE_SCHEMA {
+        for forbidden in ["role", "admin", "founder", "capab", "token", "name", "group", "mode"] {
+            assert!(!field.contains(forbidden), "`{field}` would let an invite grant something");
         }
     }
 }
@@ -73,7 +74,7 @@ fn the_document_states_the_order_the_encoder_uses() {
     let format = include_str!("../FORMAT.md");
     let mut at = 0_usize;
 
-    for field in enrollment::payload::JOINING_SCHEMA {
+    for field in enrollment::invite::INVITE_SCHEMA {
         let quoted = format!("\"{field}\"");
         let found = format[at..]
             .find(&quoted)

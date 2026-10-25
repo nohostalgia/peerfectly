@@ -40,9 +40,23 @@ impl Admin {
         let depths = vec![1; heads.len()];
         Snapshot::new(
             7,
-            vec![0xa0],
-            heads,
-            depths,
+            vec![[0xa0; 32]],
+            [0xa0; 32],
+            roster::snapshot::Covering { heads, depths },
+            Vec::new(),
+            roster::leaf::DeviceLeaf {
+                record: self
+                    .identity
+                    .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+                    .unwrap()
+                    .into_record(roster::id::OperationId::from_bytes([1; 32]))
+                    .unwrap(),
+                settings: roster::leaf::DeviceSettings::default(),
+            },
+            roster::membership::MembershipProof {
+                devices: roster::merkle::Proof { siblings: Vec::new() },
+                parameters: [0; 32],
+            },
             self.identity.signing_key().key_id(),
             self.network,
         )
@@ -314,6 +328,7 @@ fn a_founding_typed_in_upper_case_is_the_one_asked_for() {
         suffix: "home.internal".to_owned(),
         relay: None,
         ipv4_range: None,
+        window_days: None,
     };
     assert!(matches_what_was_asked(&asked("Laptop"), &founding));
     assert!(matches_what_was_asked(&asked("laptop"), &founding));
@@ -364,7 +379,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
 
     let text = said(&Read::Operation(Box::new(revocation(&admin, Vec::new()))), &revoking(None));
     assert!(text.contains("revoke `laptop`") && text.contains("sold"), "{text}");
-    assert!(text.contains("permanent"), "{text}");
+    assert!(text.contains("invited again"), "{text}");
 
     let text = said(&Read::Operation(Box::new(admission(&admin, Vec::new()))), &Command::Confirm);
     assert!(text.contains("admit `laptop`") && text.contains("a member"), "{text}");
@@ -396,7 +411,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("rename `laptop` (") && text.contains("to `desk`"), "{text}");
 
     let body = admin.snapshot_over(vec![OperationId::from_bytes([3; 32])]);
-    let text = said(&Read::Snapshot(body), &Command::Confirm);
+    let text = said(&Read::Snapshot(Box::new(body)), &Command::Confirm);
     assert!(text.contains("current membership") && text.contains("snapshot 7"), "{text}");
     assert!(text.contains("routine") && text.contains("nobody's access changes"), "{text}");
     assert!(!text.contains("head"), "no jargon: {text}");
@@ -452,7 +467,7 @@ fn the_list_names_the_network_and_every_act() {
     assert!(shown.contains("  1. revoke"), "{shown}");
     assert!(shown.contains("  2. admit"), "{shown}");
     assert!(shown.contains("  3. record"), "{shown}");
-    assert!(shown.contains("permanent"), "{shown}");
+    assert!(shown.contains("invited again"), "{shown}");
 
     let line = summary(&read, "ufficio", &Command::Replace);
     assert!(line.starts_with("peerfectly · ufficio: revoke"), "{line}");

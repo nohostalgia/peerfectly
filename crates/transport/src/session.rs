@@ -100,6 +100,26 @@ pub trait Transport: Send + Sync {
     /// its caller. Every implementation that keeps its own copy must override it.
     async fn update_state(&self, _state: RosterState) {}
 
+    /// Hands the transport what this device shows a peer as a session opens:
+    /// its leaf, the proof of it and the root they rest on, as the bytes of a
+    /// `roster::membership::Evidence`. Empty when it holds no root.
+    ///
+    /// A peer holding no roster judges this device by it alone; a peer holding
+    /// one judges by its state and may ignore it. Replaces what was said
+    /// before. The default ignores it, which is right for a transport whose
+    /// peers all hold a roster.
+    fn update_evidence(&self, _evidence: Vec<u8>) {}
+
+    /// Judges every open session again, for a transport whose peers were
+    /// judged by their evidence: called when what the caller believes changed —
+    /// a new root, or an invalidation naming a peer — so that a peer no longer
+    /// shown a member is cut off then, not at its next session. Its session is
+    /// closed as a loss of membership.
+    ///
+    /// The default does nothing, which is right for a transport that judges
+    /// peers by state: [`Self::update_state`] is its reconsideration.
+    fn reconsider(&self) {}
+
     /// Says which blocks of addresses are served by tunnels the caller runs.
     ///
     /// A transport that finds its own caller's tunnel among the machine's

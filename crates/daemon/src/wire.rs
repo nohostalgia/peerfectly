@@ -165,6 +165,7 @@ mod tests {
             .expect("valid"),
             devices: [record(1, "nas")].into_iter().map(|item| (item.id, item)).collect(),
             revoked: BTreeSet::new(),
+            settings: Default::default(),
         }
     }
 

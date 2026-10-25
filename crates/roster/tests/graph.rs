@@ -586,7 +586,7 @@ fn concurrent_promote_and_revoke_resolves_to_revoked() {
 }
 
 #[test]
-fn a_causally_later_add_does_not_resurrect_a_revoked_device() {
+fn a_causally_later_add_admits_a_revoked_device_again() {
     let mut history = History::new();
     history.genesis("g", 1);
     history.op(
@@ -601,20 +601,61 @@ fn a_causally_later_add_does_not_resurrect_a_revoked_device() {
         &["add2"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
     );
-    // The same device id, added again after the revocation.
+    // The same device id, added again after the revocation: a deliberate act.
     history.op(
         "readd",
         1,
         &["revoke"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop-new", Role::Member, false)),
     );
 
     let state = derive(&history.dag()).expect("derives");
-    assert!(state.revoked.contains(&device_id(2)));
-    assert!(
-        !state.devices.contains_key(&device_id(2)),
-        "revocation is definitive; returning needs a new key"
+    assert!(!state.revoked.contains(&device_id(2)));
+    assert_eq!(
+        state.devices.get(&device_id(2)).map(|record| record.name.as_str()),
+        Some("laptop-new"),
+        "the later admission stands, under the name it gives"
     );
+}
+
+/// An admission concurrent with a revocation of the same device loses to it,
+/// in whichever order the two arrive.
+#[test]
+fn an_add_concurrent_with_a_revocation_loses_in_either_order() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("admin3", 1, &["g"], OperationBody::AddDevice(device(3, "pc", Role::Admin, false)));
+    history.op(
+        "add2",
+        1,
+        &["admin3"],
+        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+    );
+    // Admin 1 revokes the laptop; admin 3, not having seen that, admits it again.
+    history.op(
+        "revoke",
+        1,
+        &["add2"],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
+    );
+    history.op(
+        "readd",
+        3,
+        &["add2"],
+        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+    );
+
+    let forward = derive(&history.dag()).expect("derives");
+    assert!(!forward.devices.contains_key(&device_id(2)), "the revocation wins");
+    assert!(forward.revoked.contains(&device_id(2)));
+
+    let mut backward = roster::roster::Roster::new();
+    for entry in history.entries().iter().rev() {
+        let _ = backward.offer_bytes(&entry.bytes);
+    }
+    let backward = backward.state().expect("derives");
+    assert_eq!(backward.to_bytes(), forward.to_bytes(), "the same in the other order");
+    assert_eq!(backward.root(), forward.root());
 }
 
 #[test]

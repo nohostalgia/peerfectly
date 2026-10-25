@@ -56,14 +56,16 @@ pub const DEVICE_RECORD_SCHEMA: &[&str] =
     &["id", "keys", "name", "role", "founder", "added_by", "capabilities"];
 /// Field names of the network parameters, in canonical order.
 ///
-/// `ipv4` and `leaving` may be absent: see [`NETWORK_PARAMS_OPTIONAL`].
+/// `ipv4`, `policy`, `anchors` and `leaving` may be absent: see
+/// [`NETWORK_PARAMS_OPTIONAL`].
 pub const NETWORK_PARAMS_SCHEMA: &[&str] =
-    &["ula", "ipv4", "relay", "suffix", "leaving", "snapshot_window"];
+    &["ula", "ipv4", "relay", "policy", "suffix", "anchors", "leaving", "snapshot_window"];
 /// The keys of the network parameters that may be absent.
 ///
 /// Each is left out when absent rather than written empty, so that parameters
 /// without it encode exactly as they did before it existed.
-pub const NETWORK_PARAMS_OPTIONAL: &[&str] = &["ipv4", "leaving"];
+pub const NETWORK_PARAMS_OPTIONAL: &[&str] =
+    &["ipv4", "policy", "anchors", "leaving", "snapshot_window"];
 /// Field names of a relay being left, in canonical order.
 pub const LEAVING_SCHEMA: &[&str] = &["relay", "until"];
 /// Field names of a `create_network` body, in canonical order.
@@ -247,6 +249,10 @@ pub enum OperationType {
     Rename,
     /// Changes the network parameters.
     SetNetwork,
+    /// Changes a device's settings: mode, groups, assigned address, relay.
+    SetDevice,
+    /// Admits many devices at once: the header of a batch.
+    AdmitBatch,
 }
 
 impl OperationType {
@@ -259,6 +265,8 @@ impl OperationType {
         Self::Demote,
         Self::Rename,
         Self::SetNetwork,
+        Self::SetDevice,
+        Self::AdmitBatch,
     ];
 
     /// The wire name.
@@ -272,6 +280,8 @@ impl OperationType {
             Self::Demote => "demote",
             Self::Rename => "rename",
             Self::SetNetwork => "set_network",
+            Self::SetDevice => "set_device",
+            Self::AdmitBatch => "admit_batch",
         }
     }
 
@@ -285,6 +295,8 @@ impl OperationType {
             "demote" => Ok(Self::Demote),
             "rename" => Ok(Self::Rename),
             "set_network" => Ok(Self::SetNetwork),
+            "set_device" => Ok(Self::SetDevice),
+            "admit_batch" => Ok(Self::AdmitBatch),
             _ => Err(Error::UnknownOperationType),
         }
     }
@@ -843,6 +855,16 @@ pub struct NetworkParams {
     pub leaving: Option<Leaving>,
     /// Snapshot validity window, in seconds.
     pub snapshot_window: u64,
+    /// The network's anchors: always-on full members light members turn to.
+    ///
+    /// Sorted, without repeats. Empty at founding, and it may stay so. Carried
+    /// only as a parameter leaf (see [`crate::parameters`]).
+    pub anchors: Vec<DeviceId>,
+    /// The access policy: which group may open sessions to which.
+    ///
+    /// Sorted, without repeats. Empty is no policy: every member may reach every
+    /// member. Carried only as a parameter leaf.
+    pub policy: Vec<crate::parameters::Rule>,
 }
 
 impl NetworkParams {
@@ -883,7 +905,16 @@ impl NetworkParams {
             }
             _ => {}
         }
-        Ok(Self { ula, ipv4: None, relay, suffix, leaving: None, snapshot_window })
+        Ok(Self {
+            ula,
+            ipv4: None,
+            relay,
+            suffix,
+            leaving: None,
+            snapshot_window,
+            anchors: Vec::new(),
+            policy: Vec::new(),
+        })
     }
 
     /// Chooses the IPv4 range. The range was checked when it was built.
@@ -917,7 +948,13 @@ impl NetworkParams {
     /// As [`Self::leaving`], and when the new relay is outside its bound.
     pub fn moving_to(&self, relay: impl Into<String>, issued: u64) -> Result<Self> {
         let relay = relay.into();
-        let window_ms = self.snapshot_window.saturating_mul(1_000);
+        // One freshness window; a network with none moves over the window a
+        // network is founded with by default.
+        let window = match self.snapshot_window {
+            0 => limits::DEFAULT_SNAPSHOT_WINDOW,
+            seconds => seconds,
+        };
+        let window_ms = window.saturating_mul(1_000);
         let leaving = self
             .relay
             .clone()
@@ -926,6 +963,8 @@ impl NetworkParams {
         let mut moved =
             Self::with_relay(self.ula.clone(), Some(relay), &*self.suffix, self.snapshot_window)?;
         moved.ipv4 = self.ipv4;
+        moved.anchors.clone_from(&self.anchors);
+        moved.policy.clone_from(&self.policy);
         match leaving {
             Some(leaving) => moved.leaving(leaving),
             None => Ok(moved),
@@ -952,6 +991,8 @@ impl NetworkParams {
             self.snapshot_window,
         )?;
         moved.ipv4 = self.ipv4;
+        moved.anchors.clone_from(&self.anchors);
+        moved.policy.clone_from(&self.policy);
         Ok(moved)
     }
 
@@ -998,8 +1039,11 @@ impl NetworkParams {
     /// one encoding. The IPv4 range is instead left out when absent, so that
     /// parameters without one encode exactly as they did before it existed.
     pub(crate) fn encode(&self, writer: &mut Writer) {
-        let present = 4_u64
+        let present = 3_u64
+            .saturating_add(u64::from(self.snapshot_window != 0))
             .saturating_add(u64::from(self.ipv4.is_some()))
+            .saturating_add(u64::from(!self.policy.is_empty()))
+            .saturating_add(u64::from(!self.anchors.is_empty()))
             .saturating_add(u64::from(self.leaving.is_some()));
         writer.map(present);
         writer.key("ula").bytes(&self.ula);
@@ -1016,13 +1060,24 @@ impl NetworkParams {
                 writer.array(0);
             }
         }
+        if !self.policy.is_empty() {
+            writer.key("policy");
+            crate::parameters::write_policy(writer, &self.policy);
+        }
         writer.key("suffix").str(&self.suffix);
+        if !self.anchors.is_empty() {
+            writer.key("anchors");
+            crate::parameters::write_anchors(writer, &self.anchors);
+        }
         if let Some(leaving) = &self.leaving {
             writer.key("leaving").map(2);
             writer.key("relay").str(&leaving.relay);
             writer.key("until").u64(leaving.until);
         }
-        writer.key("snapshot_window").u64(self.snapshot_window);
+        // No window is the key left out: a network that never reads as stale.
+        if self.snapshot_window != 0 {
+            writer.key("snapshot_window").u64(self.snapshot_window);
+        }
     }
 
     /// Reads the parameters.
@@ -1046,7 +1101,28 @@ impl NetworkParams {
                 _ => Some(value.str(limits::MAX_RELAY_LEN, "relay address length")?.to_owned()),
             }
         };
+        // Left out when empty, and refused when written empty: one spelling.
+        let policy = match map.optional_key("policy")? {
+            Some(value) => {
+                let rules = crate::parameters::read_policy(value)?;
+                if rules.is_empty() {
+                    return Err(Error::NonCanonical);
+                }
+                rules
+            }
+            None => Vec::new(),
+        };
         let suffix = map.key("suffix")?.str(limits::MAX_SUFFIX_LEN, "suffix length")?.to_owned();
+        let anchors = match map.optional_key("anchors")? {
+            Some(value) => {
+                let anchors = crate::parameters::read_anchors(value)?;
+                if anchors.is_empty() {
+                    return Err(Error::NonCanonical);
+                }
+                anchors
+            }
+            None => Vec::new(),
+        };
         // One key holding both, so a relay being left without an end, or an end
         // without a relay, is not something the encoding can say at all.
         let leaving = match map.optional_key("leaving")? {
@@ -1062,10 +1138,19 @@ impl NetworkParams {
             }
             None => None,
         };
-        let snapshot_window = map.key("snapshot_window")?.u64()?;
+        let snapshot_window = match map.optional_key("snapshot_window")? {
+            // Absence has one spelling: the key left out, never written as zero.
+            Some(value) => match value.u64()? {
+                0 => return Err(Error::NonCanonical),
+                seconds => seconds,
+            },
+            None => 0,
+        };
         map.finish()?;
 
-        let params = Self::with_relay(ula, relay, suffix, snapshot_window)?;
+        let mut params = Self::with_relay(ula, relay, suffix, snapshot_window)?;
+        params.anchors = anchors;
+        params.policy = policy;
         let params = match ipv4 {
             Some(range) => params.in_ipv4_range(range),
             None => params,
@@ -1124,6 +1209,15 @@ pub enum OperationBody {
     },
     /// Replaces the network parameters.
     SetNetwork(NetworkParams),
+    /// Changes a device's settings, each field on its own.
+    SetDevice {
+        /// The device whose settings change.
+        device: DeviceId,
+        /// What changes.
+        change: crate::leaf::SettingsChange,
+    },
+    /// Admits the devices a batch's entries name.
+    AdmitBatch(crate::batch::BatchHeader),
 }
 
 impl OperationBody {
@@ -1138,6 +1232,8 @@ impl OperationBody {
             Self::Demote { .. } => OperationType::Demote,
             Self::Rename { .. } => OperationType::Rename,
             Self::SetNetwork(_) => OperationType::SetNetwork,
+            Self::SetDevice { .. } => OperationType::SetDevice,
+            Self::AdmitBatch(_) => OperationType::AdmitBatch,
         }
     }
 
@@ -1184,6 +1280,8 @@ impl OperationBody {
                 device.encode(writer);
             }
             Self::SetNetwork(params) => params.encode(writer),
+            Self::SetDevice { device, change } => change.encode(device, writer),
+            Self::AdmitBatch(header) => header.encode(writer),
         }
     }
 
@@ -1248,6 +1346,13 @@ impl OperationBody {
                 Self::Rename { device, name }
             }
             OperationType::SetNetwork => Self::SetNetwork(NetworkParams::decode(&mut reader)?),
+            OperationType::SetDevice => {
+                let (device, change) = crate::leaf::SettingsChange::decode(&mut reader)?;
+                Self::SetDevice { device, change }
+            }
+            OperationType::AdmitBatch => {
+                Self::AdmitBatch(crate::batch::BatchHeader::decode(&mut reader)?)
+            }
         };
         reader.finish()?;
         Ok(body)
@@ -1527,6 +1632,28 @@ mod tests {
         assert_eq!(Err(Error::MissingField), decoded, "an end is not optional inside the group");
     }
 
+    /// No freshness window is the key left out, and a window written as zero is
+    /// a second spelling of it, refused.
+    #[test]
+    fn no_window_is_the_key_left_out_and_zero_is_refused() {
+        let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 0)
+            .expect("well-formed");
+        let mut writer = cbor::Writer::new();
+        params.encode(&mut writer);
+        let bytes = writer.finish();
+        assert!(!bytes.windows(15).any(|window| window == b"snapshot_window"));
+        assert_eq!(NetworkParams::decode(&mut cbor::Reader::new(&bytes)), Ok(params));
+
+        let mut writer = cbor::Writer::new();
+        writer.map(4);
+        writer.key("ula").bytes(&[0xfd, 0, 0, 0, 0, 0, 0, 0]);
+        writer.key("relay").array(0);
+        writer.key("suffix").str("casa.internal");
+        writer.key("snapshot_window").u64(0);
+        let zero = writer.finish();
+        assert_eq!(NetworkParams::decode(&mut cbor::Reader::new(&zero)), Err(Error::NonCanonical));
+    }
+
     /// The end is the rule: past it, the relay being left is not in use, with
     /// nothing signed to say so.
     #[test]
@@ -1597,7 +1724,7 @@ mod tests {
 
     #[test]
     fn the_operation_type_set_is_closed() {
-        assert_eq!(OperationType::ALL.len(), 7);
+        assert_eq!(OperationType::ALL.len(), 9);
         assert_eq!(OperationType::parse("delegate"), Err(Error::UnknownOperationType));
         assert_eq!(OperationType::parse(""), Err(Error::UnknownOperationType));
     }

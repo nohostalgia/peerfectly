@@ -44,6 +44,7 @@ pub mod passphrase;
 pub mod seal;
 pub mod secret;
 pub mod store;
+pub mod wrapped;
 
 pub use error::{Error, Result};
 pub use identity::{CustodianKey, NodeIdentity, PrivateKey, SigningKey, fresh_key_name};

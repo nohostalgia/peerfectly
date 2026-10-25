@@ -5,47 +5,39 @@
 //! is how it can be given a network without anybody having to trust the way the
 //! bytes travelled.
 //!
-//! # The device that is joining goes first
+//! # The admin opens the door, and the device waits behind it
 //!
 //! A device with no network is unreachable in both directions: it registers at
 //! no relay, so nobody can dial it, and it cannot announce on the local network
 //! either, because announcements are sealed with a network identifier it does
 //! not have. Something has to break that symmetry.
 //!
-//! A person types a relay address. That is enough to make the device reachable —
-//! an endpoint registers at a relay by its own key and knows nothing about any
-//! roster — and it is the smallest thing anybody can carry between two machines
-//! that are not on the same network. The device then shows what it is, and the
-//! admin comes to it.
+//! An admin issues an **invite**: the network's relay, its id, and a secret.
+//! The device derives a rendezvous key from the secret, registers under it at
+//! that relay, and waits; the admin that issued the invite derives the same key
+//! and dials it. The admin's side never listens.
 //!
-//! The direction follows from what is known rather than from preference: dialling
-//! needs the peer's transport key, which is thirty-two bytes nobody types, and
-//! the joining payload is what carries it.
+//! # What the invite's secret is, and is not
 //!
-//! # Nothing here is secret, and nothing here is authority
-//!
-//! The joining payload is **public**. It is on a screen, it will be photographed,
-//! and it will be pasted into a chat. Nothing in this crate depends on it being
-//! secret, and holding one grants nothing: it says who is asking, and asking is
-//! free.
-//!
-//! What makes an enrolment safe is not the privacy of the payload but three
-//! checks that do not depend on it:
+//! The secret only says where to meet. Whoever learns it can reach the waiting
+//! device first, so nothing about an enrolment's safety rests on it staying
+//! secret. What makes an enrolment safe is three checks that do not depend on
+//! it:
 //!
 //! - **The confirmation code is bound to the channel.** Every key involved is
-//!   public, so a code derived from keys alone could be computed in advance by
-//!   anyone who had seen the payload — and then matched by grinding key pairs
-//!   against a six-digit space. Binding it to material exported from the
-//!   established channel means the value being matched does not exist until the
-//!   channel does.
-//! - **Both keys are proved.** The channel authenticates the transport key. The
-//!   signing key — which is where a device's identity comes from — is proved by
-//!   a signature over that same channel material. Without it, a payload could
-//!   pair one device's identity with another's transport key, and a roster keeps
-//!   the first admission of a device id for ever.
+//!   public once presented, so a code derived from keys alone could be matched
+//!   by grinding key pairs against a six-digit space. Binding it to material
+//!   exported from the established channel means the value being matched does
+//!   not exist until the channel does.
+//! - **The device's keys are proved.** The channel of an invite authenticates
+//!   only the rendezvous key. The signing key — which is where a device's
+//!   identity comes from — and the transport key are each proved by a
+//!   signature over that same channel material. Without it, an introduction
+//!   could pair one device's identity with another's transport key, and a roster
+//!   keeps the first admission of a device id for ever.
 //! - **The delivered roster is verified, not trusted.** Who handed it over does
-//!   not matter. It must admit this device's own keys, be signed by an admin, and
-//!   derive consistently.
+//!   not matter. It must admit this device's own keys, be signed by an admin,
+//!   derive consistently, and be of the network the invite names.
 //!
 //! # What a person still has to do
 //!
@@ -62,17 +54,17 @@
 //! - The enrolment endpoint and the channel material it exports —
 //!   `transport-convesso`.
 //! - Membership, roles and authority — the roster's, entirely. An admin decides
-//!   what a joining device is permitted to be; the payload only proposes a name.
+//!   what a joining device is permitted to be; the device only proposes a name.
 
 pub mod adopt;
 pub mod code;
 pub mod error;
 pub mod exchange;
+pub mod invite;
 pub mod limits;
-pub mod payload;
 
 pub use adopt::Adopted;
 pub use code::{Confirmation, DOMAIN_CODE};
 pub use error::{Error, Result};
 pub use exchange::{DOMAIN_POSSESSION, Possession};
-pub use payload::Joining;
+pub use invite::Invite;

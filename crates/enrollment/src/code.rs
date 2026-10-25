@@ -2,10 +2,10 @@
 //!
 //! # Every key in this derivation is public
 //!
-//! The joining payload is on a screen; the admin's keys are in a roster every
-//! member holds. A code derived from keys alone could therefore be computed by
-//! anyone who had seen the payload — including the code the *legitimate*
-//! exchange is about to display. Knowing that value, an attacker generates key
+//! A joining device presents its keys over the exchange; the admin's keys are
+//! in a roster every member holds. A code derived from keys alone could
+//! therefore be computed by anyone who had seen them — including the code the
+//! *legitimate* exchange is about to display. Knowing that value, an attacker generates key
 //! pairs of their own until one produces the same six digits. Six digits is a
 //! space of one million: the search takes seconds, and the person then compares
 //! two screens showing the same number and confirms an enrolment into the
@@ -49,14 +49,14 @@ const CODES: u64 = 1_000_000;
 /// What the joining device brings to an exchange.
 ///
 /// Every key that will end up in its device record. Two of them are established
-/// independently — the signing key by the proof of possession, the transport key
-/// by the channel the admitting side dialled — and the attestation key is not.
+/// independently — the signing and transport keys each by a proof of
+/// possession — and the attestation key is not.
 ///
 /// It is here anyway, and that is the point. The code exists so that what the
 /// admitting side signs into the roster is what both people compared. The
 /// attestation key goes into the device record, so a code that did not cover it
-/// would leave a field in that record neither person ever saw — and a payload
-/// substituted in flight could name an attestation key of the attacker's
+/// would leave a field in that record neither person ever saw — and an
+/// introduction substituted in flight could name an attestation key of the attacker's
 /// choosing while showing the same six digits.
 ///
 /// Possession of it is not proven by this, and does not need to be: what the
@@ -79,7 +79,7 @@ impl Confirmation {
     /// Derives the code for one exchange.
     ///
     /// The roles are fixed and different, so there is no order to agree on: the
-    /// admitting side knows the joining device's keys from its payload, and the
+    /// admitting side knows the joining device's keys from its introduction, and the
     /// joining device knows the admitting side's transport key from the channel.
     /// Each supplies what it knows and both arrive at one value.
     ///
@@ -182,7 +182,7 @@ mod tests {
         let admitting = admitting();
         let channel = b"one exchange";
 
-        // The admitting side reads the joining device's keys from its payload.
+        // The admitting side reads the joining device's keys from its introduction.
         let from_the_admin = Confirmation::derive(&joining, &admitting, channel).expect("derives");
         // The joining device reads the admitting side's transport key from the
         // channel, and already holds its own two.
@@ -262,8 +262,8 @@ mod tests {
             transport: other.transport,
             attestation: joining.attestation.clone(),
         };
-        // The third key is bound too, which is the point of carrying it: a
-        // payload substituted in flight names an attestation key of the
+        // The third key is bound too, which is the point of carrying it: an
+        // introduction substituted in flight names an attestation key of the
         // attacker's choosing, and the digits have to move when it does.
         let swapped_attestation = Side {
             signing: joining.signing.clone(),

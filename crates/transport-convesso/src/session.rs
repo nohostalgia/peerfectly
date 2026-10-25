@@ -34,8 +34,16 @@ pub const FRAGMENT_ROOM: usize = DATAGRAM_ROOM - PACKET_HEADER;
 pub struct Live {
     /// Its id, the dialler's choice.
     pub id: SessionId,
-    /// The device at the other end.
-    pub device: DeviceId,
+    /// The device at the other end. Settable once, for a node holding no
+    /// roster, which learns it from the far end's evidence as the dial is
+    /// answered.
+    device: std::sync::RwLock<DeviceId>,
+    /// What the far end showed of its membership, for a node holding no roster
+    /// to judge it by again when what it believes changes.
+    evidence: std::sync::Mutex<Vec<u8>>,
+    /// Whether the far end opened it: the sessions this node accepted are the
+    /// ones its access policy decides.
+    inbound: std::sync::atomic::AtomicBool,
     /// The same peer, as convesso authenticates it.
     pub peer: PeerId,
     /// And as convesso dials it.
@@ -63,7 +71,9 @@ impl Live {
         let (packets_in, packets_out) = mpsc::channel(limits::PACKET_QUEUE);
         Arc::new(Self {
             id,
-            device,
+            device: std::sync::RwLock::new(device),
+            evidence: std::sync::Mutex::new(Vec::new()),
+            inbound: std::sync::atomic::AtomicBool::new(false),
             peer: address.peer_id(),
             address,
             context,
@@ -75,6 +85,40 @@ impl Live {
             next_packet: AtomicU32::new(0),
             closed: watch::Sender::new(None),
         })
+    }
+
+    /// The device at the other end.
+    pub fn device(&self) -> DeviceId {
+        self.device.read().map_or_else(|poisoned| *poisoned.into_inner(), |device| *device)
+    }
+
+    /// Whether the far end opened this session.
+    pub fn inbound(&self) -> bool {
+        self.inbound.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Marks this session as opened by the far end.
+    pub fn set_inbound(&self) {
+        self.inbound.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// What the far end showed of its membership.
+    pub fn evidence(&self) -> Vec<u8> {
+        self.evidence.lock().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    /// Records what the far end showed of its membership.
+    pub fn set_evidence(&self, evidence: Vec<u8>) {
+        if let Ok(mut held) = self.evidence.lock() {
+            *held = evidence;
+        }
+    }
+
+    /// Records the device at the other end, as its evidence showed it.
+    pub fn set_device(&self, device: DeviceId) {
+        if let Ok(mut held) = self.device.write() {
+            *held = device;
+        }
     }
 
     /// Why the session ended, if it has.
@@ -150,7 +194,7 @@ fn sending_failed(error: &NodeError) -> Error {
 #[async_trait]
 impl Session for SessionHandle {
     fn peer(&self) -> DeviceId {
-        self.0.device
+        self.0.device()
     }
 
     async fn send(&self, payload: &[u8]) -> Result<()> {

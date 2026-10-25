@@ -36,6 +36,8 @@ pub enum Channel {
     /// neighbour pushes to it too. The receiver checks the claim against the
     /// roster before believing it; see `neighbours::claim_holds`.
     Neighbour,
+    /// A lookup by name or address, and its answer: see `lookup`.
+    Lookup,
 }
 
 impl Channel {
@@ -45,6 +47,7 @@ impl Channel {
         match self {
             Self::Roster => 1,
             Self::Neighbour => 3,
+            Self::Lookup => 4,
         }
     }
 
@@ -57,6 +60,7 @@ impl Channel {
         match tag {
             1 => Some(Self::Roster),
             3 => Some(Self::Neighbour),
+            4 => Some(Self::Lookup),
             _ => None,
         }
     }
@@ -106,7 +110,7 @@ mod tests {
     /// what you cannot parse might be the thing that mattered.
     #[test]
     fn an_unknown_tag_is_refused_rather_than_guessed_at() {
-        for tag in [0u8, 2, 4, 9, 255] {
+        for tag in [0u8, 2, 5, 9, 255] {
             assert_eq!(Channel::from_tag(tag), None, "tag {tag}");
             assert_eq!(unframe(&[tag, 1, 2, 3]), None, "tag {tag}");
         }

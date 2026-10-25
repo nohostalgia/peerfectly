@@ -347,11 +347,28 @@
       }
     },
     "Enrolling",
+    "Joining",
     {
-      "Joining": {
-        "payload": "peerfectly-join:abc",
+      "Invited": {
+        "expires_at": 1758300000,
+        "invite": "peerfectly-invite-v1:abc",
+        "name": "sensor",
         "scannable": "▀▄"
       }
+    },
+    {
+      "InvitesHeld": [
+        {
+          "expires_at": 1758300000,
+          "name": "sensor",
+          "standing": "open"
+        },
+        {
+          "expires_at": 1758200000,
+          "name": "laptop",
+          "standing": "used"
+        }
+      ]
     },
     {
       "Adopted": {

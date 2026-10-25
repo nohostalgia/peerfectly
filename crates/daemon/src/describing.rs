@@ -137,6 +137,10 @@ impl Directory {
                 Act::Renames(self.named(device), name.clone())
             }
             OperationBody::SetNetwork(_) => Act::SetsParameters,
+            OperationBody::SetDevice { device, .. } => Act::ChangesSettings(self.named(device)),
+            OperationBody::AdmitBatch(header) => {
+                Act::AdmitsBatch { count: header.count, label: header.label.clone() }
+            }
         }
     }
 }
@@ -440,19 +444,17 @@ mod tests {
             for index in wanted {
                 covered.insert(full.operation(index).unwrap().clone()).unwrap();
             }
-            let state = roster::state::derive(&covered).unwrap().to_bytes();
+            let state = roster::state::derive(&covered).unwrap();
             let depths = heads
                 .iter()
                 .map(|head| covered.depth(covered.position(&self.id(head)).unwrap()))
                 .collect();
             let ids = heads.iter().map(|head| self.id(head)).collect();
-            let body = Snapshot::new(
-                1,
-                state,
-                ids,
-                depths,
+            let body = Snapshot::over(
+                &state,
+                roster::snapshot::Covering { heads: ids, depths },
                 signer(signer_seed).key_id(),
-                self.network.unwrap(),
+                None,
             )
             .unwrap();
             sign_snapshot(&body, &signer(signer_seed)).unwrap()

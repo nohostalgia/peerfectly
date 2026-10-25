@@ -184,22 +184,23 @@ fn a_snapshot_is_sent_before_the_operations_that_build_on_it() {
     );
 }
 
+/// An older root from a peer is lighter: kept out, and no fault of the peer.
 #[test]
-fn a_snapshot_that_would_regress_is_refused() {
+fn an_older_snapshot_is_lighter_and_kept_out() {
     let mut fixture = Fixture::found();
     fixture.extend(12);
 
     let earlier = fixture.snapshot_bytes(&fixture.roster(), 1);
     let mut node = fixture.syncer_with_snapshot(4);
-    let before = node.roster().snapshot().map(|snapshot| snapshot.body().seq);
+    let before = node.roster().snapshot().map(|snapshot| snapshot.body().generation);
     assert_eq!(before, Some(4));
 
     let (peer, _) = ids();
     let outcome = node.receive(peer, &Message::Snapshot(earlier).encode());
 
-    assert!(!outcome.is_clean(), "a regression must be refused");
+    assert!(outcome.is_clean(), "a lighter root is not a refusal");
     assert_eq!(
-        node.roster().snapshot().map(|snapshot| snapshot.body().seq),
+        node.roster().snapshot().map(|snapshot| snapshot.body().generation),
         before,
         "the held snapshot is unchanged"
     );
@@ -279,6 +280,9 @@ fn kind_of(message: &Message) -> &'static str {
     match message {
         Message::Snapshot(_) => "snapshot",
         Message::Transfer(_) => "transfer",
+        Message::Pieces(_) => "pieces",
+        Message::StateRequest(_) => "state request",
+        Message::State(_) => "state",
         Message::Offer(_) => "offer",
         Message::Attestation(_) => "attestation",
         Message::Digest(_) => "digest",

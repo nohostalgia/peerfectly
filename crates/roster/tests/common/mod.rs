@@ -107,7 +107,7 @@ pub fn params() -> NetworkParams {
     .expect("well-formed parameters")
 }
 
-/// A well-formed body of each of the seven operation types.
+/// A well-formed body of each of the nine operation types.
 pub fn body_of(op_type: OperationType) -> OperationBody {
     match op_type {
         OperationType::CreateNetwork => OperationBody::CreateNetwork {
@@ -127,6 +127,28 @@ pub fn body_of(op_type: OperationType) -> OperationBody {
             OperationBody::Rename { device: device_id(2), name: "workstation".to_owned() }
         }
         OperationType::SetNetwork => OperationBody::SetNetwork(params()),
+        OperationType::SetDevice => OperationBody::SetDevice {
+            device: device_id(2),
+            change: roster::leaf::SettingsChange {
+                mode: Some(roster::leaf::Mode::Light),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+        OperationType::AdmitBatch => OperationBody::AdmitBatch(
+            roster::batch::BatchHeader::new(
+                roster::batch::Commitment {
+                    count: 3,
+                    entries: [0x5a; 32],
+                    pieces: 1,
+                    layout: [0x5b; 32],
+                },
+                roster::leaf::Mode::Light,
+                vec![],
+                None,
+                "lot A",
+            )
+            .expect("a header"),
+        ),
     }
 }
 

@@ -4,16 +4,14 @@
 //! reads a roster and stops without one. A device here has keys and nothing
 //! else.
 //!
-//! # A relay address is the whole bootstrap
+//! # An invite is the whole bootstrap
 //!
 //! A device with no network is unreachable in both directions — it registers at
 //! no relay, so nobody can dial it, and it cannot announce on the local network
 //! either, because announcements are sealed with a network identifier it does
-//! not have. A person types a relay address, and that is enough: an endpoint
-//! registers at a relay by its own key and knows nothing about any roster.
-//!
-//! Then the device shows what it is and waits. The admin comes to it, because
-//! dialling needs the peer's transport key and the payload is what carries it.
+//! not have. An admin's invite names the network's relay and a secret: the
+//! device registers at that relay under the rendezvous key the secret derives,
+//! and waits there for the admin that issued it to dial.
 //!
 //! # What is accepted, and what that is worth
 //!
@@ -28,7 +26,6 @@ use std::time::{Duration, Instant};
 
 use enrollment::code::{Confirmation, Side};
 use enrollment::exchange::{Message, Possession};
-use enrollment::payload::Joining;
 use enrollment::{adopt, limits};
 use identity::NodeIdentity;
 use transport_convesso::enrolment::{Channel, Waiting};
@@ -58,8 +55,9 @@ pub type Refusal = String;
 /// thread stalled the connection, and the exchange died while the person was
 /// typing.
 pub trait Person: Send + Sync + 'static {
-    /// Shows the payload a person must carry to the admin.
-    fn show_payload(&self, text: &str, scannable: &str);
+    /// Says the device is registered at its rendezvous and waits for the admin
+    /// that invited it.
+    fn waiting(&self) {}
 
     /// Asks for the code the admin is displaying.
     ///
@@ -103,38 +101,28 @@ pub trait Person: Send + Sync + 'static {
 
 /// What a join driven by the daemon has reached.
 ///
-/// A join is a conversation with two pauses in it: one while a person carries
-/// the payload to an admin, and one while they compare six digits. The control
+/// A join is a conversation with two pauses in it: one while it waits for the
+/// admin that invited it to dial, and one while a person compares six digits. The control
 /// channel is one request and one answer, so the daemon holds where the
 /// conversation has got to and the command line asks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     /// Registering at the relay. Nothing to show yet.
     Registering,
-    /// Waiting for an admin, with the payload a person carries to one.
-    Waiting {
-        /// The payload as text.
-        payload: String,
-        /// The same payload, drawn.
-        scannable: String,
-    },
+    /// Registered at the rendezvous, waiting for the admin to dial.
+    Waiting,
     /// An admin has arrived and is showing a code for a person to type here.
     ///
     /// What this device derived is not carried: a person must read the digits
     /// off the admin's screen, and a client that could show them its own would
     /// be offering the wrong screen to read.
-    Confirming {
-        /// The payload, still, in case the person is looking at it.
-        payload: String,
-    },
+    Confirming,
     /// The proof of possession is prepared and needs a signature from a key this
     /// process cannot reach.
     ///
     /// Nothing has been written and nothing has been sent: what is waiting is the
     /// one thing a device must do to show the identity it presented is its own.
     Signing {
-        /// The payload, still, in case the person is looking at it.
-        payload: String,
         /// The bytes to be signed, and what they will become.
         request: identity::detached::SigningRequest,
     },
@@ -216,11 +204,6 @@ impl AcrossTheChannel {
             Err(refusal) => Progress::Failed(refusal),
         });
     }
-
-    /// What it has got to.
-    fn now(&self) -> Progress {
-        self.progress.lock().map_or(Progress::Registering, |held| held.clone())
-    }
 }
 
 /// The service's half: what a join has reached, and how to confirm it.
@@ -293,25 +276,18 @@ impl Person for AcrossTheChannel {
         self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn show_payload(&self, text: &str, scannable: &str) {
-        self.reached(Progress::Waiting {
-            payload: text.to_owned(),
-            scannable: scannable.to_owned(),
-        });
+    fn waiting(&self) {
+        self.reached(Progress::Waiting);
     }
 
     fn code_shown_by_the_admin(&self, ours: &Confirmation) -> Option<String> {
-        let payload = match self.now() {
-            Progress::Waiting { payload, .. } | Progress::Confirming { payload, .. } => payload,
-            _ => String::new(),
-        };
         // The code this device derived is deliberately **not** carried here.
         // Progress is what a client is shown, and a client that could show the
         // code would be inviting the person to read it from this screen rather
         // than from the admin's — which is the screen an attacker who dialled
         // first controls.
         let _ = ours;
-        self.reached(Progress::Confirming { payload });
+        self.reached(Progress::Confirming);
 
         // Bounded, because an unbounded wait here holds a thread from the
         // blocking pool for as long as the daemon runs, on a join nobody is
@@ -321,11 +297,7 @@ impl Person for AcrossTheChannel {
     }
 
     fn signs_the_proof(&self, request: &identity::detached::SigningRequest) -> Option<Vec<u8>> {
-        let payload = match self.now() {
-            Progress::Waiting { payload, .. } | Progress::Confirming { payload, .. } => payload,
-            _ => String::new(),
-        };
-        self.reached(Progress::Signing { payload, request: request.clone() });
+        self.reached(Progress::Signing { request: request.clone() });
 
         // Bounded, for the reason the code's wait is bounded: an unbounded wait
         // holds a thread from the blocking pool for as long as the daemon runs,
@@ -358,62 +330,92 @@ pub struct Joined {
     pub devices: usize,
 }
 
-/// Waits to be admitted, and adopts the network if everything checks out.
-///
-/// # Errors
-///
-/// When this machine already holds a network, when the relay cannot be reached,
-/// when the wait ends without an admission, or when what arrived could not be
-/// believed.
-pub async fn join(
-    paths: &Paths,
-    relay: &str,
-    name: &str,
-    person: Arc<dyn Person>,
-) -> Result<Joined, Refusal> {
-    join_with(paths, relay, name, person, &crate::keys::PlatformKeys).await
+/// What a join from an invite holds of it: the network it must be, and the name
+/// this device proposes.
+pub struct Invited {
+    /// The only network this device may adopt.
+    pub network: roster::id::NetworkId,
+    /// The name it proposes. The inviting admin's record decides.
+    pub name: String,
 }
 
-/// Joins with keys from `keys`.
+/// Joins from an invite: waits at the rendezvous key its secret derives, at the
+/// relay it names, for the admin that issued it to dial.
+///
+/// A join always makes fresh keys: whatever identity this network's directory
+/// held from an earlier membership is dropped first, so a device revoked and
+/// invited again arrives as a new device, and any copy of its old keys belongs
+/// to no member.
 ///
 /// # Errors
 ///
-/// As [`join`], and when the keys decline to prove possession.
-pub async fn join_with(
+/// When this machine already holds a network here, when the invite does not
+/// read or its relay cannot be reached, when the wait ends without an
+/// admission, or when what arrived could not be believed or is not the network
+/// the invite names.
+pub async fn join(
     paths: &Paths,
-    relay: &str,
+    invite_text: &str,
     name: &str,
     person: Arc<dyn Person>,
     keys: &dyn crate::keys::Keys,
 ) -> Result<Joined, Refusal> {
     paths.create().map_err(|cause| cause.to_string())?;
+    if !Log::at(paths.roster()).read().map_err(|cause| cause.to_string())?.is_empty() {
+        return Err(already_holds(paths));
+    }
+    // Fresh keys, always.
+    for previous in [paths.identity(), paths.light()] {
+        if previous.exists() {
+            std::fs::remove_file(&previous).map_err(|cause| cause.to_string())?;
+        }
+    }
+    join_fresh(paths, invite_text, name, person, keys).await
+}
 
+/// The refusal of a join into a directory that already holds a network.
+fn already_holds(paths: &Paths) -> Refusal {
+    format!(
+        "this machine already holds a network here. Joining another would abandon it, so it is \
+         refused.\nTo start over deliberately, remove {} first.",
+        paths.roster().display()
+    )
+}
+
+/// As [`join`], in a directory made for this join: whatever identity
+/// it holds was made for it — the daemon makes one before the join when the
+/// key is kept elsewhere — and is the one the join presents.
+///
+/// # Errors
+///
+/// As [`join`].
+pub async fn join_fresh(
+    paths: &Paths,
+    invite_text: &str,
+    name: &str,
+    person: Arc<dyn Person>,
+    keys: &dyn crate::keys::Keys,
+) -> Result<Joined, Refusal> {
+    let invite = enrollment::Invite::from_text(invite_text).map_err(|cause| cause.to_string())?;
+    paths.create().map_err(|cause| cause.to_string())?;
     let log = Log::at(paths.roster());
     if !log.read().map_err(|cause| cause.to_string())?.is_empty() {
-        return Err(format!(
-            "this machine already holds a network. Joining another would abandon it, so it is \
-             refused.\nTo start over deliberately, remove {} first.",
-            paths.roster().display()
-        ));
+        return Err(already_holds(paths));
     }
-
     let identity = keys.identity(paths).map_err(|cause| cause.to_string())?;
-    let waiting = Waiting::listen(&identity, relay).await.map_err(|cause| cause.to_string())?;
+    let waiting = Waiting::at_rendezvous(&invite.rendezvous_seed(), &invite.relay)
+        .await
+        .map_err(|cause| cause.to_string())?;
+    let invited = Invited { network: invite.network, name: name.to_owned() };
 
-    // Everything after listening runs inside one future, so that however it ends
-    // — a relay that does not answer, a wait that runs out, a person abandoning
-    // it — the endpoint is closed. Dropped instead, its socket stayed bound.
     let work = async {
         note(&person, "registering at the relay...").await;
         tokio::time::timeout(Duration::from_secs(30), waiting.online())
             .await
-            .map_err(|_| format!("{relay} did not answer within thirty seconds"))?;
-
-        let payload =
-            Joining::of(&identity, name, waiting.relay()).map_err(|cause| cause.to_string())?;
-        show(&person, payload.to_text()).await;
-
-        wait_for_admission(&waiting, &identity, &person).await
+            .map_err(|_| format!("{} did not answer within thirty seconds", invite.relay))?;
+        note(&person, "waiting for the admin that invited this device to reach it...").await;
+        waits(&person).await;
+        wait_for_admission(&waiting, &identity, &person, &invited).await
     };
     let outcome = tokio::select! {
         outcome = work => outcome,
@@ -421,13 +423,16 @@ pub async fn join_with(
     };
     waiting.close().await;
 
-    let Delivered { operations, snapshot, adopted } = outcome?;
+    let Delivered { operations, snapshot, adopted, base } = outcome?;
+    // The base first: a log that does not reach the genesis is never left
+    // without the state beneath it.
+    if let Some((root, state)) = &adopted.base {
+        crate::state::write_base(paths, root, state).map_err(|cause| cause.to_string())?;
+    }
     for operation in &operations {
         log.append(operation).map_err(|cause| cause.to_string())?;
     }
-
-    keep_delivered_snapshot(paths, &operations, snapshot.as_deref());
-
+    keep_delivered_snapshot(paths, base, &operations, snapshot.as_deref());
     Ok(Joined { suffix: adopted.state.params.suffix.clone(), devices: adopted.state.devices.len() })
 }
 
@@ -442,15 +447,20 @@ pub async fn join_with(
 /// What a device without one gets is a roster it cannot yet confirm — the same
 /// state as one that has been out of touch too long. That is worth saying rather
 /// than hiding, and the daemon says it as soon as the network is reported.
-fn keep_delivered_snapshot(paths: &Paths, operations: &[Vec<u8>], snapshot: Option<&[u8]>) {
+fn keep_delivered_snapshot(
+    paths: &Paths,
+    base: Option<adopt::Base>,
+    operations: &[Vec<u8>],
+    snapshot: Option<&[u8]>,
+) {
     let Some(bytes) = snapshot else { return };
 
     // Checked by the roster's own rules — signed by a device these operations
     // name as an admin, over heads they contain — and never because of who sent
     // it. The same roster the operations derive to is what does the checking.
     let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
-    for operation in operations {
-        let _admitted = roster.offer_bytes(operation);
+    if adopt::fill(&mut roster, base, operations).is_err() {
+        return;
     }
     if !roster.offer_snapshot(bytes).is_accepted() {
         return;
@@ -470,6 +480,7 @@ async fn wait_for_admission(
     waiting: &Waiting,
     identity: &NodeIdentity,
     person: &Arc<dyn Person>,
+    invited: &Invited,
 ) -> Result<Delivered, Refusal> {
     let started = Instant::now();
     let whole = Duration::from_secs(limits::WAIT_SECS);
@@ -486,15 +497,15 @@ async fn wait_for_admission(
         }
 
         // One exchange at a time, because two would mean two codes on one
-        // screen. Each with a deadline of its own, because the payload is
-        // public: without one, anybody who had seen it could open an exchange,
+        // screen. Each with a deadline of its own, because the invite travels
+        // by message: without one, anybody who had seen it could open an exchange,
         // say nothing, and hold the only slot for the whole wait.
         let Ok(accepted) = tokio::time::timeout(left.min(each), waiting.accept()).await else {
             continue;
         };
         let Ok(channel) = accepted else { continue };
 
-        match one_exchange(channel, identity, person, each).await {
+        match one_exchange(channel, identity, person, each, invited).await {
             Ok(admitted) => return Ok(admitted),
             Err(refusal) => {
                 // A failed exchange does not end the wait: a person who mistyped
@@ -519,14 +530,15 @@ async fn one_exchange(
     identity: &NodeIdentity,
     person: &Arc<dyn Person>,
     deadline: Duration,
+    invited: &Invited,
 ) -> Result<Delivered, Refusal> {
     let material = channel.material().map_err(|cause| cause.to_string())?;
     let peer = channel.peer().map_err(|cause| cause.to_string())?;
 
     // The channel proves the peer holds its transport key. This proves the same
-    // about ours, which the channel says nothing about — and a device's identity
-    // comes from its signing key, so without it a payload could pair our
-    // identity with somebody else's transport key.
+    // about ours, which an invite's channel says nothing about — and a device's
+    // identity comes from its signing key, so without it an introduction could
+    // pair our identity with somebody else's transport key.
     let possession = if identity.signing_key().answers_here() {
         Possession::prove_detached(identity, &material).map_err(|cause| match cause {
             enrollment::Error::NotProved(custody) => crate::control::declined(&custody),
@@ -554,7 +566,19 @@ async fn one_exchange(
         })?;
         proof
     };
-    send(&mut channel, &Message::Hello { possession }, deadline).await?;
+    // An invite's channel authenticates only the rendezvous key, so the device
+    // says what it is and proves its transport key too.
+    let transport_possession = Possession::prove(identity.transport_key().signer(), &material)
+        .map_err(|cause| cause.to_string())?;
+    let introduction = enrollment::exchange::Introduction {
+        signing: identity.signing_key().public_key(),
+        transport: identity.transport_key().public_key(),
+        attestation: identity.attestation_key().public_key(),
+        name: invited.name.clone(),
+        possession,
+        transport_possession,
+    };
+    send(&mut channel, &Message::Introduce(introduction), deadline).await?;
 
     let ours = Side {
         signing: identity.signing_key().public_key(),
@@ -582,18 +606,79 @@ async fn one_exchange(
     // the same code from the channel.
     send(&mut channel, &Message::Accepted, deadline).await?;
 
-    let Message::Admission { operations, snapshot } = receive(&mut channel, deadline).await? else {
-        return Err("the other machine said something other than an admission".to_owned());
+    // The state the admitting side's roster rests on, where it was compacted,
+    // in as many parts as it takes; then the admission.
+    let mut assembling: Option<(Vec<u8>, roster::transfer::StateAssembler)> = None;
+    let mut parts = 0_usize;
+    let (operations, snapshot) = loop {
+        match receive(&mut channel, deadline).await? {
+            Message::Base { root, pieces } => {
+                parts = parts.saturating_add(1);
+                if parts > MOST_BASE_PARTS {
+                    return Err(
+                        "the other machine sent more of a base than any network has".to_owned()
+                    );
+                }
+                let assembler = match &mut assembling {
+                    Some((held, assembler)) if *held == root => assembler,
+                    Some(_) => {
+                        return Err(
+                            "the other machine sent parts of two different bases".to_owned()
+                        );
+                    }
+                    None => {
+                        let raw = roster::snapshot::RawSnapshot::decode(&root)
+                            .map_err(|cause| cause.to_string())?;
+                        let assembler = roster::transfer::StateAssembler::new(
+                            raw.body().network,
+                            raw.body().root,
+                            roster_sync::limits::MAX_STATE_DEVICES,
+                        );
+                        &mut assembling.insert((root, assembler)).1
+                    }
+                };
+                for piece in &pieces {
+                    assembler.add(piece).map_err(|cause| cause.to_string())?;
+                }
+            }
+            Message::Admission { operations, snapshot } => break (operations, snapshot),
+            _ => return Err("the other machine said something other than an admission".to_owned()),
+        }
+    };
+    let base = match assembling {
+        Some((root, assembler)) => {
+            assembler.finish().map(|state| Some(adopt::Base { root, state })).map_err(|cause| {
+                format!("the state the network was delivered resting on does not hold: {cause}")
+            })
+        }
+        None => Ok(None),
     };
 
     // Delivery proves nothing. What arrived must admit this device's own keys,
-    // and be signed by an admin.
-    let adopted = adopt::adopt(&operations, identity).map_err(|cause| cause.to_string());
+    // and be signed by an admin — and a base it rests on must make its root.
+    let adopted = base.clone().and_then(|base| {
+        adopt::adopt_on(base, &operations, identity).map_err(|cause| cause.to_string())
+    });
+    // Only the network the invite named. Somebody who learned the secret and
+    // dialled first could deliver a roster of another network, with this device
+    // in it: the device adopts nothing, and says so.
+    let adopted = match adopted {
+        Ok(adopted) if adopted.state.network != invited.network => Err(
+            "the network delivered is not the one the invite names: whoever dialled is not the \
+             admin that invited this device. Nothing was written."
+                .to_owned(),
+        ),
+        other => other,
+    };
     let taken = adopted.is_ok();
     let _ = send(&mut channel, &Message::Outcome { taken }, deadline).await;
 
-    Ok(Delivered { operations, snapshot, adopted: adopted? })
+    Ok(Delivered { operations, snapshot, adopted: adopted?, base: base? })
 }
+
+/// How many parts of a base a join takes at most: more than the largest state
+/// a network may hold is cut into.
+const MOST_BASE_PARTS: usize = 4096;
 
 /// What an exchange delivered, once it has been checked.
 pub struct Delivered {
@@ -608,6 +693,9 @@ pub struct Delivered {
     pub snapshot: Option<Vec<u8>>,
     /// The state the operations derive to.
     pub adopted: adopt::Adopted,
+    /// The root and state the operations rest on, where the admitting side
+    /// had compacted.
+    pub base: Option<adopt::Base>,
 }
 
 /// Asks the person for the code, without stalling the connection.
@@ -630,14 +718,10 @@ async fn proved(
     tokio::task::spawn_blocking(move || person.signs_the_proof(&request)).await.ok().flatten()
 }
 
-/// Shows the payload, off the runtime for the same reason.
-async fn show(person: &Arc<dyn Person>, text: String) {
+/// Says the device waits, off the runtime for the same reason.
+async fn waits(person: &Arc<dyn Person>) {
     let person = Arc::clone(person);
-    let _ = tokio::task::spawn_blocking(move || {
-        let drawn = scannable(&text);
-        person.show_payload(&text, &drawn);
-    })
-    .await;
+    let _ = tokio::task::spawn_blocking(move || person.waiting()).await;
 }
 
 /// Says something to the person, off the runtime for the same reason.
@@ -670,7 +754,7 @@ async fn receive(channel: &mut Channel, deadline: Duration) -> Result<Message, R
     Message::decode(&bytes).map_err(|cause| cause.to_string())
 }
 
-/// The payload as a code a camera can read.
+/// An invite as a code a camera can read.
 ///
 /// A rendering of the same bytes the text form carries, never a second format.
 /// A failure here costs the scannable form and not the enrolment, so it reports
@@ -682,7 +766,7 @@ pub fn scannable(text: &str) -> String {
 
     match QrCode::new(text.as_bytes()) {
         Ok(code) => code.render::<unicode::Dense1x2>().quiet_zone(true).build(),
-        Err(cause) => format!("(the payload could not be drawn as a code: {cause})"),
+        Err(cause) => format!("(the invite could not be drawn as a code: {cause})"),
     }
 }
 
@@ -695,22 +779,23 @@ mod tests {
     struct Nobody;
 
     impl Person for Nobody {
-        fn show_payload(&self, _text: &str, _scannable: &str) {}
         fn code_shown_by_the_admin(&self, _ours: &Confirmation) -> Option<String> {
             None
         }
         fn note(&self, _message: &str) {}
     }
 
-    /// The two forms carry one payload. A scannable code that said something
+    /// The two forms carry one invite. A scannable code that said something
     /// else would be a second format wearing one name.
     #[test]
     fn the_scannable_form_carries_the_text_form() {
-        let identity = NodeIdentity::generate().expect("generates");
-        let payload =
-            Joining::of(&identity, "laptop", "https://relay.example:443").expect("within bounds");
+        let invite = enrollment::Invite::issue(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
+            roster::id::NetworkId::from_bytes([7; 32]),
+        )
+        .expect("issues");
 
-        let text = payload.to_text();
+        let text = invite.to_text();
         let drawn = scannable(&text);
         assert!(!drawn.contains("could not be drawn"), "{drawn}");
         assert!(drawn.lines().count() > 8, "a code has to be big enough to scan: {drawn}");
@@ -731,13 +816,20 @@ mod tests {
                 suffix: "peerfectly.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                window: None,
             },
         )
         .expect("founds");
 
-        let refusal = join(&paths, "https://relay.example:443", "laptop", Arc::new(Nobody))
-            .await
-            .expect_err("already has a network");
+        let invite = enrollment::Invite::issue(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@127.0.0.1:1",
+            roster::id::NetworkId::from_bytes([7; 32]),
+        )
+        .expect("issues");
+        let refusal =
+            join(&paths, &invite.to_text(), "laptop", Arc::new(Nobody), &crate::keys::PlatformKeys)
+                .await
+                .expect_err("already has a network");
         assert!(refusal.contains("already holds a network"), "{refusal}");
         assert!(refusal.contains("remove"), "{refusal}");
     }
@@ -790,7 +882,7 @@ mod tests {
         paths.create().expect("creates");
         let (operations, snapshot) = delivered();
 
-        keep_delivered_snapshot(&paths, &operations, Some(&snapshot));
+        keep_delivered_snapshot(&paths, None, &operations, Some(&snapshot));
 
         let (kept, _at) = crate::state::read_snapshot(&paths).expect("it was kept");
         assert_eq!(snapshot, kept, "byte for byte, as it arrived");
@@ -810,7 +902,7 @@ mod tests {
             *byte ^= 0xff;
         }
 
-        keep_delivered_snapshot(&paths, &operations, Some(&snapshot));
+        keep_delivered_snapshot(&paths, None, &operations, Some(&snapshot));
 
         assert!(crate::state::read_snapshot(&paths).is_none(), "nothing was kept");
         // And the membership is untouched: this function writes one file and
@@ -827,7 +919,7 @@ mod tests {
         paths.create().expect("creates");
         let (operations, _snapshot) = delivered();
 
-        keep_delivered_snapshot(&paths, &operations, None);
+        keep_delivered_snapshot(&paths, None, &operations, None);
 
         assert!(crate::state::read_snapshot(&paths).is_none(), "there was none to keep");
     }

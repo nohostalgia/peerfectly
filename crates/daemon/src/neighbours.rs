@@ -10,12 +10,18 @@
 //! # How they are chosen
 //!
 //! Rendezvous hashing. For each of [`SLOTS`] slots, a device scores every other
-//! member and takes the highest score. The score is a hash, under its own tag, of
-//! the network, the slot, and the ids of the two devices' **admission
-//! operations** — never their keys. An admission's id depends on the admitting
-//! admin's signature and on the roster at that moment, neither of which a device
-//! controls when it makes its key, so nobody can generate keys until one lands
-//! beside a chosen victim.
+//! full member and takes the highest score. The score is a hash, under its own
+//! tag, of the network, the slot, and the two devices' **admissions** — the id of
+//! the operation that admitted each, with the device's position — never their
+//! keys alone. An admission's id depends on the admitting admin's signature and
+//! on the roster at that moment, neither of which a device controls when it
+//! makes its key, so nobody can generate keys until one lands beside a chosen
+//! victim. The position is what tells apart the devices one batch admitted.
+//!
+//! # Full members only
+//!
+//! A light member holds no operations to pass on, so it is never chosen and
+//! chooses nobody: it relies on its anchors and the full members it talks to.
 //!
 //! Every device computes everyone's choices from the roster alone, so the choice
 //! needs no coordination, and a claim to have been chosen can be checked.
@@ -67,24 +73,47 @@ pub const CLAIM_RANK: usize = 8;
 /// hash in the protocol.
 const DOMAIN: &str = "peerfectly neighbour v1";
 
-/// A member as the choice sees it: who, and the operation that admitted it.
+/// The tag a device's admission is hashed under.
+const ADMISSION: &str = "peerfectly neighbour admission v1";
+
+/// A member as the choice sees it: who, and its admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Member {
     /// The device.
     pub device: DeviceId,
-    /// The id of the operation that admitted it — for the founder, the network's
-    /// creation.
+    /// Its admission: the id of the operation that admitted it — for the
+    /// founder, the network's creation — with its position, as [`admission`]
+    /// gives it.
     pub admitted_by: OperationId,
 }
 
-/// The non-revoked members of a roster.
+/// A device's admission, as the score reads it: the operation that admitted it,
+/// with the device's position.
+///
+/// A batch admits thousands of devices with one operation; without the
+/// position they would all score alike, and every full member would choose
+/// the same few. The operation's id still decides: nothing the device chose
+/// alone moves it.
+#[must_use]
+pub fn admission(admitted_by: &OperationId, device: &DeviceId) -> OperationId {
+    let mut hasher = blake3::Hasher::new_derive_key(ADMISSION);
+    hasher.update(admitted_by.as_bytes());
+    hasher.update(&roster::leaf::DeviceLeaf::position(device));
+    OperationId::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// The full members of a roster: the only ones that choose neighbours, and
+/// the only ones chosen.
 #[must_use]
 pub fn members_of(state: &RosterState) -> Vec<Member> {
     state
         .devices
         .values()
-        .filter(|record| !state.revoked.contains(&record.id))
-        .map(|record| Member { device: record.id, admitted_by: record.added_by })
+        .filter(|record| state.settings_of(&record.id).mode == roster::leaf::Mode::Full)
+        .map(|record| Member {
+            device: record.id,
+            admitted_by: admission(&record.added_by, &record.id),
+        })
         .collect()
 }
 
@@ -424,5 +453,102 @@ mod tests {
             reached(0, &one_way) < members.len(),
             "pushing only along one's own choices misses the devices nobody chose"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "a test reports failure by panicking"
+)]
+mod full_only {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use roster::id::{DeviceId, NetworkId, OperationId};
+    use roster::leaf::{DeviceSettings, Mode};
+    use roster::state::RosterState;
+    use roster::types::{DeviceRecord, NetworkParams, Role};
+
+    use super::{choose, members_of};
+
+    fn device(n: u32) -> DeviceId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        DeviceId::from_bytes(bytes)
+    }
+
+    /// Fifty full members admitted one by one, and five thousand light members
+    /// admitted by one batch.
+    fn mixed() -> RosterState {
+        let params =
+            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                .unwrap();
+        let mut state = RosterState {
+            network: NetworkId::from_bytes([7; 32]),
+            params,
+            devices: BTreeMap::new(),
+            revoked: BTreeSet::new(),
+            settings: BTreeMap::new(),
+        };
+        let batch = OperationId::from_bytes([9; 32]);
+        for n in 0..5_050_u32 {
+            let light = n >= 50;
+            let added_by = if light {
+                batch
+            } else {
+                OperationId::from_bytes(*blake3::hash(&n.to_be_bytes()).as_bytes())
+            };
+            let id = device(n);
+            state.devices.insert(
+                id,
+                DeviceRecord {
+                    id,
+                    keys: Vec::new(),
+                    name: format!("d{n}"),
+                    role: Role::Member,
+                    founder: false,
+                    added_by,
+                    capabilities: Vec::new(),
+                },
+            );
+            if light {
+                state.set_settings(
+                    id,
+                    DeviceSettings::new(Mode::Light, Vec::new(), None, None).unwrap(),
+                );
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn a_light_member_is_never_a_neighbour_and_chooses_none() {
+        let state = mixed();
+        let members = members_of(&state);
+        assert_eq!(members.len(), 50, "only the full members take part");
+        let full: BTreeSet<DeviceId> = members.iter().map(|member| member.device).collect();
+        for me in &members {
+            let chosen = choose(&state.network, me, &members, &|_| false);
+            assert!(!chosen.is_empty());
+            assert!(chosen.iter().all(|device| full.contains(device)), "every neighbour is full");
+        }
+        assert!(
+            !members.iter().any(|member| member.device == device(60)),
+            "a light one chooses none"
+        );
+    }
+
+    #[test]
+    fn devices_of_one_batch_score_apart() {
+        let mut state = mixed();
+        // The batch's devices made full: they share an operation, and must not
+        // share an admission.
+        state.settings.clear();
+        let members = members_of(&state);
+        let admissions: BTreeSet<OperationId> =
+            members.iter().map(|member| member.admitted_by).collect();
+        assert_eq!(admissions.len(), members.len());
     }
 }

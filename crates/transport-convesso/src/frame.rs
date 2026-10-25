@@ -10,8 +10,8 @@
 //! # The frames
 //!
 //! ```text
-//! OPEN     1 | version: u8 | id: u64 BE
-//! ACCEPT   2 | id
+//! OPEN     1 | version: u8 | id: u64 BE | evidence
+//! ACCEPT   2 | id | evidence
 //! REFUSE   3 | id | reason: u8
 //! CLOSE    4 | id | reason: u8
 //! PAYLOAD  5 | id | bytes                  (a convesso message)
@@ -23,6 +23,11 @@
 //! runs a stream configuration whose largest message has room for both
 //! ([`Stream`]).
 //!
+//! `evidence` is what the sender shows of its membership — its leaf, the
+//! proof of it and the root they rest on, as `roster::membership::Evidence`
+//! bytes — or nothing, where it holds no root. A peer holding no roster judges
+//! the sender by it; one holding a roster judges by that.
+//!
 //! Decoding never panics: a frame that is truncated or of an unknown kind is
 //! refused whole.
 
@@ -30,7 +35,7 @@ use convesso_stream::config::StreamConfig;
 
 /// The version of this protocol. Carried in `OPEN`, so two ends that disagree
 /// say so rather than misreading each other.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// The bytes in front of a payload: kind, id.
 pub const PAYLOAD_HEADER: usize = 9;
@@ -64,6 +69,8 @@ pub enum Reason {
     Version,
     /// The session was closed because its peer stopped being a member.
     MembershipLost,
+    /// The refusing side's access policy does not let the dialler reach it.
+    NotAllowed,
     /// A reason this version does not know. Read as an ordinary close.
     Unknown(u8),
 }
@@ -76,6 +83,7 @@ impl Reason {
             Self::Revoked => 2,
             Self::Version => 3,
             Self::MembershipLost => 4,
+            Self::NotAllowed => 5,
             Self::Unknown(byte) => byte,
         }
     }
@@ -87,6 +95,7 @@ impl Reason {
             2 => Self::Revoked,
             3 => Self::Version,
             4 => Self::MembershipLost,
+            5 => Self::NotAllowed,
             other => Self::Unknown(other),
         }
     }
@@ -101,11 +110,15 @@ pub enum Frame {
         version: u8,
         /// The session's id.
         id: SessionId,
+        /// What the dialler shows of its membership; empty for nothing.
+        evidence: Vec<u8>,
     },
     /// The accepting side took the session.
     Accept {
         /// The session's id.
         id: SessionId,
+        /// What the accepting side shows of its membership; empty for nothing.
+        evidence: Vec<u8>,
     },
     /// The accepting side refused the session.
     Refuse {
@@ -150,14 +163,16 @@ impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Self::Open { version, id } => {
+            Self::Open { version, id, evidence } => {
                 out.push(OPEN);
                 out.push(*version);
                 out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(evidence);
             }
-            Self::Accept { id } => {
+            Self::Accept { id, evidence } => {
                 out.push(ACCEPT);
                 out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(evidence);
             }
             Self::Refuse { id, reason } => {
                 out.push(REFUSE);
@@ -192,10 +207,13 @@ impl Frame {
         match kind {
             OPEN => {
                 let (&version, rest) = rest.split_first()?;
-                let id = exact_id(rest)?;
-                Some(Self::Open { version, id })
+                let (id, evidence) = id_and_rest(rest)?;
+                Some(Self::Open { version, id, evidence: evidence.to_vec() })
             }
-            ACCEPT => Some(Self::Accept { id: exact_id(rest)? }),
+            ACCEPT => {
+                let (id, evidence) = id_and_rest(rest)?;
+                Some(Self::Accept { id, evidence: evidence.to_vec() })
+            }
             REFUSE | CLOSE => {
                 let (id, rest) = id_and_rest(rest)?;
                 let [reason] = rest else { return None };
@@ -248,8 +266,10 @@ mod tests {
 
     fn every_kind() -> Vec<Frame> {
         vec![
-            Frame::Open { version: VERSION, id: 7 },
-            Frame::Accept { id: u64::MAX },
+            Frame::Open { version: VERSION, id: 7, evidence: Vec::new() },
+            Frame::Open { version: VERSION, id: 8, evidence: vec![1, 2, 3] },
+            Frame::Accept { id: u64::MAX, evidence: Vec::new() },
+            Frame::Accept { id: 9, evidence: vec![4; 40] },
             Frame::Refuse { id: 1, reason: Reason::Revoked },
             Frame::Close { id: 2, reason: Reason::MembershipLost },
             Frame::Payload { id: 3, bytes: b"bytes".to_vec() },
@@ -273,6 +293,8 @@ mod tests {
             // its tail: only cuts into the fixed header must fail.
             let header = match frame {
                 Frame::Payload { .. } => PAYLOAD_HEADER,
+                Frame::Open { .. } => 10,
+                Frame::Accept { .. } => 9,
                 Frame::Packet { .. } => PACKET_HEADER.saturating_add(1),
                 _ => bytes.len(),
             };

@@ -172,6 +172,20 @@ const _: () = {
     assert!(!PRODUCT.is_empty());
 };
 
+/// How long a light member waits for a lookup's answer before trying the next
+/// member it could ask.
+pub const LOOKUP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often an admin's daemon dials the devices its open invites bring.
+///
+/// A device waits at its rendezvous for ten minutes, so it is reached within
+/// seconds of starting its join whatever the moment; one dial is a relay
+/// connection opened and closed, a few hundred bytes.
+pub const INVITE_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one dial of an invited device may take before the next is tried.
+pub const INVITE_DIAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[cfg(test)]
 mod tests {
     use super::*;

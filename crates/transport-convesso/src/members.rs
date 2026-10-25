@@ -118,11 +118,16 @@ pub const fn refusal(code: u16) -> Option<Error> {
 /// The admission convesso consults during every handshake, renewals included.
 ///
 /// Holds the map the transport rebuilds, so a revocation handed to the
-/// transport is what the next handshake reads.
-pub struct Gate(pub Arc<RwLock<Members>>);
+/// transport is what the next handshake reads. A node holding no roster
+/// (`light`) admits every handshake: it has nothing to judge a key by there,
+/// and judges the peer by the evidence its first frame carries instead.
+pub struct Gate(pub Arc<RwLock<Members>>, pub bool);
 
 impl Admission for Gate {
     fn admit(&mut self, peer: &PeerId, _context: &[u8]) -> Decision {
+        if self.1 {
+            return Decision::Accept { psk: None };
+        }
         let verdict = self.0.read().map_or(Err(Error::NotAMember), |members| members.verdict(peer));
         match refusal_code(&verdict).and_then(RefusalCode::application) {
             None => Decision::Accept { psk: None },
@@ -158,7 +163,7 @@ mod tests {
         let (state, _, joiner) = network();
         let members = Members::from_state(&state);
         assert_eq!(members.member(&peer_of(&joiner)), Some(joiner.device_id()));
-        let mut gate = Gate(Arc::new(RwLock::new(members)));
+        let mut gate = Gate(Arc::new(RwLock::new(members)), false);
         assert_eq!(gate.admit(&peer_of(&joiner), b"peerfectly"), Decision::Accept { psk: None });
     }
 
@@ -166,7 +171,7 @@ mod tests {
     fn a_stranger_is_refused_as_not_a_member() {
         let (state, _, _) = network();
         let stranger = NodeIdentity::generate().unwrap();
-        let mut gate = Gate(Arc::new(RwLock::new(Members::from_state(&state))));
+        let mut gate = Gate(Arc::new(RwLock::new(Members::from_state(&state))), false);
         let Decision::Refuse { code, .. } = gate.admit(&peer_of(&stranger), b"peerfectly") else {
             panic!("a stranger is refused");
         };
@@ -177,7 +182,7 @@ mod tests {
     fn newer_state_drops_a_revoked_device() {
         let (mut state, _, joiner) = network();
         let shared = Arc::new(RwLock::new(Members::from_state(&state)));
-        let mut gate = Gate(Arc::clone(&shared));
+        let mut gate = Gate(Arc::clone(&shared), false);
 
         state.devices.remove(&joiner.device_id());
         state.revoked.insert(joiner.device_id());

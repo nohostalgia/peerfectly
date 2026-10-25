@@ -14,21 +14,17 @@ no relay, so nobody can dial it; and it cannot announce on the local network
 either, because announcements are sealed with a network identifier it does not
 have. Something has to break that symmetry before any conversation can happen.
 
-`peerfectly-seed` broke it by having a person copy `roster.log` between machines.
-This breaks it by having a person type a **relay address** — the smallest thing
-anybody can carry between two machines on different networks, and a URL they
-already know because they run the relay. An endpoint registers at a relay by its
-own key and knows nothing about any roster, so that one line is enough to make a
-device reachable.
+An admin breaks it by issuing an **invite**: the network's relay, the network's
+id, and sixteen random bytes. The device derives a rendezvous key from the
+secret, registers under it at that relay, and waits. The admin that issued the
+invite derives the same key and dials it.
 
-Then the device shows what it is, and the admin comes to it.
-
-**Why that direction and not the other.** Dialling needs the peer's transport
-key — thirty-two bytes, which nobody types. The joining payload carries it, so
-the side holding the payload is the side that can dial. The direction follows
-from what is known, not from preference. It also puts the asymmetry in the right
-place: the admin has a network and something to lose, and it initiates; the
-joiner has nothing, and it waits.
+**Why that direction and not the other.** Dialling needs the peer's key —
+thirty-two bytes, which nobody types. The invite's secret lets both sides derive
+one without anybody typing it, and the side that dials is the one that has
+something to lose: the admin has a network, and it initiates; the joiner has
+nothing, and it waits. What the device will be — its name, role, mode, groups,
+address — stays in the admin's local record of the invite, never in the invite.
 
 ## The exception, and why it lands where it does
 
@@ -49,17 +45,15 @@ no method to call, not by a check somebody could omit.
 
 ## What the code is worth
 
-Six decimal digits, shown on both screens, derived from the joining device's two
-keys, the admitting device's transport key, and **material exported from the
-established channel**.
+Six decimal digits, shown on both screens, derived from the joining device's
+three keys, the admitting device's transport key, and **material exported from
+the established channel**.
 
 The channel material is the part that matters, and the reason is not obvious.
-Every key in the derivation is **public** — the joining payload is on a screen
-and will be photographed, and the admin's keys are in a roster every member
-holds. A code derived from keys alone could therefore be computed *in advance*
-by anyone who had seen the payload, including the code the legitimate exchange
-was about to display. Knowing that value, an attacker generates key pairs of
-their own until one produces the same six digits. Six digits is a space of one
+Every key in the derivation is **public** once presented, and the admin's keys
+are in a roster every member holds. A code derived from keys alone could
+therefore be matched by an attacker generating key pairs of their own until one
+produces the same six digits. Six digits is a space of one
 million; the search takes seconds. Both screens would then show the same number.
 
 Channel material closes that, because the value being matched does not exist
@@ -72,46 +66,49 @@ the codes differ at each end.
 They are not the same check twice.
 
 **The joining device confirms by typing the digits the admin displays.** Typing
-rather than agreeing, because an attacker who has seen the public payload can
-dial the waiting device at any time and offer a well-formed network of their
-own. A person pressing "yes" on both machines would accept it; a person typing
-what the other screen says would not.
+rather than agreeing, because an invite travels by message and photograph, and
+anybody who has seen it can dial the waiting device and offer a well-formed
+network of their own. A person pressing "yes" on both machines would accept it;
+a person typing what the other screen says would not. The device also refuses
+any network but the one the invite names.
 
 **The admitting device confirms by comparing.** This catches a different attack:
-the payload substituted on its way to the admin. Payloads travel through chats
-and photographs, so assume that channel is hostile. If the payload that reached
-the admin came from a machine other than the one the person is standing at, the
-admin's code will not be the code on that machine — and the admin's prompt must
-therefore **name the screen it has to match**. A prompt that shows a number and
-asks for a yes defends nothing here.
+the invite intercepted or substituted on its way to the device, so that another
+machine waits at the rendezvous. If the machine the admin reached is not the one
+the person is standing at, the admin's code will not be the code on that
+machine — and the admin's prompt must therefore **name the screen it has to
+match**. A prompt that shows a number and asks for a yes defends nothing here.
 
-## Both keys are proved, not only the one the channel authenticates
+## Both keys are proved, not taken on trust
 
-The channel proves the **transport** key: the admin dials it and nobody else can
-answer. It says nothing about the **signing** key, which is only a field in a
-public payload — and a device's identity is derived from its signing key.
+The channel of an invite proves only the rendezvous key. It says nothing about
+the **signing** key the device presents — and a device's identity is derived
+from its signing key — nor about the **transport** key its sessions will be
+authenticated by.
 
-Without a second proof, a payload pairing one device's signing key with an
+Without proofs, an introduction pairing one device's signing key with an
 attacker's transport key would have an admin sign an operation binding that
 identity, and that overlay address, to the attacker. Worse, a roster keeps the
 **first** admission of a device id and ignores later ones, so the real holder of
 that key could never afterwards be admitted under its own identity. The damage
 would not be repairable.
 
-So the joining device signs the exchange's channel material with its signing
-key, and the admitting side verifies it against the key the payload named. One
-signature, no extra round trip — the channel material already exists for the
-code — and because it covers that material it cannot be gathered on one channel
-and presented on another.
+So the joining device signs the exchange's channel material with each key, and
+the admitting side verifies both against the keys the introduction named. No
+extra round trip — the channel material already exists for the code — and
+because the signatures cover that material they cannot be gathered on one
+channel and presented on another.
 
 ## Delivery proves nothing
 
 A roster is signed operations. Who hands it over changes nothing about whether
 it is true, so a joining device asks only what it contains: an operation
-admitting **its own keys**, signed by an admin, deriving to a consistent state.
+admitting **its own keys**, signed by an admin, deriving to a consistent state,
+of the network the invite names. Where the admin's roster was compacted, the
+state beneath it arrives too, and is believed only once it makes the signed root.
 
 The relay needs no such check. Its address names its key (`key@host:port`), so
-the payload that tells a joining device where the relay is also tells it who
+the invite that tells a joining device where the relay is also tells it who
 must answer there, and nothing is ever accepted on sight.
 
 ## The bounds, and what they do not buy
@@ -120,15 +117,15 @@ One exchange at a time, each with its own deadline, and a limited number of
 attempts within one wait.
 
 One at a time is necessary — two would mean two codes on one screen. But on its
-own it hands anyone who has seen the payload a way to keep the admin out: open
+own it hands anyone who has seen the invite a way to keep the admin out: open
 an exchange, say nothing, hold the only slot for the whole wait while the person
 watches nothing happen. The per-exchange deadline is what stops that, and the
 attempt cap is what keeps a six-digit code out of reach of guessing.
 
 **Denial of the enrolment remains possible** and nothing here prevents it. The
-address is public, so anyone can make noise at it. What the bounds buy is that
-an indefinite silent stall becomes a bounded failure that names itself, and a
-retry costs one command.
+rendezvous is known to anyone who has seen the invite, so anyone can make noise
+at it. What the bounds buy is that an indefinite silent stall becomes a bounded
+failure that names itself, and a retry costs one command.
 
 ## What a person still has to do
 
@@ -144,9 +141,8 @@ talked into it. That is written here rather than left to be discovered.
 
 | Deferred | To |
 |---|---|
-| Sockets, waiting, deadlines, the terminal | `windows-daemon` |
+| Sockets, waiting, deadlines, the terminal | `windows-daemon` and the daemon |
 | The enrolment endpoint and its channel material | `transport-convesso` |
 | Membership, roles, authority | the roster's, entirely |
 | Scanning a code with a camera | a client with a camera; this renders one and reads its text |
-| Capability switches at admission (§3.1) | when something consults capabilities |
 | Recovery phrases, a second admin, delegation | §10.2 puts all three outside the MVP |

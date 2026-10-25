@@ -202,6 +202,8 @@ fn an_offer_encodes_to_the_same_bytes_it_always_did() {
     let offer = roster_sync::message::Offer {
         ids: vec![OperationId::from_bytes([0x11; 32]), OperationId::from_bytes([0x22; 32])],
         snapshot: Some(7),
+        root: None,
+        partial: Vec::new(),
     };
     let encoded = roster_sync::message::Message::Offer(offer).encode();
     let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();

@@ -114,6 +114,8 @@ async fn a_device_cannot_confirm_the_operation_that_revokes_it() {
     let claim = Message::Offer(Offer {
         ids: ids_of(&network.everything()).into_iter().chain([revocation_id]).collect(),
         snapshot: None,
+        root: None,
+        partial: Vec::new(),
     });
     founder.received(network.joiner.device_id(), &frame(Channel::Roster, &claim.encode())).await;
 
@@ -135,7 +137,12 @@ async fn a_confirmation_survives_the_peer_compacting() {
     let peer = network.joiner.device_id();
     let everything = ids_of(&network.everything());
 
-    let full = Message::Offer(Offer { ids: everything.clone(), snapshot: None });
+    let full = Message::Offer(Offer {
+        ids: everything.clone(),
+        snapshot: None,
+        root: None,
+        partial: Vec::new(),
+    });
     founder.received(peer, &frame(Channel::Roster, &full.encode())).await;
     assert_eq!(outstanding_toward(&founder, "b").await, 0, "the peer named all of it");
 
@@ -144,6 +151,8 @@ async fn a_confirmation_survives_the_peer_compacting() {
     let compacted = Message::Offer(Offer {
         ids: everything.last().copied().into_iter().collect(),
         snapshot: Some(1),
+        root: None,
+        partial: Vec::new(),
     });
     founder.received(peer, &frame(Channel::Roster, &compacted.encode())).await;
 
@@ -212,7 +221,12 @@ async fn a_confirmed_operation_stays_confirmed_across_a_restart() {
     let scratch = tempfile::tempdir().unwrap();
 
     let founder = node_off(&network.founder, &network.everything(), &scratch);
-    let offer = Message::Offer(Offer { ids: ids_of(&network.everything()), snapshot: None });
+    let offer = Message::Offer(Offer {
+        ids: ids_of(&network.everything()),
+        snapshot: None,
+        root: None,
+        partial: Vec::new(),
+    });
     founder.received(network.joiner.device_id(), &frame(Channel::Roster, &offer.encode())).await;
     assert_eq!(outstanding_toward(&founder, "b").await, 0);
     drop(founder);
@@ -268,7 +282,12 @@ async fn a_revoked_device_is_dropped_from_the_record() {
     let scratch = tempfile::tempdir().unwrap();
 
     let founder = node_off(&network.founder, &network.everything(), &scratch);
-    let offer = Message::Offer(Offer { ids: ids_of(&network.everything()), snapshot: None });
+    let offer = Message::Offer(Offer {
+        ids: ids_of(&network.everything()),
+        snapshot: None,
+        root: None,
+        partial: Vec::new(),
+    });
     for peer in [network.joiner.device_id(), network.third.device_id()] {
         founder.received(peer, &frame(Channel::Roster, &offer.encode())).await;
     }
@@ -343,6 +362,8 @@ async fn reconciling_does_not_grow_the_log_with_what_is_already_held() {
     let behind = Message::Offer(Offer {
         ids: ids_of(core::slice::from_ref(&network.genesis)),
         snapshot: None,
+        root: None,
+        partial: Vec::new(),
     });
     for _ in 0..2 {
         node.received(network.joiner.device_id(), &frame(Channel::Roster, &behind.encode())).await;
@@ -498,7 +519,12 @@ async fn only_the_members_that_have_not_confirmed_are_pressed() {
     let scratch = tempfile::tempdir().unwrap();
 
     let founder = node_off(&network.founder, &network.everything(), &scratch);
-    let offer = Message::Offer(Offer { ids: ids_of(&network.everything()), snapshot: None });
+    let offer = Message::Offer(Offer {
+        ids: ids_of(&network.everything()),
+        snapshot: None,
+        root: None,
+        partial: Vec::new(),
+    });
     founder.received(network.joiner.device_id(), &frame(Channel::Roster, &offer.encode())).await;
 
     let pressed = founder.pressed().await;
@@ -514,7 +540,12 @@ async fn a_network_with_nothing_outstanding_presses_nobody() {
     let scratch = tempfile::tempdir().unwrap();
 
     let founder = node_off(&network.founder, &network.everything(), &scratch);
-    let offer = Message::Offer(Offer { ids: ids_of(&network.everything()), snapshot: None });
+    let offer = Message::Offer(Offer {
+        ids: ids_of(&network.everything()),
+        snapshot: None,
+        root: None,
+        partial: Vec::new(),
+    });
     for peer in [network.joiner.device_id(), network.third.device_id()] {
         founder.received(peer, &frame(Channel::Roster, &offer.encode())).await;
     }

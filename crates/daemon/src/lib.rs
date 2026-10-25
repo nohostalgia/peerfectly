@@ -56,6 +56,7 @@
 pub mod admitting;
 pub mod attesting;
 pub mod channel;
+pub mod checkpoint;
 pub(crate) mod clock;
 pub mod confirmations;
 pub mod conflicts;
@@ -70,11 +71,13 @@ pub mod error;
 pub mod exposing;
 pub mod founding;
 pub mod gateway;
+pub mod invites;
 pub mod joining;
 pub mod keys;
 pub mod lifecycle;
 pub mod limits;
 pub mod logging;
+pub mod lookup;
 pub mod machine;
 pub(crate) mod names;
 pub(crate) mod neighbours;
@@ -88,6 +91,7 @@ pub mod router;
 pub mod routes;
 pub mod rule;
 pub mod schedule;
+pub mod seeking;
 pub(crate) mod service;
 pub mod signing;
 pub mod snapshots;
@@ -144,6 +148,7 @@ mod surface {
         "admitting",
         "attesting",
         "channel",
+        "checkpoint",
         "confirmations",
         "conflicts",
         "connectivity",
@@ -153,9 +158,11 @@ mod surface {
         "exposing",
         "founding",
         "gateway",
+        "invites",
         "joining",
         "keys",
         "lifecycle",
+        "lookup",
         "limits",
         "logging",
         "machine",
@@ -168,6 +175,7 @@ mod surface {
         "routes",
         "rule",
         "schedule",
+        "seeking",
         "signing",
         "snapshots",
         "state",

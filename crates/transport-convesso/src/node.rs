@@ -68,10 +68,15 @@ const MESSAGE_BUDGET: usize = 2 * (MAX_MESSAGE + ELEMENT_COST);
 /// packet queue, in datagrams of the largest size.
 const DATAGRAM_BUDGET: usize = limits::PACKET_QUEUE * (DATAGRAM_ROOM + ELEMENT_COST);
 
+/// Whether a light node believes a peer's evidence: the root it rests on, and
+/// the leaf under it, still the device's word as far as the node knows.
+pub type Judge =
+    Arc<dyn Fn(&roster::snapshot::RawSnapshot, &roster::leaf::DeviceLeaf) -> bool + Send + Sync>;
+
 /// What a dial is told.
 enum Answer {
-    /// The far end took the session.
-    Accepted,
+    /// The far end took the session, showing this evidence.
+    Accepted(Vec<u8>),
     /// It was refused, or could not be made.
     Refused(Error),
 }
@@ -97,12 +102,63 @@ enum Out {
     Close(PeerId, u16),
 }
 
+/// What the access policy is decided from, kept beside the sessions so the
+/// handshake, which cannot wait, reads it at once.
+#[derive(Default)]
+struct Policy {
+    /// The network's rules; none lets everyone reach everyone.
+    rules: Vec<roster::parameters::Rule>,
+    /// This device's own groups.
+    own: Vec<roster::leaf::Group>,
+    /// Every member's groups, for a node holding a roster.
+    groups: HashMap<DeviceId, Vec<roster::leaf::Group>>,
+}
+
+impl Policy {
+    /// What a roster state says.
+    fn of_state(state: &RosterState, own: &DeviceId) -> Self {
+        Self {
+            rules: state.params.policy.clone(),
+            own: state.settings_of(own).groups,
+            groups: state
+                .devices
+                .keys()
+                .map(|device| (*device, state.settings_of(device).groups))
+                .collect(),
+        }
+    }
+
+    /// Whether `initiator`, with `shown` as its leaf where this node holds no
+    /// roster, may open a session to this device.
+    fn allows(&self, initiator: &DeviceId, shown: &[u8]) -> bool {
+        if self.rules.is_empty() {
+            return true;
+        }
+        let groups = match self.groups.get(initiator) {
+            Some(groups) => groups.clone(),
+            None => roster::membership::Evidence::from_bytes(shown)
+                .map(|evidence| evidence.leaf.settings.groups)
+                .unwrap_or_default(),
+        };
+        roster::parameters::allows(&self.rules, &groups, &self.own)
+    }
+}
+
 /// What the transport and its tasks share.
 struct Shared {
     node: Node,
     context: Context,
     members: Arc<RwLock<Members>>,
     state: Mutex<RosterState>,
+    /// What this node shows a peer as a session opens; empty for nothing.
+    evidence: std::sync::Mutex<Vec<u8>>,
+    /// For a node holding no roster: how it judges the root a peer's evidence
+    /// rests on. `None` for a node that judges peers by its state.
+    judge: Option<Judge>,
+    /// The access policy, and the groups it is decided over.
+    policy: std::sync::RwLock<Policy>,
+    /// This device.
+    own: DeviceId,
     sessions: std::sync::Mutex<HashMap<SessionId, Arc<Live>>>,
     accepted_from: std::sync::Mutex<HashMap<PeerId, SessionId>>,
     dials: std::sync::Mutex<HashMap<SessionId, Dial>>,
@@ -208,7 +264,36 @@ impl ConvessoTransport {
     /// When the transport key is not ed25519, the relay's pinned key is not
     /// one, or the node cannot start.
     pub async fn bind(identity: &NodeIdentity, state: RosterState) -> Result<Self> {
-        Self::bind_with(identity, state, None).await
+        Self::bind_with(identity, state, None, None).await
+    }
+
+    /// Starts a node for a device holding no roster: a light member.
+    ///
+    /// It knows its network and the parameters it uses, shows `evidence`, and
+    /// judges every peer by the evidence that peer shows — its leaf must name
+    /// the key the handshake authenticated, its proof must lead to its root,
+    /// and `judge` must believe the root.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bind`].
+    pub async fn bind_light(
+        identity: &NodeIdentity,
+        network: roster::id::NetworkId,
+        params: roster::types::NetworkParams,
+        evidence: Vec<u8>,
+        judge: Judge,
+    ) -> Result<Self> {
+        let state = RosterState {
+            network,
+            params,
+            devices: std::collections::BTreeMap::new(),
+            revoked: std::collections::BTreeSet::new(),
+            settings: std::collections::BTreeMap::new(),
+        };
+        let transport = Self::bind_with(identity, state, None, Some(judge)).await?;
+        transport.update_evidence(evidence);
+        Ok(transport)
     }
 
     /// [`Self::bind`], with convesso resolving the relay's host through
@@ -224,13 +309,14 @@ impl ConvessoTransport {
         state: RosterState,
         resolver: convesso_tokio::Resolver,
     ) -> Result<Self> {
-        Self::bind_with(identity, state, Some(resolver)).await
+        Self::bind_with(identity, state, Some(resolver), None).await
     }
 
     async fn bind_with(
         identity: &NodeIdentity,
         state: RosterState,
         resolver: Option<convesso_tokio::Resolver>,
+        judge: Option<Judge>,
     ) -> Result<Self> {
         let key = identity.transport_key();
         if key.algorithm() != Algorithm::Ed25519 {
@@ -251,7 +337,7 @@ impl ConvessoTransport {
 
         let members = Arc::new(RwLock::new(Members::from_state(&state)));
         let options = ContextOptions {
-            access: Access::Admit(Box::new(Gate(Arc::clone(&members)))),
+            access: Access::Admit(Box::new(Gate(Arc::clone(&members), judge.is_some()))),
             delivery: Delivery::PerPeer { messages: MESSAGE_BUDGET, datagrams: DATAGRAM_BUDGET },
             ..ContextOptions::default()
         };
@@ -280,6 +366,10 @@ impl ConvessoTransport {
             context,
             members,
             state: Mutex::new(state.clone()),
+            evidence: std::sync::Mutex::new(Vec::new()),
+            policy: std::sync::RwLock::new(Policy::of_state(&state, &identity.device_id())),
+            own: identity.device_id(),
+            judge,
             sessions: std::sync::Mutex::new(HashMap::new()),
             accepted_from: std::sync::Mutex::new(HashMap::new()),
             dials: std::sync::Mutex::new(HashMap::new()),
@@ -339,7 +429,7 @@ impl ConvessoTransport {
             |sessions| {
                 sessions
                     .values()
-                    .filter(|live| live.device == *device && live.closure().is_none())
+                    .filter(|live| live.device() == *device && live.closure().is_none())
                     .cloned()
                     .collect()
             },
@@ -360,7 +450,11 @@ impl Transport for ConvessoTransport {
         // Decided now, acted on once the far end has answered. A dialler that
         // refused before sending anything would leave the far end's `accept`
         // waiting for ever; this one dials, and closes what it opened (design D3).
-        let verdict = {
+        let verdict = if shared.judge.is_some() {
+            // Nothing to decide by yet: the far end's evidence comes back with
+            // its answer. Provisionally the device its key is; confirmed below.
+            Ok(DeviceId::from_bytes(*peer.key_id().as_bytes()))
+        } else {
             let state = shared.state.lock().await;
             transport::auth::authorize(&state, &peer.key_id())
         };
@@ -391,14 +485,25 @@ impl Transport for ConvessoTransport {
             }
         };
 
-        let open = Frame::Open { version: VERSION, id }.encode();
+        let open = Frame::Open { version: VERSION, id, evidence: own_evidence(shared) }.encode();
         if let Err(cause) = shared.context.send_message(address, open).await {
             forget();
             return Err(Error::PeerUnreachable { cause: Some(cause.to_string()) });
         }
 
         let outcome = match tokio::time::timeout(DIAL_PATIENCE, answered).await {
-            Ok(Ok(Answer::Accepted)) => Ok(()),
+            Ok(Ok(Answer::Accepted(evidence))) => match judged(shared, peer, &evidence) {
+                // A light node learns here who it reached.
+                Some(Ok(device)) => {
+                    if let Some(live) = &live {
+                        live.set_device(device);
+                        live.set_evidence(evidence);
+                    }
+                    Ok(())
+                }
+                Some(Err(error)) => Err(error),
+                None => Ok(()),
+            },
             Ok(Ok(Answer::Refused(error))) => Err(error),
             Ok(Err(_)) => Err(Error::PeerUnreachable {
                 cause: Some("the node stopped while dialling".to_owned()),
@@ -409,6 +514,10 @@ impl Transport for ConvessoTransport {
         };
         if let Err(error) = outcome {
             forget();
+            if error.is_membership_refusal() {
+                let close = Frame::Close { id, reason: reason_of(&error) }.encode();
+                let _ = shared.outbound.send(Out::Message(address, close));
+            }
             return Err(error);
         }
         match (verdict, live) {
@@ -455,15 +564,88 @@ impl Transport for ConvessoTransport {
         }
     }
 
+    fn update_evidence(&self, evidence: Vec<u8>) {
+        // A node holding no roster knows its own groups from its own leaf.
+        if self.shared.judge.is_some()
+            && let Ok(shown) = roster::membership::Evidence::from_bytes(&evidence)
+            && let Ok(mut policy) = self.shared.policy.write()
+        {
+            policy.own = shown.leaf.settings.groups;
+        }
+        if let Ok(mut held) = self.shared.evidence.lock() {
+            *held = evidence;
+        }
+    }
+
+    fn reconsider(&self) {
+        let shared = &self.shared;
+        let Some(judge) = shared.judge.as_ref() else { return };
+        let Ok(sessions) = shared.sessions.lock() else { return };
+        for live in sessions.values().filter(|live| live.closure().is_none()) {
+            let Ok(key) = PublicKey::new(Algorithm::Ed25519, live.address.as_bytes().to_vec())
+            else {
+                continue;
+            };
+            let shown = live.evidence();
+            let holds =
+                transport::auth::authenticate_by_evidence(&shown, &key.key_id(), &|root, leaf| {
+                    judge(root, leaf)
+                });
+            if holds.ok() != Some(live.device()) {
+                live.shut(Error::ClosedOnMembershipLoss);
+                let close = Frame::Close { id: live.id, reason: Reason::MembershipLost };
+                let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
+            } else if live.inbound() && !allowed(shared, &live.device(), &shown) {
+                live.shut(Error::NotAllowed);
+                let close = Frame::Close { id: live.id, reason: Reason::NotAllowed };
+                let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
+            }
+        }
+    }
+
     async fn update_state(&self, state: RosterState) {
         let shared = &self.shared;
+        if shared.judge.is_some() {
+            // A node holding no roster is handed the parameters it uses: the
+            // policy among them. Its peers are judged by their evidence.
+            if let Ok(mut policy) = shared.policy.write() {
+                policy.rules = state.params.policy.clone();
+            }
+            *shared.state.lock().await = state;
+            self.reconsider();
+            return;
+        }
+        if let Ok(mut policy) = shared.policy.write() {
+            *policy = Policy::of_state(&state, &shared.own);
+        }
         if let Ok(mut members) = shared.members.write() {
             *members = Members::from_state(&state);
         }
         let mut leaving = HashSet::new();
         if let Ok(mut sessions) = shared.sessions.lock() {
             for live in sessions.values() {
-                if live.closure().is_none() && !transport::auth::is_member(&state, &live.device) {
+                // Still a member is not enough: a device whose transport key
+                // changed is not the key this session authenticated.
+                let still = shared
+                    .members
+                    .read()
+                    .is_ok_and(|members| members.member(&live.peer) == Some(live.device()));
+                if live.closure().is_none()
+                    && live.inbound()
+                    && transport::auth::is_member(&state, &live.device())
+                    && still
+                    && !allowed(shared, &live.device(), &live.evidence())
+                {
+                    // A changed policy closes what it no longer allows.
+                    live.shut(Error::NotAllowed);
+                    let close = Frame::Close { id: live.id, reason: Reason::NotAllowed };
+                    let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
+                    leaving.insert(live.peer);
+                    continue;
+                }
+                if live.closure().is_none()
+                    && (!transport::auth::is_member(&state, &live.device()) || !still)
+                {
                     live.shut(Error::ClosedOnMembershipLoss);
                     let close = Frame::Close { id: live.id, reason: Reason::MembershipLost };
                     let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
@@ -670,6 +852,7 @@ const fn reason_of(error: &Error) -> Reason {
         Error::Revoked => Reason::Revoked,
         Error::IncompatibleVersion => Reason::Version,
         Error::ClosedOnMembershipLoss => Reason::MembershipLost,
+        Error::NotAllowed => Reason::NotAllowed,
         _ => Reason::Ordinary,
     }
 }
@@ -680,6 +863,7 @@ const fn refusal_of(reason: Reason) -> Error {
         Reason::NotAMember => Error::NotAMember,
         Reason::Revoked => Error::Revoked,
         Reason::Version => Error::IncompatibleVersion,
+        Reason::NotAllowed => Error::NotAllowed,
         Reason::Ordinary | Reason::MembershipLost | Reason::Unknown(_) => Error::ClosedByPeer,
     }
 }
@@ -838,7 +1022,7 @@ fn answer_dial(shared: &Shared, id: SessionId, peer: &PeerId, answer: Answer) {
         Some(dial) => dial.answer.send(answer).err(),
         None => Some(answer),
     };
-    if matches!(unwanted, Some(Answer::Accepted)) {
+    if matches!(unwanted, Some(Answer::Accepted(_))) {
         if let Ok(mut sessions) = shared.sessions.lock() {
             sessions.remove(&id);
         }
@@ -847,8 +1031,54 @@ fn answer_dial(shared: &Shared, id: SessionId, peer: &PeerId, answer: Answer) {
     }
 }
 
+/// Whether the access policy lets `initiator` open a session to this device.
+fn allowed(shared: &Shared, initiator: &DeviceId, shown: &[u8]) -> bool {
+    shared.policy.read().is_ok_and(|policy| policy.allows(initiator, shown))
+}
+
+/// This node's evidence, as it stands.
+fn own_evidence(shared: &Shared) -> Vec<u8> {
+    shared.evidence.lock().map(|held| held.clone()).unwrap_or_default()
+}
+
+/// The device a peer's evidence shows it to be, for a node holding no roster;
+/// `None` for one that judges by its state.
+///
+/// The leaf must name, for the transport purpose, the very key the handshake
+/// authenticated: a valid proof of another device's leaf shows nothing about
+/// this peer.
+fn judged(
+    shared: &Shared,
+    peer: &PublicKey,
+    evidence: &[u8],
+) -> Option<core::result::Result<DeviceId, Error>> {
+    let judge = shared.judge.as_ref()?;
+    Some(transport::auth::authenticate_by_evidence(evidence, &peer.key_id(), &|root, leaf| {
+        judge(root, leaf)
+    }))
+}
+
+/// The transport key behind an authenticated convesso peer, read from the
+/// evidence it shows: the one of its leaf's transport keys that is this peer.
+fn key_shown_by(peer: &PeerId, evidence: &[u8]) -> Option<(PublicKey, Address)> {
+    let evidence = roster::membership::Evidence::from_bytes(evidence).ok()?;
+    evidence.leaf.record.keys.iter().find_map(|entry| {
+        if entry.purpose != roster::types::KeyPurpose::Transport || entry.alg != Algorithm::Ed25519
+        {
+            return None;
+        }
+        let bytes = <[u8; 32]>::try_from(entry.value.as_slice()).ok()?;
+        let address = Address::parse(bytes).ok()?;
+        (address.peer_id() == *peer)
+            .then(|| {
+                PublicKey::new(Algorithm::Ed25519, bytes.to_vec()).ok().map(|key| (key, address))
+            })
+            .flatten()
+    })
+}
+
 /// A peer opens a session with this node.
-fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
+fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId, evidence: &[u8]) {
     let refuse = |reason: Reason| {
         let _ = shared.outbound.send(Out::Reply(peer, Frame::Refuse { id, reason }.encode()));
     };
@@ -856,8 +1086,18 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
         refuse(Reason::Version);
         return;
     }
-    let entry =
-        shared.members.read().ok().map(|members| (members.verdict(&peer), members.address(&peer)));
+    let entry = if shared.judge.is_some() {
+        // No roster to look the key up in: the evidence names the key, and must
+        // name the one the handshake authenticated.
+        Some(match key_shown_by(&peer, evidence) {
+            Some((key, address)) => {
+                (judged(shared, &key, evidence).unwrap_or(Err(Error::NotAMember)), Some(address))
+            }
+            None => (Err(Error::NotAMember), None),
+        })
+    } else {
+        shared.members.read().ok().map(|members| (members.verdict(&peer), members.address(&peer)))
+    };
     let (device, address) = match entry {
         Some((Ok(device), Some(address))) => (device, address),
         Some((Err(error), _)) => {
@@ -874,7 +1114,15 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
         // A repeated `OPEN`: the first one is the session.
         return;
     }
+    // The receiver's check, once, as the session opens: the initiator's groups
+    // from the leaf it verified, against this device's own.
+    if !allowed(shared, &device, evidence) {
+        refuse(Reason::NotAllowed);
+        return;
+    }
     let live = Live::new(id, device, address, shared.context.clone());
+    live.set_evidence(evidence.to_vec());
+    live.set_inbound();
     sessions.insert(id, Arc::clone(&live));
     let replaced = shared.accepted_from.lock().ok().and_then(|mut from| from.insert(peer, id));
     if let Some(older) = replaced.and_then(|older| sessions.get(&older).cloned()) {
@@ -895,14 +1143,19 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
         refuse(Reason::Ordinary);
         return;
     }
-    let _ = shared.outbound.send(Out::Reply(peer, Frame::Accept { id }.encode()));
+    let accept = Frame::Accept { id, evidence: own_evidence(shared) };
+    let _ = shared.outbound.send(Out::Reply(peer, accept.encode()));
 }
 
 /// A reliable message from `peer`.
 async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
     match Frame::decode(data) {
-        Some(Frame::Open { version, id }) => opened(shared, peer, version, id),
-        Some(Frame::Accept { id }) => answer_dial(shared, id, &peer, Answer::Accepted),
+        Some(Frame::Open { version, id, evidence }) => {
+            opened(shared, peer, version, id, &evidence);
+        }
+        Some(Frame::Accept { id, evidence }) => {
+            answer_dial(shared, id, &peer, Answer::Accepted(evidence));
+        }
         Some(Frame::Refuse { id, reason }) => {
             answer_dial(shared, id, &peer, Answer::Refused(refusal_of(reason)));
         }

@@ -42,6 +42,40 @@ pub const MAX_CAPABILITIES: usize = 16;
 /// `lan_exit:` followed by an IPv6 CIDR fits comfortably.
 pub const MAX_CAPABILITY_LEN: usize = 128;
 
+/// Maximum number of access groups one device belongs to.
+///
+/// A sensor is in one or two; a server in a handful. The bound keeps a leaf,
+/// which a light member holds and sends at every session, small.
+pub const MAX_GROUPS_PER_DEVICE: usize = 16;
+
+/// Maximum length in bytes of an access group's name.
+pub const MAX_GROUP_LEN: usize = 32;
+
+/// Maximum number of anchors a network lists.
+///
+/// A light member keeps two to four of them, chosen by hashing over the list,
+/// and fetches the list's leaf with a proof: the bound keeps that leaf small.
+pub const MAX_ANCHORS: usize = 32;
+
+/// Maximum number of rules in a network's access policy.
+pub const MAX_POLICY_RULES: usize = 256;
+
+/// Maximum number of entries one batch admission declares.
+///
+/// A production lot, not a whole fleet: a fleet is admitted in several
+/// batches. The bound caps what a node stores for a batch that never completes.
+pub const MAX_BATCH_ENTRIES: u64 = 65_536;
+
+/// Maximum length in bytes of a batch's label, the line a person reads.
+pub const MAX_BATCH_LABEL_LEN: usize = 64;
+
+/// Maximum size in bytes of one piece of a state in transfer.
+///
+/// A state of any size travels as pieces of at most this much, well inside
+/// what one message may carry, so a network of a million devices needs no
+/// larger message than one of five.
+pub const MAX_STATE_PIECE_SIZE: usize = 64 * 1024;
+
 /// Maximum length in bytes of a revocation reason.
 ///
 /// The reason is shown to a person deciding whether to trust a device again.
@@ -191,6 +225,13 @@ mod tests {
         assert_eq!(MAX_NAME_LEN, 64);
         assert_eq!(MAX_CAPABILITIES, 16);
         assert_eq!(MAX_CAPABILITY_LEN, 128);
+        assert_eq!(MAX_GROUPS_PER_DEVICE, 16);
+        assert_eq!(MAX_GROUP_LEN, 32);
+        assert_eq!(MAX_ANCHORS, 32);
+        assert_eq!(MAX_POLICY_RULES, 256);
+        assert_eq!(MAX_BATCH_ENTRIES, 65_536);
+        assert_eq!(MAX_BATCH_LABEL_LEN, 64);
+        assert_eq!(MAX_STATE_PIECE_SIZE, 65_536);
         assert_eq!(MAX_REASON_LEN, 256);
         assert_eq!(MAX_SUFFIX_LEN, 64);
         assert_eq!(ID_LEN, 32);

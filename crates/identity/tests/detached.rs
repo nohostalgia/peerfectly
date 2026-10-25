@@ -73,14 +73,11 @@ fn a_detached_signature_produces_the_same_snapshot() {
     dag.insert(raw.verify(&identity.signing_key().public_key()).expect("verifies"))
         .expect("inserts");
 
-    let network = NetworkId::from_bytes(*core.id().as_bytes());
-    let body = Snapshot::new(
-        1,
-        derive(&dag).expect("derives").to_bytes(),
-        vec![core.id()],
-        vec![0],
+    let body = Snapshot::over(
+        &derive(&dag).expect("derives"),
+        roster::snapshot::Covering { heads: vec![core.id()], depths: vec![0] },
         identity.signing_key().key_id(),
-        network,
+        None,
     )
     .expect("well-formed");
 
@@ -104,11 +101,22 @@ fn operation_and_snapshot_requests_never_share_their_bytes() {
     let key = identity.signing_key().public_key();
 
     let operation = prepare_operation(&core, &key);
+    let record = identity
+        .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+        .expect("a device")
+        .into_record(core.id())
+        .expect("a record");
     let body = Snapshot::new(
         1,
-        core.encode(),
-        vec![core.id()],
-        vec![0],
+        vec![],
+        [0xa0; 32],
+        roster::snapshot::Covering { heads: vec![core.id()], depths: vec![0] },
+        vec![],
+        roster::leaf::DeviceLeaf { record, settings: roster::leaf::DeviceSettings::default() },
+        roster::membership::MembershipProof {
+            devices: roster::merkle::Proof { siblings: vec![] },
+            parameters: [0; 32],
+        },
         identity.signing_key().key_id(),
         NetworkId::from_bytes([9; 32]),
     )
