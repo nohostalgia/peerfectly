@@ -14,6 +14,12 @@
 /// impossible to pass by accident.
 pub const ALLOW_UNSAFE_LOCATION: &str = "--allow-unsafe-location";
 
+/// The flag that runs the daemon as an anchor: a full member with no packet
+/// interface, carrying the roster for others. It configures nothing on the
+/// machine — no device, address, route, resolver or firewall table — so it
+/// needs neither `/dev/net/tun` nor `CAP_NET_ADMIN`.
+pub const HEADLESS: &str = "--headless";
+
 pub mod custody;
 pub mod firewall;
 pub mod home;

@@ -141,6 +141,7 @@ pub mod light;
 pub mod limits;
 pub mod member;
 pub mod membership;
+pub mod members;
 pub mod merkle;
 pub mod parameters;
 pub mod params;

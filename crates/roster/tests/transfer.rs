@@ -17,13 +17,7 @@ use support::params;
 
 /// A state of `count` devices, every fifth light and in a group.
 fn state_of(count: u32) -> RosterState {
-    let mut state = RosterState {
-        network: NetworkId::from_bytes([7; 32]),
-        params: params(),
-        devices: BTreeMap::new(),
-        revoked: BTreeSet::new(),
-        settings: BTreeMap::new(),
-    };
+    let mut state = RosterState::from_parts(NetworkId::from_bytes([7; 32]), params(), BTreeMap::new(), BTreeSet::new(), BTreeMap::new());
     for index in 0..count {
         let mut seed = [0_u8; 32];
         seed[..4].copy_from_slice(&index.to_be_bytes());
@@ -96,9 +90,8 @@ fn a_piece_that_lies_is_found_out_at_the_end() {
     // The sender drops one device: every piece decodes, and the root is wrong.
     let fewer = {
         let mut smaller = state.clone();
-        let first = *smaller.devices.keys().next().unwrap();
+        let first = smaller.devices.keys().next().unwrap();
         smaller.devices.remove(&first);
-        smaller.settings.remove(&first);
         pieces_of(&smaller)
     };
     let mut assembler = StateAssembler::new(state.network, state.root(), state.devices.len());

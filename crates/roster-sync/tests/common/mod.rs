@@ -297,7 +297,7 @@ pub fn orphan(index: u64) -> Vec<u8> {
 /// Derived membership, as a sorted list of device ids, for comparing two nodes.
 pub fn membership(node: &Roster) -> Vec<DeviceId> {
     let state = node.state().expect("derives");
-    let mut devices: Vec<DeviceId> = state.devices.keys().copied().collect();
+    let mut devices: Vec<DeviceId> = state.devices.keys().collect();
     devices.sort_unstable();
     devices
 }

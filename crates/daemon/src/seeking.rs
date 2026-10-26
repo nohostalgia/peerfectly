@@ -6,9 +6,14 @@
 //! - **to reach a peer:** what it already checked, then what it heard
 //!   announced on its LAN, then a full member it holds a session with, then
 //!   one of its anchors;
-//! - **on first start:** its anchors, the full member that admitted it, any
-//!   full member it is in session with, then the LAN. An empty anchor list is
-//!   an ordinary state: a home network has none.
+//! - **on every start, and when the one that admitted it is off:** its
+//!   anchors, the full member that admitted it, the other full members it
+//!   keeps, any full member it is in session with, then the LAN. An empty
+//!   anchor list is an ordinary state: a home network has none.
+//!
+//! **The full members it keeps** are handed to it by a full member, with
+//! their proofs: its anchors where the network names any; otherwise up to
+//! [`FULLS_PER_MEMBER`] full members seen lately, ranked by the same score.
 //!
 //! **Anchors** are chosen by rendezvous hashing of the member's own device id
 //! over the network's anchor list, the [`ANCHORS_PER_MEMBER`] highest scores.
@@ -26,6 +31,10 @@ use roster::id::DeviceId;
 /// while a list that grows moves only a third of the members it would move
 /// with nine.
 pub const ANCHORS_PER_MEMBER: usize = 3;
+
+/// How many full members a light member is handed where the network names no
+/// anchors: as many as anchors, for the same reason.
+pub const FULLS_PER_MEMBER: usize = ANCHORS_PER_MEMBER;
 
 /// The tag the anchor score is hashed under.
 const DOMAIN: &str = "peerfectly anchor v1";
@@ -51,6 +60,36 @@ pub fn anchors_for(member: &DeviceId, list: &[DeviceId]) -> Vec<DeviceId> {
     scored.dedup_by(|a, b| a.1 == b.1);
     let mut chosen: Vec<DeviceId> =
         scored.into_iter().take(ANCHORS_PER_MEMBER).map(|(_, anchor)| anchor).collect();
+    chosen.sort_unstable();
+    chosen
+}
+
+/// The full members a full member hands `member`: its anchors, where the
+/// network names any; otherwise up to [`FULLS_PER_MEMBER`] of `fulls`, those
+/// `recent` says were seen lately first, each group in the order the anchor
+/// score gives. Sorted.
+///
+/// Not a rule two devices must agree on: it is what the one handing them knows,
+/// and every one is checked by its proof where it lands.
+#[must_use]
+pub fn handed(
+    member: &DeviceId,
+    anchors: &[DeviceId],
+    fulls: &[DeviceId],
+    recent: &dyn Fn(&DeviceId) -> bool,
+) -> Vec<DeviceId> {
+    if !anchors.is_empty() {
+        return anchors_for(member, anchors);
+    }
+    let mut ranked: Vec<(bool, [u8; 32], DeviceId)> = fulls
+        .iter()
+        .filter(|full| *full != member)
+        .map(|full| (recent(full), score(member, full), *full))
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    ranked.dedup_by(|a, b| a.2 == b.2);
+    let mut chosen: Vec<DeviceId> =
+        ranked.into_iter().take(FULLS_PER_MEMBER).map(|(_, _, full)| full).collect();
     chosen.sort_unstable();
     chosen
 }
@@ -97,12 +136,14 @@ pub fn lookup_order(
     order
 }
 
-/// Whom to reach first, on a member's first start: its anchors, the full
-/// member that admitted it, full members in session, then the LAN. Each once.
+/// Whom to reach, on a member's start and when the one that admitted it is
+/// off: its anchors, the full member that admitted it, the other full members
+/// it keeps, full members in session, then the LAN. Each once.
 #[must_use]
 pub fn first_start_order(
     anchors: &[DeviceId],
     admitter: Option<DeviceId>,
+    kept: &[DeviceId],
     in_session: &[DeviceId],
     lan: &[DeviceId],
 ) -> Vec<DeviceId> {
@@ -111,6 +152,7 @@ pub fn first_start_order(
         .iter()
         .copied()
         .chain(admitter)
+        .chain(kept.iter().copied())
         .chain(in_session.iter().copied())
         .chain(lan.iter().copied())
     {
@@ -137,12 +179,37 @@ mod tests {
         let me = device(1);
         assert!(anchors_for(&me, &[]).is_empty(), "an empty list is ordinary");
         let admitter = device(2);
-        assert_eq!(first_start_order(&[], Some(admitter), &[], &[]), vec![admitter]);
+        assert_eq!(first_start_order(&[], Some(admitter), &[], &[], &[]), vec![admitter]);
         assert_eq!(
-            first_start_order(&[device(9)], Some(admitter), &[device(3)], &[device(4), admitter]),
-            vec![device(9), admitter, device(3), device(4)],
-            "anchors, the admitter, sessions, the LAN, each once"
+            first_start_order(
+                &[device(9)],
+                Some(admitter),
+                &[device(7), device(9)],
+                &[device(3)],
+                &[device(4), admitter]
+            ),
+            vec![device(9), admitter, device(7), device(3), device(4)],
+            "anchors, the admitter, the full members kept, sessions, the LAN, each once"
         );
+    }
+
+    #[test]
+    fn a_member_is_handed_its_anchors_or_full_members_seen_lately() {
+        let me = device(1);
+        let anchors: Vec<DeviceId> = (10..18).map(device).collect();
+        let fulls: Vec<DeviceId> = (20..30).map(device).collect();
+        assert_eq!(
+            handed(&me, &anchors, &fulls, &|_| false),
+            anchors_for(&me, &anchors),
+            "its anchors, where there are any"
+        );
+
+        let lately = [device(21), device(25)];
+        let given = handed(&me, &[], &fulls, &|full| lately.contains(full));
+        assert_eq!(given.len(), FULLS_PER_MEMBER);
+        assert!(lately.iter().all(|full| given.contains(full)), "those seen lately first");
+        assert!(!handed(&me, &[], &[me, device(2)], &|_| true).contains(&me), "never itself");
+        assert_eq!(handed(&me, &[], &[device(2)], &|_| false), vec![device(2)], "what there is");
     }
 
     #[test]

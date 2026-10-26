@@ -348,6 +348,17 @@ fn warnings(network: &Network, block: &mut Block) {
         );
     }
 
+    // Perhaps hours after the command that issued the invite ended: where there
+    // is no tray, this is where the person hears of it.
+    if let Some(name) = &network.arrived {
+        block.blank();
+        block.note(format!(
+            "the device invited as {} has arrived, and is waiting at the code",
+            shown(name)
+        ));
+        block.plain("  to compare the code and admit it:  peerfectly resume");
+    }
+
     if network.has_unpropagated_work() {
         block.blank();
         block.note("waiting: signed operations have not reached every device");
@@ -487,6 +498,8 @@ mod tests {
             custody: crate::control::Custody::HeldHere,
             owner_taken: false,
             confirmation: None,
+            arrived: None,
+            anchors: Vec::new(),
             relay: Some("https://relay.example:443".to_owned()),
             relay_leaving: None,
             accused: Vec::new(),
@@ -515,6 +528,20 @@ mod tests {
 
         moving.relay_leaving = None;
         assert!(!infrastructure(&moving).contains("old.example"), "nothing, after the end");
+    }
+
+    /// **An invited device that arrived after its command ended is told in
+    /// `status`**, with the command that comes back to it.
+    #[test]
+    fn status_says_an_invited_device_has_arrived() {
+        let mut report = two_networks();
+        assert!(!report.to_string().contains("has arrived"));
+        if let Some(casa) = report.networks.first_mut() {
+            casa.arrived = Some("tv".to_owned());
+        }
+        let drawn = report.to_string();
+        assert!(drawn.contains("invited as tv has arrived"), "{drawn}");
+        assert!(drawn.contains("peerfectly resume"), "{drawn}");
     }
 
     fn two_networks() -> Report {

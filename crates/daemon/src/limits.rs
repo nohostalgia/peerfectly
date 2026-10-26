@@ -183,7 +183,18 @@ pub const LOOKUP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(
 /// connection opened and closed, a few hundred bytes.
 pub const INVITE_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long one dial of an invited device may take before the next is tried.
+/// How recently a full member must have been in contact to be handed to a
+/// light member first, in minutes: a week, so that one switched off for the
+/// weekend still counts and one gone for good stops being offered.
+pub const HANDED_SEEN_WITHIN_MINUTES: u64 = 7 * 24 * 60;
+
+/// How long reaching an invited device may take before the next is tried.
+///
+/// Reaching only. A device reached then introduces itself, which may wait on
+/// its person typing a passphrase, and has the exchange's deadline for that:
+/// one bound on the two together dropped every exchange whose person took
+/// longer than this to type it — found in the testbed, where the joining key
+/// was a sealed file.
 pub const INVITE_DIAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[cfg(test)]

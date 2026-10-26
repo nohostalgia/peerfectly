@@ -34,7 +34,7 @@
 //! pin a device's last contact in the future for good, while a clock set back
 //! makes one reading early and corrects at the next contact.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roster::id::DeviceId;
@@ -67,9 +67,9 @@ impl LastContacts {
     }
 
     /// Forgets every device not in `kept`. Returns whether anything went.
-    pub(crate) fn retain(&mut self, kept: &BTreeSet<DeviceId>) -> bool {
+    pub(crate) fn retain(&mut self, kept: impl Fn(&DeviceId) -> bool) -> bool {
         let before = self.by_device.len();
-        self.by_device.retain(|device, _| kept.contains(device));
+        self.by_device.retain(|device, _| kept(device));
         self.by_device.len() != before
     }
 }
@@ -211,10 +211,10 @@ mod tests {
         let mut contacts = LastContacts::default();
         contacts.touch(device(1), 1);
         contacts.touch(device(2), 1);
-        assert!(contacts.retain(&BTreeSet::from([device(1)])));
+        assert!(contacts.retain(|held| *held == device(1)));
         assert_eq!(contacts.minute(&device(1)), Some(1));
         assert_eq!(contacts.minute(&device(2)), None);
-        assert!(!contacts.retain(&BTreeSet::from([device(1)])), "a second pass drops nothing");
+        assert!(!contacts.retain(|held| *held == device(1)), "a second pass drops nothing");
     }
 
     /// Nothing is kept but one number per device: no history and no address.

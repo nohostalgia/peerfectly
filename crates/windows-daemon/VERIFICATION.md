@@ -2493,3 +2493,70 @@ afterwards, and start it once more.
 **Result**: partly run, 2026-10-25.
 - The tests, from an elevated console: 2 passed, in 4.29 s (reported by the person who ran them).
 - The rest — `certutil`, `machine.kind`, the checkpoint, and the changed folder — not run yet.
+
+## C4. Invites, the tray's notice, a batch, and how many dialogs a batch of signatures shows
+
+`scalable-membership` 13.1, 13.2 and 13.4. The MSI of this branch installed; the phone with the
+app of this branch (13.3), to join by invite. Networks founded before this branch are not carried:
+forget them first. From an elevated console, as for C2 (the console the tray opens is not elevated:
+note whether it can sign, and what it says if it cannot):
+
+```powershell
+peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+peerfectly up prova
+```
+```powershell
+peerfectly invite telefono --network prova --light
+```
+
+When it says it is waiting, press `ctrl-c`. Then:
+
+```powershell
+peerfectly invites prova
+```
+
+On the phone, join with the invite (scan the code `invite` drew, or paste its text). Leave the
+console alone and watch the tray. When the notice appears, open the tray menu and click the line
+*telefono has arrived in prova: compare the code…*. In the console that opens, type the six digits
+it shows on the phone, answer `yes`, and confirm Windows' dialog or dialogs.
+
+Then a batch, with a `peerfectly-batch-v1` file of three boards (one was made for this run, from
+the Linux testbed, as `lot-windows.json`):
+
+```powershell
+peerfectly admit --batch lot-windows.json --network prova --light --ipv4-block 100.64.9.0/28
+```
+
+And one invite withdrawn:
+
+```powershell
+peerfectly invite tv --network prova
+```
+(`ctrl-c` when it waits)
+```powershell
+peerfectly withdraw tv --network prova
+```
+```powershell
+peerfectly invites prova
+```
+
+**Expect**:
+- `found` lists 2 acts and `invite --light`'s admission 2 acts (the admission, and the settings the
+  invite chose);
+- `ctrl-c` says the invite stays open, until when, and prints `peerfectly resume` and
+  `peerfectly withdraw telefono`; `invites` lists `telefono` as `open` with its time left;
+- the notice beside the tray, *telefono has arrived in prova*, within a minute of the phone joining,
+  and the menu's first line saying the same;
+- the console opened from the menu shows the phone's name, key and six digits, signs on `yes`, and
+  the phone joins; the line leaves the menu;
+- `peerfectly status` shows, before the click, *the device invited as telefono has arrived*;
+- the batch review shows 3 devices, `lotto windows`, `light`, the block, `skipped none`, and signs on
+  one consent; `peers prova` lists `scheda-1..3`;
+- `withdraw` says *the invite for tv admits nobody now*, and `invites` lists `tv` as `withdrawn`.
+
+**Record** for 13.4, for `found` and for the admission (2 signatures each) and for the batch (1):
+how many Windows dialogs appeared — one for the whole act, or one per signature.
+
+**Result**: not run.

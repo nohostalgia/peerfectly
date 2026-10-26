@@ -55,6 +55,7 @@
 
 pub mod admitting;
 pub mod attesting;
+pub(crate) mod batches;
 pub mod channel;
 pub mod checkpoint;
 pub(crate) mod clock;

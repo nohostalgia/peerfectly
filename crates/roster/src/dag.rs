@@ -429,6 +429,24 @@ impl Dag {
         self.base.as_deref().map(|footing| &footing.state)
     }
 
+    /// Puts `state` in place of the state the base rests on: the same state,
+    /// kept elsewhere — read back from a store once it is written there.
+    ///
+    /// # Errors
+    ///
+    /// When this graph rests on no base, or `state` is not the one its root
+    /// signs.
+    pub fn replace_base_state(&mut self, state: crate::state::RosterState) -> Result<()> {
+        let Some(footing) = self.base.as_mut() else {
+            return Err(Error::CompactionRefused("the graph rests on no base"));
+        };
+        if state.root() != footing.snapshot.body().root {
+            return Err(Error::SnapshotStateMismatch);
+        }
+        footing.state = state;
+        Ok(())
+    }
+
     /// Whether an operation is already accounted for by the base snapshot.
     ///
     /// Such an operation is retained only so its children can be placed.

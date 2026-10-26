@@ -67,8 +67,10 @@ pub struct RosterState {
     pub network: crate::id::NetworkId,
     /// The current network parameters.
     pub params: NetworkParams,
-    /// Devices currently in the network, keyed by id.
-    pub devices: BTreeMap<DeviceId, DeviceRecord>,
+    /// Devices currently in the network, with their settings, keyed by id: a
+    /// shared base and the changes on top of it, with the tree over them kept
+    /// as they change (`crate::members`).
+    pub devices: crate::members::Members,
     /// Devices removed by a revocation this node still holds, and not admitted
     /// again.
     ///
@@ -78,11 +80,6 @@ pub struct RosterState {
     /// that holds the window and one that holds the whole history agree on
     /// everything the root commits to.
     pub revoked: BTreeSet<DeviceId>,
-    /// What admins have set about devices since admitting them.
-    ///
-    /// Only devices whose settings differ from the default appear: a device
-    /// absent here is full, in no group, with no assigned address or relay.
-    pub settings: BTreeMap<DeviceId, DeviceSettings>,
 }
 
 /// The context the state's root is derived under.
@@ -92,16 +89,44 @@ impl RosterState {
     /// A device's settings: those an admin set, or the default.
     #[must_use]
     pub fn settings_of(&self, device: &DeviceId) -> DeviceSettings {
-        self.settings.get(device).cloned().unwrap_or_default()
+        self.devices.get(device).map(|leaf| leaf.settings.clone()).unwrap_or_default()
+    }
+
+    /// A state from its parts as maps: the devices' records, and the settings
+    /// of those whose settings are not the default.
+    #[must_use]
+    pub fn from_parts(
+        network: crate::id::NetworkId,
+        params: NetworkParams,
+        devices: BTreeMap<DeviceId, DeviceRecord>,
+        revoked: BTreeSet<DeviceId>,
+        mut settings: BTreeMap<DeviceId, DeviceSettings>,
+    ) -> Self {
+        let devices = devices
+            .into_iter()
+            .map(|(device, record)| DeviceLeaf {
+                record,
+                settings: settings.remove(&device).unwrap_or_default(),
+            })
+            .collect();
+        Self { network, params, devices, revoked }
+    }
+
+    /// A state of `network` under `params`, with no devices.
+    #[must_use]
+    pub fn empty(network: crate::id::NetworkId, params: NetworkParams) -> Self {
+        Self {
+            network,
+            params,
+            devices: crate::members::Members::new(),
+            revoked: BTreeSet::new(),
+        }
     }
 
     /// The device holding a key of any purpose.
     #[must_use]
     pub fn device_holding(&self, key: &KeyId) -> Option<DeviceId> {
-        self.devices
-            .values()
-            .find(|record| record.keys.iter().any(|entry| entry.key_id() == *key))
-            .map(|record| record.id)
+        self.devices.holding(key, None).map(|leaf| leaf.record.id)
     }
 
     /// The devices `previous` held whose leaf this state no longer holds as it
@@ -111,41 +136,38 @@ impl RosterState {
     /// earlier proof to invalidate.
     #[must_use]
     pub fn delta_from(&self, previous: &Self) -> Vec<DeviceId> {
+        // Over one base, only where either changed; otherwise every device.
+        if let Some(differing) = self.devices.differing(&previous.devices) {
+            return differing
+                .into_iter()
+                .filter(|device| previous.devices.contains_key(device))
+                .collect();
+        }
         previous
             .devices
-            .keys()
-            .filter(|device| previous.leaf(device) != self.leaf(device))
-            .copied()
+            .iter()
+            .filter(|(device, leaf)| self.devices.get(device).as_deref() != Some(&**leaf))
+            .map(|(device, _)| device)
             .collect()
     }
 
     /// Records a device's settings, keeping only those that differ from the
     /// default, so that one state has one representation.
     pub fn set_settings(&mut self, device: DeviceId, settings: DeviceSettings) {
-        if settings == DeviceSettings::default() {
-            self.settings.remove(&device);
-        } else {
-            self.settings.insert(device, settings);
-        }
+        self.devices.set_settings(device, settings);
     }
 
     /// A device as the state tree holds it, if it is a member.
     #[must_use]
     pub fn leaf(&self, device: &DeviceId) -> Option<DeviceLeaf> {
-        let record = self.devices.get(device)?.clone();
-        Some(DeviceLeaf { record, settings: self.settings_of(device) })
+        self.devices.get(device).map(|leaf| (*leaf).clone())
     }
 
-    /// The tree of the state's devices, one leaf per member.
+    /// The tree of the state's devices, one leaf per member: kept as they
+    /// change, so this costs a copy of a reference.
     #[must_use]
     pub fn devices_tree(&self) -> merkle::Tree {
-        let mut tree = merkle::Tree::new();
-        for device in self.devices.keys() {
-            if let Some(leaf) = self.leaf(device) {
-                tree.insert(DeviceLeaf::position(device), leaf.value_hash());
-            }
-        }
-        tree
+        self.devices.tree().clone()
     }
 
     /// The root committing to this state: the network, its devices and its
@@ -156,7 +178,7 @@ impl RosterState {
     /// same root.
     #[must_use]
     pub fn root(&self) -> merkle::Hash {
-        Self::root_of(&self.network, &self.devices_tree().root(), &self.params.tree().root())
+        Self::root_of(&self.network, &self.devices.root(), &self.params.tree().root())
     }
 
     /// The state root over a network and the roots of its two subtrees.
@@ -191,7 +213,7 @@ impl RosterState {
     /// for a device with one signing key and differ for a device that also
     /// holds an enclave key, so this lookup is not the identity function.
     #[must_use]
-    pub fn device_for_key(&self, key: &KeyId) -> Option<&DeviceRecord> {
+    pub fn device_for_key(&self, key: &KeyId) -> Option<alloc::sync::Arc<DeviceLeaf>> {
         self.device_for_key_of_purpose(key, crate::types::KeyPurpose::Signing)
     }
 
@@ -210,10 +232,8 @@ impl RosterState {
         &self,
         key: &KeyId,
         purpose: crate::types::KeyPurpose,
-    ) -> Option<&DeviceRecord> {
-        self.devices.values().find(|record| {
-            record.keys.iter().any(|entry| entry.purpose == purpose && entry.key_id() == *key)
-        })
+    ) -> Option<alloc::sync::Arc<DeviceLeaf>> {
+        self.devices.holding(key, Some(purpose))
     }
 
     /// The canonical bytes of this state.
@@ -228,13 +248,14 @@ impl RosterState {
         writer.key("params");
         self.params.encode(&mut writer);
         writer.key("devices").array(self.devices.len() as u64);
-        for record in self.devices.values() {
-            record.encode(&mut writer);
+        for leaf in self.devices.values() {
+            leaf.record.encode(&mut writer);
         }
         writer.key("network").bytes(self.network.as_bytes());
         // Only devices whose settings differ from the default, by id.
-        writer.key("settings").array(self.settings.len() as u64);
-        for (device, settings) in &self.settings {
+        let changed: Vec<(DeviceId, DeviceSettings)> = self.devices.changed_settings().collect();
+        writer.key("settings").array(changed.len() as u64);
+        for (device, settings) in &changed {
             writer.array(2);
             device.encode(&mut writer);
             settings.encode(&mut writer);
@@ -289,7 +310,14 @@ impl RosterState {
         reader.finish()?;
         // Revocations are not part of the committed state: a node starting from
         // these bytes knows of none until it holds the operations that make them.
-        Ok(Self { network, params, devices, revoked: BTreeSet::new(), settings })
+        let devices = devices
+            .into_iter()
+            .map(|(device, record)| DeviceLeaf {
+                record,
+                settings: settings.remove(&device).unwrap_or_default(),
+            })
+            .collect();
+        Ok(Self { network, params, devices, revoked: BTreeSet::new() })
     }
 
     /// A short digest of the state, for comparing two nodes cheaply.
@@ -461,16 +489,10 @@ impl Base {
                 };
                 let network = dag.network().ok_or(Error::MissingGenesis)?;
                 let id = device.device_id()?;
-                let mut devices = BTreeMap::new();
-                devices.insert(id, device.clone().into_record(operation.id())?);
+                let mut state = RosterState::empty(network, params.clone());
+                state.devices.insert(id, device.clone().into_record(operation.id())?);
                 Ok(Self {
-                    state: RosterState {
-                        network,
-                        params: params.clone(),
-                        devices,
-                        revoked: BTreeSet::new(),
-                        settings: BTreeMap::new(),
-                    },
+                    state,
                     rank: Rank::new(0, operation.id()),
                     genesis: Some(*index),
                 })
@@ -659,7 +681,8 @@ pub fn state_for_parents(dag: &Dag, parents: &[OperationId]) -> Result<RosterSta
     resolve(dag, &base, &mask).ok_or(Error::MissingGenesis)
 }
 
-/// The state after one operation that **extends every head** of the graph.
+/// The state after one operation that **extends every head** of the graph, or
+/// `None` where only deriving can say.
 ///
 /// The fast path of admission and of keeping state. An operation whose parents
 /// are all the current heads is concurrent with nothing: no operation already
@@ -674,41 +697,37 @@ pub fn state_for_parents(dag: &Dag, parents: &[OperationId]) -> Result<RosterSta
 /// decide the answer. `Roster` is what holds to that, and the property tests
 /// check the result against [`derive`] after every admission.
 ///
-/// The operation must already have passed admission: its author is an admin and
-/// unrevoked here, and anything it names exists. What remains to judge is founder
-/// protection, which admission deliberately leaves to derivation, so an operation
-/// that breaks it returns the state unchanged — exactly as being disregarded
-/// would.
+/// Even then, some operations decide by more than the state shows. Derivation
+/// settles an address two devices were assigned, and an admin's light setting,
+/// over every operation held, so the device that lost keeps its claim: a
+/// revocation, a promotion or demotion, or a change of mode or address can give
+/// back what an earlier operation was overruled on, and the state no longer
+/// says what. For those this answers `None`, and the roster derives — which
+/// costs the window, not the network. Founder protection is among what
+/// derivation then judges.
 #[must_use]
-pub fn extend(state: &RosterState, operation: &crate::sign::VerifiedOperation) -> RosterState {
+pub fn extend(
+    state: &RosterState,
+    operation: &crate::sign::VerifiedOperation,
+) -> Option<RosterState> {
     let mut next = state.clone();
-    let author = state.device_for_key(&operation.core().author).map(|device| device.id);
-
-    // Founder protection, judged here as derivation judges it: only a founder
-    // may retire itself, and no admin may retire another.
-    if let Some(target) = Dag::target_of(&operation.core().body) {
-        let removes_authority = matches!(
-            operation.core().body,
-            OperationBody::RevokeDevice { .. } | OperationBody::Demote { .. }
-        );
-        if removes_authority && state.is_founder(&target) && Some(target) != author {
-            return next;
-        }
-    }
-
     match &operation.core().body {
         // The founding operation names no parents, so it never extends a head.
-        OperationBody::CreateNetwork { .. } => {}
+        // A batch takes effect only once every entry is held, which is the
+        // batch handling's to decide, not one operation's.
+        OperationBody::CreateNetwork { .. } | OperationBody::AdmitBatch(_) => {}
+        OperationBody::RevokeDevice { .. }
+        | OperationBody::Promote { .. }
+        | OperationBody::Demote { .. } => return None,
         OperationBody::AddDevice(spec) => {
-            let Ok(id) = spec.device_id() else { return next };
+            let Ok(id) = spec.device_id() else { return Some(next) };
             // The first add wins: a second add changes a device that is already
             // a member not at all. An add extending every head follows every
             // revocation held, so a revoked device is admitted again.
             if next.devices.contains_key(&id) {
-                return next;
+                return Some(next);
             }
             next.revoked.remove(&id);
-            next.settings.remove(&id);
             next.devices.insert(
                 id,
                 DeviceRecord {
@@ -722,50 +741,20 @@ pub fn extend(state: &RosterState, operation: &crate::sign::VerifiedOperation) -
                 },
             );
         }
-        OperationBody::RevokeDevice { device, .. } => {
-            next.revoked.insert(*device);
-            next.devices.remove(device);
-            next.settings.remove(device);
-        }
-        OperationBody::Promote { device, founder } => {
-            // A light device is not made an admin: an admin must be full.
-            if next.settings_of(device).mode == Mode::Light {
-                return next;
-            }
-            if let Some(record) = next.devices.get_mut(device) {
-                record.role = Role::Admin;
-                // Founder status is granted and never withdrawn.
-                record.founder = record.founder || *founder;
-            }
-        }
-        OperationBody::Demote { device } => {
-            if let Some(record) = next.devices.get_mut(device) {
-                record.role = Role::Member;
-            }
-        }
         OperationBody::Rename { device, name } => {
-            if let Some(record) = next.devices.get_mut(device) {
-                record.name = name.clone();
-            }
+            next.devices.modify(device, |record| record.name.clone_from(name));
         }
         OperationBody::SetNetwork(params) => next.params = params.clone(),
         OperationBody::SetDevice { device, change } => {
-            if next.devices.contains_key(device) {
-                // An admin is not made light: its mode is left as it is.
-                let mut change = change.clone();
-                if next.is_admin(device) && change.mode == Some(Mode::Light) {
-                    change.mode = None;
-                }
-                let settings = next.settings_of(device).changed_by(&change);
-                next.set_settings(*device, settings);
+            if change.mode.is_some() || change.ipv4.is_some() {
+                return None;
             }
+            let settings = next.settings_of(device).changed_by(change);
+            next.set_settings(*device, settings);
         }
-        // A batch takes effect only once every entry is held, which is the
-        // batch handling's to decide, not one operation's.
-        OperationBody::AdmitBatch(_) => {}
     }
     keep_member_anchors(&mut next);
-    next
+    Some(next)
 }
 
 /// Drops from the anchor list every entry that names no member.
@@ -963,6 +952,38 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
             revocations.entry(*device).or_default().push(index);
         }
     }
+    // Only the devices the window names can come out different from the base.
+    // Every rule below reads a device's own operations, and a base device no
+    // held operation names keeps the record and settings the base gives it:
+    // the base is itself a derived state, so it already keeps the rules among
+    // its own devices. The one rule that reaches across devices is an address,
+    // which a device the window assigns it takes from a base device holding
+    // it — so the base's holder of every address the window assigns is
+    // touched too. Everything else is carried over from the base as it is,
+    // which is what lets a window over a million devices cost the window.
+    let mut touched: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut assigning: BTreeSet<[u8; 4]> = BTreeSet::new();
+    for (_, operation) in selected(dag, mask) {
+        match &operation.core().body {
+            OperationBody::AddDevice(spec) => touched.extend(spec.device_id().ok()),
+            OperationBody::AdmitBatch(_) => {
+                for entry in dag.entries_of(&operation.id()).unwrap_or_default() {
+                    touched.extend(entry.device_id().ok());
+                    assigning.extend(entry.ipv4);
+                }
+            }
+            body => {
+                if let OperationBody::SetDevice { change, .. } = body {
+                    assigning.extend(change.ipv4.flatten());
+                }
+                touched.extend(Dag::target_of(body));
+            }
+        }
+    }
+    for address in assigning {
+        touched.extend(base.state.devices.holding_address(address));
+    }
+
     let survives = |device: &DeviceId, added_at: Option<usize>| -> bool {
         let Some(revoking) = revocations.get(device) else { return true };
         match added_at {
@@ -978,7 +999,8 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     // different transport key — the deeper one wins, ties broken by id, so the
     // whole record comes from one operation rather than being spliced.
     let mut added: BTreeMap<DeviceId, (Rank, DeviceSpec, OperationId)> = BTreeMap::new();
-    for (id, record) in &base.state.devices {
+    for id in &touched {
+        let Some(record) = base.state.devices.get(id) else { continue };
         if !survives(id, None) {
             continue;
         }
@@ -1081,7 +1103,8 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     // Rule 3: last-writer-wins by causal depth, ties broken by the greater
     // operation id. Arbitrary, but identical everywhere.
     let mut names: BTreeMap<DeviceId, (Rank, String)> = BTreeMap::new();
-    for (id, record) in &base.state.devices {
+    for id in &touched {
+        let Some(record) = base.state.devices.get(id) else { continue };
         // Only where the base's own admission still stands: a device the window
         // revoked and admitted again starts from its new admission's name.
         if added.get(id).is_some_and(|(_, _, added_by)| *added_by == record.added_by) {
@@ -1247,7 +1270,20 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     let revoked: BTreeSet<DeviceId> =
         revocations.keys().filter(|device| !devices.contains_key(*device)).copied().collect();
 
-    let mut state = RosterState { network, params, devices, revoked, settings };
+    // The base's devices, with what the window made of the ones it touched.
+    let mut members = base.state.devices.clone();
+    for device in &touched {
+        match devices.remove(device) {
+            Some(record) => members.insert_leaf(DeviceLeaf {
+                record,
+                settings: settings.remove(device).unwrap_or_default(),
+            }),
+            None => {
+                members.remove(device);
+            }
+        }
+    }
+    let mut state = RosterState { network, params, devices: members, revoked };
     keep_member_anchors(&mut state);
     Some(state)
 }

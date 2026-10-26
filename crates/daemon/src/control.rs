@@ -664,6 +664,18 @@ pub struct Network {
     /// a surface that did not show it would leave a person watching their devices
     /// stop answering with nothing anywhere saying why.
     pub confirmation: Option<Unconfirmed>,
+    /// The device one of this network's invites brought, waiting at the code
+    /// for this device's person: the name it was invited under.
+    ///
+    /// So that a surface can say so and offer to come back to it: the command
+    /// that issued the invite may have ended hours ago. `None` when nothing
+    /// waits.
+    #[serde(default)]
+    pub arrived: Option<String>,
+    /// The network's anchors: the full members its light members turn to
+    /// first. Empty where it has none, which is a normal state.
+    #[serde(default)]
+    pub anchors: Vec<Named>,
 }
 
 /// Why a device cannot confirm a network's roster.
@@ -1211,7 +1223,11 @@ impl Command {
             | Self::Withdraw { network, .. }
             | Self::Invites { network }
             | Self::Revoke { network, .. }
+            | Self::RevokeVoiding { network, .. }
+            | Self::StageBatch { network, .. }
+            | Self::AdmitBatch { network, .. }
             | Self::Rename { network, .. }
+            | Self::SetAnchors { network, .. }
             | Self::ChangeRelay { network, .. } => Needs::TheOwnerOf(network.clone()),
             Self::Expose { network, .. } | Self::Unexpose { network, .. } => {
                 Needs::TheOwnerOfAsAdministrator(network.clone())
@@ -1456,6 +1472,54 @@ pub enum Command {
         reason: String,
     },
 
+    /// Add devices to the batch being put together for a network, before it is
+    /// admitted: a batch file travels in parts, each well within what one
+    /// command may carry. A batch for another network, or one admitted or
+    /// abandoned, starts again.
+    StageBatch {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The devices, in the file's order.
+        devices: Vec<BatchDevice>,
+    },
+
+    /// Admit the batch put together with [`Command::StageBatch`], as one.
+    ///
+    /// Asked first without `reviewed`: the daemon answers with what the batch
+    /// would do ([`Outcome::BatchReview`]) and signs nothing. Asked again with
+    /// the names of the entries the person was shown would be skipped, it signs
+    /// — unless the network moved since, and those are no longer the ones.
+    AdmitBatch {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// A line a person reads: which lot this is.
+        label: String,
+        /// Whether its devices are admitted light.
+        light: bool,
+        /// The groups every device joins.
+        groups: Vec<String>,
+        /// The IPv4 block their addresses are assigned from, inside the
+        /// network's range; `None` for derived addresses.
+        block: Option<String>,
+        /// The entries shown as skipped, once the person has reviewed it.
+        reviewed: Option<Vec<String>>,
+    },
+
+    /// A revocation whose person was told what it voids, and said go ahead.
+    ///
+    /// What a surface sends after [`Outcome::WouldVoid`]: the same revocation,
+    /// with the acknowledgement. Its own command rather than a flag on
+    /// [`Command::Revoke`], so that what every surface already sends keeps
+    /// asking first.
+    RevokeVoiding {
+        /// As [`Command::Revoke`]'s.
+        network: Option<String>,
+        /// As [`Command::Revoke`]'s.
+        target: Target,
+        /// As [`Command::Revoke`]'s.
+        reason: String,
+    },
+
     /// Give a device a new name.
     ///
     /// Named as [`Command::Revoke`] names it, exactly, by name or by id. The new
@@ -1468,6 +1532,19 @@ pub enum Command {
         target: Target,
         /// The name it is to answer to, as the person typed it.
         name: String,
+    },
+
+    /// Set the network's anchor list: the full members light members turn to
+    /// when the one that admitted them is off.
+    ///
+    /// The list given replaces the one held; none clears it. Signed like every
+    /// administrative act. An anchor is a full member and nothing else, so the
+    /// daemon refuses a device that is not one before anything is signed.
+    SetAnchors {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The devices, by the names they answer to. Empty clears the list.
+        anchors: Vec<Target>,
     },
 
     /// The signature a previous answer asked for.
@@ -1599,6 +1676,8 @@ impl Command {
         // only in the tests — found by writing the verification step for it and
         // discovering the word did not work.
         ("takeownership", true),
+        // The invites issued into a network, open or ended.
+        ("invites", true),
     ];
 
     /// The usage line for forgetting a network this device cannot carry.
@@ -1616,6 +1695,68 @@ impl Command {
     /// as revoking: it takes arguments.
     pub const RENAME_USAGE: &'static str = "peerfectly rename <name> <new name> [--network N]\n       \
                                              peerfectly rename --id <id> <new name> [--network N]";
+
+    /// The usage line for withdrawing an invite.
+    pub const WITHDRAW_USAGE: &'static str = "peerfectly withdraw <name> [--network N]";
+
+    /// Reads a withdrawal from the words after `withdraw`: the name the invite
+    /// was issued for.
+    ///
+    /// # Errors
+    ///
+    /// When no name is given, or more than one.
+    pub fn withdrawal(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::WITHDRAW_USAGE);
+        let mut name = None;
+        let mut network = None;
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                flag if flag.starts_with("--") => return Err(usage()),
+                given if name.is_none() && !given.is_empty() => name = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(Self::Withdraw { network, name: name.ok_or_else(usage)? })
+    }
+
+    /// The usage lines for setting a network's anchors, and clearing them.
+    pub const SET_ANCHORS_USAGE: &'static str = "peerfectly set-anchors <name>... [--network N]\n       \
+                                                  peerfectly set-anchors --none [--network N]";
+
+    /// Reads an anchor list from the words after `set-anchors`.
+    ///
+    /// Here rather than in the command line, as revoking's is: what reaches
+    /// the daemon is signed.
+    ///
+    /// # Errors
+    ///
+    /// When nothing is named and `--none` is not given, when both are, or when
+    /// a flag is not one this knows.
+    pub fn anchors_setting(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::SET_ANCHORS_USAGE);
+        let mut anchors = Vec::new();
+        let mut network = None;
+        let mut none = false;
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                "--none" => none = true,
+                flag if flag.starts_with("--") => return Err(usage()),
+                "" => return Err(usage()),
+                name => anchors.push(Target::Name(name.to_owned())),
+            }
+        }
+        // Clearing is said, never implied: a list typed empty by mistake would
+        // leave every light member with no anchor to turn to.
+        if none == anchors.is_empty() {
+            Ok(Self::SetAnchors { network, anchors })
+        } else {
+            Err(usage())
+        }
+    }
 
     /// The usage line for moving a network to another relay.
     pub const RELAY_USAGE: &'static str =
@@ -1792,6 +1933,7 @@ impl Command {
             "address" => Ok(Self::Address { network }),
             "stop" => Ok(Self::Stop),
             "takeownership" => Ok(Self::TakeOwnership { network }),
+            "invites" => Ok(Self::Invites { network }),
             _ => Err(Unknown { name: name.to_owned() }),
         }
     }
@@ -1827,6 +1969,8 @@ impl Command {
             Self::Up { .. }
                 | Self::Down { .. }
                 | Self::Revoke { .. }
+                // The same revocation, after its person was told what it voids.
+                | Self::RevokeVoiding { .. }
                 | Self::Rename { .. }
                 | Self::Found { .. }
                 | Self::Join { .. }
@@ -1867,6 +2011,7 @@ impl Command {
             Self::Address { .. } => "address",
             Self::Stop => "stop",
             Self::TakeOwnership { .. } => "takeownership",
+            Self::Invites { .. } => "invites",
             _ => "",
         }
     }
@@ -1900,8 +2045,13 @@ impl Command {
             Self::Join { .. } => ("join", None),
             Self::Forget { label, .. } => ("forget", Some(label.as_str())),
             Self::Found { label, .. } => ("found", Some(label.as_str())),
-            Self::Revoke { network, .. } => ("revoke", network.as_deref()),
+            Self::Revoke { network, .. } | Self::RevokeVoiding { network, .. } => {
+                ("revoke", network.as_deref())
+            }
+            Self::StageBatch { network, .. } => ("stage batch", network.as_deref()),
+            Self::AdmitBatch { network, .. } => ("admit batch", network.as_deref()),
             Self::Rename { network, .. } => ("rename", network.as_deref()),
+            Self::SetAnchors { network, .. } => ("set-anchors", network.as_deref()),
             Self::Signed { .. } => ("signed", None),
             Self::TakeOwnership { network } => ("takeownership", network.as_deref()),
             Self::ChangeRelay { network, .. } => ("relay", network.as_deref()),
@@ -1934,6 +2084,9 @@ impl Outcome {
             Self::NeedsKey(_) => "needs a key",
             Self::NotAllowed { .. } => "not allowed",
             Self::OnlyAdmin { .. } => "only admin",
+            Self::WouldVoid { .. } => "would void",
+            Self::BatchReview { .. } => "batch review",
+            Self::Staged { .. } => "staged",
             Self::Exposed { .. } => "exposed",
             Self::Failed { .. } => "failed",
         }
@@ -2009,6 +2162,80 @@ pub struct TakenName {
     pub name: String,
     /// The short id of the device holding it.
     pub id: String,
+}
+
+/// One device of a batch file, as the command line read it: what its board
+/// gave the production station. Keys are Ed25519 public keys, in hexadecimal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchDevice {
+    /// The name it is admitted under.
+    pub name: String,
+    /// Its serial, as printed on it; empty for none.
+    #[serde(default)]
+    pub serial: String,
+    /// Its signing key.
+    pub signing: String,
+    /// Its transport key.
+    pub transport: String,
+    /// Its attestation key: every member holds one.
+    pub attestation: String,
+}
+
+/// The name of the one format of a batch file this build reads.
+pub const BATCH_FORMAT: &str = "peerfectly-batch-v1";
+
+/// A batch file: what a production station wrote of a lot of boards, for an
+/// admin to admit. JSON, so that whatever runs the station can write it, and
+/// a person can read it:
+///
+/// ```json
+/// { "format": "peerfectly-batch-v1", "label": "lot 2026-10 A",
+///   "devices": [ { "name": "sensor-001", "serial": "SN0001",
+///                  "signing": "…", "transport": "…", "attestation": "…" } ] }
+/// ```
+///
+/// It carries public keys only: whoever copies it learns which keys will be
+/// members, and can be none of them. What the admin decides — the mode, the
+/// groups, the address block — is not in it, but given when it is admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchFile {
+    /// [`BATCH_FORMAT`].
+    pub format: String,
+    /// Which lot this is.
+    pub label: String,
+    /// Its devices.
+    pub devices: Vec<BatchDevice>,
+}
+
+impl BatchFile {
+    /// Reads a batch file's text.
+    ///
+    /// # Errors
+    ///
+    /// In words, when it is not JSON of this shape, or another format.
+    pub fn read(text: &str) -> core::result::Result<Self, String> {
+        let file: Self = serde_json::from_str(text)
+            .map_err(|cause| format!("that is not a batch file: {cause}"))?;
+        if file.format != BATCH_FORMAT {
+            return Err(format!(
+                "that batch file is `{}`, and this build reads `{BATCH_FORMAT}`",
+                shown(&file.format)
+            ));
+        }
+        if file.devices.is_empty() {
+            return Err("that batch file names no device".to_owned());
+        }
+        Ok(file)
+    }
+}
+
+/// An entry of a batch that would have no effect, and why, as reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedLine {
+    /// The name it would have been admitted under.
+    pub name: String,
+    /// Why it would be skipped.
+    pub why: String,
 }
 
 /// One invite, as listed.
@@ -2180,6 +2407,43 @@ pub enum Outcome {
         network: String,
     },
 
+    /// A revocation of an admin would void acts of that admin's which this
+    /// device cannot keep: batches it holds only by their header, and acts
+    /// resting on another's batch too recent to wait for.
+    ///
+    /// **Nothing was signed.** A surface shows what is voided and, on yes,
+    /// sends [`Command::RevokeVoiding`].
+    WouldVoid {
+        /// The network, by the name it is reported under.
+        network: String,
+        /// What the revocation voids, in words.
+        voids: String,
+    },
+
+    /// What a batch would do, for a person to review. **Nothing was signed.**
+    BatchReview {
+        /// The network, by the name it is reported under.
+        network: String,
+        /// How many devices it holds.
+        count: u64,
+        /// Its label.
+        label: String,
+        /// The mode its devices are admitted in.
+        mode: String,
+        /// The groups they join.
+        groups: Vec<String>,
+        /// The block their addresses come from, if any.
+        block: Option<String>,
+        /// The entries that would have no effect, and why.
+        skipped: Vec<SkippedLine>,
+    },
+
+    /// How many devices the batch being put together holds now.
+    Staged {
+        /// How many.
+        count: u64,
+    },
+
     /// What is open, each port to the one network it was opened to.
     ///
     /// **Never produced on a phone**, which has no firewall rules to write.
@@ -2311,6 +2575,8 @@ mod tests {
             custody: Custody::HeldHere,
             owner_taken: false,
             confirmation: None,
+            arrived: None,
+            anchors: Vec::new(),
             relay: Some("https://relay.example:443".to_owned()),
             relay_leaving: None,
             accused: Vec::new(),
@@ -3341,6 +3607,58 @@ mod tests {
         ] {
             assert!(Command::relay_change(&words(wrong)).is_err(), "`{wrong}` is not a change");
         }
+    }
+
+    #[test]
+    fn a_batch_file_is_read_and_its_format_held_to() {
+        let device = r#"{ "name": "s1", "serial": "SN1", "signing": "aa", "transport": "bb", "attestation": "cc" }"#;
+        let file = format!(r#"{{ "format": "peerfectly-batch-v1", "label": "lot", "devices": [{device}] }}"#);
+        let read = BatchFile::read(&file).unwrap();
+        assert_eq!((read.label.as_str(), read.devices.len()), ("lot", 1));
+
+        let other = file.replace("peerfectly-batch-v1", "peerfectly-batch-v9");
+        assert!(BatchFile::read(&other).unwrap_err().contains("peerfectly-batch-v1"));
+        let empty = r#"{ "format": "peerfectly-batch-v1", "label": "lot", "devices": [] }"#;
+        assert!(BatchFile::read(empty).unwrap_err().contains("no device"));
+        assert!(BatchFile::read("not json").is_err());
+    }
+
+    #[test]
+    fn a_withdrawal_names_one_invite() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::withdrawal(&words("sensor --network casa")).unwrap(),
+            Command::Withdraw { network: Some("casa".to_owned()), name: "sensor".to_owned() }
+        );
+        assert!(Command::withdrawal(&[]).is_err(), "no name");
+        assert!(Command::withdrawal(&words("sensor laptop")).is_err(), "two names");
+        assert!(Command::withdrawal(&words("sensor --all")).is_err(), "a flag it does not know");
+    }
+
+    #[test]
+    fn an_anchor_list_is_read_by_name_and_cleared_only_when_said() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+
+        assert_eq!(
+            Command::anchors_setting(&words("nas server --network casa")).unwrap(),
+            Command::SetAnchors {
+                network: Some("casa".to_owned()),
+                anchors: vec![
+                    Target::Name("nas".to_owned()),
+                    Target::Name("server".to_owned())
+                ],
+            }
+        );
+        assert_eq!(
+            Command::anchors_setting(&words("--none")).unwrap(),
+            Command::SetAnchors { network: None, anchors: Vec::new() }
+        );
+
+        assert!(Command::anchors_setting(&[]).is_err(), "an empty list is not a clearing");
+        assert!(Command::anchors_setting(&words("--network casa")).is_err(), "nor is a network");
+        assert!(Command::anchors_setting(&words("nas --none")).is_err(), "not both");
+        assert!(Command::anchors_setting(&words("--id 0a1b")).is_err(), "by name only");
+        assert!(Command::anchors_setting(&words("nas --network")).is_err(), "a network flag alone");
     }
 
     #[test]

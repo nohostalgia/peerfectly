@@ -540,6 +540,7 @@ fn admissions_arriving_in_any_order_give_one_root() {
     assert_eq!(forward.devices.len(), 11);
     assert_eq!(forward.root(), backward.root());
     for device in forward.devices.keys() {
+        let device = &device;
         let leaf = forward.leaf(device).expect("member");
         let proof = forward.devices_tree().prove(&roster::leaf::DeviceLeaf::position(device));
         assert!(
@@ -564,7 +565,7 @@ fn later_operations_outrank_values_carried_in_the_snapshot() {
     // The last rename in the chain is `name11`, applied after the snapshot.
     let state = compacted.state().expect("derives");
     assert_eq!(
-        state.devices.get(&device_id(2)).map(|record| record.name.as_str()),
+        state.devices.get(&device_id(2)).map(|record| record.name.clone()).as_deref(),
         Some("name11"),
         "a post-snapshot rename beats the name inside the snapshot"
     );
@@ -1685,4 +1686,46 @@ fn no_window_is_the_key_and_the_leaf_left_out() {
     let back = roster::types::NetworkParams::from_leaves(params.leaves()).expect("reads back");
     assert_eq!(back, params);
     assert_eq!(back.snapshot_window, 0);
+}
+
+/// An address the window assigns is taken from the device the snapshot holds
+/// it for, though nothing in the window names that device. A compacted node
+/// carries every untouched device over from its snapshot, so this is the one
+/// rule that reaches across: it must find the holder all the same.
+#[test]
+fn an_address_taken_after_the_snapshot_leaves_its_holder_without_it() {
+    let taken = [100, 70, 0, 3];
+    let assign = |seed: u8| OperationBody::SetDevice {
+        device: device_id(seed),
+        change: roster::leaf::SettingsChange {
+            ipv4: Some(Some(taken)),
+            ..roster::leaf::SettingsChange::default()
+        },
+    };
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("b", 1, &["a"], assign(2));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("d", 1, &["c"], OperationBody::Rename { device: device_id(3), name: "x".to_owned() });
+    history.op("e", 1, &["d"], assign(3));
+    history.op("f", 1, &["e"], OperationBody::Rename { device: device_id(3), name: "y".to_owned() });
+    history.op("h", 1, &["f"], OperationBody::Rename { device: device_id(3), name: "z".to_owned() });
+
+    let mut whole = Roster::with_staleness_depth(1);
+    load(&mut whole, &history);
+    let mut compacted = Roster::with_staleness_depth(1);
+    load(&mut compacted, &history);
+    assert!(compacted.offer_snapshot(&history.snapshot_at(1, 1, &["c"])).is_accepted());
+    compacted.compact().expect("compacts");
+    assert!(!compacted.dag().contains(&history.id("b")), "the assignment to 2 is discarded");
+
+    // Kept a step at a time, the state is what deriving the whole graph gives.
+    let state = whole.state().expect("derives");
+    assert_eq!(state.to_bytes(), derive(whole.dag()).expect("derives").to_bytes());
+    assert_eq!(state.settings_of(&device_id(3)).ipv4, Some(taken), "the later assignment wins");
+    assert_eq!(state.settings_of(&device_id(2)).ipv4, None, "and the holder loses it");
+    // Derived afresh from what the compacted node holds: the snapshot's state
+    // and the window over it.
+    assert_eq!(derive(compacted.dag()).expect("derives").to_bytes(), state.to_bytes());
 }

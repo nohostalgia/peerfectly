@@ -356,6 +356,16 @@ pub struct DeviceLeaf {
     pub settings: DeviceSettings,
 }
 
+/// A leaf reads as its record: who the device is, which is what nearly every
+/// question about a member asks. Its settings are asked for by name.
+impl core::ops::Deref for DeviceLeaf {
+    type Target = DeviceRecord;
+
+    fn deref(&self) -> &DeviceRecord {
+        &self.record
+    }
+}
+
 impl DeviceLeaf {
     /// Where the device's leaf sits in the state tree.
     #[must_use]

@@ -37,6 +37,13 @@
             ],
             "address": "fd00::4",
             "admin": true,
+            "anchors": [
+              {
+                "id": "0a1b-2c3d-4e5f-6a7b",
+                "name": "nas"
+              }
+            ],
+            "arrived": "tv",
             "confirmation": null,
             "custody": "KeyStore",
             "id": "3d4e-5f6a-7b8c-9d0e",
@@ -223,6 +230,26 @@
                 "does": "SetsParameters",
                 "owed": [],
                 "signed_here": "NotRecorded"
+              },
+              {
+                "does": {
+                  "ChangesSettings": {
+                    "id": "0a1b-2c3d-4e5f-6a7b",
+                    "name": "nas"
+                  }
+                },
+                "owed": [],
+                "signed_here": "NotRecorded"
+              },
+              {
+                "does": {
+                  "AdmitsBatch": {
+                    "count": 3,
+                    "label": "lot 2026-10 A"
+                  }
+                },
+                "owed": [],
+                "signed_here": "NotRecorded"
               }
             ],
             "waiting_unlisted": 3
@@ -257,6 +284,8 @@
             ],
             "address": null,
             "admin": false,
+            "anchors": [],
+            "arrived": null,
             "confirmation": "Stale",
             "custody": "KeyStore",
             "id": "4e5f-6a7b-8c9d-0e1f",
@@ -429,6 +458,35 @@
     {
       "OnlyAdmin": {
         "network": "casa"
+      }
+    },
+    {
+      "WouldVoid": {
+        "network": "casa",
+        "voids": "this revocation voids 1 act of laptop [9f2c-1a07-3b44-d0e1] it is concurrent with: rename tv to salotto"
+      }
+    },
+    {
+      "BatchReview": {
+        "block": "100.64.9.0/28",
+        "count": 3,
+        "groups": [
+          "sensori"
+        ],
+        "label": "lot 2026-10 A",
+        "mode": "light",
+        "network": "casa",
+        "skipped": [
+          {
+            "name": "sensore-1",
+            "why": "already a member of the network"
+          }
+        ]
+      }
+    },
+    {
+      "Staged": {
+        "count": 100
       }
     },
     {

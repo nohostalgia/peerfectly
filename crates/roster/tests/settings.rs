@@ -79,7 +79,7 @@ fn of_two_writers_of_one_field_the_later_wins() {
     history.op("full", 1, &["light"], set(3, full));
     let state = loaded(&history).state().unwrap();
     assert_eq!(state.settings_of(&device_id(3)).mode, Mode::Full);
-    assert!(state.settings.is_empty(), "back at the default, nothing is recorded");
+    assert!(state.devices.changed_settings().next().is_none(), "back at the default, nothing is recorded");
 }
 
 #[test]
@@ -129,7 +129,10 @@ fn settings_survive_the_state_bytes() {
     );
     let state = loaded(&history).state().unwrap();
     let decoded = roster::state::RosterState::from_bytes(&state.to_bytes()).unwrap();
-    assert_eq!(decoded.settings, state.settings);
+    assert_eq!(
+        decoded.devices.changed_settings().collect::<Vec<_>>(),
+        state.devices.changed_settings().collect::<Vec<_>>()
+    );
     assert_eq!(decoded.root(), state.root());
 }
 

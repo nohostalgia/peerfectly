@@ -135,6 +135,13 @@ pub const BASE_SCHEMA: &[&str] = &["kind", "root", "pieces"];
 /// a message, with room for the root beside them.
 pub const BASE_PIECES_PER_MESSAGE: usize = 14;
 
+/// Field names of a part of the batches' pieces, in canonical order.
+pub const BATCH_SCHEMA: &[&str] = &["kind", "pieces"];
+
+/// How many batch pieces one [`Message::Batch`] carries at most: as many as
+/// fit a message, each as large as an operation may be.
+pub const BATCH_PIECES_PER_MESSAGE: usize = 120;
+
 /// Field names of the joining device's statement that the code matched.
 pub const ACCEPTED_SCHEMA: &[&str] = &["kind"];
 
@@ -220,6 +227,19 @@ pub enum Message {
         pieces: Vec<Vec<u8>>,
     },
 
+    /// Admitting side to joiner, before the admission: pieces of the batches
+    /// among the operations to come, as many times as they need.
+    ///
+    /// A batch's operation is only its header; the roster takes it into the
+    /// graph once its pieces are in, and whatever follows it — an admission
+    /// signed after a batch among them — waits until then. Each piece names its
+    /// batch and proves against that batch's header, so nothing here is
+    /// believed for having been sent.
+    Batch {
+        /// Pieces, as `roster::batch::pieces_of` cuts them.
+        pieces: Vec<Vec<u8>>,
+    },
+
     /// Admitting side to joiner: the network, after a person confirmed.
     ///
     /// Signed operations, so what they are worth does not depend on this being
@@ -260,6 +280,7 @@ impl Message {
             Self::Introduce(_) => "introduce",
             Self::Accepted => "accepted",
             Self::Base { .. } => "base",
+            Self::Batch { .. } => "batch",
             Self::Admission { .. } => "admit",
             Self::Outcome { .. } => "outcome",
         }
@@ -293,6 +314,16 @@ impl Message {
                 writer.map(3);
                 writer.key("kind").str("base");
                 writer.key("root").bytes(root);
+                writer.key("pieces").array(pieces.len() as u64);
+                for piece in pieces {
+                    writer.bytes(piece);
+                }
+                writer.finish()
+            }
+            Self::Batch { pieces } => {
+                let mut writer = Writer::new();
+                writer.map(2);
+                writer.key("kind").str("batch");
                 writer.key("pieces").array(pieces.len() as u64);
                 for piece in pieces {
                     writer.bytes(piece);
@@ -438,6 +469,23 @@ impl Message {
                 reader.finish()?;
                 Ok(Self::Base { root, pieces })
             }
+            "batch" => {
+                let mut map = reader.map(BATCH_SCHEMA)?;
+                if map.key("kind")?.str(16, "message kind")? != "batch" {
+                    return Err(Error::Malformed("the body names a different message"));
+                }
+                let value = map.key("pieces")?;
+                let declared = value.array(BATCH_PIECES_PER_MESSAGE, "batch pieces")?;
+                let mut pieces = Vec::new();
+                for _ in 0..declared {
+                    pieces.push(
+                        value.bytes(roster::limits::MAX_OPERATION_SIZE, "batch piece")?.to_vec(),
+                    );
+                }
+                map.finish()?;
+                reader.finish()?;
+                Ok(Self::Batch { pieces })
+            }
             "admit" => {
                 let mut map = reader.map_with_optional(ADMISSION_SCHEMA, &["snapshot"])?;
                 if map.key("kind")?.str(16, "message kind")? != "admit" {
@@ -582,6 +630,7 @@ mod tests {
         vec![
             introduce(),
             Message::Base { root: vec![1], pieces: vec![vec![2, 3]] },
+            Message::Batch { pieces: vec![vec![2, 3], Vec::new()] },
             Message::Admission { operations: vec![vec![1, 2, 3], vec![4, 5]], snapshot: None },
             Message::Admission { operations: Vec::new(), snapshot: None },
             // Both spellings of the snapshot field, because absence is a
@@ -801,6 +850,17 @@ mod tests {
         let largest = Message::Base {
             root: vec![0; roster::limits::MAX_SNAPSHOT_SIZE],
             pieces: vec![vec![0; roster::limits::MAX_STATE_PIECE_SIZE]; BASE_PIECES_PER_MESSAGE],
+        };
+        assert!(largest.encode().len() <= limits::MAX_EXCHANGE_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn a_part_of_the_batches_is_bounded() {
+        let full = Message::Batch { pieces: vec![vec![0; 4]; BATCH_PIECES_PER_MESSAGE + 1] };
+        assert!(Message::decode(&full.encode()).is_err(), "more pieces than a part carries");
+
+        let largest = Message::Batch {
+            pieces: vec![vec![0; roster::limits::MAX_OPERATION_SIZE]; BATCH_PIECES_PER_MESSAGE],
         };
         assert!(largest.encode().len() <= limits::MAX_EXCHANGE_MESSAGE_SIZE);
     }

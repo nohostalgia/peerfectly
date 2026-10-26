@@ -34,18 +34,16 @@ pub struct Router {
     prefix: Prefix,
     /// Address to device, for devices with a live session.
     live: BTreeMap<Ipv6Addr, DeviceId>,
-    /// Which device holds which IPv4 address, from the roster state.
+    /// Which device holds which IPv4 address, from the roster state: an IPv4
+    /// address is routed to its holder, where the holder is routable at its
+    /// IPv6 one.
     holdings: Ipv4Holdings,
-    /// IPv4 address to device, for devices with a live session that hold one.
-    live_v4: BTreeMap<Ipv4Addr, DeviceId>,
     /// Address to device, for every member, session or not.
     ///
     /// What lets a packet for a member with no session open one: the router has
     /// to know whose address it is before anyone can be asked to answer at it.
     /// Derived from the roster's members, never supplied.
     members: BTreeMap<Ipv6Addr, DeviceId>,
-    /// The same for IPv4, from the holdings.
-    members_v4: BTreeMap<Ipv4Addr, DeviceId>,
 }
 
 impl Router {
@@ -56,9 +54,7 @@ impl Router {
             prefix,
             live: BTreeMap::new(),
             holdings: Ipv4Holdings::default(),
-            live_v4: BTreeMap::new(),
             members: BTreeMap::new(),
-            members_v4: BTreeMap::new(),
         }
     }
 
@@ -69,11 +65,29 @@ impl Router {
     pub fn set_members(&mut self, devices: impl IntoIterator<Item = DeviceId>) {
         self.members =
             devices.into_iter().map(|device| (address_of(&device, &self.prefix), device)).collect();
-        self.members_v4 = self
-            .members
-            .values()
-            .filter_map(|device| self.holdings.of(device).map(|address| (address, *device)))
-            .collect();
+    }
+
+    /// Follows the members from `previous` to `state`, every member but `me`:
+    /// only the devices that changed are looked at, where the two states rest
+    /// on one base, and every member otherwise.
+    pub fn follow_members(
+        &mut self,
+        previous: &roster::state::RosterState,
+        state: &roster::state::RosterState,
+        me: &DeviceId,
+    ) {
+        let Some(changed) = state.devices.differing(&previous.devices) else {
+            self.set_members(state.devices.keys().filter(|device| device != me));
+            return;
+        };
+        for device in changed {
+            let address = address_of(&device, &self.prefix);
+            if device != *me && state.devices.contains_key(&device) {
+                self.members.insert(address, device);
+            } else {
+                self.members.remove(&address);
+            }
+        }
     }
 
     /// The member whose address this is, whether or not a session to it is open.
@@ -83,8 +97,19 @@ impl Router {
     pub fn member_at(&self, destination: impl Into<IpAddr>) -> Option<DeviceId> {
         match destination.into() {
             IpAddr::V6(address) => self.members.get(&address).copied(),
-            IpAddr::V4(address) => self.members_v4.get(&address).copied(),
+            IpAddr::V4(address) => self.holder_in(address, &self.members),
         }
+    }
+
+    /// The holder of an IPv4 address, where it is among `routable`.
+    fn holder_in(
+        &self,
+        address: Ipv4Addr,
+        routable: &BTreeMap<Ipv6Addr, DeviceId>,
+    ) -> Option<DeviceId> {
+        self.holdings
+            .holder(address)
+            .filter(|device| routable.contains_key(&address_of(device, &self.prefix)))
     }
 
     /// Records that a session to a device is established.
@@ -94,33 +119,19 @@ impl Router {
     pub fn opened(&mut self, device: DeviceId) {
         let address = address_of(&device, &self.prefix);
         self.live.insert(address, device);
-        if let Some(address) = self.holdings.of(&device) {
-            self.live_v4.insert(address, device);
-        }
     }
 
     /// Records that a session has gone.
     pub fn closed(&mut self, device: &DeviceId) {
         let address = address_of(device, &self.prefix);
         self.live.remove(&address);
-        self.live_v4.retain(|_, holder| holder != device);
     }
 
-    /// Replaces the IPv4 holdings, and with them every live IPv4 entry.
+    /// Replaces the IPv4 holdings.
     ///
     /// A device that lost its address stops being routable at it, and one that
     /// gained one becomes routable, without its session changing.
     pub fn set_holdings(&mut self, holdings: Ipv4Holdings) {
-        self.live_v4 = self
-            .live
-            .values()
-            .filter_map(|device| holdings.of(device).map(|address| (address, *device)))
-            .collect();
-        self.members_v4 = self
-            .members
-            .values()
-            .filter_map(|device| holdings.of(device).map(|address| (address, *device)))
-            .collect();
         self.holdings = holdings;
     }
 
@@ -133,7 +144,7 @@ impl Router {
     pub fn route(&self, destination: impl Into<IpAddr>) -> Option<DeviceId> {
         match destination.into() {
             IpAddr::V6(address) => self.live.get(&address).copied(),
-            IpAddr::V4(address) => self.live_v4.get(&address).copied(),
+            IpAddr::V4(address) => self.holder_in(address, &self.live),
         }
     }
 

@@ -267,13 +267,13 @@ pub(crate) fn waiting(
         let owed: Vec<Owed> = state
             .devices
             .keys()
-            .filter(|member| *member != me)
+            .filter(|member| member != me)
             .filter(|member| owed_to(operation, member))
             .filter(|member| !confirmed.holds(member, &operation.id()))
             .map(|member| Owed {
-                device: directory.named(member),
-                connected: connected.contains(member),
-                last_contact: contact(contacts, member),
+                device: directory.named(&member),
+                connected: connected.contains(&member),
+                last_contact: contact(contacts, &member),
             })
             .collect();
         if owed.is_empty() {

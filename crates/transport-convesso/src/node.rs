@@ -122,8 +122,8 @@ impl Policy {
             own: state.settings_of(own).groups,
             groups: state
                 .devices
-                .keys()
-                .map(|device| (*device, state.settings_of(device).groups))
+                .iter()
+                .map(|(device, leaf)| (device, leaf.settings.groups.clone()))
                 .collect(),
         }
     }
@@ -284,13 +284,7 @@ impl ConvessoTransport {
         evidence: Vec<u8>,
         judge: Judge,
     ) -> Result<Self> {
-        let state = RosterState {
-            network,
-            params,
-            devices: std::collections::BTreeMap::new(),
-            revoked: std::collections::BTreeSet::new(),
-            settings: std::collections::BTreeMap::new(),
-        };
+        let state = RosterState::from_parts(network, params, std::collections::BTreeMap::new(), std::collections::BTreeSet::new(), std::collections::BTreeMap::new());
         let transport = Self::bind_with(identity, state, None, Some(judge)).await?;
         transport.update_evidence(evidence);
         Ok(transport)

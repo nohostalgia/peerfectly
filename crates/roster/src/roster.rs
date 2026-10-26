@@ -893,6 +893,26 @@ impl Roster {
         Ok(())
     }
 
+    /// Puts `state` in place of the state this roster rests on, as
+    /// [`Dag::replace_base_state`] does, and derives the state at the heads over
+    /// it: what a node does once it has written its base to a store, so that
+    /// what it holds in memory is the store's and no longer a copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`Dag::replace_base_state`].
+    pub fn replace_base_state(&mut self, state: RosterState) -> Result<()> {
+        let root = state.root();
+        if self.snapshot.as_ref().is_some_and(|held| held.body().root == root)
+            && self.snapshot_state.is_some()
+        {
+            self.snapshot_state = Some(state.clone());
+        }
+        self.dag.replace_base_state(state)?;
+        self.at_heads = derive(&self.dag).ok();
+        Ok(())
+    }
+
     /// The state behind `root`, where this node holds it: the current state,
     /// the base it rests on, or the one its held root was checked against.
     ///
@@ -1779,7 +1799,7 @@ impl Roster {
     /// correct one, and it is taken whenever there is any doubt at all.
     fn follow(&mut self, in_one_step: bool) {
         let extended = in_one_step.then_some(self.at_heads.as_ref()).flatten().and_then(|state| {
-            self.dag.operations().last().map(|operation| crate::state::extend(state, operation))
+            self.dag.operations().last().and_then(|operation| crate::state::extend(state, operation))
         });
         self.at_heads = match extended {
             Some(next) => Some(next),
@@ -1999,17 +2019,17 @@ fn attestation_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<
 /// The public key a root names as its author: a signing or attestation key of
 /// some device in `state`.
 fn root_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<PublicKey> {
-    state
-        .devices
-        .values()
-        .flat_map(|record| record.keys.iter())
-        .find(|entry| {
-            entry.key_id() == *author
-                && matches!(
-                    entry.purpose,
-                    crate::types::KeyPurpose::Signing | crate::types::KeyPurpose::Attestation
-                )
-        })
+    let signs = |purpose| {
+        matches!(
+            purpose,
+            crate::types::KeyPurpose::Signing | crate::types::KeyPurpose::Attestation
+        )
+    };
+    let holder = state.devices.holding_for(author, signs)?;
+    holder
+        .keys
+        .iter()
+        .find(|entry| entry.key_id() == *author && signs(entry.purpose))
         .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok())
 }
 

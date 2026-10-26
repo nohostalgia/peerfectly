@@ -48,6 +48,9 @@ fn report() -> Report {
         owner_taken: false,
         // A network confirmed within the time it allows.
         confirmation: None,
+        // An invited device waiting at the code, and an anchor.
+        arrived: Some("tv".to_owned()),
+        anchors: vec![nas.clone()],
         relay: Some("https://relay.example:443".to_owned()),
         // A network in the middle of moving relay, so a renderer has one to draw.
         relay_leaving: Some(daemon::control::RelayLeaving {
@@ -141,6 +144,16 @@ fn report() -> Report {
                 signed_here: Signed::NotRecorded,
                 owed: Vec::new(),
             },
+            Waiting {
+                does: Act::ChangesSettings(nas.clone()),
+                signed_here: Signed::NotRecorded,
+                owed: Vec::new(),
+            },
+            Waiting {
+                does: Act::AdmitsBatch { count: 3, label: "lot 2026-10 A".to_owned() },
+                signed_here: Signed::NotRecorded,
+                owed: Vec::new(),
+            },
         ],
         waiting_unlisted: 3,
         problem: Some(Fault {
@@ -163,6 +176,8 @@ fn report() -> Report {
         // And one this device has not been able to confirm, so a renderer of
         // the report has both to draw.
         confirmation: Some(daemon::control::Unconfirmed::Stale),
+        arrived: None,
+        anchors: Vec::new(),
         relay: None,
         relay_leaving: None,
         accused: vec![Accused {
@@ -313,6 +328,26 @@ fn outcomes() -> Vec<Outcome> {
         // Removing a network this device is the only admin of: a question for
         // a person, asked before anything is touched.
         Outcome::OnlyAdmin { network: "casa".to_owned() },
+        // Revoking an admin whose acts would be voided: a question, asked
+        // before anything is signed.
+        Outcome::WouldVoid {
+            network: "casa".to_owned(),
+            voids: "this revocation voids 1 act of laptop [9f2c-1a07-3b44-d0e1] it is concurrent with: rename tv to salotto".to_owned(),
+        },
+        // A batch, reviewed before it is signed, and a part of it handed over.
+        Outcome::BatchReview {
+            network: "casa".to_owned(),
+            count: 3,
+            label: "lot 2026-10 A".to_owned(),
+            mode: "light".to_owned(),
+            groups: vec!["sensori".to_owned()],
+            block: Some("100.64.9.0/28".to_owned()),
+            skipped: vec![daemon::control::SkippedLine {
+                name: "sensore-1".to_owned(),
+                why: "already a member of the network".to_owned(),
+            }],
+        },
+        Outcome::Staged { count: 100 },
         Outcome::NotAllowed {
             message: "`casa` belongs to somebody else on this machine, and you are not authorised. Nothing about it was changed."
                 .to_owned(),

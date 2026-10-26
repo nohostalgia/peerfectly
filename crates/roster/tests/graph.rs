@@ -612,7 +612,7 @@ fn a_causally_later_add_admits_a_revoked_device_again() {
     let state = derive(&history.dag()).expect("derives");
     assert!(!state.revoked.contains(&device_id(2)));
     assert_eq!(
-        state.devices.get(&device_id(2)).map(|record| record.name.as_str()),
+        state.devices.get(&device_id(2)).map(|record| record.name.clone()).as_deref(),
         Some("laptop-new"),
         "the later admission stands, under the name it gives"
     );
@@ -799,7 +799,7 @@ fn the_deeper_rename_wins() {
     );
 
     let state = derive(&history.dag()).expect("derives");
-    assert_eq!(state.devices.get(&device_id(2)).map(|r| r.name.as_str()), Some("deep"));
+    assert_eq!(state.devices.get(&device_id(2)).map(|r| r.name.clone()).as_deref(), Some("deep"));
 }
 
 #[test]
@@ -836,7 +836,7 @@ fn equal_depth_renames_are_broken_by_operation_id_and_agree_in_both_orders() {
     for order in [["g", "add2", "add9", "left", "right"], ["g", "add2", "add9", "right", "left"]] {
         let state = derive(&history.dag_of(&order)).expect("derives");
         assert_eq!(
-            state.devices.get(&device_id(2)).map(|r| r.name.as_str()),
+            state.devices.get(&device_id(2)).map(|r| r.name.clone()).as_deref(),
             Some(expected),
             "the greater id wins, in {order:?}"
         );

@@ -423,16 +423,25 @@ pub async fn join_fresh(
     };
     waiting.close().await;
 
-    let Delivered { operations, snapshot, adopted, base } = outcome?;
+    let Delivered { operations, pieces, snapshot, adopted, base } = outcome?;
     // The base first: a log that does not reach the genesis is never left
     // without the state beneath it.
     if let Some((root, state)) = &adopted.base {
-        crate::state::write_base(paths, root, state).map_err(|cause| cause.to_string())?;
+        // The store is opened for the write and closed after it: the node that
+        // carries the network opens it next.
+        let store = crate::state::open_base_store(paths).map_err(|cause| cause.to_string())?;
+        crate::state::write_base(paths, &store, root, state).map_err(|cause| cause.to_string())?;
+        drop(store);
     }
     for operation in &operations {
         log.append(operation).map_err(|cause| cause.to_string())?;
     }
-    keep_delivered_snapshot(paths, base, &operations, snapshot.as_deref());
+    // Beside the log, as the node keeps them: replayed after it at every start.
+    let kept = Log::at(paths.pieces());
+    for piece in &pieces {
+        kept.append(piece).map_err(|cause| cause.to_string())?;
+    }
+    keep_delivered_snapshot(paths, base, &operations, &pieces, snapshot.as_deref());
     Ok(Joined { suffix: adopted.state.params.suffix.clone(), devices: adopted.state.devices.len() })
 }
 
@@ -451,6 +460,7 @@ fn keep_delivered_snapshot(
     paths: &Paths,
     base: Option<adopt::Base>,
     operations: &[Vec<u8>],
+    pieces: &[Vec<u8>],
     snapshot: Option<&[u8]>,
 ) {
     let Some(bytes) = snapshot else { return };
@@ -459,7 +469,7 @@ fn keep_delivered_snapshot(
     // name as an admin, over heads they contain — and never because of who sent
     // it. The same roster the operations derive to is what does the checking.
     let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
-    if adopt::fill(&mut roster, base, operations).is_err() {
+    if adopt::fill(&mut roster, base, operations, pieces).is_err() {
         return;
     }
     if !roster.offer_snapshot(bytes).is_accepted() {
@@ -607,11 +617,23 @@ async fn one_exchange(
     send(&mut channel, &Message::Accepted, deadline).await?;
 
     // The state the admitting side's roster rests on, where it was compacted,
-    // in as many parts as it takes; then the admission.
+    // and the pieces of its batches, in as many parts as they take; then the
+    // admission.
     let mut assembling: Option<(Vec<u8>, roster::transfer::StateAssembler)> = None;
     let mut parts = 0_usize;
+    let mut pieces: Vec<Vec<u8>> = Vec::new();
+    let mut batch_parts = 0_usize;
     let (operations, snapshot) = loop {
         match receive(&mut channel, deadline).await? {
+            Message::Batch { pieces: part } => {
+                batch_parts = batch_parts.saturating_add(1);
+                if batch_parts > MOST_BATCH_PARTS {
+                    return Err(
+                        "the other machine sent more of its batches than any network has".to_owned()
+                    );
+                }
+                pieces.extend(part);
+            }
             Message::Base { root, pieces } => {
                 parts = parts.saturating_add(1);
                 if parts > MOST_BASE_PARTS {
@@ -657,7 +679,7 @@ async fn one_exchange(
     // Delivery proves nothing. What arrived must admit this device's own keys,
     // and be signed by an admin — and a base it rests on must make its root.
     let adopted = base.clone().and_then(|base| {
-        adopt::adopt_on(base, &operations, identity).map_err(|cause| cause.to_string())
+        adopt::adopt_on(base, &operations, &pieces, identity).map_err(|cause| cause.to_string())
     });
     // Only the network the invite named. Somebody who learned the secret and
     // dialled first could deliver a roster of another network, with this device
@@ -673,17 +695,23 @@ async fn one_exchange(
     let taken = adopted.is_ok();
     let _ = send(&mut channel, &Message::Outcome { taken }, deadline).await;
 
-    Ok(Delivered { operations, snapshot, adopted: adopted?, base: base? })
+    Ok(Delivered { operations, pieces, snapshot, adopted: adopted?, base: base? })
 }
 
 /// How many parts of a base a join takes at most: more than the largest state
 /// a network may hold is cut into.
 const MOST_BASE_PARTS: usize = 4096;
 
+/// How many parts of the batches' pieces a join takes at most: room for every
+/// batch the roster holds incomplete at once, whole, several times over.
+const MOST_BATCH_PARTS: usize = 4096;
+
 /// What an exchange delivered, once it has been checked.
 pub struct Delivered {
     /// The operations, exactly as they arrived.
     pub operations: Vec<Vec<u8>>,
+    /// The pieces of the batches among them, exactly as they arrived.
+    pub pieces: Vec<Vec<u8>>,
     /// The network's snapshot, where the admitting side sent one.
     ///
     /// Unverified here: it is checked against the operations beside it, and a
@@ -882,7 +910,7 @@ mod tests {
         paths.create().expect("creates");
         let (operations, snapshot) = delivered();
 
-        keep_delivered_snapshot(&paths, None, &operations, Some(&snapshot));
+        keep_delivered_snapshot(&paths, None, &operations, &[], Some(&snapshot));
 
         let (kept, _at) = crate::state::read_snapshot(&paths).expect("it was kept");
         assert_eq!(snapshot, kept, "byte for byte, as it arrived");
@@ -902,7 +930,7 @@ mod tests {
             *byte ^= 0xff;
         }
 
-        keep_delivered_snapshot(&paths, None, &operations, Some(&snapshot));
+        keep_delivered_snapshot(&paths, None, &operations, &[], Some(&snapshot));
 
         assert!(crate::state::read_snapshot(&paths).is_none(), "nothing was kept");
         // And the membership is untouched: this function writes one file and
@@ -919,7 +947,7 @@ mod tests {
         paths.create().expect("creates");
         let (operations, _snapshot) = delivered();
 
-        keep_delivered_snapshot(&paths, None, &operations, None);
+        keep_delivered_snapshot(&paths, None, &operations, &[], None);
 
         assert!(crate::state::read_snapshot(&paths).is_none(), "there was none to keep");
     }

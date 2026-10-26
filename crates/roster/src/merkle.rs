@@ -29,7 +29,7 @@
 //! This module uses `core` and `alloc` only, so that the verification half can
 //! be built for a microcontroller.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// A 32-byte hash: a key, a value's hash, or a node.
@@ -75,6 +75,91 @@ fn bit(key: &Hash, depth: usize) -> bool {
     byte.checked_shr(shift).is_some_and(|shifted| shifted & 1 == 1)
 }
 
+/// A node as a store keeps it: by its hash, holding its children's hashes
+/// rather than the children.
+///
+/// A tree kept this way is believed only through its root. A node loaded by
+/// its hash is checked to hash to it, so a walk down from a root that is
+/// trusted is checked at every step, and a node the store altered is never
+/// taken for the one asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// A leaf: where it sits, and what it holds.
+    Leaf {
+        /// Where it sits.
+        key: Hash,
+        /// What it holds.
+        value: Hash,
+    },
+    /// A branch, by its two subtrees' hashes; [`EMPTY`] for an empty one.
+    Branch {
+        /// The subtree whose keys have this level's bit clear.
+        left: Hash,
+        /// The subtree whose keys have it set.
+        right: Hash,
+    },
+}
+
+/// How long a stored node's bytes are: a tag and two hashes.
+pub const STORED_LEN: usize = 65;
+
+impl Stored {
+    /// The hash this node is kept under.
+    #[must_use]
+    pub fn hash(&self) -> Hash {
+        match self {
+            Self::Leaf { key, value } => leaf_hash(key, value),
+            Self::Branch { left, right } => branch_hash(left, right),
+        }
+    }
+
+    /// The node's bytes: `0` and key and value for a leaf, `1` and the two
+    /// subtrees' hashes for a branch.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; STORED_LEN] {
+        let (tag, first, second) = match self {
+            Self::Leaf { key, value } => (0, key, value),
+            Self::Branch { left, right } => (1, left, right),
+        };
+        let mut bytes = [0; STORED_LEN];
+        let (head, rest) = bytes.split_at_mut(1);
+        let (one, two) = rest.split_at_mut(32);
+        head.copy_from_slice(&[tag]);
+        one.copy_from_slice(first);
+        two.copy_from_slice(second);
+        bytes
+    }
+
+    /// Reads a node's bytes. `None` for anything [`Stored::to_bytes`] does not
+    /// write.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (&tag, rest) = bytes.split_first()?;
+        let (first, second) = rest.split_at_checked(32)?;
+        let first = Hash::try_from(first).ok()?;
+        let second = Hash::try_from(second).ok()?;
+        match tag {
+            0 => Some(Self::Leaf { key: first, value: second }),
+            1 => Some(Self::Branch { left: first, right: second }),
+            _ => None,
+        }
+    }
+}
+
+/// Where a tree's nodes are kept when they are not in memory.
+pub trait NodeSource: Send + Sync {
+    /// The node kept under `hash`, if the source holds one. The tree checks
+    /// that it hashes to `hash`.
+    fn node(&self, hash: &Hash) -> Option<Stored>;
+
+    /// Told when a node the source gave, or failed to give, is not the one a
+    /// trusted parent names: whatever keeps the nodes was changed by someone
+    /// other than the tree. The tree goes on as if the subtree were empty,
+    /// which no honest tree has, so its roots stop agreeing with anyone's;
+    /// what holds the source is to stop believing it.
+    fn tampered(&self);
+}
+
 /// One node of the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
@@ -88,14 +173,29 @@ enum Node {
         value: Hash,
     },
     /// At least two leaves below, split at this level.
+    ///
+    /// The subtrees are shared, not owned: a tree is copied by reference, and a
+    /// change copies only the path from the root to what changed. That is what
+    /// lets every state derived from a roster keep its own tree without paying
+    /// for the whole of it.
     Branch {
         /// This branch's hash, kept so that a root costs nothing to read.
         hash: Hash,
         /// The subtree whose keys have this level's bit clear.
-        left: Box<Node>,
+        left: Arc<Node>,
         /// The subtree whose keys have it set.
-        right: Box<Node>,
+        right: Arc<Node>,
     },
+    /// A subtree left in the tree's source, known here by its hash, and
+    /// loaded when a walk goes into it.
+    Stored(Hash),
+}
+
+/// What a walk into stored subtrees needs: where they are, and, for a change,
+/// where to note the stored nodes it replaced.
+struct Lazy<'a> {
+    source: Option<&'a dyn NodeSource>,
+    dropped: &'a mut Vec<Hash>,
 }
 
 impl Node {
@@ -103,13 +203,62 @@ impl Node {
         match self {
             Self::Empty => EMPTY,
             Self::Leaf { key, value } => leaf_hash(key, value),
-            Self::Branch { hash, .. } => *hash,
+            Self::Branch { hash, .. } | Self::Stored(hash) => *hash,
+        }
+    }
+
+    /// The subtree with this hash, as a node to be loaded when needed.
+    fn stub(hash: Hash) -> Self {
+        if hash == EMPTY { Self::Empty } else { Self::Stored(hash) }
+    }
+
+    /// The node kept under `hash`, checked, with its children left stored.
+    fn load(hash: &Hash, source: Option<&dyn NodeSource>) -> Self {
+        let Some(source) = source else { return Self::Empty };
+        match source.node(hash) {
+            Some(stored) if stored.hash() == *hash => match stored {
+                Stored::Leaf { key, value } => Self::Leaf { key, value },
+                Stored::Branch { left, right } => Self::Branch {
+                    hash: *hash,
+                    left: Arc::new(Self::stub(left)),
+                    right: Arc::new(Self::stub(right)),
+                },
+            },
+            _ => {
+                source.tampered();
+                Self::Empty
+            }
+        }
+    }
+
+    /// This node, loaded if it is stored, for reading.
+    fn read(&self, source: Option<&dyn NodeSource>) -> Option<Self> {
+        match self {
+            Self::Stored(hash) => Some(Self::load(hash, source)),
+            _ => None,
+        }
+    }
+
+    /// This node, loaded if it is stored, to be changed: a stored node loaded
+    /// for a change is replaced by what the change makes of it.
+    fn open(self, lazy: &mut Lazy<'_>) -> Self {
+        match self {
+            Self::Stored(hash) => {
+                lazy.dropped.push(hash);
+                Self::load(&hash, lazy.source)
+            }
+            node => node,
         }
     }
 
     fn branch(left: Self, right: Self) -> Self {
+        Self::shared(Arc::new(left), Arc::new(right))
+    }
+
+    /// A branch over two subtrees already shared.
+    fn shared(left: Arc<Self>, right: Arc<Self>) -> Self {
         let hash = branch_hash(&left.hash(), &right.hash());
-        Self::Branch { hash, left: Box::new(left), right: Box::new(right) }
+        Self::Branch { hash, left, right }
     }
 
     /// A subtree holding exactly these two leaves, rooted at `depth`.
@@ -135,78 +284,129 @@ impl Node {
         }
     }
 
-    fn insert(self, key: Hash, value: Hash, depth: usize) -> Self {
-        match self {
-            Self::Empty => Self::Leaf { key, value },
+    fn insert(self, key: Hash, value: Hash, depth: usize, lazy: &mut Lazy<'_>) -> Self {
+        match self.open(lazy) {
+            Self::Empty | Self::Stored(_) => Self::Leaf { key, value },
             Self::Leaf { key: held, value: _ } if held == key => Self::Leaf { key, value },
             Self::Leaf { key: held, value: held_value } => {
                 Self::two((held, held_value), (key, value), depth)
             }
             Self::Branch { left, right, .. } => {
                 let next = depth.saturating_add(1);
+                // Only the side the key goes down is rebuilt; the other is kept
+                // as it is, shared with every copy that holds it.
                 if bit(&key, depth) {
-                    Self::branch(*left, right.insert(key, value, next))
+                    let right = Arc::unwrap_or_clone(right).insert(key, value, next, lazy);
+                    Self::shared(left, Arc::new(right))
                 } else {
-                    Self::branch(left.insert(key, value, next), *right)
+                    let left = Arc::unwrap_or_clone(left).insert(key, value, next, lazy);
+                    Self::shared(Arc::new(left), right)
                 }
             }
         }
     }
 
     /// Removes `key`, collapsing any branch left holding a single leaf.
-    fn remove(self, key: &Hash, depth: usize) -> Self {
-        match self {
-            Self::Empty => Self::Empty,
+    fn remove(self, key: &Hash, depth: usize, lazy: &mut Lazy<'_>) -> Self {
+        match self.open(lazy) {
+            Self::Empty | Self::Stored(_) => Self::Empty,
             Self::Leaf { key: held, .. } if held == *key => Self::Empty,
             leaf @ Self::Leaf { .. } => leaf,
             Self::Branch { left, right, .. } => {
                 let next = depth.saturating_add(1);
                 let (left, right) = if bit(key, depth) {
-                    (*left, right.remove(key, next))
+                    (left, Arc::new(Arc::unwrap_or_clone(right).remove(key, next, lazy)))
                 } else {
-                    (left.remove(key, next), *right)
+                    (Arc::new(Arc::unwrap_or_clone(left).remove(key, next, lazy)), right)
                 };
-                match (left, right) {
+                // A side left stored may be a single leaf, which must come up
+                // in place of the branch: only loading it tells.
+                let (left, right) = match (&*left, &*right) {
+                    (Self::Empty, Self::Stored(_)) => {
+                        (left, Arc::new(Arc::unwrap_or_clone(right).open(lazy)))
+                    }
+                    (Self::Stored(_), Self::Empty) => {
+                        (Arc::new(Arc::unwrap_or_clone(left).open(lazy)), right)
+                    }
+                    _ => (left, right),
+                };
+                match (&*left, &*right) {
                     (Self::Empty, Self::Empty) => Self::Empty,
-                    (Self::Empty, leaf @ Self::Leaf { .. })
-                    | (leaf @ Self::Leaf { .. }, Self::Empty) => leaf,
-                    (left, right) => Self::branch(left, right),
+                    (Self::Empty, Self::Leaf { .. }) => Arc::unwrap_or_clone(right),
+                    (Self::Leaf { .. }, Self::Empty) => Arc::unwrap_or_clone(left),
+                    _ => Self::shared(left, right),
                 }
             }
         }
     }
 
-    fn get(&self, key: &Hash, depth: usize) -> Option<&Hash> {
+    fn get(&self, key: &Hash, depth: usize, source: Option<&dyn NodeSource>) -> Option<Hash> {
+        if let Some(loaded) = self.read(source) {
+            return loaded.get(key, depth, source);
+        }
         match self {
-            Self::Empty => None,
-            Self::Leaf { key: held, value } => (held == key).then_some(value),
+            Self::Empty | Self::Stored(_) => None,
+            Self::Leaf { key: held, value } => (held == key).then_some(*value),
             Self::Branch { left, right, .. } => {
                 let next = depth.saturating_add(1);
-                if bit(key, depth) { right.get(key, next) } else { left.get(key, next) }
+                if bit(key, depth) {
+                    right.get(key, next, source)
+                } else {
+                    left.get(key, next, source)
+                }
             }
         }
     }
 
     /// Collects the siblings on the way to `key`, top first, if it is held.
-    fn prove(&self, key: &Hash, depth: usize, siblings: &mut Vec<Option<Hash>>) -> bool {
+    fn prove(
+        &self,
+        key: &Hash,
+        depth: usize,
+        siblings: &mut Vec<Option<Hash>>,
+        source: Option<&dyn NodeSource>,
+    ) -> bool {
+        if let Some(loaded) = self.read(source) {
+            return loaded.prove(key, depth, siblings, source);
+        }
         match self {
-            Self::Empty => false,
+            Self::Empty | Self::Stored(_) => false,
             Self::Leaf { key: held, .. } => held == key,
             Self::Branch { left, right, .. } => {
                 let next = depth.saturating_add(1);
                 let (towards, away) = if bit(key, depth) { (right, left) } else { (left, right) };
                 let sibling = away.hash();
                 siblings.push((sibling != EMPTY).then_some(sibling));
-                towards.prove(key, next, siblings)
+                towards.prove(key, next, siblings, source)
             }
         }
     }
 
-    fn count(&self) -> usize {
+    fn count(&self, source: Option<&dyn NodeSource>) -> usize {
+        if let Some(loaded) = self.read(source) {
+            return loaded.count(source);
+        }
         match self {
-            Self::Empty => 0,
+            Self::Empty | Self::Stored(_) => 0,
             Self::Leaf { .. } => 1,
-            Self::Branch { left, right, .. } => left.count().saturating_add(right.count()),
+            Self::Branch { left, right, .. } => {
+                left.count(source).saturating_add(right.count(source))
+            }
+        }
+    }
+
+    /// Hands every node held in memory to `emit`, stopping at stored ones.
+    fn fresh(&self, emit: &mut dyn FnMut(Hash, Stored)) {
+        match self {
+            Self::Empty | Self::Stored(_) => {}
+            Self::Leaf { key, value } => {
+                emit(self.hash(), Stored::Leaf { key: *key, value: *value });
+            }
+            Self::Branch { hash, left, right } => {
+                emit(*hash, Stored::Branch { left: left.hash(), right: right.hash() });
+                left.fresh(emit);
+                right.fresh(emit);
+            }
         }
     }
 }
@@ -327,16 +527,40 @@ impl Proof {
 pub const PROOF_SCHEMA: &[&str] = &["bits", "depth", "hashes"];
 
 /// A compressed sparse Merkle tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Held in memory, or rooted in a [`NodeSource`] and loaded as walks reach
+/// into it: then only the paths a change made are in memory, and the stored
+/// nodes those paths replaced are noted, so that whoever keeps the source can
+/// write the change as the paths it made and the nodes it no longer needs.
+#[derive(Clone, Default)]
 pub struct Tree {
     root: Node,
+    source: Option<Arc<dyn NodeSource>>,
+    stored: Option<Hash>,
+    dropped: Vec<Hash>,
 }
 
-impl Default for Tree {
+impl Default for Node {
     fn default() -> Self {
-        Self { root: Node::Empty }
+        Self::Empty
     }
 }
+
+impl core::fmt::Debug for Tree {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Tree").field("root", &self.root()).finish_non_exhaustive()
+    }
+}
+
+/// Two trees are equal when their roots are: the root commits to every leaf,
+/// however much of either is in memory.
+impl PartialEq for Tree {
+    fn eq(&self, other: &Self) -> bool {
+        self.root() == other.root()
+    }
+}
+
+impl Eq for Tree {}
 
 impl Tree {
     /// An empty tree, whose root is [`EMPTY`].
@@ -345,22 +569,41 @@ impl Tree {
         Self::default()
     }
 
+    /// The tree with this root, its nodes kept in `source`.
+    #[must_use]
+    pub fn stored(root: Hash, source: Arc<dyn NodeSource>) -> Self {
+        Self { root: Node::stub(root), source: Some(source), stored: Some(root), dropped: Vec::new() }
+    }
+
+    /// The root the tree was rooted at in its source, if it was: what tells
+    /// two trees over one source apart once one of them has been written.
+    #[must_use]
+    pub const fn stored_root(&self) -> Option<Hash> {
+        self.stored
+    }
+
+    fn source(&self) -> Option<&dyn NodeSource> {
+        self.source.as_deref()
+    }
+
     /// Puts `value` at `key`, replacing what was there.
     pub fn insert(&mut self, key: Hash, value: Hash) {
-        let root = core::mem::replace(&mut self.root, Node::Empty);
-        self.root = root.insert(key, value, 0);
+        let root = core::mem::take(&mut self.root);
+        let mut lazy = Lazy { source: self.source.as_deref(), dropped: &mut self.dropped };
+        self.root = root.insert(key, value, 0, &mut lazy);
     }
 
     /// Removes what is at `key`, if anything.
     pub fn remove(&mut self, key: &Hash) {
-        let root = core::mem::replace(&mut self.root, Node::Empty);
-        self.root = root.remove(key, 0);
+        let root = core::mem::take(&mut self.root);
+        let mut lazy = Lazy { source: self.source.as_deref(), dropped: &mut self.dropped };
+        self.root = root.remove(key, 0, &mut lazy);
     }
 
     /// The value at `key`, if any.
     #[must_use]
-    pub fn get(&self, key: &Hash) -> Option<&Hash> {
-        self.root.get(key, 0)
+    pub fn get(&self, key: &Hash) -> Option<Hash> {
+        self.root.get(key, 0, self.source())
     }
 
     /// The tree's root.
@@ -369,10 +612,10 @@ impl Tree {
         self.root.hash()
     }
 
-    /// How many leaves the tree holds.
+    /// How many leaves the tree holds. A stored tree is walked whole.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.root.count()
+        self.root.count(self.source())
     }
 
     /// Whether the tree holds nothing.
@@ -385,8 +628,124 @@ impl Tree {
     #[must_use]
     pub fn prove(&self, key: &Hash) -> Option<Proof> {
         let mut siblings = Vec::new();
-        self.root.prove(key, 0, &mut siblings).then_some(Proof { siblings })
+        self.root.prove(key, 0, &mut siblings, self.source()).then_some(Proof { siblings })
     }
+
+    /// The stored nodes changes to this tree replaced, since it was rooted in
+    /// its source. Some may be made again, unchanged, by the same changes:
+    /// whoever writes the change removes these first and then puts every
+    /// [`Tree::fresh`] node.
+    #[must_use]
+    pub fn dropped(&self) -> &[Hash] {
+        &self.dropped
+    }
+
+    /// Hands every node of the tree held in memory, and not in its source, to
+    /// `emit`: for a stored tree, the paths its changes made.
+    pub fn fresh(&self, emit: &mut dyn FnMut(Hash, Stored)) {
+        self.root.fresh(emit);
+    }
+}
+
+/// Builds a tree's nodes from its leaves in key order, holding no more than a
+/// path of it: what writes a store of a million leaves without a million in
+/// memory. Every node goes to `emit` once, and the root is what
+/// [`Tree::root`] would be over the same leaves.
+pub struct Builder<F: FnMut(Hash, Stored)> {
+    emit: F,
+    /// Subtrees not yet joined, left to right: a key in each, the level of
+    /// its top branch (none for a lone leaf), and its hash there.
+    open: Vec<(Hash, Option<usize>, Hash)>,
+    /// Between each two neighbours in `open`, the level they split at.
+    splits: Vec<usize>,
+    last: Option<Hash>,
+}
+
+impl<F: FnMut(Hash, Stored)> Builder<F> {
+    /// A builder handing its nodes to `emit`.
+    pub const fn new(emit: F) -> Self {
+        Self { emit, open: Vec::new(), splits: Vec::new(), last: None }
+    }
+
+    /// Adds a leaf. Keys must come in increasing order: a key that does not
+    /// is refused, and `false` returned.
+    pub fn push(&mut self, key: Hash, value: Hash) -> bool {
+        if self.last.is_some_and(|last| last >= key) {
+            return false;
+        }
+        let leaf = Stored::Leaf { key, value };
+        let hash = leaf.hash();
+        (self.emit)(hash, leaf);
+        if let Some(last) = self.last {
+            // Sorted keys: the level the new leaf splits from the one before
+            // is shallower than any split still open to its right of it.
+            let split = common_prefix(&last, &key);
+            while self.splits.last().is_some_and(|open| *open > split) {
+                self.join_top();
+            }
+            self.splits.push(split);
+        }
+        self.open.push((key, None, hash));
+        self.last = Some(key);
+        true
+    }
+
+    /// The root over every leaf pushed.
+    pub fn finish(mut self) -> Hash {
+        while !self.splits.is_empty() {
+            self.join_top();
+        }
+        match self.open.pop() {
+            None => EMPTY,
+            Some(top) => self.lifted(top, 0),
+        }
+    }
+
+    /// Joins the two rightmost open subtrees at the level they split at.
+    fn join_top(&mut self) {
+        let (Some(split), Some(right), Some(left)) =
+            (self.splits.pop(), self.open.pop(), self.open.pop())
+        else {
+            return;
+        };
+        let below = split.saturating_add(1);
+        let left_hash = self.lifted(left, below);
+        let right_hash = self.lifted(right, below);
+        let branch = Stored::Branch { left: left_hash, right: right_hash };
+        let hash = branch.hash();
+        (self.emit)(hash, branch);
+        self.open.push((left.0, Some(split), hash));
+    }
+
+    /// A subtree's hash seen from level `to`: the branches with one empty
+    /// side between there and its top. A lone leaf stands at any level.
+    fn lifted(&mut self, (key, top, hash): (Hash, Option<usize>, Hash), to: usize) -> Hash {
+        let Some(top) = top else { return hash };
+        let mut hash = hash;
+        for level in (to..top).rev() {
+            let branch = if bit(&key, level) {
+                Stored::Branch { left: EMPTY, right: hash }
+            } else {
+                Stored::Branch { left: hash, right: EMPTY }
+            };
+            hash = branch.hash();
+            (self.emit)(hash, branch);
+        }
+        hash
+    }
+}
+
+/// How many leading bits two keys share.
+fn common_prefix(first: &Hash, second: &Hash) -> usize {
+    let mut shared = 0_usize;
+    for (one, two) in first.iter().zip(second) {
+        let differ = one ^ two;
+        if differ != 0 {
+            return shared.saturating_add(differ.leading_zeros() as usize);
+        }
+        shared = shared.saturating_add(8);
+    }
+    shared
 }
 
 #[cfg(test)]
@@ -572,6 +931,163 @@ mod tests {
             }
             prop_assert_eq!(tree.root(), before.root());
             prop_assert_eq!(tree, before);
+        }
+    }
+
+    /// Nodes kept in a map, as a store would keep them, counting how often a
+    /// node was not what it was asked for.
+    #[derive(Default)]
+    struct Kept {
+        nodes: std::sync::Mutex<std::collections::BTreeMap<Hash, Stored>>,
+        tampered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NodeSource for Kept {
+        fn node(&self, hash: &Hash) -> Option<Stored> {
+            self.nodes.lock().unwrap().get(hash).copied()
+        }
+
+        fn tampered(&self) {
+            self.tampered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Kept {
+        /// A store of the tree over these leaves, built a leaf at a time.
+        fn built(leaves: &[u32]) -> (Arc<Self>, Hash) {
+            let kept = Arc::new(Self::default());
+            let mut sorted: Vec<(Hash, Hash)> =
+                leaves.iter().map(|n| (key(*n), value(*n))).collect();
+            sorted.sort_unstable();
+            sorted.dedup_by_key(|(key, _)| *key);
+            let mut builder = Builder::new(|hash, node| {
+                kept.nodes.lock().unwrap().insert(hash, node);
+            });
+            for (key, value) in sorted {
+                assert!(builder.push(key, value));
+            }
+            let root = builder.finish();
+            (kept, root)
+        }
+
+        /// Writes a changed tree as a store does: what it replaced out, then
+        /// what it made in.
+        fn write(&self, tree: &Tree) {
+            let mut nodes = self.nodes.lock().unwrap();
+            for hash in tree.dropped() {
+                nodes.remove(hash);
+            }
+            tree.fresh(&mut |hash, node| {
+                nodes.insert(hash, node);
+            });
+        }
+
+        /// The hashes of every node reachable from `root`.
+        fn reachable(&self, root: Hash) -> std::collections::BTreeSet<Hash> {
+            let nodes = self.nodes.lock().unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut walk = vec![root];
+            while let Some(hash) = walk.pop() {
+                if hash == EMPTY || !seen.insert(hash) {
+                    continue;
+                }
+                if let Some(Stored::Branch { left, right }) = nodes.get(&hash) {
+                    walk.push(*left);
+                    walk.push(*right);
+                }
+            }
+            seen
+        }
+    }
+
+    #[test]
+    fn a_builder_refuses_keys_out_of_order() {
+        let mut builder = Builder::new(|_, _| {});
+        let (low, high) = if key(1) < key(2) { (key(1), key(2)) } else { (key(2), key(1)) };
+        assert!(builder.push(high, value(1)));
+        assert!(!builder.push(low, value(2)), "a lower key");
+        assert!(!builder.push(high, value(3)), "the same key");
+    }
+
+    #[test]
+    fn an_altered_node_is_caught_on_the_way_down() {
+        let leaves: Vec<u32> = (0..200).collect();
+        let (kept, root) = Kept::built(&leaves);
+        let tree = Tree::stored(root, kept.clone());
+        assert_eq!(tree.get(&key(7)), Some(value(7)));
+        assert_eq!(kept.tampered.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The leaf of 7 swapped for one holding another value, kept under the
+        // same hash: the store says it is the node asked for, and it is not.
+        let leaf_hash = leaf_hash(&key(7), &value(7));
+        kept.nodes
+            .lock()
+            .unwrap()
+            .insert(leaf_hash, Stored::Leaf { key: key(7), value: value(8) });
+        assert_eq!(tree.get(&key(7)), None, "not believed");
+        assert_eq!(tree.prove(&key(7)), None);
+        assert!(kept.tampered.load(std::sync::atomic::Ordering::SeqCst) > 0, "and reported");
+    }
+
+    proptest! {
+        #[test]
+        fn a_built_tree_is_the_tree_of_its_leaves(
+            leaves in proptest::collection::vec(any::<u32>(), 0..300),
+        ) {
+            let mut tree = Tree::new();
+            for n in &leaves {
+                tree.insert(key(*n), value(*n));
+            }
+            let (kept, root) = Kept::built(&leaves);
+            prop_assert_eq!(root, tree.root());
+
+            // The nodes it wrote are the tree's, all of them and no more.
+            let mut nodes = std::collections::BTreeMap::new();
+            tree.fresh(&mut |hash, node| {
+                nodes.insert(hash, node);
+            });
+            prop_assert_eq!(&*kept.nodes.lock().unwrap(), &nodes);
+
+            let stored = Tree::stored(root, kept.clone());
+            prop_assert_eq!(stored.len(), tree.len());
+            for n in &leaves {
+                prop_assert_eq!(stored.get(&key(*n)), Some(value(*n)));
+                prop_assert_eq!(stored.prove(&key(*n)), tree.prove(&key(*n)));
+            }
+            prop_assert_eq!(kept.tampered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn a_stored_tree_changes_as_one_in_memory_and_writes_only_what_it_reaches(
+            base in proptest::collection::vec(0u32..400, 0..200),
+            changes in proptest::collection::vec((any::<bool>(), 0u32..500, 0u32..3), 0..60),
+        ) {
+            let (kept, root) = Kept::built(&base);
+            let mut stored = Tree::stored(root, kept.clone());
+            let mut memory = Tree::new();
+            for n in &base {
+                memory.insert(key(*n), value(*n));
+            }
+            for (insert, n, salt) in &changes {
+                if *insert {
+                    stored.insert(key(*n), value(n ^ salt));
+                    memory.insert(key(*n), value(n ^ salt));
+                } else {
+                    stored.remove(&key(*n));
+                    memory.remove(&key(*n));
+                }
+                prop_assert_eq!(stored.root(), memory.root());
+            }
+
+            kept.write(&stored);
+            let written = Tree::stored(stored.root(), kept.clone());
+            prop_assert_eq!(written.len(), memory.len());
+            prop_assert_eq!(
+                kept.nodes.lock().unwrap().keys().copied().collect::<std::collections::BTreeSet<_>>(),
+                kept.reachable(stored.root()),
+                "no node left behind, none missing"
+            );
+            prop_assert_eq!(kept.tampered.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }
 }

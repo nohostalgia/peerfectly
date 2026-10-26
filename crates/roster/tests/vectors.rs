@@ -806,7 +806,7 @@ fn the_merge_vectors_say_what_the_requirements_say() {
     // again, as a deliberate act.
     let again = state_of("a later admission admits again");
     assert_eq!(
-        again.devices.get(&support::device_id(2)).map(|record| record.name.as_str()),
+        again.devices.get(&support::device_id(2)).map(|record| record.name.clone()).as_deref(),
         Some("laptop-again"),
         "the later admission stands"
     );

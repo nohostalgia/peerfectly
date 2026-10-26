@@ -41,6 +41,24 @@ pub trait Resolving: Send + Sync {
     async fn start(&self, address: Ipv6Addr, node: Arc<Node>) -> Result<Box<dyn Answering>>;
 }
 
+/// No resolver: an anchor's, which has no packet interface to answer names on.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Nowhere;
+
+/// What [`Nowhere`] starts: nothing, stopped by being dropped.
+struct Silent;
+
+impl Answering for Silent {
+    fn stop(&self) {}
+}
+
+#[async_trait]
+impl Resolving for Nowhere {
+    async fn start(&self, _address: Ipv6Addr, _node: Arc<Node>) -> Result<Box<dyn Answering>> {
+        Ok(Box::new(Silent))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! A resolver that records that it was asked to run.

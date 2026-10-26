@@ -280,7 +280,7 @@ async fn a_device_invited_into_a_compacted_network_rests_on_the_state_beneath_it
     let signed = vec![admin.sign_operation(&admission).unwrap()];
     let (_signed, said) = tokio::time::timeout(
         A_STEP,
-        admitting::finish_with_all(pending, signed, spec_name, &window, None, Some(base)),
+        admitting::finish_with_all(pending, signed, spec_name, &window, &[], None, Some(base)),
     )
     .await
     .expect("delivers")
@@ -290,7 +290,9 @@ async fn a_device_invited_into_a_compacted_network_rests_on_the_state_beneath_it
     assert_eq!(joined.devices, 2);
 
     // It keeps the base, and its log reaches no further back than the window.
-    assert!(daemon::state::read_base(&joiner_paths).is_some(), "the base is kept");
+    let store = daemon::state::open_base_store(&joiner_paths).unwrap();
+    assert!(daemon::state::read_base(&joiner_paths, &store).is_some(), "the base is kept");
+    drop(store);
     let log = Log::at(joiner_paths.roster()).read().unwrap();
     let genesis = Log::at(admin_paths.roster()).read().unwrap().remove(0);
     assert!(!log.contains(&genesis), "the genesis is beneath the base, and was not sent");
@@ -327,7 +329,7 @@ async fn a_base_that_does_not_make_its_root_is_refused() {
     let signed = vec![admin.sign_operation(&admission).unwrap()];
     let (_signed, said) = tokio::time::timeout(
         A_STEP,
-        admitting::finish_with_all(pending, signed, spec_name, &window, None, Some(base)),
+        admitting::finish_with_all(pending, signed, spec_name, &window, &[], None, Some(base)),
     )
     .await
     .expect("delivers")

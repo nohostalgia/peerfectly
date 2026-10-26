@@ -996,6 +996,25 @@ impl NetworkParams {
         Ok(moved)
     }
 
+    /// The same parameters with `anchors` as the anchor list, in place of the
+    /// one held. Empty is no anchors, which is a network's ordinary state.
+    ///
+    /// # Errors
+    ///
+    /// When there are more than the list holds, or one is named twice.
+    pub fn with_anchors(&self, anchors: Vec<DeviceId>) -> Result<Self> {
+        let mut changed = self.clone();
+        changed.anchors = if anchors.is_empty() {
+            anchors
+        } else {
+            match crate::parameters::Parameter::anchors(anchors)? {
+                crate::parameters::Parameter::Anchors(sorted) => sorted,
+                _ => Vec::new(),
+            }
+        };
+        Ok(changed)
+    }
+
     /// The relay being left, while the transition has not ended at `now`
     /// (milliseconds since the epoch).
     ///
@@ -1031,6 +1050,26 @@ impl NetworkParams {
         }
         self.leaving = Some(leaving);
         Ok(self)
+    }
+
+    /// The parameters' canonical bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        self.encode(&mut writer);
+        writer.finish()
+    }
+
+    /// Reads parameters from their canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not canonical parameters.
+    pub fn from_bytes(input: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(input);
+        let params = Self::decode(&mut reader)?;
+        reader.finish()?;
+        Ok(params)
     }
 
     /// Writes the parameters.

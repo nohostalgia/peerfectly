@@ -14,7 +14,9 @@
 mod support;
 
 use proptest::prelude::*;
+use roster::leaf::SettingsChange;
 use roster::roster::Roster;
+use roster::state::derive;
 use roster::types::{OperationBody, Role};
 use support::{History, device, device_id};
 
@@ -32,6 +34,11 @@ enum Step {
     Demote(u8),
     /// Revoke a device.
     Revoke(u8),
+    /// Assign a device one of a few addresses: taking it, when another device
+    /// holds it, from that device.
+    Assign(u8, u8),
+    /// Take a device's assigned address away.
+    Unassign(u8),
 }
 
 /// Generates a step.
@@ -42,6 +49,8 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         (2u8..6).prop_map(Step::Promote),
         (2u8..6).prop_map(Step::Demote),
         (2u8..6).prop_map(Step::Revoke),
+        ((2u8..6), (0u8..3)).prop_map(|(target, address)| Step::Assign(target, address)),
+        (2u8..6).prop_map(Step::Unassign),
     ]
 }
 
@@ -103,6 +112,23 @@ fn build(steps: &[Step]) -> History {
                     reason: "generated".to_owned(),
                 }
             }
+            Step::Assign(seed, address) => {
+                if !known(seed, &present, &revoked) {
+                    continue;
+                }
+                let change = SettingsChange {
+                    ipv4: Some(Some([100, 70, 0, address.saturating_add(3)])),
+                    ..SettingsChange::default()
+                };
+                OperationBody::SetDevice { device: device_id(seed), change }
+            }
+            Step::Unassign(seed) => {
+                if !known(seed, &present, &revoked) {
+                    continue;
+                }
+                let change = SettingsChange { ipv4: Some(None), ..SettingsChange::default() };
+                OperationBody::SetDevice { device: device_id(seed), change }
+            }
         };
         history.op(&label, 1, &[previous.as_str()], body);
         previous = label;
@@ -143,10 +169,13 @@ proptest! {
         }
 
         let whole = loaded(&history, 1);
-        prop_assert_eq!(
-            compacted.state().expect("derives").to_bytes(),
-            whole.state().expect("derives").to_bytes()
-        );
+        let kept = whole.state().expect("derives").to_bytes();
+        prop_assert_eq!(compacted.state().expect("derives").to_bytes(), kept.clone());
+        // Derived afresh, too: the state a node keeps a step at a time is what
+        // deriving gives, and a compacted node derives from its snapshot and
+        // the window what the other derives from everything.
+        prop_assert_eq!(derive(whole.dag()).expect("derives").to_bytes(), kept.clone());
+        prop_assert_eq!(derive(compacted.dag()).expect("derives").to_bytes(), kept);
     }
 
     /// Compaction followed by more operations still agrees.
@@ -178,10 +207,13 @@ proptest! {
         }
 
         let whole = loaded(&history, 1);
-        prop_assert_eq!(
-            compacted.state().expect("derives").to_bytes(),
-            whole.state().expect("derives").to_bytes()
-        );
+        let kept = whole.state().expect("derives").to_bytes();
+        prop_assert_eq!(compacted.state().expect("derives").to_bytes(), kept.clone());
+        // Derived afresh, too: the state a node keeps a step at a time is what
+        // deriving gives, and a compacted node derives from its snapshot and
+        // the window what the other derives from everything.
+        prop_assert_eq!(derive(whole.dag()).expect("derives").to_bytes(), kept.clone());
+        prop_assert_eq!(derive(compacted.dag()).expect("derives").to_bytes(), kept);
     }
 
     /// A generated history and a snapshot over any prefix of it always verify.

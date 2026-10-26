@@ -84,7 +84,10 @@ fn typed_label(asked: &Command) -> Option<&str> {
     match asked {
         Command::Found { label, .. } => Some(label.as_str()),
         Command::Revoke { network, .. }
+        | Command::RevokeVoiding { network, .. }
         | Command::ChangeRelay { network, .. }
+        | Command::SetAnchors { network, .. }
+        | Command::AdmitBatch { network, .. }
         | Command::Rename { network, .. }
         | Command::Invite { network, .. } => network.as_deref(),
         _ => None,
@@ -110,7 +113,7 @@ fn typed_label(asked: &Command) -> Option<&str> {
 /// admission is confirmed rather than named, and there is nothing to compare.
 pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) -> bool {
     match command {
-        Command::Revoke { reason, .. } => matches!(
+        Command::Revoke { reason, .. } | Command::RevokeVoiding { reason, .. } => matches!(
             &core.body,
             OperationBody::RevokeDevice { reason: signed, .. } if signed == reason.trim()
         ),
@@ -129,8 +132,38 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
             OperationBody::SetNetwork(params)
                 if params.relay.as_deref().is_some_and(|signed| daemon::relay::answers_given(signed, relay))
         ),
+        // The batch signed is the lot the file named, in the mode asked for.
+        Command::AdmitBatch { label, light, .. } => matches!(
+            &core.body,
+            OperationBody::AdmitBatch(header)
+                if header.label == label.trim()
+                    && (header.mode == roster::leaf::Mode::Light) == *light
+        ),
+        // The list signed holds one anchor for each name typed: which devices
+        // they are is the daemon's to resolve, from the roster, and the count is
+        // what this side can hold it to.
+        Command::SetAnchors { anchors, .. } => matches!(
+            &core.body,
+            OperationBody::SetNetwork(params) if anchors_named(anchors, &params.anchors)
+        ),
         _ => true,
     }
+}
+
+/// Whether `signed` is the anchor list `named` asks for, as far as this side
+/// can tell: one anchor for each name typed, case aside.
+fn anchors_named(named: &[daemon::control::Target], signed: &[roster::id::DeviceId]) -> bool {
+    let mut distinct: Vec<String> = named
+        .iter()
+        .map(|target| match target {
+            daemon::control::Target::Name(name) | daemon::control::Target::Id(name) => {
+                name.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    distinct.sort();
+    distinct.dedup();
+    distinct.len() == signed.len()
 }
 
 /// Whether `settings` sets the device `admission` admits, and nothing beyond
@@ -380,7 +413,7 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
                 header.mode.as_str()
             ),
             consequence: format!(
-                "they will reach the devices in {network}, and they will reach them"
+                "each will reach the devices in {network}, and those devices will reach it"
             ),
         },
     }
@@ -419,6 +452,12 @@ fn settings(params: &NetworkParams) -> String {
         |relay| format!("relay {}", daemon::control::shown(relay)),
     );
     let mut said = format!("{relay}, IPv4 range {}", params.ipv4_range());
+    if params.anchors.is_empty() {
+        said.push_str(", no anchors");
+    } else {
+        let anchors: Vec<String> = params.anchors.iter().map(daemon::control::short_id).collect();
+        said.push_str(&format!(", anchors {}", anchors.join(" ")));
+    }
     if let Some(leaving) = &params.leaving {
         let until = std::time::UNIX_EPOCH
             .checked_add(std::time::Duration::from_millis(leaving.until))

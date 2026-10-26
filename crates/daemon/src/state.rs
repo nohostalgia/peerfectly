@@ -16,7 +16,7 @@
 //! validation the network path runs, which means a tampered file is refused
 //! rather than trusted for having been on the local disk.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -158,10 +158,11 @@ impl Paths {
         self.root.join("base.snapshot")
     }
 
-    /// The state that root commits to, as bytes.
+    /// The state that root commits to: a store of its devices, their indexes
+    /// and their tree (`member_store`), believed through that root.
     #[must_use]
-    pub fn base_state(&self) -> PathBuf {
-        self.root.join("base.state")
+    pub fn base_store(&self) -> PathBuf {
+        self.root.join("base.redb")
     }
 
     /// When that snapshot was accepted, on this device's wall clock.
@@ -493,6 +494,41 @@ pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|cause| Error::State { path: path.to_path_buf(), cause: cause.to_string() })
 }
 
+/// How much of a base store redb may keep in memory: the bound a member of a
+/// million devices runs within is 64 MB in all.
+const BASE_CACHE: usize = 16 << 20;
+
+/// The base stores open in this process, by path.
+///
+/// A store is a database one owner opens at a time, and a network may be put
+/// together again — vouched for, carried again — while what held it before
+/// is still letting go. Every one of them is given the same store.
+static OPEN_STORES: std::sync::Mutex<
+    BTreeMap<PathBuf, std::sync::Weak<member_store::Store>>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Opens the store a network's base is kept in, creating an empty one where
+/// there is none; the one already open, where this process holds it.
+///
+/// # Errors
+///
+/// When the store cannot be opened.
+pub fn open_base_store(paths: &Paths) -> Result<std::sync::Arc<member_store::Store>> {
+    let path = paths.base_store();
+    let mut open = OPEN_STORES.lock().map_err(|_| Error::State {
+        path: path.clone(),
+        cause: "the open stores are not readable".to_owned(),
+    })?;
+    open.retain(|_, store| store.strong_count() > 0);
+    if let Some(store) = open.get(&path).and_then(std::sync::Weak::upgrade) {
+        return Ok(store);
+    }
+    let store = member_store::Store::open(&path, BASE_CACHE)
+        .map_err(|cause| Error::State { path: path.clone(), cause: cause.to_string() })?;
+    open.insert(path, std::sync::Arc::downgrade(&store));
+    Ok(store)
+}
+
 /// Keeps the base a compacted log rests on: its root and that root's state.
 ///
 /// Written before the log is rewritten, so that a log which no longer carries
@@ -500,27 +536,35 @@ pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
 ///
 /// The root is written as the bytes it was signed over, which is what its
 /// encoding reproduces. The state is not signed at all: it is derived, written
-/// canonically, and believed on reading only because its root is the one the
+/// to `store` — as the changes since the base it rests on, where it rests on
+/// this store — and believed on reading only because its root is the one the
 /// signed root names.
 ///
 /// # Errors
 ///
-/// When either file cannot be written.
+/// When either cannot be written.
 pub fn write_base(
     paths: &Paths,
+    store: &member_store::Store,
     snapshot: &roster::snapshot::SignedSnapshot,
     state: &roster::state::RosterState,
 ) -> Result<()> {
-    replace_file(&paths.base_state(), &state.to_bytes())?;
+    store
+        .write(state)
+        .map_err(|cause| Error::State { path: paths.base_store(), cause: cause.to_string() })?;
     replace_file(&paths.base_snapshot(), &snapshot.to_bytes())
 }
 
-/// The base a compacted log rests on, where both halves are readable.
+/// The base a compacted log rests on, where both halves are there: the root's
+/// bytes, and the state `store` holds, its devices read as they are needed.
 #[must_use]
-pub fn read_base(paths: &Paths) -> Option<(Vec<u8>, Vec<u8>)> {
+pub fn read_base(
+    paths: &Paths,
+    store: &std::sync::Arc<member_store::Store>,
+) -> Option<(Vec<u8>, roster::state::RosterState)> {
     let snapshot = fs::read(paths.base_snapshot()).ok()?;
-    let state = fs::read(paths.base_state()).ok()?;
-    (!snapshot.is_empty() && !state.is_empty()).then_some((snapshot, state))
+    let state = store.state().ok()??;
+    (!snapshot.is_empty()).then_some((snapshot, state))
 }
 
 /// Records the snapshot a network has accepted, and when.

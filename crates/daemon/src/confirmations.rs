@@ -85,14 +85,14 @@ impl Confirmed {
         self.by_device.get(device).is_some_and(|held| held.contains(id))
     }
 
-    /// Forgets devices that are no longer in `members`.
+    /// Forgets devices that are no longer members, as `member` says.
     ///
     /// Returns whether anything was dropped. A revoked or departed device is not
     /// somebody an operation can still be outstanding toward, and keeping its
     /// pairs would grow the file against devices that no longer exist.
-    pub fn retain_members(&mut self, members: &BTreeSet<DeviceId>) -> bool {
+    pub fn retain_members(&mut self, member: impl Fn(&DeviceId) -> bool) -> bool {
         let before = self.by_device.len();
-        self.by_device.retain(|device, _| members.contains(device));
+        self.by_device.retain(|device, _| member(device));
         self.by_device.len() != before
     }
 
@@ -268,10 +268,10 @@ mod tests {
         confirmed.confirm(device(2), [operation(0xa)]);
 
         let members = BTreeSet::from([device(1)]);
-        assert!(confirmed.retain_members(&members));
+        assert!(confirmed.retain_members(|device| members.contains(device)));
         assert!(confirmed.holds(&device(1), &operation(0xa)), "the member is kept");
         assert!(!confirmed.holds(&device(2), &operation(0xa)), "the departed device is not");
-        assert!(!confirmed.retain_members(&members), "and a second pass drops nothing");
+        assert!(!confirmed.retain_members(|device| members.contains(device)), "and a second pass drops nothing");
     }
 
     /// The same file whichever way it is addressed, so a test and the daemon

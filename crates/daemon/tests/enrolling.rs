@@ -419,10 +419,10 @@ async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
     // An enrolment exchange is not a session with a member, and it recorded no
     // contact: the admin's node, assembled from the directory the admission was
     // written to, holds none for the device that joined.
-    let joined_device = *joined_state
+    let joined_device = joined_state
         .devices
         .keys()
-        .find(|device| **device != admin_identity.device_id())
+        .find(|device| *device != admin_identity.device_id())
         .expect("the joined device");
     let admin_node = daemon::node::Node::from_log(
         std::sync::Arc::new(admin_identity),

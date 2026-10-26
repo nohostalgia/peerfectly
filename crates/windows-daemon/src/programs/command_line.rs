@@ -293,6 +293,11 @@ fn in_the_tray() -> std::process::ExitCode {
                         icon.borrow().starts_at_login(at_login.is_on());
                     }
                 }
+                // The person's own command line, in a console of its own: it
+                // shows the code and asks there, as if they had typed it.
+                tray::Sends::ResumeInAConsole => {
+                    let _ = desktop::run_in_a_console(&beside(&program, COMMAND_LINE), "resume");
+                }
             }
             if wish == tray::Wish::Quit {
                 over.set(true);

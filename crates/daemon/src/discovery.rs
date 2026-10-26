@@ -386,9 +386,10 @@ impl Discovery {
             transport.learned(&record.key, &record.addresses);
         }
         // Newer news of where it is: a rest earned before it says nothing now.
-        let announcing = state.devices.values().find(|device| {
-            transport_key_of(device).is_some_and(|held| held.as_bytes() == record.key.as_bytes())
-        });
+        let announcing = state.device_for_key_of_purpose(
+            &record.key.key_id(),
+            roster::types::KeyPurpose::Transport,
+        );
         if let Some(device) = announcing {
             self.node.announced(device.id);
         }
@@ -419,7 +420,7 @@ impl Discovery {
             if device.id == me || self.node.has_session(&device.id).await {
                 continue;
             }
-            let Some(key) = transport_key_of(device) else { continue };
+            let Some(key) = transport_key_of(&device) else { continue };
 
             let cached = self.cache.lock().await.addresses_for(&key.key_id(), Instant::now());
             if !cached.is_empty() {
@@ -462,7 +463,7 @@ impl Discovery {
 /// Whether a member of this network holds this transport key.
 fn member_holds(state: &RosterState, key: &PublicKey) -> bool {
     state.devices.values().any(|device| {
-        transport_key_of(device).is_some_and(|held| held.as_bytes() == key.as_bytes())
+        transport_key_of(&device).is_some_and(|held| held.as_bytes() == key.as_bytes())
     })
 }
 

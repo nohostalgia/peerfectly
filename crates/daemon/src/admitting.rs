@@ -132,6 +132,12 @@ impl Pending {
         &self.name
     }
 
+    /// The name its invite was issued under.
+    #[must_use]
+    pub fn invited_name(&self) -> &str {
+        &self.invited.0.name
+    }
+
     /// The device already answering to that name, if there is one.
     #[must_use]
     pub const fn taken(&self) -> Option<&Taken> {
@@ -210,12 +216,13 @@ pub async fn finish_with(
     snapshot: Option<Vec<u8>>,
 ) -> Result<(Vec<u8>, String), Refusal> {
     let (signed, said) =
-        finish_with_all(pending, vec![signed], spec_name, log, snapshot, None).await?;
+        finish_with_all(pending, vec![signed], spec_name, log, &[], snapshot, None).await?;
     Ok((signed.into_iter().next().unwrap_or_default(), said))
 }
 
 /// Delivers an admission and what was signed with it — the settings an invite
-/// chose — resting on `base` where this device's roster was compacted.
+/// chose — resting on `base` where this device's roster was compacted, with the
+/// `pieces` of the batches it holds.
 ///
 /// The endpoint is closed whatever happens, as [`finish_with`] closes it.
 ///
@@ -227,11 +234,13 @@ pub async fn finish_with_all(
     signed: Vec<Vec<u8>>,
     spec_name: String,
     log: &[Vec<u8>],
+    pieces: &[Vec<u8>],
     snapshot: Option<Vec<u8>>,
     base: Option<enrollment::adopt::Base>,
 ) -> Result<(Vec<Vec<u8>>, String), Refusal> {
     let mut pending = pending;
-    let outcome = deliver_signed(&mut pending, signed, spec_name, log, snapshot, base).await;
+    let outcome =
+        deliver_signed(&mut pending, signed, spec_name, log, pieces, snapshot, base).await;
     (*pending.endpoint).close().await;
     outcome
 }
@@ -323,6 +332,7 @@ async fn deliver_signed(
     signed: Vec<Vec<u8>>,
     spec_name: String,
     log: &[Vec<u8>],
+    pieces: &[Vec<u8>],
     snapshot: Option<Vec<u8>>,
     base: Option<enrollment::adopt::Base>,
 ) -> Result<(Vec<Vec<u8>>, String), Refusal> {
@@ -346,6 +356,12 @@ async fn deliver_signed(
                 send(&mut channel, &message, deadline).await?;
             }
         }
+        // A batch's operation is only its header: without its pieces the joiner
+        // holds it incomplete, and whatever was signed after it — this
+        // admission, where a batch came before — would wait on it.
+        for part in pieces.chunks(enrollment::exchange::BATCH_PIECES_PER_MESSAGE) {
+            send(&mut channel, &Message::Batch { pieces: part.to_vec() }, deadline).await?;
+        }
         // The snapshot goes with the roster, so the device arrives able to
         // confirm what it was given. Without one it would begin having accepted
         // none — which is the state a device reaches after being out of touch too
@@ -365,9 +381,11 @@ async fn deliver_signed(
         Ok(_) | Err(_) => "it did not say whether it adopted the network".to_owned(),
     };
 
-    // Which name it was admitted under, when that is not the one it proposed.
-    // Before this a device quietly became `name-2` and nobody was told.
-    let said = if spec_name != pending.applicant.name {
+    // Which name it was admitted under, when that is not the one its invite
+    // gave. Before this a device quietly became `name-2` and nobody was told.
+    // Not the one it proposed: the invite's name decides, and a device that
+    // proposed another was not refused a name in use.
+    let said = if spec_name != admitted_name(&pending.invited.0.name) {
         format!(
             "{said}. that name was already in use, so it was admitted as `{}`",
             crate::control::shown(&spec_name)
@@ -400,7 +418,8 @@ async fn deliver(
             identity.sign_operation(&settings).map_err(|cause| crate::control::declined(&cause))?,
         );
     }
-    let (signed, said) = deliver_signed(pending, signed, spec_name, log, snapshot, None).await?;
+    let (signed, said) =
+        deliver_signed(pending, signed, spec_name, log, &[], snapshot, None).await?;
     Ok((signed.into_iter().next().unwrap_or_default(), said))
 }
 
@@ -490,10 +509,18 @@ async fn exchange_invited(
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let key = transport_convesso::enrolment::rendezvous_key(&invite.rendezvous_seed())
         .map_err(|cause| cause.to_string())?;
-    let mut channel = tokio::time::timeout(deadline, endpoint.reach(&key, &invite.relay))
-        .await
-        .map_err(|_| "the invited device did not answer".to_owned())?
-        .map_err(|cause| cause.to_string())?;
+    // Reaching it is what is tried every few seconds, and given little time: a
+    // device that is not there is the usual answer. Once reached, its
+    // introduction may wait on a person — the possession it proves is signed by
+    // a key that a passphrase or a TPM may guard — and has the exchange's own
+    // deadline, as every step after it does.
+    let mut channel = tokio::time::timeout(
+        crate::limits::INVITE_DIAL_PATIENCE,
+        endpoint.reach(&key, &invite.relay),
+    )
+    .await
+    .map_err(|_| "the invited device did not answer".to_owned())?
+    .map_err(|cause| cause.to_string())?;
     let material = channel.material().map_err(|cause| cause.to_string())?;
     let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
         return Err("the device said something other than an introduction".to_owned());

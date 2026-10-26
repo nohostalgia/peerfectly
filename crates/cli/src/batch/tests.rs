@@ -299,6 +299,31 @@ fn a_settings_change_must_carry_what_was_typed() {
     assert!(!matches_what_was_asked(&relay("elsewhere.example"), &moving));
 }
 
+/// An anchor list signed holds one anchor for each name typed, case aside; and
+/// is described with the anchors it sets.
+#[test]
+fn an_anchor_list_must_be_as_long_as_the_names_typed() {
+    let admin = Admin::new();
+    let one = DeviceId::from_bytes([1; 32]);
+    let two = DeviceId::from_bytes([2; 32]);
+    let setting = |anchors: Vec<DeviceId>| {
+        admin.core(OperationBody::SetNetwork(params().with_anchors(anchors).unwrap()), Vec::new())
+    };
+    let named = |names: &[&str]| Command::SetAnchors {
+        network: None,
+        anchors: names.iter().map(|name| Target::Name((*name).to_owned())).collect(),
+    };
+    assert!(matches_what_was_asked(&named(&["nas", "server"]), &setting(vec![one, two])));
+    assert!(matches_what_was_asked(&named(&["nas", "NAS"]), &setting(vec![one])), "case aside");
+    assert!(!matches_what_was_asked(&named(&["nas"]), &setting(vec![one, two])), "one more");
+    assert!(!matches_what_was_asked(&named(&["nas", "server"]), &setting(vec![one])));
+    assert!(matches_what_was_asked(&named(&[]), &setting(Vec::new())), "a clearing");
+
+    let described =
+        describe(&Read::Operation(Box::new(setting(vec![one]))), "casa", &named(&["nas"])).act;
+    assert!(described.contains(&daemon::control::short_id(&one)), "{described}");
+}
+
 /// The reason a revocation gives is the one typed.
 #[test]
 fn a_revocation_must_carry_the_reason_typed() {

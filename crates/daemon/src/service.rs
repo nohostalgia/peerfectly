@@ -177,6 +177,17 @@ enum Resume {
     /// replacing batch names the revocation as its parent and is checked against
     /// the state the revocation leaves — previewed, since neither is signed yet —
     /// and the two are applied in that order.
+    /// A batch of devices is being admitted: its header, the entries it
+    /// commits to, which travel as pieces once it is signed, and the snapshot
+    /// the network is then owed.
+    AdmittingBatch {
+        /// Which network.
+        label: Label,
+        /// The entries the header commits to.
+        entries: Vec<roster::batch::BatchEntry>,
+        /// Where its roster stood when the batch was built.
+        prepared_against: crate::signing::Moment,
+    },
     Admitting {
         /// Which network.
         label: Label,
@@ -190,6 +201,18 @@ enum Resume {
         /// Where its roster stood when the batch was built.
         prepared_against: crate::signing::Moment,
     },
+}
+
+/// What a batch's admin asked for beside its devices.
+pub(crate) struct BatchWanted {
+    /// Its label.
+    pub(crate) label: String,
+    /// Whether its devices are admitted light.
+    pub(crate) light: bool,
+    /// The groups they join.
+    pub(crate) groups: Vec<String>,
+    /// The block their addresses come from.
+    pub(crate) block: Option<String>,
 }
 
 /// What a person is told when the roster moved under a batch they were
@@ -413,6 +436,9 @@ pub struct Service {
     /// things on one screen and a person with no way to tell which they were being
     /// asked about — which is as true of two networks as it was of one.
     pending: Mutex<Option<Pending>>,
+    /// The batch being put together, part by part, and for which network as
+    /// asked: one at a time, as everything a person decides on is.
+    staged: Mutex<(Option<String>, Vec<crate::control::BatchDevice>)>,
     /// Acts prepared and waiting for a signature this process cannot make.
     ///
     /// Separate from `pending` because it is a different kind of waiting: that
@@ -669,6 +695,7 @@ impl Service {
             interfaces: Arc::new(crate::connectivity::SystemInterfaces),
             exposing: Arc::new(crate::exposing::Nowhere),
             pending: Mutex::new(None),
+            staged: Mutex::new((None, Vec::new())),
             unsigned: Mutex::new(crate::signing::Waiting::default()),
             proving: Mutex::new(None),
             asking: Mutex::new(crate::control::Caller::Unattributed),
@@ -873,6 +900,7 @@ impl Service {
                             roster.dag().base_snapshot().map(|snapshot| snapshot.body().root);
                         network.is_some_and(|network| written.names(&network))
                             && written.allows_base(base.as_ref())
+                            && !node.base_tampered()
                             && written.heads_survive(|head| roster.dag().contains(head))
                     });
                     if agrees != Some(true) {
@@ -888,6 +916,9 @@ impl Service {
                 Trouble::RosterProvesNothing,
                 "the log derives no network this device is named in".to_owned(),
             )),
+            Err(crate::error::Error::State { path, cause }) if path == paths.base_store() => {
+                Err((Trouble::ChangedOutside, cause))
+            }
             Err(cause) => Err((Trouble::RosterRefused, cause.to_string())),
         }
     }
@@ -1812,6 +1843,17 @@ impl Service {
         self.keys.custody_of(node.identity())
     }
 
+    /// The name a network's invite was issued under, where the device it
+    /// brought waits at the code for this device's person.
+    async fn arrived_in(&self, label: &Label) -> Option<String> {
+        match &*self.pending.lock().await {
+            Some(Pending::Admitting { label: held, pending }) if held == label && pending.live() => {
+                Some(pending.invited_name().to_owned())
+            }
+            _ => None,
+        }
+    }
+
     /// One network, as the report describes it.
     async fn describe(&self, network: &Arc<Network>) -> crate::control::Network {
         let node = network.node();
@@ -1823,6 +1865,7 @@ impl Service {
         let label = network.label().to_string();
         let me = node.identity().device_id();
         let id = crate::control::short_id(&me);
+        let arrived = self.arrived_in(network.label()).await;
 
         let Ok(state) = node.state().await else {
             return crate::control::Network {
@@ -1840,6 +1883,8 @@ impl Service {
                 // confirm. The trouble here is a different one, and reported as
                 // itself.
                 confirmation: None,
+                arrived: None,
+                anchors: Vec::new(),
                 relay: None,
                 relay_leaving: None,
                 accused: Vec::new(),
@@ -1904,6 +1949,13 @@ impl Service {
             custody: self.custody_of(node),
             owner_taken: crate::state::was_taken(&network.paths),
             confirmation: node.unconfirmed().await,
+            arrived,
+            anchors: state
+                .params
+                .anchors
+                .iter()
+                .map(|device| membership.directory.named(device))
+                .collect(),
             address: Self::own_address(node, &state),
             ipv4: ipv4(&me),
             name: state
@@ -2045,6 +2097,9 @@ impl Service {
             }
             Resume::ChangingParameters { label, prepared_against } => {
                 self.relay_change_signed(&label, &prepared_against, &requests, signatures).await
+            }
+            Resume::AdmittingBatch { label, entries, prepared_against } => {
+                self.batch_signed(&label, &entries, &prepared_against, &requests, signatures).await
             }
             Resume::Founding { label, genesis, identity, for_whom } => {
                 self.founding_signed(label, &genesis, &identity, &for_whom, &requests, signatures)
@@ -2455,6 +2510,249 @@ impl Service {
             }
         };
         self.sign_parameters(&network, label, &state, params, issued).await
+    }
+
+    /// Reviews, or signs, the batch put together for a network.
+    ///
+    /// Everything is checked before anything is shown: the keys, the names,
+    /// the block inside the network's range and large enough, every address
+    /// assigned. Without `reviewed`, what it would do comes back and nothing is
+    /// signed; with it, the entries the person was shown as skipped must still
+    /// be the ones, or nothing is signed.
+    async fn admit_batch(
+        &self,
+        asked_for: Option<String>,
+        which: Option<&Label>,
+        wanted: &BatchWanted,
+        reviewed: Option<Vec<String>>,
+    ) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => return Self::said(Err(cause)),
+        };
+        let label = network.label().clone();
+        let node = Arc::clone(network.node());
+        let state = match node.state().await {
+            Ok(state) => state,
+            Err(cause) => {
+                return Outcome::Failed {
+                    message: format!("the roster does not describe a network: {cause}"),
+                    left_behind: Vec::new(),
+                };
+            }
+        };
+        if !state.is_admin(&node.identity().device_id()) {
+            return Outcome::refused(
+                "only an admin of the network admits a batch. Nothing was signed.".to_owned(),
+            );
+        }
+        if let Some(refusal) = self.keys.admin_refusal() {
+            return Outcome::refused(format!(
+                "this network makes this device an admin, and {refusal}. Nothing was signed."
+            ));
+        }
+        if self.pending.lock().await.is_some() {
+            return Outcome::Failed {
+                message: "something is already waiting to be confirmed".to_owned(),
+                left_behind: Vec::new(),
+            };
+        }
+        let devices = {
+            let staged = self.staged.lock().await;
+            if staged.0 != asked_for || staged.1.is_empty() {
+                return Outcome::refused(
+                    "no batch has been put together for that network. Nothing was signed."
+                        .to_owned(),
+                );
+            }
+            staged.1.clone()
+        };
+        let (header, entries) = match crate::batches::prepared(&state, &devices, wanted) {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was signed.")),
+        };
+        let skipped = crate::batches::skipped_lines(&state, &header, &entries);
+
+        let Some(seen) = reviewed else {
+            return Outcome::BatchReview {
+                network: label.to_string(),
+                count: header.count,
+                label: header.label.clone(),
+                mode: header.mode.as_str().to_owned(),
+                groups: header.groups.iter().map(|group| group.as_str().to_owned()).collect(),
+                block: header.block.map(|block| block.to_string()),
+                skipped,
+            };
+        };
+        let shown: Vec<String> = skipped.iter().map(|line| line.name.clone()).collect();
+        if shown != seen {
+            return Outcome::refused(MOVED_WHILE_DECIDING.to_owned());
+        }
+        *self.staged.lock().await = (None, Vec::new());
+
+        let identity = node.identity();
+        let prepared_against = node.moment().await;
+        let core = match roster::types::OperationCore::new(
+            crate::clock::signing_time(),
+            identity.signing_key().algorithm(),
+            roster::types::OperationBody::AdmitBatch(header),
+            prepared_against.heads.clone(),
+            identity.signing_key().key_id(),
+            state.network,
+        ) {
+            Ok(core) => core,
+            Err(cause) => return Outcome::refused(format!("{cause}. Nothing was signed.")),
+        };
+        if !identity.signing_key().answers_here() {
+            let requests = Self::with_owed_snapshot(&node, core::slice::from_ref(&core)).await;
+            let resume = Resume::AdmittingBatch { label: label.clone(), entries, prepared_against };
+            return self.wants_signatures(requests, identity, &label, resume).await;
+        }
+        match identity.sign_operation(&core) {
+            Ok(signed) => self.carry_batch(&network, signed, &entries).await,
+            Err(cause) => Outcome::refused(crate::control::declined(&cause)),
+        }
+    }
+
+    /// Completes a batch with the signature it waited for.
+    async fn batch_signed(
+        &self,
+        label: &Label,
+        entries: &[roster::batch::BatchEntry],
+        prepared_against: &crate::signing::Moment,
+        requests: &[identity::detached::SigningRequest],
+        signatures: &[Vec<u8>],
+    ) -> Outcome {
+        let network = match self.named(label).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let artifacts =
+            match self.verified_batch(&network, prepared_against, requests, signatures).await {
+                Ok(artifacts) => artifacts,
+                Err(refused) => return refused,
+            };
+        let mut artifacts = artifacts.into_iter();
+        let Some(signed) = artifacts.next() else {
+            return Outcome::refused("the batch held no header".to_owned());
+        };
+        let carried = self.carry_batch(&network, signed, entries).await;
+        self.with_the_snapshot(&network, carried, artifacts.next()).await
+    }
+
+    /// Puts a signed batch header and its pieces into the roster, bringing the
+    /// network up for it: the pieces after the header, which they prove against.
+    async fn carry_batch(
+        &self,
+        network: &Arc<Network>,
+        signed: Vec<u8>,
+        entries: &[roster::batch::BatchEntry],
+    ) -> Outcome {
+        let Ok(raw) = roster::sign::RawOperation::decode(&signed) else {
+            return Outcome::refused("the signed batch does not read".to_owned());
+        };
+        let pieces = match roster::batch::pieces_of(&raw.id(), entries) {
+            Ok(pieces) => pieces,
+            Err(cause) => return Outcome::refused(cause.to_string()),
+        };
+        let raised = match self.admit_to(network, &signed).await {
+            Ok(raised) => raised,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        if let Err(cause) = network.node().admit_pieces(&pieces).await {
+            return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+        }
+        let report = self.report().await;
+        Outcome::Reported(if raised {
+            report.with_note("the network was brought up to carry it")
+        } else {
+            report
+        })
+    }
+
+    /// Sets a network's anchor list to the devices named, as its admin.
+    ///
+    /// Each must be a full member: an anchor is one that light members turn
+    /// to, and a light member holds nothing to answer them with. Refused before
+    /// anything is signed otherwise, and where the list would not change.
+    async fn set_anchors(&self, which: Option<&Label>, named: &[crate::control::Target]) -> Outcome {
+        const CHOOSE: &str = "Rename one of them first, so that each answers to a name of its own.";
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let label = network.label().clone();
+        let state = match network.node().state().await {
+            Ok(state) => state,
+            Err(cause) => {
+                return Outcome::Failed {
+                    message: format!("the roster does not describe a network: {cause}"),
+                    left_behind: Vec::new(),
+                };
+            }
+        };
+        if !state.is_admin(&network.node().identity().device_id()) {
+            return Outcome::refused(
+                "only an admin of the network sets its anchors. Nothing was signed.".to_owned(),
+            );
+        }
+        if let Some(refusal) = self.keys.admin_refusal() {
+            return Outcome::refused(format!(
+                "this network makes this device an admin, and {refusal}. Nothing was signed."
+            ));
+        }
+        if self.pending.lock().await.is_some() {
+            return Outcome::Failed {
+                message: "something is already waiting to be confirmed".to_owned(),
+                left_behind: Vec::new(),
+            };
+        }
+        let mut anchors: Vec<roster::id::DeviceId> = Vec::new();
+        for target in named {
+            let found = match crate::revoking::find(&state, target, CHOOSE) {
+                Ok(found) => found,
+                Err(refusal) => {
+                    return Outcome::Failed {
+                        message: format!("{refusal}. Nothing was signed."),
+                        left_behind: Vec::new(),
+                    };
+                }
+            };
+            if found.settings.mode == roster::leaf::Mode::Light {
+                return Outcome::refused(format!(
+                    "{} [{}] is a light member, and an anchor is a full member: light members \
+                     turn to it for what they do not hold. Nothing was signed.",
+                    crate::control::shown(&found.record.name),
+                    crate::control::short_id(&found.record.id)
+                ));
+            }
+            if !anchors.contains(&found.record.id) {
+                anchors.push(found.record.id);
+            }
+        }
+        if anchors.len() > roster::limits::MAX_ANCHORS {
+            return Outcome::refused(format!(
+                "a network has at most {} anchors. Nothing was signed.",
+                roster::limits::MAX_ANCHORS
+            ));
+        }
+        let params = match state.params.with_anchors(anchors) {
+            Ok(params) => params,
+            Err(cause) => return Outcome::refused(format!("{cause}. Nothing was signed.")),
+        };
+        if params.anchors == state.params.anchors {
+            return Outcome::refused(
+                "those are the network's anchors already. Nothing was signed.".to_owned(),
+            );
+        }
+        let issued = crate::clock::signing_time();
+        self.sign_parameters(&network, &label, &state, params, issued).await
     }
 
     /// Signs new parameters for a network as its admin, and carries them.
@@ -2962,6 +3260,8 @@ impl Service {
             Command::Confirm => self.confirm().await,
             Command::ConfirmJoin { code } => self.confirm_join(code).await,
             Command::Abandon => {
+                // A batch being put together is let go with whatever else waits.
+                *self.staged.lock().await = (None, Vec::new());
                 match self.pending.lock().await.take() {
                     Some(Pending::Admitting { pending, .. }) => {
                         crate::admitting::abandon(pending).await;
@@ -2985,7 +3285,45 @@ impl Service {
                 Outcome::Done
             }
             Command::Revoke { network, target, reason } => match Self::wanted(network) {
-                Ok(label) => self.revoke(label.as_ref(), &target, &reason).await,
+                Ok(label) => self.revoke(label.as_ref(), &target, &reason, false).await,
+                Err(cause) => {
+                    Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                }
+            },
+            Command::RevokeVoiding { network, target, reason } => match Self::wanted(network) {
+                Ok(label) => self.revoke(label.as_ref(), &target, &reason, true).await,
+                Err(cause) => {
+                    Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                }
+            },
+            Command::StageBatch { network, devices } => {
+                let mut staged = self.staged.lock().await;
+                if staged.0 != network {
+                    *staged = (network, Vec::new());
+                }
+                if staged.1.len().saturating_add(devices.len())
+                    > usize::try_from(roster::limits::MAX_BATCH_ENTRIES).unwrap_or(usize::MAX)
+                {
+                    *staged = (None, Vec::new());
+                    return Outcome::refused(format!(
+                        "a batch holds at most {} devices. Nothing was kept.",
+                        roster::limits::MAX_BATCH_ENTRIES
+                    ));
+                }
+                staged.1.extend(devices);
+                Outcome::Staged { count: u64::try_from(staged.1.len()).unwrap_or(u64::MAX) }
+            }
+            Command::AdmitBatch { network, label, light, groups, block, reviewed } => {
+                match Self::wanted(network.clone()) {
+                    Ok(which) => {
+                        let wanted = BatchWanted { label, light, groups, block };
+                        self.admit_batch(network, which.as_ref(), &wanted, reviewed).await
+                    }
+                    Err(cause) => Self::said(Err(cause)),
+                }
+            }
+            Command::SetAnchors { network, anchors } => match Self::wanted(network) {
+                Ok(label) => self.set_anchors(label.as_ref(), &anchors).await,
                 Err(cause) => {
                     Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
                 }
@@ -3093,11 +3431,16 @@ impl Service {
     ///
     /// Whether this device may make the revocation is **the roster's** decision,
     /// not checked here. A refusal comes back in the roster's words.
+    ///
+    /// Where it would void acts this device cannot keep, it signs nothing and
+    /// says so ([`Outcome::WouldVoid`]) unless `voiding_agreed`: the person is
+    /// told before signing, not after.
     async fn revoke(
         &self,
         which: Option<&Label>,
         target: &crate::control::Target,
         reason: &str,
+        voiding_agreed: bool,
     ) -> Outcome {
         let network = match self.which(which).await {
             Ok(network) => network,
@@ -3128,6 +3471,9 @@ impl Service {
         let anchor = node.urgent_anchor(&expulsion.device).await;
         let voids = voided_note(&state, &expulsion, &anchor);
         let heads = anchor.heads;
+        if let (Some(voids), false) = (&voids, voiding_agreed) {
+            return Outcome::WouldVoid { network: network.label().to_string(), voids: voids.clone() };
+        }
 
         // An admin role the roster gives a machine that cannot hold an admin's
         // key is declared, not exercised. Signing anyway would put this
@@ -3564,8 +3910,12 @@ impl Service {
                 continue;
             }
             for record in open {
+                // Reaching, then the introduction a person may have to sign for:
+                // each step bounds itself, and this bounds the whole.
                 let dialled = tokio::time::timeout(
-                    crate::limits::INVITE_DIAL_PATIENCE,
+                    crate::limits::INVITE_DIAL_PATIENCE.saturating_add(
+                        std::time::Duration::from_secs(enrollment::limits::EXCHANGE_DEADLINE_SECS),
+                    ),
                     crate::admitting::open_invited(node.identity(), &state, &record),
                 )
                 .await;
@@ -4022,7 +4372,7 @@ impl Service {
         let Ok(state) = network.node().state().await else { return false };
         let me = network.node().identity().device_id();
         state.is_admin(&me)
-            && !state.devices.keys().any(|device| *device != me && state.is_admin(device))
+            && !state.devices.keys().any(|device| device != me && state.is_admin(&device))
     }
 
     /// What a waiting enrolment has got to.
@@ -4457,6 +4807,11 @@ impl Service {
     async fn keep_checkpoint(network: &Arc<Network>, now: bool) {
         let node = network.node();
         let Some(keeper) = node.keeper() else { return };
+        // A base that failed a check is not vouched for: the next start holds
+        // the network down, and the person is told now.
+        if node.base_tampered_told().await {
+            return;
+        }
         let Some(values) =
             crate::checkpoint::Values::of(node, &network.paths, network.label().as_str()).await
         else {
@@ -4975,14 +5330,22 @@ impl Service {
         // says nothing.
         let snapshot = crate::state::read_snapshot(&paths).map(|(bytes, _at)| bytes);
         // Where this roster was compacted, the state its log rests on goes too.
-        let base = crate::state::read_base(&paths).and_then(|(root, state)| {
-            roster::state::RosterState::from_bytes(&state)
-                .ok()
-                .map(|state| enrollment::adopt::Base { root, state })
-        });
-
-        match crate::admitting::finish_with_all(pending, signed, spec_name, &log, snapshot, base)
+        // The root as the bytes it was signed over, which its encoding
+        // reproduces: what `state::write_base` keeps on disk too.
+        let base = network
+            .node()
+            .base()
             .await
+            .map(|(root, state)| enrollment::adopt::Base { root: root.to_bytes(), state });
+
+        // The pieces of its batches, kept beside the log: a batch delivered as
+        // its header alone would hold back everything signed after it.
+        let pieces = crate::state::Log::at(paths.pieces()).read().unwrap_or_default();
+
+        match crate::admitting::finish_with_all(
+            pending, signed, spec_name, &log, &pieces, snapshot, base,
+        )
+        .await
         {
             Ok((operations, said)) => {
                 // Used, once its device has the network: it admits nobody else.
@@ -5140,7 +5503,7 @@ fn invited_from(
             if !range.contains(octets) {
                 return Err(format!("{address} is outside the network's range, {range}"));
             }
-            if state.settings.values().any(|settings| settings.ipv4 == Some(octets)) {
+            if state.devices.values().any(|leaf| leaf.settings.ipv4 == Some(octets)) {
                 return Err(format!("{address} is assigned to a device already"));
             }
             Some(octets)
@@ -5541,6 +5904,15 @@ mod tests {
         let network = service.all().await.first().map(Arc::clone).expect("the network");
         let told = network.node().event().await.expect("an event");
         assert!(told.cause.contains("has arrived"), "{told:?}");
+        // And the report names it, for a tray to tell the person and offer it.
+        let arrived_in = |outcome: Outcome| match outcome {
+            Outcome::Reported(report) => report.networks.first().and_then(|n| n.arrived.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            arrived_in(service.handle(Command::Status).await).as_deref(),
+            Some("sensor")
+        );
 
         // The person comes back, the code is typed on the device, and confirmed.
         assert!(underway.confirm(&code));
@@ -5556,12 +5928,13 @@ mod tests {
             .expect("runs")
             .expect("joins");
         assert_eq!(joined.devices, 2);
+        assert_eq!(arrived_in(service.handle(Command::Status).await), None, "dealt with");
 
         // Admitted as the invite said, on both sides.
         let state = network.node().state().await.expect("derives");
         let (device, _) =
             state.devices.iter().find(|(_, record)| record.name == "sensor").expect("admitted");
-        let settings = state.settings_of(device);
+        let settings = state.settings_of(&device);
         assert_eq!(settings.mode, roster::leaf::Mode::Light);
         assert_eq!(settings.groups, vec![roster::leaf::Group::new("sensori").expect("a group")]);
         assert_eq!(settings.ipv4, Some([100, 64, 0, 9]));
@@ -6156,7 +6529,7 @@ mod tests {
 
         let node = service.node().await.expect("a network");
         let state = node.state().await.expect("a roster");
-        let names: Vec<&str> = state.devices.values().map(|record| record.name.as_str()).collect();
+        let names: Vec<String> = state.devices.values().map(|record| record.name.clone()).collect();
         assert_eq!(names, ["nas"]);
     }
 
@@ -7520,7 +7893,7 @@ mod tests {
         assert_ne!(casa.node().identity().device_id(), lavoro.node().identity().device_id());
 
         for device in one.devices.keys() {
-            assert!(!other.devices.contains_key(device), "neither roster holds the other's");
+            assert!(!other.devices.contains_key(&device), "neither roster holds the other's");
         }
     }
 
@@ -8235,10 +8608,10 @@ mod tests {
         let there = lavoro.node().state().await.expect("a network");
 
         for device in there.devices.keys() {
-            assert!(!here.devices.contains_key(device), "a device crossed");
+            assert!(!here.devices.contains_key(&device), "a device crossed");
         }
         for device in here.devices.keys() {
-            assert!(!there.devices.contains_key(device), "a device crossed the other way");
+            assert!(!there.devices.contains_key(&device), "a device crossed the other way");
         }
         assert_ne!(here.params.ula, there.params.ula, "nor a parameter");
         assert_ne!(here.params.suffix, there.params.suffix);
@@ -8617,11 +8990,11 @@ mod tests {
         );
 
         let state = network.node().state().await.expect("a network");
-        let named: Vec<&str> = state.devices.values().map(|device| device.name.as_str()).collect();
+        let named: Vec<String> = state.devices.values().map(|device| device.name.clone()).collect();
         assert_eq!(named, vec!["nas"], "and the device's name is what the roster carries");
 
         // Neither name is the other's, and the label reaches no roster.
-        assert!(!named.contains(&"casa"));
+        assert!(!named.iter().any(|name| name == "casa"));
     }
 
     /// A suffix beneath one already held is refused, naming what holds it.
@@ -10082,6 +10455,226 @@ mod tests {
         );
     }
 
+    /// The anchors an admin names, by the names they answer to, are the
+    /// network's anchor list; naming none clears it.
+    #[tokio::test]
+    async fn an_admin_sets_the_anchors_by_name() {
+        let fixture = fixture(None).await;
+        let founder = Arc::clone(
+            fixture.service.node().await.expect("the fixture holds a network").identity(),
+        );
+        let laptop = add_a_device(&fixture.service, &founder).await;
+        fixture.service.admit(&laptop).await.expect("admits");
+        let anchors = |names: &[&str]| Command::SetAnchors {
+            network: None,
+            anchors: names
+                .iter()
+                .map(|name| crate::control::Target::Name((*name).to_owned()))
+                .collect(),
+        };
+
+        let outcome = fixture.service.handle(anchors(&["Laptop"])).await;
+        assert!(matches!(outcome, Outcome::Reported(_)), "{outcome:?}");
+        let node = fixture.service.node().await.expect("the fixture holds a network");
+        let state = node.state().await.expect("derives");
+        let named = state.devices.named("laptop");
+        let laptop_id = named.first().expect("admitted").record.id;
+        assert_eq!(state.params.anchors, vec![laptop_id]);
+
+        // The same list again signs nothing.
+        let again = fixture.service.handle(anchors(&["laptop"])).await;
+        let Outcome::Failed { message, .. } = again else { panic!("{again:?}") };
+        assert!(message.contains("already"), "{message}");
+
+        // A name nobody answers to signs nothing.
+        let stranger = fixture.service.handle(anchors(&["nobody"])).await;
+        let Outcome::Failed { message, .. } = stranger else { panic!("{stranger:?}") };
+        assert!(message.contains("Nothing was signed"), "{message}");
+
+        let cleared = fixture.service.handle(anchors(&[])).await;
+        assert!(matches!(cleared, Outcome::Reported(_)), "{cleared:?}");
+        let state = node.state().await.expect("derives");
+        assert!(state.params.anchors.is_empty(), "cleared");
+    }
+
+    /// A light member is not an anchor: light members turn to an anchor for
+    /// what they do not hold, and a light member holds no more.
+    #[tokio::test]
+    async fn a_light_member_is_not_made_an_anchor() {
+        use roster::types::{OperationBody, OperationCore};
+
+        let fixture = fixture(None).await;
+        let founder = Arc::clone(
+            fixture.service.node().await.expect("the fixture holds a network").identity(),
+        );
+        let laptop = add_a_device(&fixture.service, &founder).await;
+        fixture.service.admit(&laptop).await.expect("admits");
+        let node = fixture.service.node().await.expect("the fixture holds a network");
+        let state = node.state().await.expect("derives");
+        let laptop_id = state.devices.named("laptop").first().expect("admitted").record.id;
+        let light = OperationCore::new(
+            3,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device: laptop_id,
+                change: roster::leaf::SettingsChange {
+                    mode: Some(roster::leaf::Mode::Light),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            node.heads().await,
+            founder.signing_key().key_id(),
+            state.network,
+        )
+        .expect("well-formed");
+        let signed = roster::sign::sign_operation(&light, founder.signer()).expect("signs");
+        fixture.service.admit(&signed).await.expect("admits");
+
+        let outcome = fixture
+            .service
+            .handle(Command::SetAnchors {
+                network: None,
+                anchors: vec![crate::control::Target::Name("laptop".to_owned())],
+            })
+            .await;
+        let (Outcome::Declined { message } | Outcome::Failed { message, .. }) = outcome else {
+            panic!("it must refuse: {outcome:?}");
+        };
+        assert!(message.contains("light member"), "{message}");
+        assert!(message.contains("Nothing was signed"), "{message}");
+        assert!(node.state().await.expect("derives").params.anchors.is_empty());
+    }
+
+    /// A batch file is put together in parts, reviewed with nothing signed,
+    /// and admitted as one with the review the person saw.
+    #[tokio::test]
+    async fn a_batch_is_staged_reviewed_and_admitted_as_one() {
+        use roster::types::KeyPurpose;
+
+        let fixture = fixture(None).await;
+        let node = fixture.service.node().await.expect("the fixture holds a network");
+        let before = node.state().await.expect("derives").devices.len();
+        let device = |n: u32| {
+            let board = NodeIdentity::generate().expect("generates");
+            let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+            let hex_of = |purpose: KeyPurpose| {
+                spec.keys
+                    .iter()
+                    .find(|entry| entry.purpose == purpose)
+                    .map(|entry| hex::encode(&entry.value))
+                    .expect("held")
+            };
+            crate::control::BatchDevice {
+                name: format!("board-{n}"),
+                serial: format!("SN{n}"),
+                signing: hex_of(KeyPurpose::Signing),
+                transport: hex_of(KeyPurpose::Transport),
+                attestation: hex_of(KeyPurpose::Attestation),
+            }
+        };
+        for part in [0..3_u32, 3..6] {
+            let staged = fixture
+                .service
+                .handle(Command::StageBatch { network: None, devices: part.map(device).collect() })
+                .await;
+            assert!(matches!(staged, Outcome::Staged { .. }), "{staged:?}");
+        }
+        let admit = |reviewed: Option<Vec<String>>| Command::AdmitBatch {
+            network: None,
+            label: "lot A".to_owned(),
+            light: true,
+            groups: Vec::new(),
+            block: Some("100.64.9.0/28".to_owned()),
+            reviewed,
+        };
+        let review = fixture.service.handle(admit(None)).await;
+        let Outcome::BatchReview { count, skipped, mode, .. } = review else {
+            panic!("a review first: {review:?}")
+        };
+        assert_eq!((count, mode.as_str(), skipped.len()), (6, "light", 0));
+        assert_eq!(node.state().await.expect("derives").devices.len(), before, "nothing signed");
+
+        let admitted = fixture.service.handle(admit(Some(Vec::new()))).await;
+        assert!(matches!(admitted, Outcome::Reported(_)), "{admitted:?}");
+        assert_eq!(node.state().await.expect("derives").devices.len(), before + 6, "all six in");
+    }
+
+    /// Revoking an admin whose batch this device holds only by its header asks
+    /// first: it says what the revocation voids and signs nothing, and the same
+    /// revocation sent with the acknowledgement goes ahead.
+    #[tokio::test]
+    async fn revoking_an_admin_says_what_it_voids_before_signing() {
+        use roster::batch::{BatchEntry, BatchHeader};
+        use roster::sign::sign_operation;
+        use roster::types::{OperationBody, OperationCore};
+
+        let fixture = fixture(None).await;
+        let node = fixture.service.node().await.expect("the fixture holds a network");
+        let founder = Arc::clone(node.identity());
+        let network = node.state().await.expect("derives").network;
+        let deputy = NodeIdentity::generate().expect("generates");
+        let promoted = OperationCore::new(
+            2,
+            founder.signing_key().algorithm(),
+            OperationBody::AddDevice(
+                deputy.device_spec("deputy", Role::Admin, false, vec![]).expect("spec"),
+            ),
+            node.heads().await,
+            founder.signing_key().key_id(),
+            network,
+        )
+        .expect("well-formed");
+        fixture
+            .service
+            .admit(&sign_operation(&promoted, founder.signer()).expect("signs"))
+            .await
+            .expect("admits");
+
+        // The deputy's batch, of which this device holds the header alone.
+        let entries: Vec<BatchEntry> = (0..3)
+            .map(|index| {
+                let board = NodeIdentity::generate().expect("generates");
+                let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+                BatchEntry { keys: spec.keys, name: format!("board-{index}"), serial: Vec::new(), ipv4: None }
+            })
+            .collect();
+        let header =
+            BatchHeader::for_entries(&entries, roster::leaf::Mode::Light, Vec::new(), None, "lot")
+                .expect("a header");
+        let batch = OperationCore::new(
+            crate::clock::signing_time(),
+            deputy.signing_key().algorithm(),
+            OperationBody::AdmitBatch(header),
+            node.heads().await,
+            deputy.signing_key().key_id(),
+            network,
+        )
+        .expect("well-formed");
+        fixture
+            .service
+            .admit(&deputy.sign_operation(&batch).expect("signs"))
+            .await
+            .expect("admits the header");
+
+        let revoke = |voiding: bool| {
+            let (network, target, reason) =
+                (None, crate::control::Target::Name("deputy".to_owned()), "lost".to_owned());
+            if voiding {
+                Command::RevokeVoiding { network, target, reason }
+            } else {
+                Command::Revoke { network, target, reason }
+            }
+        };
+        let asked = fixture.service.handle(revoke(false)).await;
+        let Outcome::WouldVoid { voids, .. } = asked else { panic!("it must ask first: {asked:?}") };
+        assert!(voids.contains("voids 1 act"), "{voids}");
+        assert!(node.state().await.expect("derives").revoked.is_empty(), "nothing was signed");
+
+        let done = fixture.service.handle(revoke(true)).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+        assert_eq!(node.state().await.expect("derives").revoked.len(), 1, "and now it is revoked");
+    }
+
     /// A machine that cannot hold an admin's key renames nothing, as it revokes
     /// nothing.
     #[tokio::test]
@@ -11216,6 +11809,53 @@ mod tests {
     /// **A long-lived network compacts as it goes, and starts again from its
     /// base.** Every act publishes a root and compacts beneath the newest one
     /// far enough behind; what is kept on disk is the base and a log no longer
+    /// A base store holding another state than the signed root names, as one
+    /// rewritten behind the daemon's back would, holds the network down as
+    /// changed outside rather than resting on it or reading as a roster that
+    /// proves nothing.
+    #[tokio::test]
+    async fn a_base_store_changed_outside_holds_the_network_down() {
+        let (service, _machine, scratch) = unjoined().await;
+        found_one(&service).await;
+        let founder =
+            Arc::clone(service.node().await.expect("the fixture holds a network").identity());
+        let laptop = add_a_device(&service, &founder).await;
+        service.admit(&laptop).await.expect("admits");
+        let mut name = "laptop".to_owned();
+        for step in 0..120 {
+            let next = format!("n{step}");
+            let outcome = service
+                .handle(Command::Rename {
+                    network: None,
+                    target: crate::control::Target::Name(name.clone()),
+                    name: next.clone(),
+                })
+                .await;
+            assert!(matches!(outcome, Outcome::Reported(_)), "rename {step}: {outcome:?}");
+            name = next;
+        }
+        let label = Label::new("casa").expect("valid");
+        let paths = service.home().paths_for(&label);
+        assert!(paths.base_store().exists(), "it compacted");
+        let state = service.node().await.expect("a network").state().await.expect("derives");
+        let home = service.home().clone();
+        drop(service);
+        Service::vouch(&home, &label, &crate::keys::PlatformKeys).expect("vouches");
+
+        // The same network with no devices in it: consistent with itself, and
+        // not what any root of the network signs.
+        let store = crate::state::open_base_store(&paths).expect("opens");
+        store
+            .write(&roster::state::RosterState::empty(state.network, state.params.clone()))
+            .expect("writes");
+        drop(store);
+
+        let (carried, refused) = carried_and_refused(&started(&home)).await;
+        assert!(carried.is_empty(), "nothing is carried: {carried:?}");
+        assert_eq!(refused, vec![("casa".to_owned(), Trouble::ChangedOutside)]);
+        drop(scratch);
+    }
+
     /// than the window, and a daemon started over that directory derives the
     /// same network.
     #[tokio::test]
@@ -11246,20 +11886,21 @@ mod tests {
         let held = node.held_operations().await;
         assert!(held < RENAMES, "the graph holds {held} operations, not the whole history");
         let paths = service.home().paths_for(&Label::new("casa").expect("valid"));
-        assert!(crate::state::read_base(&paths).is_some(), "the base is kept");
+        assert!(
+            paths.base_snapshot().exists() && paths.base_store().exists(),
+            "the base is kept"
+        );
         let logged = crate::state::Log::at(paths.roster()).read().expect("reads").len();
         assert!(logged < RENAMES, "and the log keeps {logged} operations, not the whole history");
         let before = node.state().await.expect("derives");
         drop(node);
-        // This fixture's service keeps no checkpoints, so a person vouches for
-        // the network as it stands before the daemon that does starts.
-        Service::vouch(
-            service.home(),
-            &Label::new("casa").expect("valid"),
-            &crate::keys::PlatformKeys,
-        )
-        .expect("vouches");
+        let home = service.home().clone();
         drop(service);
+        // This fixture's service keeps no checkpoints, so a person vouches for
+        // the network as it stands before the daemon that does starts — with
+        // nothing carrying it, as a vouch is made.
+        Service::vouch(&home, &Label::new("casa").expect("valid"), &crate::keys::PlatformKeys)
+            .expect("vouches");
 
         let again = Service::over(
             Home::under(scratch.path()),

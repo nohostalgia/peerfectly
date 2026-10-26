@@ -21,9 +21,18 @@
 //! Two devices are never assigned one address in a state: derivation settles
 //! concurrent assignments by last writer, and the loser falls back to its
 //! derived candidate.
+//!
+//! # Following a roster's changes
+//!
+//! Each address is decided by the devices claiming it and nothing else, so a
+//! change decides again only the addresses its devices claimed before and
+//! claim now: [`Ipv4Holdings::updated`]. And holdings are copied to whatever
+//! routes by them, so they are kept as a shared base and the changes on top,
+//! as the roster keeps its devices: a copy costs the changes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use roster::id::{DeviceId, NetworkId};
 use roster::state::RosterState;
@@ -40,20 +49,117 @@ pub struct Collision {
     pub with: BTreeSet<DeviceId>,
 }
 
+/// A map shared between copies, and what changed on top of it: a value, or
+/// `None` where one was removed.
+#[derive(Debug, Clone)]
+struct Layered<K: Ord + Clone, V: Clone> {
+    base: Arc<BTreeMap<K, V>>,
+    over: BTreeMap<K, Option<V>>,
+}
+
+impl<K: Ord + Clone, V: Clone> Default for Layered<K, V> {
+    fn default() -> Self {
+        Self { base: Arc::new(BTreeMap::new()), over: BTreeMap::new() }
+    }
+}
+
+impl<K: Ord + Clone, V: Clone + PartialEq> PartialEq for Layered<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        // Copies of one base differ only where their changes do.
+        if Arc::ptr_eq(&self.base, &other.base) {
+            let keys: BTreeSet<&K> = self.over.keys().chain(other.over.keys()).collect();
+            return keys.into_iter().all(|key| self.get(key) == other.get(key));
+        }
+        self.iter().eq(other.iter())
+    }
+}
+
+impl<K: Ord + Clone, V: Clone + PartialEq> Eq for Layered<K, V> {}
+
+impl<K: Ord + Clone, V: Clone> Layered<K, V> {
+    fn of(map: BTreeMap<K, V>) -> Self {
+        Self { base: Arc::new(map), over: BTreeMap::new() }
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        match self.over.get(key) {
+            Some(changed) => changed.as_ref(),
+            None => self.base.get(key),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.over.insert(key, Some(value));
+    }
+
+    fn remove(&mut self, key: &K) {
+        if self.base.contains_key(key) {
+            self.over.insert(key.clone(), None);
+        } else {
+            self.over.remove(key);
+        }
+    }
+
+    /// Every entry, in key order: the base and the changes merged.
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        let mut base = self.base.iter().peekable();
+        let mut over = self.over.iter().peekable();
+        std::iter::from_fn(move || {
+            loop {
+                let take_over = match (base.peek(), over.peek()) {
+                    (None, None) => return None,
+                    (Some(_), None) => false,
+                    (None, Some(_)) => true,
+                    (Some((base_key, _)), Some((over_key, _))) => over_key <= base_key,
+                };
+                if take_over {
+                    let (key, changed) = over.next()?;
+                    if base.peek().is_some_and(|(base_key, _)| *base_key == key) {
+                        base.next();
+                    }
+                    if let Some(value) = changed {
+                        return Some((key, value));
+                    }
+                } else {
+                    return base.next();
+                }
+            }
+        })
+    }
+
+    /// Folds the changes into a new base once they are a good part of it, so
+    /// that copying stays cheap and reading stays one lookup or two.
+    fn settle(&mut self) {
+        if self.over.len() <= self.base.len() / 8 + 64 {
+            return;
+        }
+        let merged: BTreeMap<K, V> =
+            self.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+        self.base = Arc::new(merged);
+        self.over.clear();
+    }
+}
+
+/// The devices claiming an address: those assigned it, those deriving it.
+type Claim = (BTreeSet<DeviceId>, BTreeSet<DeviceId>);
+
 /// The IPv4 addresses a network's devices hold, in both directions.
-///
-/// Computed whole from a roster state and replaced whole when the roster
-/// changes; nothing updates it in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ipv4Holdings {
+    /// The network addresses were derived for.
+    network: NetworkId,
     /// The range addresses were derived in.
     range: Ipv4Range,
+    /// Every address claimed, by whom.
+    claims: Layered<Ipv4Addr, Claim>,
+    /// What each present device claims, and whether it was assigned it.
+    claim_of: Layered<DeviceId, (Ipv4Addr, bool)>,
     /// Each present device holding an address.
-    by_device: BTreeMap<DeviceId, Ipv4Addr>,
+    by_device: Layered<DeviceId, Ipv4Addr>,
     /// Each held address, and the device holding it.
-    by_address: BTreeMap<Ipv4Addr, DeviceId>,
+    by_address: Layered<Ipv4Addr, DeviceId>,
     /// Each present device without an address, and why.
-    colliding: BTreeMap<DeviceId, Collision>,
+    colliding: Layered<DeviceId, Collision>,
 }
 
 impl Default for Ipv4Holdings {
@@ -77,10 +183,13 @@ impl Ipv4Holdings {
     #[must_use]
     pub fn empty(range: Ipv4Range) -> Self {
         Self {
+            network: NetworkId::from_bytes([0; 32]),
             range,
-            by_device: BTreeMap::new(),
-            by_address: BTreeMap::new(),
-            colliding: BTreeMap::new(),
+            claims: Layered::default(),
+            claim_of: Layered::default(),
+            by_device: Layered::default(),
+            by_address: Layered::default(),
+            colliding: Layered::default(),
         }
     }
 
@@ -91,7 +200,7 @@ impl Ipv4Holdings {
         range: Ipv4Range,
         devices: impl IntoIterator<Item = &'a DeviceId>,
     ) -> Self {
-        Self::assigned(network, range, devices.into_iter().map(|device| (device, None)))
+        Self::assigned(network, range, devices.into_iter().map(|device| (*device, None)))
     }
 
     /// Decides the holdings of a network: each present device, with the
@@ -100,50 +209,75 @@ impl Ipv4Holdings {
     /// An assigned address that is not one of the range's hosts is as good as
     /// none: the device falls back to its derived candidate.
     #[must_use]
-    pub fn assigned<'a>(
+    pub fn assigned(
         network: &NetworkId,
         range: Ipv4Range,
-        devices: impl IntoIterator<Item = (&'a DeviceId, Option<[u8; 4]>)>,
+        devices: impl IntoIterator<Item = (DeviceId, Option<[u8; 4]>)>,
     ) -> Self {
-        // Every address claimed, by whom: those assigned it, those deriving it.
-        let mut claims: BTreeMap<Ipv4Addr, (BTreeSet<DeviceId>, BTreeSet<DeviceId>)> =
-            BTreeMap::new();
+        let mut claims: BTreeMap<Ipv4Addr, Claim> = BTreeMap::new();
+        let mut claim_of: BTreeMap<DeviceId, (Ipv4Addr, bool)> = BTreeMap::new();
         for (device, assigned) in devices {
-            match assigned.filter(|address| assignable(&range, *address)) {
-                Some(address) => {
-                    claims.entry(Ipv4Addr::from(address)).or_default().0.insert(*device);
-                }
-                None => {
-                    claims
-                        .entry(ipv4_candidate(network, device, &range))
-                        .or_default()
-                        .1
-                        .insert(*device);
-                }
+            let (address, was_assigned) = Self::claimed(network, &range, &device, assigned);
+            let claim = claims.entry(address).or_default();
+            if was_assigned {
+                claim.0.insert(device);
+            } else {
+                claim.1.insert(device);
             }
+            claim_of.insert(device, (address, was_assigned));
         }
 
-        let mut holdings = Self::empty(range);
-        for (address, (assigned, derived)) in claims {
-            let everyone: BTreeSet<DeviceId> = assigned.union(&derived).copied().collect();
-            // One device assigned it holds it, whoever derives it; failing that,
-            // one device deriving it, alone.
-            let holder = match (assigned.len(), derived.len()) {
-                (1, _) => assigned.first().copied(),
-                (0, 1) => derived.first().copied(),
-                _ => None,
-            };
+        let mut by_device = BTreeMap::new();
+        let mut by_address = BTreeMap::new();
+        let mut colliding = BTreeMap::new();
+        for (address, claim) in &claims {
+            let (holder, everyone) = Self::decided(claim);
             for device in &everyone {
                 if Some(*device) == holder {
-                    holdings.by_device.insert(*device, address);
-                    holdings.by_address.insert(address, *device);
+                    by_device.insert(*device, *address);
+                    by_address.insert(*address, *device);
                 } else {
                     let with = everyone.iter().filter(|other| *other != device).copied().collect();
-                    holdings.colliding.insert(*device, Collision { candidate: address, with });
+                    colliding.insert(*device, Collision { candidate: *address, with });
                 }
             }
         }
-        holdings
+        Self {
+            network: *network,
+            range,
+            claims: Layered::of(claims),
+            claim_of: Layered::of(claim_of),
+            by_device: Layered::of(by_device),
+            by_address: Layered::of(by_address),
+            colliding: Layered::of(colliding),
+        }
+    }
+
+    /// The address a device claims, and whether it was assigned it.
+    fn claimed(
+        network: &NetworkId,
+        range: &Ipv4Range,
+        device: &DeviceId,
+        assigned: Option<[u8; 4]>,
+    ) -> (Ipv4Addr, bool) {
+        match assigned.filter(|address| assignable(range, *address)) {
+            Some(address) => (Ipv4Addr::from(address), true),
+            None => (ipv4_candidate(network, device, range), false),
+        }
+    }
+
+    /// Who holds an address its claimants contend for, and all of them.
+    ///
+    /// One device assigned it holds it, whoever derives it; failing that, one
+    /// device deriving it, alone.
+    fn decided((assigned, derived): &Claim) -> (Option<DeviceId>, BTreeSet<DeviceId>) {
+        let everyone: BTreeSet<DeviceId> = assigned.union(derived).copied().collect();
+        let holder = match (assigned.len(), derived.len()) {
+            (1, _) => assigned.first().copied(),
+            (0, 1) => derived.first().copied(),
+            _ => None,
+        };
+        (holder, everyone)
     }
 
     /// The holdings a roster state implies.
@@ -152,10 +286,103 @@ impl Ipv4Holdings {
         Self::assigned(
             &state.network,
             state.params.ipv4_range(),
-            state.devices.keys().map(|device| {
-                (device, state.settings.get(device).and_then(|settings| settings.ipv4))
-            }),
+            state.devices.iter().map(|(device, leaf)| (device, leaf.settings.ipv4)),
         )
+    }
+
+    /// The holdings `state` implies, where these are the holdings `previous`
+    /// implied: only the addresses the devices that changed claimed, or claim
+    /// now, are decided again. Where the two states share no base, or the
+    /// network or its range changed, decided whole.
+    #[must_use]
+    pub fn updated(&self, previous: &RosterState, state: &RosterState) -> Self {
+        let range = state.params.ipv4_range();
+        if state.network != self.network
+            || previous.network != self.network
+            || range != self.range
+            || previous.params.ipv4_range() != self.range
+        {
+            return Self::of_state(state);
+        }
+        let Some(changed) = state.devices.differing(&previous.devices) else {
+            return Self::of_state(state);
+        };
+        let mut next = self.clone();
+        let mut unsettled: BTreeSet<Ipv4Addr> = BTreeSet::new();
+        for device in changed {
+            if let Some((address, was_assigned)) = next.claim_of.get(&device).copied() {
+                next.unclaim(&device, address, was_assigned);
+                unsettled.insert(address);
+            }
+            if let Some(leaf) = state.devices.get(&device) {
+                let (address, was_assigned) =
+                    Self::claimed(&self.network, &range, &device, leaf.settings.ipv4);
+                next.claim(device, address, was_assigned);
+                unsettled.insert(address);
+            }
+        }
+        for address in unsettled {
+            next.decide(address);
+        }
+        next.claims.settle();
+        next.claim_of.settle();
+        next.by_device.settle();
+        next.by_address.settle();
+        next.colliding.settle();
+        next
+    }
+
+    fn unclaim(&mut self, device: &DeviceId, address: Ipv4Addr, was_assigned: bool) {
+        if let Some(mut claim) = self.claims.get(&address).cloned() {
+            if was_assigned {
+                claim.0.remove(device);
+            } else {
+                claim.1.remove(device);
+            }
+            self.claims.insert(address, claim);
+        }
+        self.claim_of.remove(device);
+        self.by_device.remove(device);
+        self.colliding.remove(device);
+        if self.by_address.get(&address) == Some(device) {
+            self.by_address.remove(&address);
+        }
+    }
+
+    fn claim(&mut self, device: DeviceId, address: Ipv4Addr, was_assigned: bool) {
+        let mut claim = self.claims.get(&address).cloned().unwrap_or_default();
+        if was_assigned {
+            claim.0.insert(device);
+        } else {
+            claim.1.insert(device);
+        }
+        self.claims.insert(address, claim);
+        self.claim_of.insert(device, (address, was_assigned));
+    }
+
+    /// Decides `address` again, from the devices claiming it now.
+    fn decide(&mut self, address: Ipv4Addr) {
+        let claim = self.claims.get(&address).cloned().unwrap_or_default();
+        if claim.0.is_empty() && claim.1.is_empty() {
+            self.claims.remove(&address);
+            self.by_address.remove(&address);
+            return;
+        }
+        let (holder, everyone) = Self::decided(&claim);
+        match holder {
+            Some(holder) => self.by_address.insert(address, holder),
+            None => self.by_address.remove(&address),
+        }
+        for device in &everyone {
+            if Some(*device) == holder {
+                self.by_device.insert(*device, address);
+                self.colliding.remove(device);
+            } else {
+                self.by_device.remove(device);
+                let with = everyone.iter().filter(|other| *other != device).copied().collect();
+                self.colliding.insert(*device, Collision { candidate: address, with });
+            }
+        }
     }
 
     /// The range addresses were derived in.
@@ -257,7 +484,7 @@ mod tests {
         let holdings = Ipv4Holdings::assigned(
             &network(),
             narrow(),
-            [(&assigned, Some(address.octets())), (&deriving, None), (&other, None)],
+            [(assigned, Some(address.octets())), (deriving, None), (other, None)],
         );
         assert_eq!(holdings.of(&assigned), Some(address));
         assert_eq!(holdings.holder(address), Some(assigned));
@@ -272,10 +499,10 @@ mod tests {
     fn an_address_outside_the_hosts_falls_back_to_the_candidate() {
         let range = narrow();
         let first = range.address();
-        let holdings = Ipv4Holdings::assigned(&network(), range, [(&device(1), Some(first))]);
+        let holdings = Ipv4Holdings::assigned(&network(), range, [(device(1), Some(first))]);
         assert_eq!(holdings.of(&device(1)), Some(ipv4_candidate(&network(), &device(1), &range)));
         let elsewhere =
-            Ipv4Holdings::assigned(&network(), range, [(&device(1), Some([192, 168, 1, 1]))]);
+            Ipv4Holdings::assigned(&network(), range, [(device(1), Some([192, 168, 1, 1]))]);
         assert_eq!(elsewhere.of(&device(1)), Some(ipv4_candidate(&network(), &device(1), &range)));
     }
 
@@ -298,5 +525,73 @@ mod tests {
         assert_eq!(holdings.range(), Ipv4Range::DEFAULT);
         assert_eq!(holdings.held().count(), 0);
         assert_eq!(holdings.holder(Ipv4Addr::new(100, 64, 0, 1)), None);
+    }
+
+    /// A state over a narrow range, every device in it assigned what `assigned`
+    /// says of it.
+    fn state_of(devices: &BTreeMap<u8, Option<u8>>, base: Option<&RosterState>) -> RosterState {
+        let mut state = base.cloned().unwrap_or_else(|| {
+            let mut params = roster::types::NetworkParams::new(
+                vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+                "example.internal",
+                0,
+            )
+            .expect("parameters");
+            params.ipv4 = Some(narrow());
+            RosterState::empty(network(), params)
+        });
+        let held: Vec<DeviceId> = state.devices.keys().collect();
+        for device in held {
+            if !devices.keys().any(|tag| self::device(*tag) == device) {
+                state.devices.remove(&device);
+            }
+        }
+        for (tag, last) in devices {
+            let leaf = roster::leaf::DeviceLeaf {
+                record: roster::types::DeviceRecord {
+                    id: device(*tag),
+                    keys: Vec::new(),
+                    name: format!("d{tag}"),
+                    role: roster::types::Role::Member,
+                    founder: false,
+                    added_by: roster::id::OperationId::from_bytes([1; 32]),
+                    capabilities: Vec::new(),
+                },
+                settings: roster::leaf::DeviceSettings::new(
+                    roster::leaf::Mode::Full,
+                    Vec::new(),
+                    last.map(|last| [10, 0, 0, last % 16]),
+                    None,
+                )
+                .expect("settings"),
+            };
+            state.devices.insert_leaf(leaf);
+        }
+        state
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn following_changes_is_deciding_whole(
+            steps in proptest::collection::vec(
+                proptest::collection::btree_map(0u8..24, proptest::option::of(0u8..16), 0..20),
+                1..8,
+            ),
+        ) {
+            let mut previous = state_of(&BTreeMap::new(), None);
+            previous.devices.flatten();
+            let mut holdings = Ipv4Holdings::of_state(&previous);
+            for devices in &steps {
+                let next = state_of(devices, Some(&previous));
+                holdings = holdings.updated(&previous, &next);
+                let whole = Ipv4Holdings::of_state(&next);
+                proptest::prop_assert_eq!(&holdings, &whole);
+                proptest::prop_assert_eq!(
+                    holdings.held().collect::<Vec<_>>(),
+                    whole.held().collect::<Vec<_>>()
+                );
+                previous = next;
+            }
+        }
     }
 }

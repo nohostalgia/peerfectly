@@ -69,6 +69,18 @@ pub trait Custody: Send + Sync {
     /// When nothing was signed — declined, refused, a wrong passphrase — in
     /// words. Nothing in the batch is signed then.
     fn sign_all(&self, asking: &Asking<'_>) -> Result<Vec<Vec<u8>>, String>;
+
+    /// Whether this process may sign an administrative act at all: asked
+    /// before an act that ends in a signature begins, where finding out at the
+    /// signature would waste what came before — an invite, whose device has
+    /// arrived and been shown a code by then.
+    ///
+    /// # Errors
+    ///
+    /// When it may not, in words a person can act on.
+    fn may_sign(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A batch about to be signed, as a platform needs it to ask.
@@ -126,6 +138,12 @@ impl Custody for NoCustody {
 
     fn sign_all(&self, _asking: &Asking<'_>) -> Result<Vec<Vec<u8>>, String> {
         Err("this machine cannot protect a signing key, so nothing was signed. Nothing changed."
+            .to_owned())
+    }
+
+    fn may_sign(&self) -> Result<(), String> {
+        Err("this machine cannot protect a signing key, so it signs no administrative act. \
+             Nothing changed."
             .to_owned())
     }
 }
@@ -246,6 +264,31 @@ impl Cli<'_> {
             return runtime.block_on(self.invite_through_the_daemon(command));
         }
 
+        // Admitting a batch file: read here, reviewed, and signed with one consent.
+        if word == "admit" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(cause) => {
+                    eprintln!("could not start: {cause}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return runtime.block_on(self.admit_batch(&rest));
+        }
+
+        // Coming back to an invite whose device arrived after its command ended.
+        if word == "resume" {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(cause) => {
+                    eprintln!("could not start: {cause}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return runtime.block_on(self.resume_invites());
+        }
+
         // Opening a port to one network, closing it, and listing what is open.
         if word == "expose" || word == "unexpose" || word == "exposed" {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -348,6 +391,24 @@ impl Cli<'_> {
                     return ExitCode::FAILURE;
                 }
             }
+        } else if word == "withdraw" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match daemon::control::Command::withdrawal(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "set-anchors" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match daemon::control::Command::anchors_setting(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
         } else if word == "rename" {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             match daemon::control::Command::renaming(&rest) {
@@ -397,8 +458,37 @@ impl Cli<'_> {
             // does not work.
             let answer = self.ask_and_sign(command).await;
             let answer = self.when_only_admin(answer, said_yes).await;
+            let answer = self.when_voiding(&asked, answer, said_yes).await;
             self.shown(&asked, answer)
         })
+    }
+
+    /// Puts the question a revocation that voids acts asks, before anything is
+    /// signed, and sends it again with the acknowledgement on yes.
+    async fn when_voiding(
+        &self,
+        asked: &Command,
+        answer: io::Result<Outcome>,
+        agrees: fn() -> bool,
+    ) -> io::Result<Outcome> {
+        let Ok(Outcome::WouldVoid { voids, .. }) = &answer else { return answer };
+        let Command::Revoke { network, target, reason } = asked else { return answer };
+        println!();
+        println!("Before anything is signed: {voids}.");
+        println!();
+        println!("Acts an admin signed concurrently with its removal lose their effect, and");
+        println!("this device cannot keep these. Whoever they admitted or changed is as before.");
+        println!();
+        print!("Revoke anyway? [yes/no] ");
+        if !agrees() {
+            return Ok(Outcome::Declined { message: "nothing was signed.".to_owned() });
+        }
+        let voiding = Command::RevokeVoiding {
+            network: network.clone(),
+            target: target.clone(),
+            reason: reason.clone(),
+        };
+        self.ask_and_sign_as(voiding, asked).await
     }
 
     /// Puts the only admin's question where the daemon asked for it, and sends
@@ -464,7 +554,19 @@ impl Cli<'_> {
                 }
                 ExitCode::SUCCESS
             }
-            Ok(Outcome::Done) => ExitCode::SUCCESS,
+            Ok(Outcome::Done) => {
+                if let Command::Withdraw { name, .. } = asked {
+                    println!(
+                        "withdrawn: the invite for {} admits nobody now.",
+                        daemon::control::shown(name)
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(Outcome::InvitesHeld(lines)) => {
+                print!("{}", invites_listed(&lines));
+                ExitCode::SUCCESS
+            }
             Ok(Outcome::Declined { message }) => {
                 // Nothing was signed; a person said no. Not a failure, and not a success.
                 eprintln!("{message}");
@@ -479,6 +581,11 @@ impl Cli<'_> {
             }
             Ok(Outcome::NotAllowed { message }) => {
                 eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+            // Reached only if the question was not put; nothing was signed.
+            Ok(Outcome::WouldVoid { voids, .. }) => {
+                eprintln!("nothing was signed: {voids}.");
                 ExitCode::FAILURE
             }
             // Reached only if the question was not put; nothing was removed.
@@ -972,8 +1079,14 @@ impl Cli<'_> {
         use std::io::Write as _;
         use std::process::ExitCode;
 
-        use daemon::control::{Command, Outcome};
+        use daemon::control::Outcome;
 
+        // Before anything is issued: a device that arrives to an invite this
+        // process cannot sign for is a person's time and a code shown for nothing.
+        if let Err(refusal) = self.custody.may_sign() {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
         let issued = match self.ask(command).await {
             Ok(outcome) => outcome,
             Err(cause) => {
@@ -1006,6 +1119,160 @@ impl Cli<'_> {
             }
         };
 
+        self.admit_when_arrived(Some((name, expires_at))).await
+    }
+
+    /// Admits a batch file: reads it, hands it to the daemon in parts, shows
+    /// what it would do, and on one yes has it signed.
+    async fn admit_batch(&self, words: &[String]) -> std::process::ExitCode {
+        use std::process::ExitCode;
+
+        use daemon::control::{BatchFile, Command, Outcome};
+
+        let asked = match admitting_from(words) {
+            Ok(asked) => asked,
+            Err(refusal) => {
+                eprintln!("{refusal}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let text = match std::fs::read_to_string(&asked.file) {
+            Ok(text) => text,
+            Err(cause) => {
+                eprintln!("{}: {cause}", asked.file);
+                return ExitCode::FAILURE;
+            }
+        };
+        let file = match BatchFile::read(&text) {
+            Ok(file) => file,
+            Err(refusal) => {
+                eprintln!("{refusal}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(refusal) = self.custody.may_sign() {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+
+        // In parts, each well within what one command may carry.
+        for part in file.devices.chunks(BATCH_PART) {
+            let staging = Command::StageBatch { network: asked.network.clone(), devices: part.to_vec() };
+            match self.ask(staging).await {
+                Ok(Outcome::Staged { .. }) => {}
+                Ok(Outcome::Declined { message } | Outcome::Failed { message, .. }) => {
+                    eprintln!("{message}");
+                    return ExitCode::FAILURE;
+                }
+                Ok(other) => {
+                    eprintln!("unexpected answer from the daemon: {other:?}");
+                    return ExitCode::FAILURE;
+                }
+                Err(cause) => {
+                    eprintln!("{cause}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
+        let admit = |reviewed: Option<Vec<String>>| Command::AdmitBatch {
+            network: asked.network.clone(),
+            label: file.label.clone(),
+            light: asked.light,
+            groups: asked.groups.clone(),
+            block: asked.block.clone(),
+            reviewed,
+        };
+        let review = match self.ask(admit(None)).await {
+            Ok(Outcome::BatchReview { network, count, label, mode, groups, block, skipped }) => {
+                println!();
+                println!("{network}: admit a batch of {count} devices, `{}`", daemon::control::shown(&label));
+                println!("  mode        {mode}");
+                println!(
+                    "  groups      {}",
+                    if groups.is_empty() { "none".to_owned() } else { groups.join(", ") }
+                );
+                println!(
+                    "  addresses   {}",
+                    block.map_or_else(|| "derived".to_owned(), |block| format!("from {block}"))
+                );
+                if skipped.is_empty() {
+                    println!("  skipped     none");
+                } else {
+                    println!("  skipped     {} of them, which will have no effect:", skipped.len());
+                    for line in &skipped {
+                        let name = daemon::control::shown(&line.name).to_string();
+                        println!("    {name:<24} {}", line.why);
+                    }
+                }
+                println!();
+                print!("Admit this batch? [yes/no] ");
+                skipped.into_iter().map(|line| line.name).collect::<Vec<_>>()
+            }
+            Ok(Outcome::Declined { message } | Outcome::Failed { message, .. }) => {
+                let _ = self.ask(Command::Abandon).await;
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+            Ok(other) => {
+                eprintln!("unexpected answer from the daemon: {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(cause) => {
+                eprintln!("{cause}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if !said_yes() {
+            let _ = self.ask(Command::Abandon).await;
+            eprintln!("nothing was signed.");
+            return ExitCode::FAILURE;
+        }
+        let command = admit(Some(review));
+        let expected = command.clone();
+        match self.ask_and_sign_as(command, &expected).await {
+            Ok(Outcome::Reported(report)) => {
+                print!("{report}");
+                println!();
+                println!("admitted. Each board joins at its next attempt.");
+                ExitCode::SUCCESS
+            }
+            Ok(Outcome::Declined { message } | Outcome::Failed { message, .. }) => {
+                eprintln!("{message}");
+                ExitCode::FAILURE
+            }
+            Ok(_) => ExitCode::SUCCESS,
+            Err(cause) => {
+                eprintln!("{cause}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// Comes back to the invites still open: waits for one's device to arrive,
+    /// shows its code, and signs on the person's consent — what `invite` does
+    /// after issuing, for a person who stopped waiting then.
+    async fn resume_invites(&self) -> std::process::ExitCode {
+        use std::io::Write as _;
+
+        if let Err(refusal) = self.custody.may_sign() {
+            eprintln!("{refusal}");
+            return std::process::ExitCode::FAILURE;
+        }
+        print!("waiting for an invited device");
+        let _ = std::io::stdout().flush();
+        self.admit_when_arrived(None).await
+    }
+
+    /// Waits for an invited device to arrive, shows its code, and signs the
+    /// admission on the person's consent. `issued` is the invite just issued,
+    /// to say what stays open if the person stops waiting; `None` when resuming.
+    async fn admit_when_arrived(&self, issued: Option<(String, u64)>) -> std::process::ExitCode {
+        use std::io::Write as _;
+        use std::process::ExitCode;
+
+        use daemon::control::{Command, Outcome};
+
         // The daemon dials the device on its own. This waits for it to arrive,
         // and a person who stops waiting leaves the invite open.
         let opened = loop {
@@ -1013,12 +1280,27 @@ impl Cli<'_> {
                 () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                 _ = tokio::signal::ctrl_c() => {
                     println!();
-                    println!(
-                        "stopped waiting. The invite for {} stays open {}, and this machine",
-                        daemon::control::shown(&name),
-                        open_for(expires_at)
-                    );
-                    println!("goes on dialling the device: when it arrives, the daemon says so.");
+                    match &issued {
+                        Some((name, expires_at)) => {
+                            println!(
+                                "stopped waiting. The invite for {} stays open {}, and this machine",
+                                daemon::control::shown(name),
+                                open_for(*expires_at)
+                            );
+                            println!(
+                                "goes on dialling the device: when it arrives, the daemon says so."
+                            );
+                            println!();
+                            println!("  to come back to it:  peerfectly resume");
+                            println!(
+                                "  to withdraw it:      peerfectly withdraw {}",
+                                daemon::control::shown(name)
+                            );
+                        }
+                        None => println!(
+                            "stopped waiting. The invites stay open: `peerfectly invites` lists them."
+                        ),
+                    }
                     return ExitCode::SUCCESS;
                 }
             }
@@ -1426,6 +1708,76 @@ fn machine_name() -> Option<String> {
 /// How `join` is spelled, in one place so the usage and the refusal agree.
 const JOIN_USAGE: &str = "peerfectly join <the invite an admin sent> [--name NAME]";
 
+/// How many devices of a batch file one command carries: well within what a
+/// command may hold, at a few hundred bytes a device.
+const BATCH_PART: usize = 100;
+
+/// How `admit --batch` is spelled.
+const ADMIT_USAGE: &str = "peerfectly admit --batch <file> [--network N] [--light] [--group G]... \
+                           [--ipv4-block A.B.C.D/N]";
+
+/// What `admit --batch` was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmittingAsked {
+    file: String,
+    network: Option<String>,
+    light: bool,
+    groups: Vec<String>,
+    block: Option<String>,
+}
+
+/// Reads the words after `admit`.
+fn admitting_from(words: &[String]) -> Result<AdmittingAsked, String> {
+    let usage = || format!("usage: {ADMIT_USAGE}");
+    let mut asked = AdmittingAsked {
+        file: String::new(),
+        network: None,
+        light: false,
+        groups: Vec::new(),
+        block: None,
+    };
+    let mut rest = words.iter();
+    while let Some(word) = rest.next() {
+        match word.as_str() {
+            "--batch" => asked.file = rest.next().ok_or_else(usage)?.clone(),
+            "--network" => asked.network = Some(rest.next().ok_or_else(usage)?.clone()),
+            "--light" => asked.light = true,
+            "--group" => asked.groups.push(rest.next().ok_or_else(usage)?.clone()),
+            "--ipv4-block" => asked.block = Some(rest.next().ok_or_else(usage)?.clone()),
+            _ => return Err(usage()),
+        }
+    }
+    if asked.file.is_empty() {
+        return Err(usage());
+    }
+    Ok(asked)
+}
+
+/// The invites a network's admin issued, one line each: the name, where it
+/// stands, and until when it is open or since when it ended.
+fn invites_listed(lines: &[daemon::control::InviteLine]) -> String {
+    if lines.is_empty() {
+        return "no invites issued here.\n".to_owned();
+    }
+    let mut out = String::new();
+    for line in lines {
+        // Until when it is open, or when it ran out; a used or withdrawn one
+        // has nothing more to say.
+        let when = match line.standing.as_str() {
+            "open" => open_for(line.expires_at),
+            "expired" => std::time::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(line.expires_at))
+                .map_or_else(String::new, |at| format!("at {}", daemon::drawing::when(at))),
+            _ => String::new(),
+        };
+        let name = daemon::control::shown(&line.name).to_string();
+        let said = format!("  {name:<20} {:<10} {when}", line.standing);
+        out.push_str(said.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 /// How `invite` is spelled, in one place so the usage and the refusal agree.
 const INVITE_USAGE: &str = "peerfectly invite <name> [--network N] [--admin] [--light] \
                             [--group G]... [--ipv4 A.B.C.D] [--hours H]";
@@ -1463,7 +1815,10 @@ fn usage(privileged: &str) -> String {
     // anywhere else.
     out.push_str(&format!("\n  {FOUND_USAGE}{needs}\n"));
     out.push_str(&format!("  {JOIN_USAGE}{needs}\n"));
-    out.push_str(&format!("  {INVITE_USAGE}\n"));
+    out.push_str(&format!("  {INVITE_USAGE}{needs}\n"));
+    out.push_str(&format!("  peerfectly resume{needs}\n"));
+    out.push_str(&format!("  {ADMIT_USAGE}{needs}\n"));
+    out.push_str(&format!("  {}\n", daemon::control::Command::WITHDRAW_USAGE));
     out.push_str(&format!(
         "  {REVOKE_USAGE}{needs}
 "
@@ -1477,6 +1832,7 @@ fn usage(privileged: &str) -> String {
 "
     ));
     out.push_str(&format!("  {}{needs}\n", daemon::control::Command::RELAY_USAGE));
+    out.push_str(&format!("  {}{needs}\n", daemon::control::Command::SET_ANCHORS_USAGE));
     out.push_str(&format!("  peerfectly expose <network> tcp|udp <port>{needs}\n"));
     out.push_str(&format!("  peerfectly unexpose <network> tcp|udp <port>{needs}\n"));
     out.push_str("  peerfectly exposed [network]\n");
@@ -1645,6 +2001,23 @@ mod tests {
         assert_eq!(name, "board");
         assert!(super::joining_from(&words("--name board")).is_err(), "an invite first");
     }
+
+    #[test]
+    fn admitting_a_batch_reads_its_file_and_the_admin_s_choices() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let asked = super::admitting_from(&words(
+            "--batch lot.json --network casa --light --group sensori --group cucina --ipv4-block 100.64.9.0/24",
+        ))
+        .unwrap();
+        assert_eq!(asked.file, "lot.json");
+        assert_eq!(asked.network.as_deref(), Some("casa"));
+        assert!(asked.light);
+        assert_eq!(asked.groups, ["sensori", "cucina"]);
+        assert_eq!(asked.block.as_deref(), Some("100.64.9.0/24"));
+        assert!(super::admitting_from(&words("--light")).is_err(), "no file");
+        assert!(super::admitting_from(&words("lot.json")).is_err(), "the file named by its flag");
+    }
+
 }
 
 #[cfg(test)]

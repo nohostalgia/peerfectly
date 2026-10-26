@@ -887,17 +887,18 @@ async fn a_rotated_transport_key_ends_the_session_it_authenticated() {
     // for it no longer names the key this session authenticated.
     let mut rotated = network.state.clone();
     let fresh = NodeIdentity::generate().unwrap();
-    let record = rotated.devices.get_mut(&network.joiner.device_id()).unwrap();
-    for entry in &mut record.keys {
-        if entry.purpose == roster::types::KeyPurpose::Transport {
-            *entry = roster::types::KeyEntry::new(
-                Algorithm::Ed25519,
-                roster::types::KeyPurpose::Transport,
-                fresh.transport_key().public_key().as_bytes().to_vec(),
-            )
-            .unwrap();
+    rotated.devices.modify(&network.joiner.device_id(), |record| {
+        for entry in &mut record.keys {
+            if entry.purpose == roster::types::KeyPurpose::Transport {
+                *entry = roster::types::KeyEntry::new(
+                    Algorithm::Ed25519,
+                    roster::types::KeyPurpose::Transport,
+                    fresh.transport_key().public_key().as_bytes().to_vec(),
+                )
+                .unwrap();
+            }
         }
-    }
+    });
     founder.update_state(rotated).await;
     assert!(
         matches!(dialled.send(b"old key").await, Err(Error::ClosedOnMembershipLoss)),

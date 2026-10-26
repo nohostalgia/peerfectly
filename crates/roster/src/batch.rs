@@ -617,8 +617,9 @@ pub fn skipped(
     header: &BatchHeader,
     entries: &[BatchEntry],
 ) -> alloc::collections::BTreeMap<crate::id::DeviceId, Skip> {
-    let mut taken: alloc::collections::BTreeSet<[u8; 4]> =
-        held.settings.values().filter_map(|settings| settings.ipv4).collect();
+    // The addresses entries before this one took; those members hold are asked
+    // of the state's index, rather than gathered from every member.
+    let mut taken: alloc::collections::BTreeSet<[u8; 4]> = alloc::collections::BTreeSet::new();
     let mut ordered: Vec<(crate::id::DeviceId, &BatchEntry)> = entries
         .iter()
         .filter_map(|entry| entry.device_id().ok().map(|device| (device, entry)))
@@ -633,7 +634,7 @@ pub fn skipped(
         let Some(address) = entry.ipv4 else { continue };
         if !header.block.is_some_and(|block| block.contains(address)) {
             out.insert(device, Skip::AddressOutsideBlock);
-        } else if !taken.insert(address) {
+        } else if !held.devices.holding_address(address).is_empty() || !taken.insert(address) {
             out.insert(device, Skip::AddressTaken);
         }
     }

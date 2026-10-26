@@ -40,12 +40,7 @@ pub const PIECE_PARAMETER_SCHEMA: &[&str] = &["name", "value"];
 pub fn pieces_of(state: &RosterState) -> Vec<Vec<u8>> {
     let parameters: Vec<(&'static str, Vec<u8>)> =
         state.params.leaves().iter().map(|leaf| (leaf.name(), leaf.value_bytes())).collect();
-    let leaves: Vec<Vec<u8>> = state
-        .devices
-        .keys()
-        .filter_map(|device| state.leaf(device))
-        .map(|leaf| leaf.to_bytes())
-        .collect();
+    let leaves: Vec<Vec<u8>> = state.devices.values().map(|leaf| leaf.to_bytes()).collect();
 
     let mut out = Vec::new();
     let mut current: Vec<Vec<u8>> = Vec::new();
@@ -176,17 +171,8 @@ impl StateAssembler {
     /// When the parameters are incomplete, or the leaves make another root.
     pub fn finish(self) -> Result<RosterState> {
         let params = NetworkParams::from_leaves(self.parameters)?;
-        let mut state = RosterState {
-            network: self.network,
-            params,
-            devices: BTreeMap::new(),
-            revoked: alloc::collections::BTreeSet::new(),
-            settings: BTreeMap::new(),
-        };
-        for (device, leaf) in self.devices {
-            state.devices.insert(device, leaf.record);
-            state.set_settings(device, leaf.settings);
-        }
+        let mut state = RosterState::empty(self.network, params);
+        state.devices = self.devices.into_values().collect();
         if state.root() != self.root {
             return Err(Error::SnapshotStateMismatch);
         }

@@ -5,7 +5,13 @@
 //! - its view of the network's roots ([`LightView`]): the current one, the
 //!   chain before it it can remember, and the invalidations not yet joined;
 //! - the network's parameters, as far as it uses them;
-//! - the peers it has checked, each with the leaf and proof it was shown.
+//! - the peers it has checked, each with the leaf and proof it was shown —
+//!   among them the full members it can turn to besides its contact.
+//!
+//! The parameters follow the roots: a full member hands over the parameters
+//! with the root of the devices' tree, and the two together must make the root
+//! this member holds — so a member far from any admin still moves with a relay
+//! change or a new anchor list, and believes nothing it cannot check.
 //!
 //! From these it answers what a full member answers from its roster, for the
 //! devices it knows: [`LightMember::state`] is a roster state holding itself and
@@ -20,7 +26,7 @@ use alloc::vec::Vec;
 use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::id::{DeviceId, NetworkId};
-use crate::leaf::DeviceLeaf;
+use crate::leaf::{DeviceLeaf, Mode};
 use crate::light::{LightView, ProofVerdict, RootOutcome};
 use crate::membership::{Evidence, MembershipProof};
 use crate::merkle::Hash;
@@ -63,7 +69,11 @@ pub struct LightMember {
 /// own signer leaf names: whether that signer had the authority to sign is the
 /// view's to judge.
 fn signed_root(bytes: &[u8]) -> Result<Snapshot> {
-    let raw = RawSnapshot::decode(bytes)?;
+    signed_raw(&RawSnapshot::decode(bytes)?)
+}
+
+/// As [`signed_root`], for a root already read.
+fn signed_raw(raw: &RawSnapshot) -> Result<Snapshot> {
     let author = raw.body().author;
     let key = raw
         .body()
@@ -137,6 +147,36 @@ impl LightMember {
         self.view.current()
     }
 
+    /// The full members this one can turn to besides its contact: the peers it
+    /// checked whose leaf says they are full. Sorted.
+    #[must_use]
+    pub fn known_fulls(&self) -> Vec<DeviceId> {
+        self.peers
+            .values()
+            .filter(|known| known.leaf.settings.mode == Mode::Full)
+            .map(|known| known.leaf.record.id)
+            .filter(|device| *device != self.contact())
+            .collect()
+    }
+
+    /// Takes the parameters a full member handed over, with the root of the
+    /// devices' tree beside them: believed only where the two make the current
+    /// root, which this member holds signed. Whether they changed anything.
+    ///
+    /// # Errors
+    ///
+    /// When this member holds no root, or the two do not make it.
+    pub fn take_params(&mut self, devices_root: &Hash, params: NetworkParams) -> Result<bool> {
+        let current = self.view.current().ok_or(Error::SnapshotUnverified)?;
+        let made = RosterState::root_of(&self.network, devices_root, &params.tree().root());
+        if made != current {
+            return Err(Error::SnapshotStateMismatch);
+        }
+        let changed = params != self.params;
+        self.params = params;
+        Ok(changed)
+    }
+
     /// Whether this member's own proof must be renewed: a root it holds names
     /// it, or no root it remembers is the one its proof rests on.
     #[must_use]
@@ -149,13 +189,7 @@ impl LightMember {
     /// parameters.
     #[must_use]
     pub fn state(&self) -> RosterState {
-        let mut state = RosterState {
-            network: self.network,
-            params: self.params.clone(),
-            devices: BTreeMap::new(),
-            revoked: alloc::collections::BTreeSet::new(),
-            settings: BTreeMap::new(),
-        };
+        let mut state = RosterState::empty(self.network, self.params.clone());
         // The contact too, where nothing since revoked it: not proved under the
         // current root, and not needing to be — it is only dialled, and proves
         // itself as any peer does when the session opens.
@@ -185,8 +219,21 @@ impl LightMember {
     ///
     /// When the bytes are not a root signed by its own signer.
     pub fn offer_root(&mut self, bytes: &[u8]) -> Result<RootOutcome> {
-        let root = signed_root(bytes)?;
-        let outcome = self.view.offer(&root);
+        Ok(self.offer_signed(&signed_root(bytes)?))
+    }
+
+    /// Offers the root a peer showed beside its evidence: one newer than this
+    /// member's is verified as any root is, and adopted where it follows.
+    ///
+    /// # Errors
+    ///
+    /// When it is not a root signed by its own signer.
+    pub fn offer_shown_root(&mut self, root: &RawSnapshot) -> Result<RootOutcome> {
+        Ok(self.offer_signed(&signed_raw(root)?))
+    }
+
+    fn offer_signed(&mut self, root: &Snapshot) -> RootOutcome {
+        let outcome = self.view.offer(root);
         if matches!(outcome, RootOutcome::Adopted | RootOutcome::Switched) {
             self.contact = root.signer.clone();
         }
@@ -198,7 +245,7 @@ impl LightMember {
                     && view.standing(device, &known.against) != ProofVerdict::Refused
             });
         }
-        Ok(outcome)
+        outcome
     }
 
     /// Checks a peer's evidence and remembers the peer.

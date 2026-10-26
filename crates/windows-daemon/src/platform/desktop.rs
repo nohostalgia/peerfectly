@@ -1,5 +1,5 @@
-//! Three things the tray asks of the person's desktop: dark menus, the
-//! elevation prompt, and a message window.
+//! What the tray asks of the person's desktop: dark menus, the elevation
+//! prompt, a message window, a console, and a notice beside the icon.
 //!
 //! # Dark menus: tried, never required
 //!
@@ -28,8 +28,13 @@
 use std::path::Path;
 
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
-use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW, SW_HIDE};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::Shell::{
+    NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW, ShellExecuteW, Shell_NotifyIconW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MB_ICONWARNING, MB_OK, MessageBoxW, SW_HIDE, SW_SHOWNORMAL,
+};
 
 /// `SetPreferredAppMode`'s ordinal in `uxtheme.dll`.
 const SET_PREFERRED_APP_MODE: usize = 135;
@@ -100,6 +105,67 @@ pub fn run_elevated(program: &Path, argument: &str) -> bool {
     // Documented: greater than 32 is success; anything else, including the
     // person declining, is not.
     started as usize > 32
+}
+
+/// Runs `program` with `argument` in a console of its own, as this person.
+///
+/// Returns whether it was started. It does not wait for it.
+pub fn run_in_a_console(program: &Path, argument: &str) -> bool {
+    let verb = wide("open");
+    let file = wide(&program.display().to_string());
+    let parameters = wide(argument);
+    // SAFETY: every string outlives the call; no window owns it, and no working
+    // directory is given. A console program started from a desktop one gets a
+    // console of its own.
+    let started = unsafe {
+        ShellExecuteW(
+            core::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ptr(),
+            core::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    started as usize > 32
+}
+
+/// The id `tray-icon` gives the first icon a process makes, which is the only
+/// one the tray makes: its icons are numbered from one.
+const FIRST_ICON: u32 = 1;
+
+/// Shows a notice beside the tray's icon, whose window is `window`: a balloon,
+/// which Windows 10 and later show as a notification.
+///
+/// Returns whether Windows took it. Nothing depends on it: what it says, the
+/// menu says too.
+pub fn notice(window: HWND, title: &str, text: &str) -> bool {
+    // SAFETY: a plain C struct, for which all zeroes is a valid value.
+    let mut data: NOTIFYICONDATAW = unsafe { core::mem::zeroed() };
+    data.cbSize = u32::try_from(core::mem::size_of::<NOTIFYICONDATAW>()).unwrap_or(0);
+    data.hWnd = window;
+    data.uID = FIRST_ICON;
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO;
+    copy_into(&mut data.szInfoTitle, title);
+    copy_into(&mut data.szInfo, text);
+    // SAFETY: the struct is whole and sized, and names an icon of this
+    // process's own window; Windows copies what it needs during the call.
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) != 0 }
+}
+
+/// Copies `text` into a fixed wide buffer, cut short to fit, always ending in
+/// a nul.
+fn copy_into(buffer: &mut [u16], text: &str) {
+    let room = buffer.len().saturating_sub(1);
+    let mut written = 0;
+    for (slot, unit) in buffer.iter_mut().zip(text.encode_utf16().take(room)) {
+        *slot = unit;
+        written += 1;
+    }
+    if let Some(end) = buffer.get_mut(written) {
+        *end = 0;
+    }
 }
 
 /// Shows `text` in a message window titled "peerfectly", and waits for it to be
