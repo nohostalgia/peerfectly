@@ -240,7 +240,8 @@ impl Home {
     /// that could not be carried, which is a network the person never had.
     ///
     /// Only a directory with no record and an empty log is removed. One that holds
-    /// either is a network, and is never touched here.
+    /// either is a network, and is never touched here; one that holds a join in
+    /// progress is the service's to resume.
     ///
     /// Returns whether anything was removed.
     ///
@@ -249,7 +250,7 @@ impl Home {
     /// When the directory exists and cannot be read or removed.
     pub fn discard_unfounded(&self, label: &Label) -> Result<bool> {
         let paths = self.paths_for(label);
-        if !paths.root().exists() || paths.record().exists() {
+        if !paths.root().exists() || paths.record().exists() || crate::joins::in_progress(&paths) {
             return Ok(false);
         }
         if !crate::state::Log::at(paths.roster()).read()?.is_empty() {
@@ -472,7 +473,8 @@ impl Home {
                 continue;
             }
             let paths = self.paths_for(&label);
-            if paths.record().exists() {
+            // A join in progress is not a network yet: the service resumes it.
+            if paths.record().exists() || crate::joins::in_progress(&paths) {
                 continue;
             }
             // No identity means no membership this device could hold, and asking for
@@ -605,6 +607,10 @@ impl Home {
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             let paths = Paths::under(entry.path());
+            // A join in progress is listed as one, not as a network.
+            if crate::joins::in_progress(&paths) {
+                continue;
+            }
 
             match Record::read(&paths) {
                 Ok(record) => survey.held.push(Held { record, paths }),

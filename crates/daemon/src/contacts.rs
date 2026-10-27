@@ -268,6 +268,7 @@ mod tests {
         let sources: &[(&str, &str)] = &[
             ("admitting.rs", include_str!("admitting.rs")),
             ("attesting.rs", include_str!("attesting.rs")),
+            ("batches.rs", include_str!("batches.rs")),
             ("channel.rs", include_str!("channel.rs")),
             ("clock.rs", include_str!("clock.rs")),
             ("confirmations.rs", include_str!("confirmations.rs")),
@@ -281,6 +282,7 @@ mod tests {
             ("founding.rs", include_str!("founding.rs")),
             ("gateway.rs", include_str!("gateway.rs")),
             ("joining.rs", include_str!("joining.rs")),
+            ("joins.rs", include_str!("joins.rs")),
             ("keys.rs", include_str!("keys.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
             ("invites.rs", include_str!("invites.rs")),

@@ -155,12 +155,18 @@ mod tests {
     }
 
     fn state() -> RosterState {
-        RosterState::from_parts(NetworkId::from_bytes([1; 32]), NetworkParams::new(
+        RosterState::from_parts(
+            NetworkId::from_bytes([1; 32]),
+            NetworkParams::new(
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "example.internal",
                 2_592_000,
             )
-            .expect("valid"), [record(1, "nas")].into_iter().map(|item| (item.id, item)).collect(), BTreeSet::new(), Default::default())
+            .expect("valid"),
+            [record(1, "nas")].into_iter().map(|item| (item.id, item)).collect(),
+            BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     fn query_bytes(name: &str, kind: RecordType) -> Vec<u8> {

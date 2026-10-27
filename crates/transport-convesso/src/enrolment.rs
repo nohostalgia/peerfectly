@@ -260,6 +260,25 @@ impl Waiting {
         Ok(Self { endpoint, relay: relay.to_owned() })
     }
 
+    /// Starts a node at a network's relay under a joining device's own
+    /// transport key: where a member that holds its admission dials it, when
+    /// the device does not yet know it was admitted.
+    ///
+    /// The device has no roster and no running node yet, so nothing else is
+    /// registered under the key. It stops before the device's own node starts.
+    ///
+    /// # Errors
+    ///
+    /// When the key is not ed25519, the relay is not `key@host:port`, or the
+    /// node cannot start.
+    pub async fn under_own_key(identity: &NodeIdentity, relay: &str) -> Result<Self> {
+        let key = identity.transport_key();
+        if key.algorithm() != Algorithm::Ed25519 {
+            return Err(BuildError::NotEd25519 { algorithm: key.algorithm() });
+        }
+        Self::at_rendezvous(key.material().expose(), relay).await
+    }
+
     /// Waits until the relay has this node, so a peer can reach it.
     pub async fn online(&self) {
         let mut online = self.endpoint.online.clone();
@@ -327,18 +346,14 @@ pub struct Admitting {
 impl Admitting {
     /// Starts a node that will only ever dial.
     ///
-    /// `identity` and `state` are taken for the shape the daemon calls: the
-    /// admitting node runs under a key of its own (see the module), and its
-    /// relay is the one [`Admitting::reach`] is given, which the daemon has
-    /// already checked is one this network uses.
+    /// The admitting node runs under a key of its own (see the module), and
+    /// its relay is the one [`Admitting::reach`] is given: the network's, which
+    /// the daemon read from its own roster or its own invite.
     ///
     /// # Errors
     ///
     /// When the generator fails, or the node cannot start.
-    pub async fn dialling(
-        _identity: &NodeIdentity,
-        _state: &roster::state::RosterState,
-    ) -> Result<Self> {
+    pub async fn dialling() -> Result<Self> {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).map_err(|cause| BuildError::Start(cause.to_string()))?;
         let own = Identity::from_ed25519_seed(&seed)

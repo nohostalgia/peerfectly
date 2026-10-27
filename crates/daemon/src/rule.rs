@@ -195,7 +195,13 @@ mod tests {
         )
         .expect("valid");
         params.suffix = suffix.to_owned();
-        RosterState::from_parts(NetworkId::from_bytes([1; 32]), params, BTreeMap::new(), BTreeSet::new(), Default::default())
+        RosterState::from_parts(
+            NetworkId::from_bytes([1; 32]),
+            params,
+            BTreeMap::new(),
+            BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     fn resolver() -> Ipv6Addr {

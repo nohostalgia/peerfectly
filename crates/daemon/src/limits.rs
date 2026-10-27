@@ -176,11 +176,12 @@ const _: () = {
 /// member it could ask.
 pub const LOOKUP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often an admin's daemon dials the devices its open invites bring.
+/// How often an admin's daemon dials the rendezvous of its open invites, and
+/// the approved devices that do not have the network yet.
 ///
-/// A device waits at its rendezvous for ten minutes, so it is reached within
-/// seconds of starting its join whatever the moment; one dial is a relay
-/// connection opened and closed, a few hundred bytes.
+/// A device is reached within seconds of starting its join whatever the
+/// moment; one dial is a relay connection opened and closed, a few hundred
+/// bytes.
 pub const INVITE_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How recently a full member must have been in contact to be handed to a
@@ -196,6 +197,12 @@ pub const HANDED_SEEN_WITHIN_MINUTES: u64 = 7 * 24 * 60;
 /// longer than this to type it — found in the testbed, where the joining key
 /// was a sealed file.
 pub const INVITE_DIAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long after its admission a new member this device has never been in
+/// contact with is dialled by the members around it, to be brought the
+/// network: three days. A device switched off for longer is still dialled by
+/// the admin that approved it, until it has the network.
+pub const NEWCOMER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3 * 24 * 60 * 60);
 
 #[cfg(test)]
 mod tests {

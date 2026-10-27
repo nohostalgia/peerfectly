@@ -25,35 +25,16 @@ pub const MAX_RELAY_LEN: usize = roster::limits::MAX_RELAY_LEN;
 /// authenticated yet, and a length is checked before anything is reserved for it.
 pub const MAX_EXCHANGE_MESSAGE_SIZE: usize = 1024 * 1024;
 
-/// How long a device waits to be admitted, in seconds.
+/// How long one message of an exchange may take before the exchange is
+/// abandoned, in seconds.
 ///
-/// Long enough for a person to walk to another machine, read its code, and type
-/// six digits back. Short enough that a device left waiting by accident stops
-/// answering strangers the same afternoon.
-pub const WAIT_SECS: u64 = 10 * 60;
-
-/// How long one exchange may take before it is abandoned, in seconds.
-///
-/// Well short of [`WAIT_SECS`], and that gap is the point. Only one exchange runs
-/// at a time, so without a deadline of its own anybody who had seen the invite
-/// could open an exchange, say nothing, and keep the admin out for the whole
-/// wait while the person watched nothing happen.
+/// A join has no deadline of its own: it waits until it is admitted or
+/// cancelled. Each exchange does, and that is the point. Only one runs at a
+/// time on the joining device, so without one anybody who had seen the invite
+/// could open an exchange, say nothing, and keep the admin out for as long as
+/// they liked. Nothing in an exchange waits on a person, so a minute is
+/// generous.
 pub const EXCHANGE_DEADLINE_SECS: u64 = 60;
-
-/// How many exchanges one wait will entertain before giving up.
-///
-/// A person needs a handful: a mistyped code, a second attempt, a relay that
-/// dropped the first connection. Far below what an attacker would need to make
-/// guessing a six-digit code worth attempting, which is what keeps the code
-/// short enough to read aloud.
-pub const ATTEMPTS_PER_WAIT: u32 = 10;
-
-/// How many decimal digits the confirmation code has.
-///
-/// The Signal and Bluetooth precedent. Long enough that guessing one within
-/// [`ATTEMPTS_PER_WAIT`] is hopeless, short enough that a person reads it aloud
-/// correctly the first time.
-pub const CODE_DIGITS: u32 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -62,32 +43,7 @@ mod tests {
     #[test]
     fn stated_bounds_are_pinned() {
         assert_eq!(MAX_EXCHANGE_MESSAGE_SIZE, 1024 * 1024);
-        assert_eq!(WAIT_SECS, 600);
         assert_eq!(EXCHANGE_DEADLINE_SECS, 60);
-        assert_eq!(ATTEMPTS_PER_WAIT, 10);
-        assert_eq!(CODE_DIGITS, 6);
-    }
-
-    /// The gap between the two is what stops one silent peer from occupying the
-    /// whole wait. If they ever met, a single stalled exchange would consume it.
-    #[test]
-    fn an_exchange_cannot_occupy_the_whole_wait() {
-        assert!(
-            EXCHANGE_DEADLINE_SECS.saturating_mul(2) < WAIT_SECS,
-            "a wait must outlast several exchanges, or one stall ends it"
-        );
-    }
-
-    /// Guessing the code has to be hopeless within the attempts allowed, or the
-    /// code would have to be longer than a person will read aloud.
-    #[test]
-    fn the_code_outruns_the_attempts_allowed() {
-        let space = 10_u64.saturating_pow(CODE_DIGITS);
-        let attempts = u64::from(ATTEMPTS_PER_WAIT);
-        assert!(
-            space / attempts > 10_000,
-            "an attacker gets {attempts} guesses at a space of {space}"
-        );
     }
 
     /// A name or relay the roster could never act on would be refused far from

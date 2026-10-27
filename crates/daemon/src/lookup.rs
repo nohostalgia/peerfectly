@@ -51,6 +51,11 @@ pub enum Query {
     /// What the light member with this id stands on: the parameters, and the
     /// full members it may turn to.
     Footing(DeviceId),
+    /// Not a question: a light member saying it holds this root now, after
+    /// adopting it. A full member holding the same root counts the light member
+    /// as holding everything beneath it, as a full member's offer would say. The
+    /// answer is empty.
+    Holds([u8; 32]),
 }
 
 /// A lookup message.
@@ -79,6 +84,7 @@ const BY_IPV6: u8 = 2;
 const BY_IPV4: u8 = 3;
 const ROOTS_AFTER: u8 = 4;
 const FOOTING: u8 = 5;
+const HOLDS: u8 = 6;
 
 impl Message {
     /// Its bytes.
@@ -109,6 +115,10 @@ impl Message {
                     Query::Footing(device) => {
                         out.push(FOOTING);
                         out.extend_from_slice(device.as_bytes());
+                    }
+                    Query::Holds(root) => {
+                        out.push(HOLDS);
+                        out.extend_from_slice(root);
                     }
                 }
             }
@@ -144,6 +154,7 @@ impl Message {
                     FOOTING => {
                         Query::Footing(DeviceId::from_bytes(<[u8; 32]>::try_from(value).ok()?))
                     }
+                    HOLDS => Query::Holds(<[u8; 32]>::try_from(value).ok()?),
                     _ => return None,
                 };
                 Some(Self::Request { id, query })
@@ -165,13 +176,10 @@ pub fn resolve(state: &RosterState, query: &Query) -> Option<DeviceId> {
             .map(|record| record.id),
         Query::Ipv6(address) => {
             let prefix = tunnel::Prefix::from_parameter(&state.params.ula).ok()?;
-            state
-                .devices
-                .keys()
-                .find(|device| tunnel::address_of(device, &prefix) == *address)
+            state.devices.keys().find(|device| tunnel::address_of(device, &prefix) == *address)
         }
         Query::Ipv4(address) => tunnel::Ipv4Holdings::of_state(state).holder(*address),
-        Query::RootsAfter(_) | Query::Footing(_) => None,
+        Query::RootsAfter(_) | Query::Footing(_) | Query::Holds(_) => None,
     }
 }
 
@@ -222,7 +230,7 @@ pub fn answers(
             Some(assigned) => Ipv4Addr::from(assigned) == *address,
             None => tunnel::ipv4_candidate(network, &device, &params.ipv4_range()) == *address,
         },
-        Query::RootsAfter(_) | Query::Footing(_) => false,
+        Query::RootsAfter(_) | Query::Footing(_) | Query::Holds(_) => false,
     }
 }
 
@@ -519,17 +527,19 @@ mod tests {
             fulls: vec![vec![4; 40], vec![5; 2]],
         };
         assert_eq!(Footing::decode(&footing.encode()), Some(footing.clone()));
-        assert_eq!(Footing::decode(&footing.encode()[..20]), None, "cut short");
-        let asked = Message::Request { id: 3, query: Query::Footing(DeviceId::from_bytes([2; 32])) };
+        let cut = footing.encode().get(..20).map(<[u8]>::to_vec).unwrap();
+        assert_eq!(Footing::decode(&cut), None, "cut short");
+        let asked =
+            Message::Request { id: 3, query: Query::Footing(DeviceId::from_bytes([2; 32])) };
         assert_eq!(Message::decode(&asked.encode()), Some(asked));
+        let held = Message::Request { id: 4, query: Query::Holds([9; 32]) };
+        assert_eq!(Message::decode(&held.encode()), Some(held.clone()));
+        let cut = held.encode().get(..20).map(<[u8]>::to_vec).unwrap();
+        assert_eq!(Message::decode(&cut), None, "a root cut short");
     }
 
     /// A founder signs a change, and a root over it.
-    fn signed_on(
-        roster: &mut Roster,
-        founder: &NodeIdentity,
-        body: OperationBody,
-    ) -> Vec<u8> {
+    fn signed_on(roster: &mut Roster, founder: &NodeIdentity, body: OperationBody) -> Vec<u8> {
         let state = roster.state().unwrap();
         let core = OperationCore::new(
             100,

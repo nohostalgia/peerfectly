@@ -503,9 +503,8 @@ const BASE_CACHE: usize = 16 << 20;
 /// A store is a database one owner opens at a time, and a network may be put
 /// together again — vouched for, carried again — while what held it before
 /// is still letting go. Every one of them is given the same store.
-static OPEN_STORES: std::sync::Mutex<
-    BTreeMap<PathBuf, std::sync::Weak<member_store::Store>>,
-> = std::sync::Mutex::new(BTreeMap::new());
+static OPEN_STORES: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Weak<member_store::Store>>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 /// Opens the store a network's base is kept in, creating an empty one where
 /// there is none; the one already open, where this process holds it.

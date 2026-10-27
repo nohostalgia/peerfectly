@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 55 of 88. Every other result reads `not run`. That is the honest
+**Run so far**: 56 of 89. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2494,12 +2494,23 @@ afterwards, and start it once more.
 - The tests, from an elevated console: 2 passed, in 4.29 s (reported by the person who ran them).
 - The rest — `certutil`, `machine.kind`, the checkpoint, and the changed folder — not run yet.
 
-## C4. Invites, the tray's notice, a batch, and how many dialogs a batch of signatures shows
+## C4. Invites approved later, a batch, and how many dialogs a batch of signatures shows
 
-`scalable-membership` 13.1, 13.2 and 13.4. The MSI of this branch installed; the phone with the
-app of this branch (13.3), to join by invite. Networks founded before this branch are not carried:
-forget them first. From an elevated console, as for C2 (the console the tray opens is not elevated:
-note whether it can sign, and what it says if it cannot):
+`scalable-membership` 13.1, 13.4, 14.4, 14.5 and 14.6. The MSI of this branch installed; the phone
+with the app of this branch, to join by invite. Networks founded before this branch are not
+carried: forget them first. First, from a console that is **not** elevated:
+
+```powershell
+peerfectly status
+```
+```powershell
+peerfectly pending
+```
+```powershell
+peerfectly invite telefono --network prova
+```
+
+Then from an elevated console:
 
 ```powershell
 peerfectly found prova --relay 204.216.216.139
@@ -2508,19 +2519,20 @@ peerfectly found prova --relay 204.216.216.139
 peerfectly up prova
 ```
 ```powershell
-peerfectly invite telefono --network prova --light
+peerfectly invite telefono --network prova --group famiglia --expires 30m
 ```
 
-When it says it is waiting, press `ctrl-c`. Then:
+On the phone, join with the invite (scan the code `invite` drew, or paste its text), and note the
+key the phone shows. Wait a minute, then on the PC:
 
 ```powershell
-peerfectly invites prova
+peerfectly pending
+```
+```powershell
+peerfectly approve telefono --network prova
 ```
 
-On the phone, join with the invite (scan the code `invite` drew, or paste its text). Leave the
-console alone and watch the tray. When the notice appears, open the tray menu and click the line
-*telefono has arrived in prova: compare the code…*. In the console that opens, type the six digits
-it shows on the phone, answer `yes`, and confirm Windows' dialog or dialogs.
+Answer `yes` once the key shown matches the phone's, and confirm Windows' dialog or dialogs.
 
 Then a batch, with a `peerfectly-batch-v1` file of three boards (one was made for this run, from
 the Linux testbed, as `lot-windows.json`):
@@ -2534,29 +2546,30 @@ And one invite withdrawn:
 ```powershell
 peerfectly invite tv --network prova
 ```
-(`ctrl-c` when it waits)
 ```powershell
 peerfectly withdraw tv --network prova
 ```
 ```powershell
-peerfectly invites prova
+peerfectly pending
 ```
 
 **Expect**:
-- `found` lists 2 acts and `invite --light`'s admission 2 acts (the admission, and the settings the
-  invite chose);
-- `ctrl-c` says the invite stays open, until when, and prints `peerfectly resume` and
-  `peerfectly withdraw telefono`; `invites` lists `telefono` as `open` with its time left;
-- the notice beside the tray, *telefono has arrived in prova*, within a minute of the phone joining,
-  and the menu's first line saying the same;
-- the console opened from the menu shows the phone's name, key and six digits, signs on `yes`, and
-  the phone joins; the line leaves the menu;
-- `peerfectly status` shows, before the click, *the device invited as telefono has arrived*;
+- unelevated, `status` and `pending` answer, and `invite` is refused at once with *needs
+  Administrator*, before anything is asked of the daemon;
+- `found` lists 2 acts; `invite` prints the code and the text and returns, saying until when it is
+  open and how to approve;
+- the phone, once joined, shows its key and a page of what waits with its join as *requested*;
+- `pending` shows `telefono` with *a request waits for your approval*, the name it asked for, when
+  it arrived and the same key as the phone; the tray shows nothing of it;
+- `approve` shows the review, lists 2 acts (the admission, and the group the invite chose), signs,
+  and the phone receives the network within seconds and notifies that it is in `prova`; `pending`
+  then shows `telefono` as `used`;
 - the batch review shows 3 devices, `lotto windows`, `light`, the block, `skipped none`, and signs on
   one consent; `peers prova` lists `scheda-1..3`;
-- `withdraw` says *the invite for tv admits nobody now*, and `invites` lists `tv` as `withdrawn`.
+- `withdraw` says *the invite for tv takes no request now*, and `pending` lists `tv` as
+  `withdrawn`.
 
-**Record** for 13.4, for `found` and for the admission (2 signatures each) and for the batch (1):
+**Record** for 13.4, for `found` and for the approval (2 signatures each) and for the batch (1):
 how many Windows dialogs appeared — one for the whole act, or one per signature.
 
 **Result**: not run.

@@ -24,17 +24,17 @@
 //! secret. What makes an enrolment safe is three checks that do not depend on
 //! it:
 //!
-//! - **The confirmation code is bound to the channel.** Every key involved is
-//!   public once presented, so a code derived from keys alone could be matched
-//!   by grinding key pairs against a six-digit space. Binding it to material
-//!   exported from the established channel means the value being matched does
-//!   not exist until the channel does.
+//! - **No confirmation code.** Enrolment is asynchronous: a request is kept
+//!   until a person approves it, and nobody compares two screens. A six-digit
+//!   code was a second bearer secret when sent the way the invite was, and the
+//!   responder of the channel's handshake could grind its ephemeral to match it.
 //! - **The device's keys are proved.** The channel of an invite authenticates
-//!   only the rendezvous key. The signing key — which is where a device's
-//!   identity comes from — and the transport key are each proved by a
-//!   signature over that same channel material. Without it, an introduction
-//!   could pair one device's identity with another's transport key, and a roster
-//!   keeps the first admission of a device id for ever.
+//!   only the rendezvous key. The transport key is proved by a signature over
+//!   the channel's material; the signing key, from which a device's identity
+//!   comes, by a signature over the join's request — the invite answered and the
+//!   other two keys — made once, when the person runs the join. Without these,
+//!   an introduction could pair one device's identity with another's transport
+//!   key, and a roster keeps the first admission of a device id for ever.
 //! - **The delivered roster is verified, not trusted.** Who handed it over does
 //!   not matter. It must admit this device's own keys, be signed by an admin,
 //!   derive consistently, and be of the network the invite names.
@@ -57,14 +57,12 @@
 //!   what a joining device is permitted to be; the device only proposes a name.
 
 pub mod adopt;
-pub mod code;
 pub mod error;
 pub mod exchange;
 pub mod invite;
 pub mod limits;
 
 pub use adopt::Adopted;
-pub use code::{Confirmation, DOMAIN_CODE};
 pub use error::{Error, Result};
-pub use exchange::{DOMAIN_POSSESSION, Possession};
+pub use exchange::{DOMAIN_POSSESSION, DOMAIN_REQUEST, Possession, request_material};
 pub use invite::Invite;

@@ -15,6 +15,7 @@ pub fn main() -> std::process::ExitCode {
             usage: "\n  An act that signs asks for the network's passphrase.\n",
             privileged: "sudo",
             after_status: say_whether_names_resolve,
+            administrator: || rustix::process::geteuid().is_root(),
         },
     }
     .run()

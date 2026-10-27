@@ -271,7 +271,10 @@ mod tests {
         assert!(confirmed.retain_members(|device| members.contains(device)));
         assert!(confirmed.holds(&device(1), &operation(0xa)), "the member is kept");
         assert!(!confirmed.holds(&device(2), &operation(0xa)), "the departed device is not");
-        assert!(!confirmed.retain_members(|device| members.contains(device)), "and a second pass drops nothing");
+        assert!(
+            !confirmed.retain_members(|device| members.contains(device)),
+            "and a second pass drops nothing"
+        );
     }
 
     /// The same file whichever way it is addressed, so a test and the daemon

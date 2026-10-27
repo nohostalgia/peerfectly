@@ -1,21 +1,22 @@
-//! Admitting a device, from this side.
+//! Admitting a device, from this side: taking its request, and bringing it the
+//! network once a person has approved it.
 //!
 //! The daemon does this rather than the command line, for one reason: it holds
 //! the roster. An operation appended to the log by another process would be
 //! invisible to a running daemon until it restarted, and a device admitted into
 //! a roster nobody is using is a device that cannot connect.
 //!
-//! # Two steps, because a person stands between them
+//! # Two exchanges, with a person between them, whenever they like
 //!
-//! Dialling an invited device ([`open_invited`]) opens the exchange, proves the
-//! device holds the keys it presented, works out the confirmation code, and then
-//! **stops**. Nothing is signed. The pending exchange waits here while the person
-//! compares two screens.
+//! [`collect`] dials an open invite's rendezvous, takes the device's request,
+//! checks the keys it presents are its own, says it was received, and ends the
+//! exchange. Nothing is signed and nobody is asked: the request is kept beside
+//! the invite until a person approves or rejects it.
 //!
-//! `confirm` signs the admission and delivers the roster. `abandon` drops the
-//! exchange and leaves nothing behind. If neither arrives, the exchange expires
-//! on its own deadline — the safe direction, since expiring means nothing was
-//! admitted.
+//! [`deliver`] brings an admission that has been signed to the device it names,
+//! at the rendezvous or at the device's own transport key — the admin that
+//! approved it, or any full member the admission reached. The device adopts
+//! nothing it does not check, so a delivery proves nothing by arriving.
 //!
 //! # This side never listens
 //!
@@ -24,77 +25,29 @@
 //! protocol at all, which is the point: the exception that lets a stranger be
 //! spoken to belongs on the device that has nothing to lose.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use enrollment::code::{Confirmation, Side};
 use enrollment::exchange::Message;
 use enrollment::limits;
 use identity::NodeIdentity;
+use roster::sign::PublicKey;
 use roster::state::RosterState;
 use roster::types::{OperationBody, OperationCore};
-use tokio::sync::Mutex;
 use transport_convesso::enrolment::{Admitting, Channel};
 
 /// Why an admission did not happen.
 pub type Refusal = String;
-
-/// An exchange that is open and waiting for a person.
-///
-/// Holding one is not a decision. Nothing has been signed, the joining device is
-/// a member of nothing, and dropping this leaves both machines as they were.
-pub struct Pending {
-    /// The open channel, kept so the roster can be delivered over it.
-    ///
-    /// Shared, because something has to read it while the person here is still
-    /// deciding: the device being enrolled says the code matched over this same
-    /// channel, and that has to arrive *before* this side's person is asked
-    /// about it. A question about something that has not happened yet is one a
-    /// person answers wrongly.
-    channel: Arc<Mutex<Channel>>,
-    /// The endpoint the channel belongs to, kept so it outlives the exchange.
-    /// Boxed: on convesso it is a node of its own, larger than the rest.
-    endpoint: Box<Admitting>,
-    /// What the joining device said it is.
-    applicant: Applicant,
-    /// What the invite it came through says it will be: the name, role, mode,
-    /// groups and address the admin chose when inviting.
-    ///
-    /// With it, the invite's secret: so the invite is marked used once the
-    /// admission is signed, and not before. Boxed, being not small.
-    invited: Box<(crate::invites::Invited, [u8; enrollment::invite::SECRET_LEN])>,
-    /// The code both screens must show.
-    code: Confirmation,
-    /// When this exchange stops being usable.
-    expires: Instant,
-    /// Whether the device being enrolled has said the code matched.
-    ///
-    /// Set by the task reading the channel, read by whatever asks this side's
-    /// person. Nothing is signed while it is false.
-    accepted: Arc<AtomicBool>,
-    /// The name the joining device will be admitted under: the one it proposed,
-    /// made usable (`admitted_name`).
-    name: String,
-    /// The device already answering to the name this one proposes, if there is
-    /// one.
-    ///
-    /// Worked out when the exchange opens, against the roster this admission is
-    /// being made into, so that a person is asked before anything is signed
-    /// rather than told afterwards.
-    taken: Option<Taken>,
-}
 
 /// The device asking to be admitted: its keys and the name it proposes, as it
 /// introduced itself over an invite's exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applicant {
     /// Its signing key: its identity.
-    pub signing: roster::sign::PublicKey,
+    pub signing: PublicKey,
     /// Its transport key.
-    pub transport: roster::sign::PublicKey,
+    pub transport: PublicKey,
     /// Its attestation key.
-    pub attestation: roster::sign::PublicKey,
+    pub attestation: PublicKey,
     /// The name it proposes.
     pub name: String,
 }
@@ -110,7 +63,8 @@ impl From<&enrollment::exchange::Introduction> for Applicant {
     }
 }
 
-/// A device already answering to the name a joining device proposes.
+/// A device already answering to the name a joining device will be admitted
+/// under.
 ///
 /// Carries the **identifier** as well as the name, because a name is not an
 /// identity: the device asking to join has different keys and will have a
@@ -124,191 +78,178 @@ pub struct Taken {
     pub device: roster::id::DeviceId,
 }
 
-impl Pending {
-    /// The name the joining device proposed for itself, made usable: what the
-    /// admin is shown, before anything is signed, and what it is admitted under.
-    #[must_use]
-    pub fn proposed_name(&self) -> &str {
-        &self.name
-    }
-
-    /// The name its invite was issued under.
-    #[must_use]
-    pub fn invited_name(&self) -> &str {
-        &self.invited.0.name
-    }
-
-    /// The device already answering to that name, if there is one.
-    #[must_use]
-    pub const fn taken(&self) -> Option<&Taken> {
-        self.taken.as_ref()
-    }
-
-    /// The joining device's signing key, in the shape a person can compare.
-    #[must_use]
-    pub fn fingerprint(&self) -> String {
-        crate::relay::fingerprint(self.applicant.signing.as_bytes())
-    }
-
-    /// The code this exchange produced.
-    #[must_use]
-    pub fn code(&self) -> &Confirmation {
-        &self.code
-    }
-
-    /// The secret of the invite this device came through.
-    #[must_use]
-    pub fn invite_secret(&self) -> &[u8; enrollment::invite::SECRET_LEN] {
-        &self.invited.1
-    }
-
-    /// Whether this exchange is still usable.
-    #[must_use]
-    pub fn live(&self) -> bool {
-        Instant::now() < self.expires
-    }
-
-    /// Whether the device being enrolled has said the code matched.
-    #[must_use]
-    pub fn accepted(&self) -> bool {
-        self.accepted.load(Ordering::SeqCst)
-    }
-
-    /// Starts listening for that, in the background. Called by [`open`].
-    ///
-    /// One message, under the exchange's own deadline. A device that says
-    /// nothing costs this side the deadline and no more; a device that says
-    /// something other than an acceptance leaves the flag false, which reads the
-    /// same to everyone: there is nothing to sign.
-    fn listen(&self) {
-        let channel = Arc::clone(&self.channel);
-        let accepted = Arc::clone(&self.accepted);
-        let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
-        tokio::spawn(async move {
-            let mut held = channel.lock().await;
-            if let Ok(Message::Accepted) = receive(&mut held, deadline).await {
-                accepted.store(true, Ordering::SeqCst);
-            }
-        });
-    }
-}
-
-impl core::fmt::Debug for Pending {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Pending")
-            .field("proposed_name", &self.applicant.name)
-            .field("code", &self.code.as_str())
-            .field("live", &self.live())
-            .finish()
-    }
-}
-
-/// Delivers an admission signed somewhere this process could not sign it.
+/// Dials the rendezvous an open invite's secret derives, at the relay it names,
+/// and takes the request of the device waiting there.
 ///
-/// The endpoint is closed whatever happens, as [`confirm`] closes it: an
-/// exchange that is over must not leave a socket bound, whichever half of the
-/// act ended it.
-pub async fn finish_with(
-    pending: Pending,
-    signed: Vec<u8>,
-    spec_name: String,
-    log: &[Vec<u8>],
-    snapshot: Option<Vec<u8>>,
-) -> Result<(Vec<u8>, String), Refusal> {
-    let (signed, said) =
-        finish_with_all(pending, vec![signed], spec_name, log, &[], snapshot, None).await?;
-    Ok((signed.into_iter().next().unwrap_or_default(), said))
-}
-
-/// Delivers an admission and what was signed with it — the settings an invite
-/// chose — resting on `base` where this device's roster was compacted, with the
-/// `pieces` of the batches it holds.
-///
-/// The endpoint is closed whatever happens, as [`finish_with`] closes it.
+/// Both proofs are checked before anything is kept: the signing key's, over
+/// the request it made for **this** invite, and the transport key's, over this
+/// channel. The device is then told its request was received, and the exchange
+/// ends.
 ///
 /// # Errors
 ///
-/// When the exchange cannot deliver.
-pub async fn finish_with_all(
-    pending: Pending,
-    signed: Vec<Vec<u8>>,
-    spec_name: String,
-    log: &[Vec<u8>],
-    pieces: &[Vec<u8>],
-    snapshot: Option<Vec<u8>>,
-    base: Option<enrollment::adopt::Base>,
-) -> Result<(Vec<Vec<u8>>, String), Refusal> {
-    let mut pending = pending;
-    let outcome =
-        deliver_signed(&mut pending, signed, spec_name, log, pieces, snapshot, base).await;
-    (*pending.endpoint).close().await;
+/// When the device cannot be reached, says something other than an
+/// introduction, or does not prove the keys it presents.
+pub async fn collect(invite: &enrollment::Invite) -> Result<Applicant, Refusal> {
+    let endpoint = Admitting::dialling().await.map_err(|cause| cause.to_string())?;
+    let outcome = take_request(&endpoint, invite).await;
+    endpoint.close().await;
     outcome
 }
 
-/// Signs the admission and delivers the network.
+async fn take_request(
+    endpoint: &Admitting,
+    invite: &enrollment::Invite,
+) -> Result<Applicant, Refusal> {
+    let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
+    let rendezvous = transport_convesso::enrolment::rendezvous_key(&invite.rendezvous_seed())
+        .map_err(|cause| cause.to_string())?;
+    let mut channel = reach(endpoint, &rendezvous, &invite.relay).await?;
+    let material = channel.material().map_err(|cause| cause.to_string())?;
+    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
+        return Err("the device said something other than its request".to_owned());
+    };
+    introduction
+        .verify(&material, &invite.network, &rendezvous)
+        .map_err(|cause| cause.to_string())?;
+    send(&mut channel, &Message::Received, deadline).await?;
+    // Held open until the device has read it and gone, or a few seconds:
+    // closed at once, the endpoint took the message with it, and the device
+    // went on believing nobody had its request.
+    let _gone = receive(&mut channel, RECEIVED_LINGER).await;
+    Ok(Applicant::from(&introduction))
+}
+
+/// How long the exchange is held open after saying a request was received.
+const RECEIVED_LINGER: Duration = Duration::from_secs(5);
+
+/// Where a device to be given the network waits, and what it must be.
+pub struct Destination<'a> {
+    /// The key dialled: the invite's rendezvous key, or the device's own
+    /// transport key.
+    pub dialled: PublicKey,
+    /// The relay it waits at: the network's.
+    pub relay: &'a str,
+    /// The signing key the admission names.
+    pub signing: &'a PublicKey,
+    /// The transport key the admission names.
+    pub transport: &'a PublicKey,
+}
+
+/// What a delivery carries: the roster, as an admin delivers it.
+pub struct Delivery {
+    /// Every operation this device holds, the admission among them.
+    pub operations: Vec<Vec<u8>>,
+    /// The pieces of the batches among them.
+    pub pieces: Vec<Vec<u8>>,
+    /// The network's snapshot, where this device holds one.
+    pub snapshot: Option<Vec<u8>>,
+    /// The state the log rests on, where this roster was compacted.
+    pub base: Option<enrollment::adopt::Base>,
+}
+
+/// Brings the network to the device `destination` names.
 ///
-/// Called only after a person has compared two screens. The role is chosen here
-/// and not asked for: a joining device proposes a name and nothing else.
+/// The device introduces itself first, as it does to whoever calls. Only the
+/// device the admission names is given anything: its transport key — which it
+/// proves over this channel — and its signing key must be the admission's.
+/// Anybody else waiting at a rendezvous whose invite they read is given
+/// nothing.
+///
+/// Returns whether the device said it adopted the network. What it says is a
+/// courtesy, not evidence: the admission is signed already, and a device that
+/// lied here would only be lying about itself.
 ///
 /// # Errors
 ///
-/// When the exchange has expired, the operation cannot be signed, or the roster
-/// cannot be delivered.
-pub async fn confirm(
-    pending: Pending,
-    identity: &NodeIdentity,
-    state: &RosterState,
-    heads: Vec<roster::id::OperationId>,
-    log: &[Vec<u8>],
-    snapshot: Option<Vec<u8>>,
-    keeping_the_name: bool,
-) -> Result<(Vec<u8>, String), Refusal> {
-    let mut pending = pending;
-    // Closed whatever happens: an exchange that expired, a declined lock or a
-    // delivery that failed must not leave the endpoint's socket bound.
-    let outcome =
-        deliver(&mut pending, identity, state, heads, log, snapshot, keeping_the_name).await;
-    (*pending.endpoint).close().await;
+/// When the device cannot be reached, is not the device the admission names,
+/// or the exchange fails before the roster is sent.
+pub async fn deliver(destination: &Destination<'_>, delivery: &Delivery) -> Result<bool, Refusal> {
+    let endpoint = Admitting::dialling().await.map_err(|cause| cause.to_string())?;
+    let outcome = bring(&endpoint, destination, delivery).await;
+    endpoint.close().await;
     outcome
+}
+
+async fn bring(
+    endpoint: &Admitting,
+    destination: &Destination<'_>,
+    delivery: &Delivery,
+) -> Result<bool, Refusal> {
+    let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
+    let mut channel = reach(endpoint, &destination.dialled, destination.relay).await?;
+    let material = channel.material().map_err(|cause| cause.to_string())?;
+    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
+        return Err("the device said something other than an introduction".to_owned());
+    };
+    if introduction.transport != *destination.transport
+        || introduction.signing != *destination.signing
+    {
+        return Err("the device that answered is not the one admitted".to_owned());
+    }
+    introduction
+        .transport_possession
+        .verify(&introduction.transport, &material)
+        .map_err(|cause| cause.to_string())?;
+
+    // Where this roster was compacted its log no longer reaches the genesis, so
+    // the state beneath it goes first, in as many parts as it takes.
+    if let Some(base) = &delivery.base {
+        let pieces = roster::transfer::pieces_of(&base.state);
+        for part in pieces.chunks(enrollment::exchange::BASE_PIECES_PER_MESSAGE) {
+            let message = Message::Base { root: base.root.clone(), pieces: part.to_vec() };
+            send(&mut channel, &message, deadline).await?;
+        }
+    }
+    // A batch's operation is only its header: without its pieces the joiner
+    // holds it incomplete, and whatever was signed after it — this admission,
+    // where a batch came before — would wait on it.
+    for part in delivery.pieces.chunks(enrollment::exchange::BATCH_PIECES_PER_MESSAGE) {
+        send(&mut channel, &Message::Batch { pieces: part.to_vec() }, deadline).await?;
+    }
+    // The whole log, not only the admission: every device appears together,
+    // and a joiner that received one operation would have a network with two
+    // members and no idea about the rest. The snapshot goes with it, so the
+    // device arrives able to date what it was given.
+    let admission = Message::Admission {
+        operations: delivery.operations.clone(),
+        snapshot: delivery.snapshot.clone(),
+    };
+    send(&mut channel, &admission, deadline).await?;
+
+    Ok(matches!(receive(&mut channel, deadline).await, Ok(Message::Outcome { taken: true })))
+}
+
+/// Reaches `key` at `relay`, giving it little time: a device that is not there
+/// is the usual answer.
+async fn reach(endpoint: &Admitting, key: &PublicKey, relay: &str) -> Result<Channel, Refusal> {
+    tokio::time::timeout(crate::limits::INVITE_DIAL_PATIENCE, endpoint.reach(key, relay))
+        .await
+        .map_err(|_| "the device did not answer".to_owned())?
+        .map_err(|cause| cause.to_string())
 }
 
 /// Decides everything an admission needs decided, and stops at its signature.
 ///
-/// The exchange must be live and the far side must have said the code matched —
-/// both checked here, before anything is prepared, because a device that has to
-/// ask somebody for a signature must not ask for one that was never going to be
-/// used.
+/// Returns the operation to be signed, and the name it admits under, which is
+/// not always the name the invite gave.
 ///
-/// Returns the operation to be signed, and the name it admits under, which is not
-/// always the name that was proposed.
-pub async fn core(
-    pending: &mut Pending,
+/// # Errors
+///
+/// When the operation cannot be made.
+pub fn admission_core(
+    applicant: &Applicant,
+    invited: &crate::invites::Invited,
     identity: &NodeIdentity,
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
     keeping_the_name: bool,
 ) -> Result<(OperationCore, String), Refusal> {
-    if !pending.live() {
-        return Err("this enrolment took too long and has expired. Start it again.".to_owned());
-    }
-
-    // Nothing is signed until the device being enrolled has said that the code a
-    // person typed into it matched. That arrives over this same channel while
-    // this side's person is still deciding, which is why it is listened for
-    // rather than waited for here: by the time anybody answers, it has either
-    // happened or it has not.
-    if !pending.accepted() {
-        return Err("the device being enrolled has not said the code was accepted. Type the six digits into it first; if it shows something else, start again. Nothing was signed."
-            .to_owned());
-    }
-
-    let spec = identity_spec(&pending.applicant, &pending.invited.0, state, keeping_the_name)?;
+    let spec = identity_spec(applicant, invited, state, keeping_the_name)?;
     let spec_name = spec.name.clone();
     let operation = OperationCore::new(
-        // The minute it was signed, on this device's clock. This used to be a
-        // counter, on the belief that the value only had to rise; nothing reads it
-        // as a sequence, the roster defines it as a time for display, and a
-        // counter there rendered every admission as signed in January 1970.
+        // The minute it was signed, on this device's clock. Nothing reads it as
+        // a sequence; the roster defines it as a time for display.
         crate::clock::signing_time(),
         identity.signing_key().algorithm(),
         OperationBody::AddDevice(spec),
@@ -317,110 +258,7 @@ pub async fn core(
         state.network,
     )
     .map_err(|cause| cause.to_string())?;
-
     Ok((operation, spec_name))
-}
-
-/// Delivers an admission that has been signed, however it came to be signed.
-///
-/// The deadline here is per message, not for the exchange: by the time this runs
-/// a person may have answered a prompt on this machine, and the device waiting to
-/// be admitted is still waiting — it allows far longer for the whole thing than
-/// one message is given.
-async fn deliver_signed(
-    pending: &mut Pending,
-    signed: Vec<Vec<u8>>,
-    spec_name: String,
-    log: &[Vec<u8>],
-    pieces: &[Vec<u8>],
-    snapshot: Option<Vec<u8>>,
-    base: Option<enrollment::adopt::Base>,
-) -> Result<(Vec<Vec<u8>>, String), Refusal> {
-    let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
-
-    // The whole log, not only the admission: §3.1 says every device appears
-    // together, and a joiner that received one operation would have a network
-    // with two members and no idea about the rest.
-    let mut operations = log.to_vec();
-    operations.extend(signed.iter().cloned());
-
-    {
-        let mut channel = pending.channel.lock().await;
-        // Where this roster was compacted its log no longer reaches the
-        // genesis, so the state beneath it goes first, in as many parts as it
-        // takes.
-        if let Some(base) = base {
-            let pieces = roster::transfer::pieces_of(&base.state);
-            for part in pieces.chunks(enrollment::exchange::BASE_PIECES_PER_MESSAGE) {
-                let message = Message::Base { root: base.root.clone(), pieces: part.to_vec() };
-                send(&mut channel, &message, deadline).await?;
-            }
-        }
-        // A batch's operation is only its header: without its pieces the joiner
-        // holds it incomplete, and whatever was signed after it — this
-        // admission, where a batch came before — would wait on it.
-        for part in pieces.chunks(enrollment::exchange::BATCH_PIECES_PER_MESSAGE) {
-            send(&mut channel, &Message::Batch { pieces: part.to_vec() }, deadline).await?;
-        }
-        // The snapshot goes with the roster, so the device arrives able to
-        // confirm what it was given. Without one it would begin having accepted
-        // none — which is the state a device reaches after being out of touch too
-        // long, and a device that has just joined must not look like one.
-        send(&mut channel, &Message::Admission { operations, snapshot }, deadline).await?;
-    }
-
-    // What the other side says about it is a courtesy, not evidence: this side
-    // has already signed, and a device that lied here would only be lying about
-    // itself.
-    let mut channel = pending.channel.lock().await;
-    let said = match receive(&mut channel, deadline).await {
-        Ok(Message::Outcome { taken: true }) => "it adopted the network".to_owned(),
-        Ok(Message::Outcome { taken: false }) => {
-            "it refused the network: it did not find itself admitted in it".to_owned()
-        }
-        Ok(_) | Err(_) => "it did not say whether it adopted the network".to_owned(),
-    };
-
-    // Which name it was admitted under, when that is not the one its invite
-    // gave. Before this a device quietly became `name-2` and nobody was told.
-    // Not the one it proposed: the invite's name decides, and a device that
-    // proposed another was not refused a name in use.
-    let said = if spec_name != admitted_name(&pending.invited.0.name) {
-        format!(
-            "{said}. that name was already in use, so it was admitted as `{}`",
-            crate::control::shown(&spec_name)
-        )
-    } else {
-        said
-    };
-
-    Ok((signed, said))
-}
-
-/// Signs and delivers, over an exchange the caller closes.
-async fn deliver(
-    pending: &mut Pending,
-    identity: &NodeIdentity,
-    state: &RosterState,
-    heads: Vec<roster::id::OperationId>,
-    log: &[Vec<u8>],
-    snapshot: Option<Vec<u8>>,
-    keeping_the_name: bool,
-) -> Result<(Vec<u8>, String), Refusal> {
-    let (operation, spec_name) = core(pending, identity, state, heads, keeping_the_name).await?;
-    let mut signed = vec![
-        identity.sign_operation(&operation).map_err(|cause| crate::control::declined(&cause))?,
-    ];
-    // The mode, groups and address an invite chose, where they are not the
-    // default: set after the admission, in the same act.
-    if let Some(settings) = settings_core(pending, identity, state, &operation)? {
-        signed.push(
-            identity.sign_operation(&settings).map_err(|cause| crate::control::declined(&cause))?,
-        );
-    }
-    let (signed, said) =
-        deliver_signed(pending, signed, spec_name, log, &[], snapshot, None).await?;
-    Ok((signed.into_iter().next().unwrap_or_default(), said))
 }
 
 /// The settings an invited device is admitted with, where its invite chose
@@ -430,12 +268,11 @@ async fn deliver(
 ///
 /// When the operation cannot be made.
 pub fn settings_core(
-    pending: &Pending,
+    invited: &crate::invites::Invited,
     identity: &NodeIdentity,
     state: &RosterState,
     admission: &OperationCore,
 ) -> Result<Option<OperationCore>, Refusal> {
-    let invited = &pending.invited.0;
     let mode = (invited.mode != roster::leaf::Mode::Full).then_some(invited.mode);
     let groups = (!invited.groups.is_empty()).then(|| invited.groups.clone());
     let ipv4 = invited.ipv4.map(Some);
@@ -462,84 +299,17 @@ pub fn settings_core(
     .map_err(|cause| cause.to_string())
 }
 
-/// Opens the exchange with a device that came through one of this device's
-/// invites: dials the rendezvous key its secret derives, at the relay it names,
-/// takes the device's introduction and checks both its proofs, and works out
-/// the code. Stops there, as [`open`] does.
-///
-/// # Errors
-///
-/// When the device cannot be reached, says something other than an
-/// introduction, or does not prove the keys it presents.
-pub async fn open_invited(
-    identity: &NodeIdentity,
-    state: &RosterState,
-    record: &crate::invites::Record,
-) -> Result<Pending, Refusal> {
-    let endpoint = Admitting::dialling(identity, state).await.map_err(|cause| cause.to_string())?;
-    match exchange_invited(&endpoint, &record.invite).await {
-        Ok((channel, code, expires, applicant)) => {
-            let name = admitted_name(&record.invited.name);
-            let pending = Pending {
-                channel: Arc::new(Mutex::new(channel)),
-                endpoint: Box::new(endpoint),
-                applicant,
-                invited: Box::new((record.invited.clone(), record.invite.secret)),
-                code,
-                expires,
-                accepted: Arc::new(AtomicBool::new(false)),
-                taken: holder_of(&name, state),
-                name,
-            };
-            pending.listen();
-            Ok(pending)
-        }
-        Err(refusal) => {
-            endpoint.close().await;
-            Err(refusal)
-        }
-    }
-}
-
-/// Reaches an invited device at its rendezvous key and takes its introduction.
-async fn exchange_invited(
-    endpoint: &Admitting,
-    invite: &enrollment::Invite,
-) -> Result<(Channel, Confirmation, Instant, Applicant), Refusal> {
-    let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
-    let key = transport_convesso::enrolment::rendezvous_key(&invite.rendezvous_seed())
-        .map_err(|cause| cause.to_string())?;
-    // Reaching it is what is tried every few seconds, and given little time: a
-    // device that is not there is the usual answer. Once reached, its
-    // introduction may wait on a person — the possession it proves is signed by
-    // a key that a passphrase or a TPM may guard — and has the exchange's own
-    // deadline, as every step after it does.
-    let mut channel = tokio::time::timeout(
-        crate::limits::INVITE_DIAL_PATIENCE,
-        endpoint.reach(&key, &invite.relay),
-    )
-    .await
-    .map_err(|_| "the invited device did not answer".to_owned())?
-    .map_err(|cause| cause.to_string())?;
-    let material = channel.material().map_err(|cause| cause.to_string())?;
-    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
-        return Err("the device said something other than an introduction".to_owned());
-    };
-    introduction.verify(&material).map_err(|cause| cause.to_string())?;
-    let joining = Side {
-        signing: introduction.signing.clone(),
-        transport: introduction.transport.clone(),
-        attestation: introduction.attestation.clone(),
-    };
-    let code = Confirmation::derive(&joining, &channel.own(), &material)
-        .map_err(|cause| cause.to_string())?;
-    let expires = Instant::now().checked_add(deadline).unwrap_or_else(Instant::now);
-    Ok((channel, code, expires, Applicant::from(&introduction)))
-}
-
-/// Drops an exchange, leaving both machines as they were.
-pub async fn abandon(pending: Pending) {
-    (*pending.endpoint).close().await;
+/// What a person is told about the name a device was admitted under, where it
+/// is not the one its invite gave. Before this a device quietly became
+/// `name-2` and nobody was told.
+#[must_use]
+pub fn renamed_note(spec_name: &str, invited_name: &str) -> Option<String> {
+    (spec_name != admitted_name(invited_name)).then(|| {
+        format!(
+            "that name was already in use, so it was admitted as `{}`",
+            crate::control::shown(spec_name)
+        )
+    })
 }
 
 /// The specification the admitting side writes, from the keys the device
@@ -568,8 +338,7 @@ fn identity_spec(
         )
         .map_err(|cause| cause.to_string())?,
         // The key the joining device will date its roster with. It comes from
-        // the introduction and nowhere else, and the confirmation code covers it, so
-        // what goes into the record is what both people compared.
+        // the request and nowhere else, and the signing key's proof covers it.
         roster::types::KeyEntry::new(
             applicant.attestation.algorithm(),
             roster::types::KeyPurpose::Attestation,
@@ -583,11 +352,11 @@ fn identity_spec(
     // the device that had it is being revoked in the same act, and the name is
     // meant to carry over.
     //
-    // It has to be said here rather than left to fall out. The revocation has
-    // already been signed and applied by the time this runs, and a revoked
-    // device leaves the membership entirely — so the name *is* free. But the
-    // `state` this reads was gathered before any of that, and altering the name
-    // against it would quietly undo what the person asked for.
+    // It has to be said here rather than left to fall out. The revocation may
+    // already be signed and applied by the time this runs, but the `state` this
+    // reads may have been gathered before it, and altering the name against it
+    // would quietly undo what the person asked for.
+    //
     // An invited device takes the name its invite's record gives it, and the
     // role the admin chose when inviting; the name it proposed is a suggestion.
     let proposed = admitted_name(&invited.name);
@@ -596,15 +365,15 @@ fn identity_spec(
         .map_err(|cause| cause.to_string())
 }
 
-/// The name a joining device is admitted under: the one it proposed, made one a
+/// The name a device is admitted under: the one its invite gave, made one a
 /// resolver can answer.
 ///
-/// Lowered when that is all it needs. An older client may propose anything its
-/// person typed, and nobody on this side can be asked to retype it, so a name
-/// that is not a label is made into the nearest one, and the admin is shown that
-/// before signing. A name with nothing usable in it becomes `device`, made unique
-/// like any other.
-fn admitted_name(proposed: &str) -> String {
+/// Lowered when that is all it needs. A record written by an older build may
+/// hold anything its person typed, so a name that is not a label is made into
+/// the nearest one, and the admin is shown that before approving. A name with
+/// nothing usable in it becomes `device`, made unique like any other.
+#[must_use]
+pub fn admitted_name(proposed: &str) -> String {
     crate::names::usable(proposed)
         .ok()
         .or_else(|| crate::names::made_usable(proposed))
@@ -615,7 +384,8 @@ fn admitted_name(proposed: &str) -> String {
 ///
 /// Without regard to case: the resolver answers `Laptop` and `laptop` alike, so
 /// two devices with those names are one name nobody can look up.
-fn holder_of(name: &str, state: &RosterState) -> Option<Taken> {
+#[must_use]
+pub fn holder_of(name: &str, state: &RosterState) -> Option<Taken> {
     state
         .devices
         .values()

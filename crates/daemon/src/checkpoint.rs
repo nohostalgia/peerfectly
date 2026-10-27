@@ -351,7 +351,13 @@ impl Checkpoint {
         heads.len() == self.heads.len() && heads.iter().all(holds)
     }
 
-    /// Whether the invite records may hash to `hash`.
+    /// The invite records it names, as their hash; `None` for none.
+    #[must_use]
+    pub fn invites_hash(&self) -> Option<Hash> {
+        roster::hex::decode(&self.invites).and_then(|bytes| <Hash>::try_from(bytes).ok())
+    }
+
+    /// Whether the invite records hashing to `hash` are the ones it names.
     #[must_use]
     pub fn allows_invites(&self, hash: Option<&Hash>) -> bool {
         self.invites == optional_hex(hash)
@@ -482,6 +488,11 @@ pub struct Keeper {
     held: Mutex<Kept>,
 }
 
+/// How many of the invite records this daemon wrote are believed at once: the
+/// one being written, and the one before it, which a reader may still find in
+/// place while the new one lands.
+const INVITES_BELIEVED: usize = 2;
+
 /// What a keeper last wrote, and what it is allowing beside it.
 #[derive(Default)]
 struct Kept {
@@ -490,13 +501,52 @@ struct Kept {
     at: Option<Instant>,
     bases: Vec<Option<Hash>>,
     light: Vec<Hash>,
+    /// The invite records this daemon wrote, newest last: what a checkpoint
+    /// vouches for, whatever the file holds when it is written. `None` until
+    /// there is a checkpoint or a write to go by.
+    invites: Option<Vec<Option<Hash>>>,
+    /// What a light member keeps, as this daemon last wrote it or found it at
+    /// start where the checkpoint names it: what a checkpoint vouches for,
+    /// whatever the file holds when it is written.
+    light_held: Option<Hash>,
 }
 
 impl Keeper {
     /// A keeper for the network at `paths`, which last wrote `written`.
     #[must_use]
     pub fn new(key: Arc<dyn MachineKey>, paths: Paths, written: Option<Checkpoint>) -> Self {
-        Self { key, paths, held: Mutex::new(Kept { written, ..Kept::default() }) }
+        let invites = written.as_ref().map(|checkpoint| vec![checkpoint.invites_hash()]);
+        Self { key, paths, held: Mutex::new(Kept { written, invites, ..Kept::default() }) }
+    }
+
+    /// Says the daemon is about to write invite records hashing to `hash`
+    /// (`None`: no file). Called before the write, so a checkpoint never
+    /// vouches for what somebody else put there.
+    pub fn writing_invites(&self, hash: Option<Hash>) {
+        if let Ok(mut held) = self.held.lock() {
+            let written = held.invites.get_or_insert_with(Vec::new);
+            written.push(hash);
+            let keep = written.len().saturating_sub(INVITES_BELIEVED);
+            written.drain(..keep);
+        }
+    }
+
+    /// Whether invite records hashing to `hash` are ones this daemon wrote:
+    /// what is read is believed only then. True where there is nothing yet
+    /// to go by.
+    #[must_use]
+    pub fn vouches_invites(&self, hash: Option<&Hash>) -> bool {
+        self.held.lock().is_ok_and(|held| {
+            held.invites.as_ref().is_none_or(|written| written.contains(&hash.copied()))
+        })
+    }
+
+    /// Says what a light member keeps hashes to `hash` now: written by this
+    /// daemon and landed, or found at start as the checkpoint names it.
+    pub fn holds_light(&self, hash: Hash) {
+        if let Ok(mut held) = self.held.lock() {
+            held.light_held = Some(hash);
+        }
     }
 
     /// Writes the checkpoint for `values` where it would say something new.
@@ -506,7 +556,20 @@ impl Keeper {
     ///
     /// When it cannot be signed or written.
     pub fn keep(&self, values: Values, now: bool) -> Result<bool> {
+        let mut values = values;
         let mut held = self.held.lock().map_err(|_| self.poisoned())?;
+        // The invite records the daemon wrote, not whatever the file holds now:
+        // a file changed while the daemon runs is not vouched for by the next
+        // checkpoint, and is dropped at the next start.
+        if let Some(written) = held.invites.as_ref().and_then(|written| written.last()) {
+            values.invites = *written;
+        }
+        // The same for what a light member keeps.
+        if values.light.is_some()
+            && let Some(kept) = held.light_held
+        {
+            values.light = Some(kept);
+        }
         let checkpoint = Checkpoint::of(&values, &held.bases, &held.light);
         if held.written.as_ref() == Some(&checkpoint) {
             held.values = Some(values);
@@ -714,6 +777,42 @@ mod tests {
         keeper.keep(now, true).unwrap();
         let held = read(&paths, &key).unwrap().unwrap();
         assert!(!held.allows_base(None) && held.allows_base(Some(&[9; 32])));
+    }
+
+    /// What a light member keeps is vouched for as the daemon wrote it, not
+    /// as the file holds it when the checkpoint is written: a file changed
+    /// behind a running daemon is not named, and is refused at the next start.
+    #[test]
+    fn a_light_member_is_vouched_for_as_the_daemon_wrote_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path().join("casa"));
+        paths.create().unwrap();
+        let keeper = Keeper::new(key(scratch.path()), paths.clone(), None);
+        let key = SoftwareKey::at(scratch.path()).unwrap().0;
+        let kept = [3; 32];
+        let planted = [4; 32];
+        keeper.holds_light(kept);
+
+        let mut now = values(&paths);
+        now.light = Some(planted);
+        keeper.keep(now.clone(), true).unwrap();
+        let held = read(&paths, &key).unwrap().unwrap();
+        assert!(held.allows_light(&kept), "what the daemon holds");
+        assert!(!held.allows_light(&planted), "not what the file was made to hold");
+
+        // A write named and not landed: the one in place stays named beside it.
+        keeper.allow_light([5; 32]).unwrap();
+        keeper.keep(now.clone(), true).unwrap();
+        let held = read(&paths, &key).unwrap().unwrap();
+        assert!(held.allows_light(&kept) && held.allows_light(&[5; 32]));
+        assert!(!held.allows_light(&planted));
+
+        // Landed: only the new one.
+        keeper.holds_light([5; 32]);
+        keeper.landed();
+        keeper.keep(now, true).unwrap();
+        let held = read(&paths, &key).unwrap().unwrap();
+        assert!(held.allows_light(&[5; 32]) && !held.allows_light(&kept));
     }
 
     #[test]

@@ -48,8 +48,7 @@ pub fn resolve(state: &RosterState, target: &Target, given: &str) -> Result<Rena
     if found.name == to {
         return Err(format!("{} is already this device's name. Nothing was signed.", shown(&to)));
     }
-    if let Some(holder) =
-        state.devices.named(&to).into_iter().find(|record| record.id != found.id)
+    if let Some(holder) = state.devices.named(&to).into_iter().find(|record| record.id != found.id)
     {
         return Err(format!(
             "{} is already the name of {} [{}]. Nothing was signed.",

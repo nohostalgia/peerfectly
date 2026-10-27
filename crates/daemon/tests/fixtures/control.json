@@ -1,4 +1,182 @@
 {
+  "administrator": [
+    [
+      "Status",
+      false
+    ],
+    [
+      "Waiting",
+      false
+    ],
+    [
+      {
+        "Up": {
+          "network": "casa"
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Down": {
+          "network": "casa"
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Pending": {
+          "network": null
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Exposed": {
+          "network": null
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Invite": {
+          "admin": false,
+          "groups": [],
+          "ipv4": null,
+          "light": true,
+          "minutes": 30,
+          "name": "tv",
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Withdraw": {
+          "name": "tv",
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Approve": {
+          "name": "tv",
+          "network": "casa",
+          "replace": false
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Reject": {
+          "name": "tv",
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Join": {
+          "invite": "peerfectly-invite-v1:abc",
+          "name": "phone"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "CancelJoin": {
+          "label": "joining"
+        }
+      },
+      true
+    ],
+    [
+      "Confirm",
+      true
+    ],
+    [
+      "Abandon",
+      true
+    ],
+    [
+      {
+        "Forget": {
+          "label": "casa",
+          "last_admin": false
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Found": {
+          "ipv4_range": null,
+          "label": "casa",
+          "name": "pixel",
+          "relay": null,
+          "suffix": "casa.internal",
+          "window_days": null
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Revoke": {
+          "network": "casa",
+          "reason": "stolen",
+          "target": {
+            "Id": "0a1b-2c3d-4e5f-6a7b"
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
+        "RevokeVoiding": {
+          "network": "casa",
+          "reason": "stolen",
+          "target": {
+            "Id": "0a1b-2c3d-4e5f-6a7b"
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
+        "SetAnchors": {
+          "anchors": [
+            {
+              "Name": "nas"
+            }
+          ],
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "ChangeRelay": {
+          "immediately": false,
+          "network": "casa",
+          "relay": "r.example"
+        }
+      },
+      true
+    ]
+  ],
   "outcomes": [
     {
       "Reported": {
@@ -252,6 +430,7 @@
                 "signed_here": "NotRecorded"
               }
             ],
+            "waiting_never_met": 3,
             "waiting_unlisted": 3
           },
           {
@@ -339,6 +518,7 @@
             },
             "tunnel": "Down",
             "waiting": [],
+            "waiting_never_met": 0,
             "waiting_unlisted": 0
           }
         ],
@@ -348,7 +528,8 @@
             "cause": "IdentityWillNotOpen",
             "label": "old"
           }
-        ]
+        ],
+        "waiting_on": null
       }
     },
     {
@@ -359,24 +540,17 @@
         "may_stop_the_daemon": false,
         "networks": [],
         "note": "one network on this machine belongs to somebody else, and none to you",
-        "unusable": []
+        "unusable": [],
+        "waiting_on": null
       }
     },
     "Done",
     {
-      "Admitting": {
-        "accepted": true,
-        "code": "418209",
-        "fingerprint": "AB:CD",
-        "proposed_name": "tablet",
-        "taken": {
-          "id": "0b0b-0b0b-0b0b-0b0b",
-          "name": "tablet"
-        }
+      "JoinStarted": {
+        "fingerprint": "AB12-CD34-EF56-7890-1234",
+        "label": "joining"
       }
     },
-    "Enrolling",
-    "Joining",
     {
       "Invited": {
         "expires_at": 1758300000,
@@ -386,24 +560,42 @@
       }
     },
     {
-      "InvitesHeld": [
-        {
-          "expires_at": 1758300000,
-          "name": "sensor",
-          "standing": "open"
-        },
-        {
-          "expires_at": 1758200000,
-          "name": "laptop",
-          "standing": "used"
-        }
-      ]
-    },
-    {
-      "Adopted": {
-        "carrying": false,
-        "devices": 3,
-        "suffix": "studio.internal"
+      "Pending": {
+        "invites": [
+          {
+            "expires_at": 1758300000,
+            "name": "sensor",
+            "network": "casa",
+            "request": null,
+            "standing": "open"
+          },
+          {
+            "expires_at": 1758200000,
+            "name": "tablet",
+            "network": "casa",
+            "request": {
+              "arrived_at": 1758190000,
+              "fingerprint": "AB12-CD34-EF56-7890-1234",
+              "proposed_name": "Mario's tablet",
+              "taken": {
+                "id": "0b0b-0b0b-0b0b-0b0b",
+                "name": "tablet"
+              }
+            },
+            "standing": "requested"
+          }
+        ],
+        "joins": [
+          {
+            "fingerprint": "9F00-1E2D-3C4B-5A69-7887",
+            "label": "joining",
+            "problem": "the exchange took too long",
+            "requested_at": 1758100060,
+            "since": 1758100000,
+            "standing": "requested"
+          }
+        ],
+        "stopped": "the founding of `casa`, waiting for its relay's key to be confirmed"
       }
     },
     {

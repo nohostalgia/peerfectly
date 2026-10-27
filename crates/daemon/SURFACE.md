@@ -127,6 +127,11 @@ enforced or in effect.
 `Network::waiting_unlisted` counts operations that were not listed. Revocations
 are never among them. Say that there are more; never draw the list as complete.
 
+`Network::waiting_never_met` counts members owed something that were never in
+contact with this device. They are not under any operation in `waiting`: they hold
+no network yet for anything to be missing from, and take the current state when
+they first make contact. Say how many; do not draw them as missing an operation.
+
 ### A network this device cannot confirm says so, and says which
 
 `Network::confirmation` is `None` for a roster confirmed within the time the

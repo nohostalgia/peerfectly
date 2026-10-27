@@ -501,12 +501,18 @@ mod tests {
     }
 
     fn state_with_suffix(devices: Vec<DeviceRecord>, suffix: &str) -> RosterState {
-        RosterState::from_parts(NetworkId::from_bytes([1; 32]), NetworkParams::new(
+        RosterState::from_parts(
+            NetworkId::from_bytes([1; 32]),
+            NetworkParams::new(
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 suffix,
                 2_592_000,
             )
-            .expect("valid"), devices.into_iter().map(|record| (record.id, record)).collect(), BTreeSet::new(), Default::default())
+            .expect("valid"),
+            devices.into_iter().map(|record| (record.id, record)).collect(),
+            BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     #[test]

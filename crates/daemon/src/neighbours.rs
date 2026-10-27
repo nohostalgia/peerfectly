@@ -226,10 +226,8 @@ pub fn claim_holds(
 /// is not one.
 fn full_member(state: &RosterState, device: &DeviceId) -> Option<Member> {
     let leaf = state.devices.get(device)?;
-    (leaf.settings.mode == roster::leaf::Mode::Full).then(|| Member {
-        device: *device,
-        admitted_by: admission(&leaf.record.added_by, device),
-    })
+    (leaf.settings.mode == roster::leaf::Mode::Full)
+        .then(|| Member { device: *device, admitted_by: admission(&leaf.record.added_by, device) })
 }
 
 /// Every full member of a state, read as it goes: a million are not listed.
@@ -389,9 +387,8 @@ impl Choices {
             (0..SLOTS)
                 .zip(&self.slots)
                 .filter_map(|(slot, kept)| {
-                    let found = kept.kept.iter().map(|(_, device)| *device).find(|device| {
-                        !silent(device)
-                    });
+                    let found =
+                        kept.kept.iter().map(|(_, device)| *device).find(|device| !silent(device));
                     // Every one kept is silent, and some are not kept: only a
                     // walk finds the best of the rest.
                     match (found, kept.floor) {
@@ -710,7 +707,13 @@ mod full_only {
         let params =
             NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
                 .unwrap();
-        let mut state = RosterState::from_parts(NetworkId::from_bytes([7; 32]), params, BTreeMap::new(), BTreeSet::new(), BTreeMap::new());
+        let mut state = RosterState::from_parts(
+            NetworkId::from_bytes([7; 32]),
+            params,
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+        );
         let batch = OperationId::from_bytes([9; 32]);
         for n in 0..5_050_u32 {
             let light = n >= 50;

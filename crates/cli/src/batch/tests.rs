@@ -131,8 +131,14 @@ fn an_act_and_its_snapshot_hold_together() {
     assert_eq!(2, read.len());
 }
 
+/// An approval of the request for `laptop`, replacing the device holding the
+/// name or not.
+fn approving(replace: bool) -> Command {
+    Command::Approve { network: None, name: "laptop".to_owned(), replace }
+}
+
 /// A replacement: a revocation, the admission built on it, and the snapshot
-/// over both — for an admission confirmation, and nothing else.
+/// over both — for an approval that replaces, and nothing else.
 #[test]
 fn a_replacement_holds_together_only_as_an_admission() {
     let admin = Admin::new();
@@ -141,8 +147,12 @@ fn a_replacement_holds_together_only_as_an_admission() {
     let over = admin.snapshot_over(vec![admit.id()]);
     let items = || vec![operation(&revoke), operation(&admit), snapshot(&over)];
 
-    assert!(holds_together(&Command::Replace, &batch("casa", items())).is_ok());
-    assert!(holds_together(&Command::Confirm, &batch("casa", items())).is_ok());
+    assert!(holds_together(&approving(true), &batch("casa", items())).is_ok());
+    let refused = holds_together(&approving(false), &batch("casa", items())).unwrap_err();
+    assert!(
+        refused.contains("two acts"),
+        "an approval that does not replace revokes nothing: {refused}"
+    );
     let refused = holds_together(&revoking(None), &batch("casa", items())).unwrap_err();
     assert!(refused.contains("two acts"), "{refused}");
 }
@@ -210,7 +220,7 @@ fn acts_that_do_not_follow_one_another_are_refused() {
     let revoke = revocation(&admin, Vec::new());
     let beside = admission(&admin, Vec::new());
     let refused = holds_together(
-        &Command::Replace,
+        &approving(true),
         &batch("casa", vec![operation(&revoke), operation(&beside)]),
     )
     .unwrap_err();
@@ -482,19 +492,19 @@ fn the_list_names_the_network_and_every_act() {
     let admit = admission(&admin, vec![revoke.id()]);
     let over = admin.snapshot_over(vec![admit.id()]);
     let read = holds_together(
-        &Command::Replace,
+        &approving(true),
         &batch("ufficio", vec![operation(&revoke), operation(&admit), snapshot(&over)]),
     )
     .unwrap();
 
-    let shown = listed(&read, "ufficio", &Command::Replace);
+    let shown = listed(&read, "ufficio", &approving(true));
     assert!(shown.starts_with("ufficio: 3 acts to sign with this network's admin key"), "{shown}");
     assert!(shown.contains("  1. revoke"), "{shown}");
     assert!(shown.contains("  2. admit"), "{shown}");
     assert!(shown.contains("  3. record"), "{shown}");
     assert!(shown.contains("invited again"), "{shown}");
 
-    let line = summary(&read, "ufficio", &Command::Replace);
+    let line = summary(&read, "ufficio", &approving(true));
     assert!(line.starts_with("peerfectly · ufficio: revoke"), "{line}");
     assert!(!line.contains('\n'), "one line: {line}");
 }

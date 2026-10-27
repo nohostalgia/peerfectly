@@ -74,6 +74,7 @@ pub mod founding;
 pub mod gateway;
 pub mod invites;
 pub mod joining;
+pub mod joins;
 pub mod keys;
 pub mod lifecycle;
 pub mod limits;
@@ -161,6 +162,7 @@ mod surface {
         "gateway",
         "invites",
         "joining",
+        "joins",
         "keys",
         "lifecycle",
         "lookup",

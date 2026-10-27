@@ -43,6 +43,9 @@ pub(crate) struct Membership {
     pub(crate) waiting: Vec<Waiting>,
     /// How many further operations are waiting and not listed.
     pub(crate) waiting_unlisted: usize,
+    /// How many members owed something were never in contact, and so are not
+    /// listed under each operation.
+    pub(crate) waiting_never_met: usize,
     /// When each device was last in contact with this one.
     pub(crate) contacts: LastContacts,
 }
@@ -245,12 +248,21 @@ pub(crate) fn owed_to(operation: &VerifiedOperation, member: &DeviceId) -> bool 
     !matches!(operation.body(), OperationBody::RevokeDevice { device, .. } if device == member)
 }
 
-/// What signed here some member has not said it holds, per operation.
+/// What signed here some member has not said it holds, per operation, how many
+/// operations were left out of the list, and how many members were never in
+/// contact at all.
 ///
 /// Revocations first, then the rest in the order they are held, and the rest
 /// bounded by [`WAITING_LISTED`]. Revocations are never bounded: the one list a
 /// person reads before deciding a stolen laptop is dealt with cannot be the list
 /// that dropped its revocation at entry twenty-one.
+///
+/// A member never in contact with this device, and not connected now, is counted
+/// rather than listed under each operation. It holds no network yet for anything
+/// to be missing from — a board of a batch still in its box — and it receives
+/// the current state at its first contact, from whoever it meets. Listed, a lot of
+/// a thousand boards would put a thousand lines under every operation, and bury
+/// the device that matters.
 pub(crate) fn waiting(
     directory: &Directory,
     state: &RosterState,
@@ -259,9 +271,11 @@ pub(crate) fn waiting(
     confirmed: &Confirmed,
     connected: &BTreeSet<DeviceId>,
     contacts: &LastContacts,
-) -> (Vec<Waiting>, usize) {
+) -> (Vec<Waiting>, usize, usize) {
     let mut revocations = Vec::new();
     let mut others = Vec::new();
+    let mut never_met = BTreeSet::new();
+    let met = |member: &DeviceId| connected.contains(member) || contacts.minute(member).is_some();
 
     for operation in authored {
         let owed: Vec<Owed> = state
@@ -270,6 +284,13 @@ pub(crate) fn waiting(
             .filter(|member| member != me)
             .filter(|member| owed_to(operation, member))
             .filter(|member| !confirmed.holds(member, &operation.id()))
+            .filter(|member| {
+                if met(member) {
+                    return true;
+                }
+                never_met.insert(*member);
+                false
+            })
             .map(|member| Owed {
                 device: directory.named(&member),
                 connected: connected.contains(&member),
@@ -294,7 +315,7 @@ pub(crate) fn waiting(
 
     let unlisted = others.len().saturating_sub(WAITING_LISTED);
     revocations.extend(others.into_iter().take(WAITING_LISTED));
-    (revocations, unlisted)
+    (revocations, unlisted, never_met.len())
 }
 
 #[cfg(test)]
@@ -882,7 +903,7 @@ mod tests {
         assert!(owed_to(&revocation, &id(7)), "and owed to anybody else");
 
         let (_, _, directory) = view(&before);
-        let (listed, _) = waiting(
+        let (listed, _, _) = waiting(
             &directory,
             &state_before,
             &[&revocation],
@@ -941,7 +962,7 @@ mod tests {
                     || matches!(op.body(), OperationBody::RevokeDevice { .. })
             })
             .collect();
-        let (listed, unlisted) = waiting(
+        let (listed, unlisted, never_met) = waiting(
             &directory,
             &state,
             &mine,
@@ -950,6 +971,9 @@ mod tests {
             &BTreeSet::from([id(3)]),
             &LastContacts::default(),
         );
+        // The twenty-five admitted were never in contact: counted once each, and
+        // not listed under every operation. `laptop` is revoked, so no member.
+        assert_eq!(never_met, 25);
 
         assert!(
             listed.first().unwrap().does.is_revocation(),
@@ -998,11 +1022,13 @@ mod tests {
         let mut contacts = LastContacts::default();
         contacts.touch(id(2), 29_283_334);
 
-        let (listed, _) =
+        let (listed, _, never_met) =
             waiting(&directory, &state, &desk, &id(1), &confirmed, &BTreeSet::new(), &contacts);
         let owed: Vec<Option<&str>> =
             listed.first().unwrap().owed.iter().map(|entry| name(&entry.device)).collect();
-        assert!(owed.contains(&Some("laptop")) && owed.contains(&Some("desk")));
+        assert!(owed.contains(&Some("laptop")), "in contact once, so owed it by name");
+        assert!(!owed.contains(&Some("desk")), "never in contact: counted, not listed");
+        assert_eq!(never_met, 1);
         assert!(!owed.contains(&Some("phone")), "the member that said it holds it is not owed it");
 
         let laptop = listed

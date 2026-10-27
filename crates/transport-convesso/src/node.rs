@@ -284,7 +284,13 @@ impl ConvessoTransport {
         evidence: Vec<u8>,
         judge: Judge,
     ) -> Result<Self> {
-        let state = RosterState::from_parts(network, params, std::collections::BTreeMap::new(), std::collections::BTreeSet::new(), std::collections::BTreeMap::new());
+        let state = RosterState::from_parts(
+            network,
+            params,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeMap::new(),
+        );
         let transport = Self::bind_with(identity, state, None, Some(judge)).await?;
         transport.update_evidence(evidence);
         Ok(transport)
@@ -789,8 +795,12 @@ fn ensure_readers(shared: &Arc<Shared>) {
 
 /// Starts a reader for `address` if it has none running.
 fn ensure_reader(shared: &Arc<Shared>, address: Address) {
+    ensure_reader_of(shared, address.peer_id());
+}
+
+/// Starts a reader for `peer` if it has none running.
+fn ensure_reader_of(shared: &Arc<Shared>, peer: PeerId) {
     let Ok(mut readers) = shared.readers.lock() else { return };
-    let peer = address.peer_id();
     if readers.get(&peer).is_some_and(|reader| !reader.is_finished()) {
         return;
     }
@@ -965,6 +975,14 @@ async fn read_context_events(shared: Arc<Shared>, mut events: ContextEvents) {
             ContextEvent::Datagram { peer, data, .. } => on_datagram(&shared, peer, &data),
             ContextEvent::ChannelReset { peer, reason } => {
                 lose_peer(&shared, &peer, &reset(&reason));
+            }
+            // A node holding no roster has a reader for nobody it has not met:
+            // a member admitted a moment ago would have its open held back
+            // unread — convesso grants a peer's channel only the room of its
+            // receiver — and its dial would time out. Whoever connects is read,
+            // and the judge decides what what it opens with is worth.
+            ContextEvent::Connected { peer } if shared.judge.is_some() => {
+                ensure_reader_of(&shared, peer);
             }
             ContextEvent::Connected { .. } | ContextEvent::PathChanged { .. } => {}
         }

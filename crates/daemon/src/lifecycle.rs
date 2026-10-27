@@ -345,12 +345,18 @@ mod tests {
     use crate::machine::testing::{Fail, Recording};
 
     fn state() -> RosterState {
-        RosterState::from_parts(NetworkId::from_bytes([1; 32]), NetworkParams::new(
+        RosterState::from_parts(
+            NetworkId::from_bytes([1; 32]),
+            NetworkParams::new(
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "example.internal",
                 2_592_000,
             )
-            .expect("valid"), BTreeMap::new(), BTreeSet::new(), Default::default())
+            .expect("valid"),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     fn resolver() -> Ipv6Addr {
@@ -417,12 +423,18 @@ mod tests {
 
     /// A second network, with its own prefix and its own suffix.
     fn other_state() -> RosterState {
-        RosterState::from_parts(roster::id::NetworkId::from_bytes([2; 32]), roster::types::NetworkParams::new(
+        RosterState::from_parts(
+            roster::id::NetworkId::from_bytes([2; 32]),
+            roster::types::NetworkParams::new(
                 vec![0xfd, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "lavoro.internal",
                 2_592_000,
             )
-            .expect("valid"), std::collections::BTreeMap::new(), std::collections::BTreeSet::new(), Default::default())
+            .expect("valid"),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     #[tokio::test]

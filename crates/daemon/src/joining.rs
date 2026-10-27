@@ -1,33 +1,40 @@
 //! Waiting to be given a network.
 //!
-//! This runs where there is no daemon, because there cannot be one: the daemon
-//! reads a roster and stops without one. A device here has keys and nothing
-//! else.
+//! A device here has keys and nothing else: no roster, so nobody it could
+//! name, and no network id to announce under. An admin's invite is the whole
+//! bootstrap: it names the network's relay and a secret, and the device
+//! registers at that relay under the rendezvous key the secret derives.
 //!
-//! # An invite is the whole bootstrap
+//! # Asynchronous, and it lasts until it ends
 //!
-//! A device with no network is unreachable in both directions — it registers at
-//! no relay, so nobody can dial it, and it cannot announce on the local network
-//! either, because announcements are sealed with a network identifier it does
-//! not have. An admin's invite names the network's relay and a secret: the
-//! device registers at that relay under the rendezvous key the secret derives,
-//! and waits there for the admin that issued it to dial.
+//! Nobody has to be present when anybody else is. The device waits — at the
+//! rendezvous, and under its own new transport key — for as long as its join
+//! lasts, which is until it is admitted or a person cancels it. Every exchange
+//! is opened by the other side:
+//!
+//! - the admin's daemon dials the rendezvous while the invite is open, takes
+//!   the device's **request**, and says it was received. A person approves it
+//!   there later, whenever they choose;
+//! - once it is approved, the admin's daemon, or any full member the admission
+//!   reached, dials the device and **delivers** the network.
+//!
+//! The join is kept on disk ([`crate::joins`]) and resumed after a restart.
 //!
 //! # What is accepted, and what that is worth
 //!
 //! While waiting, this accepts an exchange from a peer no roster names — there
 //! is no roster with which to name anyone. It grants that peer nothing. What
-//! arrives is verified afterwards: the network must admit this device's own
-//! keys and be signed by an admin. And a person compares six digits before any
-//! of it is believed.
+//! arrives is verified: the network must be the one the invite names, admit
+//! this device's own keys, and be signed by an admin. Anything else costs one
+//! refused exchange, and the join goes on.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use enrollment::code::{Confirmation, Side};
 use enrollment::exchange::{Message, Possession};
 use enrollment::{adopt, limits};
 use identity::NodeIdentity;
+use tokio::sync::watch;
 use transport_convesso::enrolment::{Channel, Waiting};
 
 use crate::state::{Log, Paths};
@@ -35,96 +42,25 @@ use crate::state::{Log, Paths};
 /// Why a join did not happen.
 ///
 /// A message rather than a variant, for the reason [`crate::relay::Refusal`] is:
-/// each one ends the command, and the person needs the sentence.
+/// each one is shown to a person, and the person needs the sentence.
 pub type Refusal = String;
 
-/// How a person answers the question this asks.
-///
-/// Taken as a trait so the wait can be driven by a test without a terminal. The
-/// person is the security control here, not a detail of the interface: nothing
-/// in this module may proceed on its own.
-///
-/// # These are called off the runtime
-///
-/// Every method here may block for as long as a person takes, and the
-/// session this enrolment runs over needs the runtime to keep driving it
-/// meanwhile. So they are called on a blocking thread — an implementation may
-/// read from a terminal without thinking about it.
-///
-/// Found the hard way: reading a code from standard input on the runtime's own
-/// thread stalled the connection, and the exchange died while the person was
-/// typing.
-pub trait Person: Send + Sync + 'static {
-    /// Says the device is registered at its rendezvous and waits for the admin
-    /// that invited it.
-    fn waiting(&self) {}
+/// How long a join rests after an exchange, whatever came of it: so a peer
+/// opening exchanges over and over costs the device little, and never ends the
+/// join.
+pub const PACE: Duration = Duration::from_secs(2);
 
-    /// Asks for the code the admin is displaying.
-    ///
-    /// Returning `None` abandons the enrolment.
-    fn code_shown_by_the_admin(&self, ours: &Confirmation) -> Option<String>;
-
-    /// Has a signing key that is not reachable from here prove it is held.
-    ///
-    /// Only reached when [`identity::SigningKey::answers_here`] is false, which
-    /// is a machine whose key store answers only in the session of the person who
-    /// owns it. Everywhere else the proof is signed on the spot and this is never
-    /// called, which is why it has a default: a surface that cannot ask says so
-    /// by not answering, and the join ends saying what it needed.
-    ///
-    /// Returning `None` ends the join. Nothing is written either way.
-    fn signs_the_proof(&self, request: &identity::detached::SigningRequest) -> Option<Vec<u8>> {
-        let _ = request;
-        None
-    }
-
-    /// Says what happened, as it happens.
-    fn note(&self, message: &str);
-
-    /// Says that an exchange was refused, and why.
-    ///
-    /// Separate from [`Self::note`] because it is not commentary: it is the
-    /// answer to the person who just typed six digits. The wait itself goes on —
-    /// somebody who mistyped tries again — so nothing else will report it, and a
-    /// person left waiting for an outcome that is not coming reads it as the
-    /// device having frozen.
-    fn exchange_refused(&self, refusal: &str) {
-        let _ = refusal;
-    }
-
-    /// Whether the person has abandoned the join. Asked while it waits, so the
-    /// endpoint it opened is closed rather than dropped.
-    fn abandoned(&self) -> bool {
-        false
-    }
-}
-
-/// What a join driven by the daemon has reached.
-///
-/// A join is a conversation with two pauses in it: one while it waits for the
-/// admin that invited it to dial, and one while a person compares six digits. The control
-/// channel is one request and one answer, so the daemon holds where the
-/// conversation has got to and the command line asks.
+/// What a join has reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     /// Registering at the relay. Nothing to show yet.
     Registering,
-    /// Registered at the rendezvous, waiting for the admin to dial.
+    /// Registered, waiting for the admin's daemon to take the request.
     Waiting,
-    /// An admin has arrived and is showing a code for a person to type here.
-    ///
-    /// What this device derived is not carried: a person must read the digits
-    /// off the admin's screen, and a client that could show them its own would
-    /// be offering the wrong screen to read.
-    Confirming,
-    /// The proof of possession is prepared and needs a signature from a key this
-    /// process cannot reach.
-    ///
-    /// Nothing has been written and nothing has been sent: what is waiting is the
-    /// one thing a device must do to show the identity it presented is its own.
-    Signing {
-        /// The bytes to be signed, and what they will become.
-        request: identity::detached::SigningRequest,
+    /// The admin's daemon has the request, and a person there decides.
+    Requested {
+        /// When it said so, in seconds since the epoch.
+        at: u64,
     },
     /// The network was adopted.
     Joined {
@@ -137,187 +73,81 @@ pub enum Progress {
     Failed(String),
 }
 
-/// A person reached through the control channel rather than a terminal.
-///
-/// The daemon holds the join; the command line asks what it has got to and hands
-/// back the code a person typed. This is the bridge: it records progress where
-/// the service can read it, and blocks on the confirmation the way the terminal
-/// version blocks on stdin.
-///
-/// Every method here runs on the blocking pool, off the runtime — `joining` calls
-/// them through `spawn_blocking` for exactly that reason. Blocking the reactor
-/// inside an enrolment is how a test once hung for forty-three minutes.
-pub struct AcrossTheChannel {
-    /// The last exchange refusal, shared with [`Underway`].
-    refused: Arc<std::sync::Mutex<Option<String>>>,
-    /// Where the join has got to, for the service to read.
-    progress: Arc<std::sync::Mutex<Progress>>,
-    /// The code a person typed, once they have.
-    ///
-    /// A `std::sync` channel rather than a tokio one because the waiting happens
-    /// on the blocking pool. With a timeout, so a join nobody confirms ends
-    /// rather than holding a thread for as long as the daemon runs.
-    confirmed: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
-    /// The signature over the proof of possession, once somebody has made it.
-    ///
-    /// A second channel rather than a second use of the first: the two are
-    /// answers to different questions, and a join that muddled them would take
-    /// six typed digits for a signature.
-    proved: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
-    /// Set when the person abandons the join.
-    abandoned: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl AcrossTheChannel {
-    /// A person, and the handle the service confirms through.
-    #[must_use]
-    pub fn new() -> (Arc<Self>, Underway) {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let (proves, proved) = std::sync::mpsc::channel();
-        let progress = Arc::new(std::sync::Mutex::new(Progress::Registering));
-        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let refused = Arc::new(std::sync::Mutex::new(None));
-        let person = Arc::new(Self {
-            refused: Arc::clone(&refused),
-            progress: Arc::clone(&progress),
-            confirmed: std::sync::Mutex::new(receiver),
-            proved: std::sync::Mutex::new(proved),
-            abandoned: Arc::clone(&abandoned),
-        });
-        (person, Underway { refused, progress, confirm: sender, prove: proves, abandoned })
-    }
-
-    /// Records where the join has got to.
-    pub(crate) fn reached(&self, progress: Progress) {
-        if let Ok(mut held) = self.progress.lock() {
-            *held = progress;
-        }
-    }
-
-    /// Records how the join ended.
-    ///
-    /// The join's own result, rather than the running commentary: what a person
-    /// needs is whether they have a network, and if not, why not.
-    pub fn finished(&self, outcome: Result<Joined, Refusal>) {
-        self.reached(match outcome {
-            Ok(joined) => Progress::Joined { suffix: joined.suffix, devices: joined.devices },
-            Err(refusal) => Progress::Failed(refusal),
-        });
-    }
-}
-
-/// The service's half: what a join has reached, and how to confirm it.
+/// What a running join shares with the service: where it has got to, what last
+/// went wrong, and how to end it.
 pub struct Underway {
-    /// The last exchange refusal, if one has happened.
-    ///
-    /// A refused exchange leaves the wait open, so there is no failure to
-    /// report — but there is a person who has just typed six digits and needs
-    /// to know they were wrong.
-    refused: Arc<std::sync::Mutex<Option<String>>>,
-    /// Where the join has got to.
     progress: Arc<std::sync::Mutex<Progress>>,
-    /// Hands a person's code to the join.
-    confirm: std::sync::mpsc::Sender<String>,
-    /// Hands the join a signature over its proof of possession.
-    prove: std::sync::mpsc::Sender<Vec<u8>>,
-    /// Tells the join the person has left it.
-    abandoned: Arc<std::sync::atomic::AtomicBool>,
+    refused: Arc<std::sync::Mutex<Option<String>>>,
+    cancel: watch::Sender<bool>,
+}
+
+/// The join's half of [`Underway`].
+#[derive(Clone)]
+pub struct Reporting {
+    progress: Arc<std::sync::Mutex<Progress>>,
+    refused: Arc<std::sync::Mutex<Option<String>>>,
+    cancelled: watch::Receiver<bool>,
 }
 
 impl Underway {
+    /// A join's shared state, starting at `progress`, and the join's half of it.
+    #[must_use]
+    pub fn new(progress: Progress) -> (Self, Reporting) {
+        let progress = Arc::new(std::sync::Mutex::new(progress));
+        let refused = Arc::new(std::sync::Mutex::new(None));
+        let (cancel, cancelled) = watch::channel(false);
+        let reporting =
+            Reporting { progress: Arc::clone(&progress), refused: Arc::clone(&refused), cancelled };
+        (Self { progress, refused, cancel }, reporting)
+    }
+
     /// Where the join has got to.
     #[must_use]
     pub fn progress(&self) -> Progress {
         self.progress.lock().map_or(Progress::Registering, |held| held.clone())
     }
 
-    /// Hands the join the code a person typed.
+    /// What the last exchange that did not work out said, if one has not.
     ///
-    /// Returns whether anything was listening: a join that has already ended is
-    /// not confirmed, it is over.
-    pub fn confirm(&self, code: &str) -> bool {
-        self.confirm.send(code.to_owned()).is_ok()
-    }
-
-    /// Hands the join a signature over its proof of possession.
-    ///
-    /// Returns whether anything was listening, as [`Self::confirm`] does.
-    pub fn proved(&self, signature: Vec<u8>) -> bool {
-        self.prove.send(signature).is_ok()
-    }
-
-    /// What this join is waiting to have signed, if it is waiting for that.
+    /// Not a failure: the join goes on after it. It is what a person waiting
+    /// is shown when nothing seems to happen.
     #[must_use]
-    pub fn wants_signing(&self) -> Option<identity::detached::SigningRequest> {
-        match self.progress() {
-            Progress::Signing { request, .. } => Some(request),
-            _ => None,
-        }
+    pub fn last_refusal(&self) -> Option<String> {
+        self.refused.lock().ok().and_then(|held| held.clone())
     }
 
-    /// The last exchange refusal, taken.
-    ///
-    /// Taken rather than read, because it answers one person once: a refusal
-    /// left lying about would answer the *next* attempt with the last attempt's
-    /// reason.
-    #[must_use]
-    pub fn refusal(&self) -> Option<String> {
-        self.refused.lock().ok().and_then(|mut held| held.take())
-    }
-
-    /// Tells the join to stop waiting and close what it opened.
-    pub fn abandon(&self) {
-        self.abandoned.store(true, std::sync::atomic::Ordering::SeqCst);
+    /// Ends the join: it stops waiting and closes what it opened.
+    pub fn cancel(&self) {
+        let _ = self.cancel.send(true);
     }
 }
 
-impl Person for AcrossTheChannel {
-    fn abandoned(&self) -> bool {
-        self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+impl Reporting {
+    /// Records where the join has got to.
+    pub fn reached(&self, progress: Progress) {
+        if let Ok(mut held) = self.progress.lock() {
+            *held = progress;
+        }
     }
 
-    fn waiting(&self) {
-        self.reached(Progress::Waiting);
-    }
-
-    fn code_shown_by_the_admin(&self, ours: &Confirmation) -> Option<String> {
-        // The code this device derived is deliberately **not** carried here.
-        // Progress is what a client is shown, and a client that could show the
-        // code would be inviting the person to read it from this screen rather
-        // than from the admin's — which is the screen an attacker who dialled
-        // first controls.
-        let _ = ours;
-        self.reached(Progress::Confirming);
-
-        // Bounded, because an unbounded wait here holds a thread from the
-        // blocking pool for as long as the daemon runs, on a join nobody is
-        // coming back to. The bound is the same one the whole wait has.
-        let held = self.confirmed.lock().ok()?;
-        held.recv_timeout(Duration::from_secs(limits::WAIT_SECS)).ok()
-    }
-
-    fn signs_the_proof(&self, request: &identity::detached::SigningRequest) -> Option<Vec<u8>> {
-        self.reached(Progress::Signing { request: request.clone() });
-
-        // Bounded, for the reason the code's wait is bounded: an unbounded wait
-        // holds a thread from the blocking pool for as long as the daemon runs,
-        // on a join nobody is coming back to.
-        let held = self.proved.lock().ok()?;
-        held.recv_timeout(Duration::from_secs(limits::WAIT_SECS)).ok()
-    }
-
-    fn note(&self, message: &str) {
-        // A note is not progress. The one that matters — why a join ended — is
-        // recorded by the service from the join's own result.
-        let _ = message;
-    }
-
-    fn exchange_refused(&self, refusal: &str) {
-        // Kept so the service can answer the person at once, instead of polling
-        // for an outcome that a continuing wait will never produce.
+    fn refused(&self, refusal: &str) {
         if let Ok(mut held) = self.refused.lock() {
             *held = Some(refusal.to_owned());
         }
+    }
+
+    fn registered(&self) {
+        if let Ok(mut held) = self.progress.lock()
+            && *held == Progress::Registering
+        {
+            *held = Progress::Waiting;
+        }
+    }
+
+    /// Returns once the join is cancelled.
+    async fn until_cancelled(&self) {
+        let mut cancelled = self.cancelled.clone();
+        let _ = cancelled.wait_for(|cancelled| *cancelled).await;
     }
 }
 
@@ -330,102 +160,193 @@ pub struct Joined {
     pub devices: usize,
 }
 
-/// What a join from an invite holds of it: the network it must be, and the name
-/// this device proposes.
-pub struct Invited {
-    /// The only network this device may adopt.
-    pub network: roster::id::NetworkId,
-    /// The name it proposes. The inviting admin's record decides.
-    pub name: String,
+/// The fingerprint of a device's signing key, as both screens show it: twenty
+/// hexadecimal characters of its SHA-256, in groups of four.
+///
+/// Derived from the key and from nothing a channel chose, so nobody can make
+/// another key show the same without searching 2^80 of them.
+#[must_use]
+pub fn fingerprint(signing: &roster::sign::PublicKey) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(signing.as_bytes());
+    let hex: String = digest.iter().take(10).map(|byte| format!("{byte:02X}")).collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|group| String::from_utf8_lossy(group).into_owned())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
-/// Joins from an invite: waits at the rendezvous key its secret derives, at the
-/// relay it names, for the admin that issued it to dial.
-///
-/// A join always makes fresh keys: whatever identity this network's directory
-/// held from an earlier membership is dropped first, so a device revoked and
-/// invited again arrives as a new device, and any copy of its old keys belongs
-/// to no member.
+/// What the signing key signs for a join from `invite`: the invite answered,
+/// and the other two keys this device brings.
 ///
 /// # Errors
 ///
-/// When this machine already holds a network here, when the invite does not
-/// read or its relay cannot be reached, when the wait ends without an
-/// admission, or when what arrived could not be believed or is not the network
-/// the invite names.
-pub async fn join(
+/// When the invite's secret derives no key.
+pub fn request_material(
+    invite: &enrollment::Invite,
+    identity: &NodeIdentity,
+) -> Result<Vec<u8>, Refusal> {
+    let rendezvous = transport_convesso::enrolment::rendezvous_key(&invite.rendezvous_seed())
+        .map_err(|cause| cause.to_string())?;
+    Ok(enrollment::request_material(
+        &invite.network,
+        &rendezvous,
+        &identity.transport_key().public_key(),
+        &identity.attestation_key().public_key(),
+    ))
+}
+
+/// Proves, here, that this device holds its signing key: once, when the join
+/// begins, because the key may be one only a person can unlock.
+///
+/// # Errors
+///
+/// When the key will not sign — a person declined it.
+pub fn prove_here(
+    invite: &enrollment::Invite,
+    identity: &NodeIdentity,
+) -> Result<Possession, Refusal> {
+    let material = request_material(invite, identity)?;
+    Possession::prove_detached(identity, &material).map_err(|cause| match cause {
+        enrollment::Error::NotProved(custody) => crate::control::declined(&custody),
+        other => other.to_string(),
+    })
+}
+
+/// The signature somebody else must make where the key is out of this
+/// process's reach.
+///
+/// # Errors
+///
+/// When the invite's secret derives no key.
+pub fn proof_request(
+    invite: &enrollment::Invite,
+    identity: &NodeIdentity,
+) -> Result<identity::detached::SigningRequest, Refusal> {
+    let material = request_material(invite, identity)?;
+    Possession::request(&identity.signing_key().public_key(), &material)
+        .map_err(|cause| cause.to_string())
+}
+
+/// The proof `signature` makes, once it is checked against this device's key.
+///
+/// A device that sent a proof it had not verified would be vouching for
+/// whatever answered.
+///
+/// # Errors
+///
+/// When it does not verify.
+pub fn proof_from(
+    invite: &enrollment::Invite,
+    identity: &NodeIdentity,
+    signature: Vec<u8>,
+) -> Result<Possession, Refusal> {
+    let material = request_material(invite, identity)?;
+    let proof = Possession::from_bytes(signature);
+    proof.verify(&identity.signing_key().public_key(), &material).map_err(|_| {
+        "what signed the proof does not hold this device's signing key. Nothing was sent."
+            .to_owned()
+    })?;
+    Ok(proof)
+}
+
+/// Runs a join until it ends: admitted, or cancelled.
+///
+/// Registers at the invite's relay under the rendezvous key and under this
+/// device's own transport key, and answers every exchange either brings, one at
+/// a time. A refused exchange is recorded and the join goes on. `kept` is
+/// called with the moment the admin's daemon said it has the request, so it is
+/// kept across a restart.
+///
+/// # Errors
+///
+/// When the invite does not read, the relay cannot be used, a network already
+/// stands here, or the join was cancelled.
+pub async fn run(
     paths: &Paths,
-    invite_text: &str,
-    name: &str,
-    person: Arc<dyn Person>,
-    keys: &dyn crate::keys::Keys,
+    join: &crate::joins::Join,
+    identity: &NodeIdentity,
+    reporting: &Reporting,
+    kept: impl Fn(u64) + Send + Sync,
 ) -> Result<Joined, Refusal> {
-    paths.create().map_err(|cause| cause.to_string())?;
+    let invite = enrollment::Invite::from_text(&join.invite).map_err(|cause| cause.to_string())?;
     if !Log::at(paths.roster()).read().map_err(|cause| cause.to_string())?.is_empty() {
-        return Err(already_holds(paths));
+        // A delivery that was written, and a stop before the network was taken
+        // on: what is here is checked as a delivery is.
+        return delivered_before(paths, &invite, identity);
     }
-    // Fresh keys, always.
-    for previous in [paths.identity(), paths.light()] {
-        if previous.exists() {
-            std::fs::remove_file(&previous).map_err(|cause| cause.to_string())?;
-        }
+    let proof = roster::hex::decode(&join.proof)
+        .map(Possession::from_bytes)
+        .ok_or_else(|| "the join holds no proof of its signing key".to_owned())?;
+    if let Some(at) = join.requested_at {
+        reporting.reached(Progress::Requested { at });
     }
-    join_fresh(paths, invite_text, name, person, keys).await
-}
 
-/// The refusal of a join into a directory that already holds a network.
-fn already_holds(paths: &Paths) -> Refusal {
-    format!(
-        "this machine already holds a network here. Joining another would abandon it, so it is \
-         refused.\nTo start over deliberately, remove {} first.",
-        paths.roster().display()
-    )
-}
-
-/// As [`join`], in a directory made for this join: whatever identity
-/// it holds was made for it — the daemon makes one before the join when the
-/// key is kept elsewhere — and is the one the join presents.
-///
-/// # Errors
-///
-/// As [`join`].
-pub async fn join_fresh(
-    paths: &Paths,
-    invite_text: &str,
-    name: &str,
-    person: Arc<dyn Person>,
-    keys: &dyn crate::keys::Keys,
-) -> Result<Joined, Refusal> {
-    let invite = enrollment::Invite::from_text(invite_text).map_err(|cause| cause.to_string())?;
-    paths.create().map_err(|cause| cause.to_string())?;
-    let log = Log::at(paths.roster());
-    if !log.read().map_err(|cause| cause.to_string())?.is_empty() {
-        return Err(already_holds(paths));
-    }
-    let identity = keys.identity(paths).map_err(|cause| cause.to_string())?;
-    let waiting = Waiting::at_rendezvous(&invite.rendezvous_seed(), &invite.relay)
+    let rendezvous = Waiting::at_rendezvous(&invite.rendezvous_seed(), &invite.relay)
         .await
         .map_err(|cause| cause.to_string())?;
-    let invited = Invited { network: invite.network, name: name.to_owned() };
+    let own = match Waiting::under_own_key(identity, &invite.relay).await {
+        Ok(own) => own,
+        Err(cause) => {
+            rendezvous.close().await;
+            return Err(cause.to_string());
+        }
+    };
 
     let work = async {
-        note(&person, "registering at the relay...").await;
-        tokio::time::timeout(Duration::from_secs(30), waiting.online())
-            .await
-            .map_err(|_| format!("{} did not answer within thirty seconds", invite.relay))?;
-        note(&person, "waiting for the admin that invited this device to reach it...").await;
-        waits(&person).await;
-        wait_for_admission(&waiting, &identity, &person, &invited).await
+        let online = async {
+            tokio::join!(rendezvous.online(), own.online());
+            reporting.registered();
+        };
+        let exchanges = async {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = rendezvous.accept() => accepted,
+                    accepted = own.accept() => accepted,
+                };
+                let Ok(channel) = accepted else {
+                    tokio::time::sleep(PACE).await;
+                    continue;
+                };
+                match one_exchange(channel, identity, &proof, &invite, &join.name).await {
+                    Ok(Exchanged::Received) => {
+                        let at = crate::state::wall_seconds();
+                        reporting.reached(Progress::Requested { at });
+                        kept(at);
+                    }
+                    Ok(Exchanged::Delivered(delivered)) => return delivered,
+                    Err(refusal) => reporting.refused(&refusal),
+                }
+                tokio::time::sleep(PACE).await;
+            }
+        };
+        let ((), delivered) = tokio::join!(online, exchanges);
+        delivered
     };
     let outcome = tokio::select! {
-        outcome = work => outcome,
-        () = until_abandoned(&person) => Err("the join was abandoned; nothing was written".to_owned()),
+        delivered = work => Ok(delivered),
+        () = reporting.until_cancelled() => Err("the join was cancelled; nothing was written".to_owned()),
     };
-    waiting.close().await;
+    rendezvous.close().await;
+    own.close().await;
+    let delivered = outcome?;
+    keep_delivered(paths, delivered)
+}
 
-    let Delivered { operations, pieces, snapshot, adopted, base } = outcome?;
-    // The base first: a log that does not reach the genesis is never left
-    // without the state beneath it.
+/// What an exchange came to.
+enum Exchanged {
+    /// The admin's daemon has the request.
+    Received,
+    /// The network, checked.
+    Delivered(Box<Delivered>),
+}
+
+/// Writes a delivery that was checked: the base first, so a log that does not
+/// reach the genesis is never left without the state beneath it.
+fn keep_delivered(paths: &Paths, delivered: Box<Delivered>) -> Result<Joined, Refusal> {
+    let Delivered { operations, pieces, snapshot, adopted, base } = *delivered;
     if let Some((root, state)) = &adopted.base {
         // The store is opened for the write and closed after it: the node that
         // carries the network opens it next.
@@ -433,6 +354,7 @@ pub async fn join_fresh(
         crate::state::write_base(paths, &store, root, state).map_err(|cause| cause.to_string())?;
         drop(store);
     }
+    let log = Log::at(paths.roster());
     for operation in &operations {
         log.append(operation).map_err(|cause| cause.to_string())?;
     }
@@ -445,192 +367,74 @@ pub async fn join_fresh(
     Ok(Joined { suffix: adopted.state.params.suffix.clone(), devices: adopted.state.devices.len() })
 }
 
-/// Checks a delivered snapshot against the operations it came with, and keeps it.
-///
-/// **A snapshot that does not check costs the roster nothing.** The operations
-/// prove the membership and have already been written; the snapshot only dates
-/// it. Refusing the whole delivery over one would throw away a membership a
-/// person has just confirmed on two screens, in order to punish a field that is
-/// allowed to be missing entirely.
-///
-/// What a device without one gets is a roster it cannot yet confirm — the same
-/// state as one that has been out of touch too long. That is worth saying rather
-/// than hiding, and the daemon says it as soon as the network is reported.
-fn keep_delivered_snapshot(
+/// A join resumed over a log it had already written: believed only if that log
+/// is the invited network and admits this device, as a delivery is.
+fn delivered_before(
     paths: &Paths,
-    base: Option<adopt::Base>,
-    operations: &[Vec<u8>],
-    pieces: &[Vec<u8>],
-    snapshot: Option<&[u8]>,
-) {
-    let Some(bytes) = snapshot else { return };
-
-    // Checked by the roster's own rules — signed by a device these operations
-    // name as an admin, over heads they contain — and never because of who sent
-    // it. The same roster the operations derive to is what does the checking.
-    let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
-    if adopt::fill(&mut roster, base, operations, pieces).is_err() {
-        return;
-    }
-    if !roster.offer_snapshot(bytes).is_accepted() {
-        return;
-    }
-    let _kept = crate::state::write_snapshot(paths, bytes, crate::state::wall_seconds());
-}
-
-/// One wait: several exchanges, one at a time, each with its own deadline.
-/// Returns once the person has abandoned the join.
-async fn until_abandoned(person: &Arc<dyn Person>) {
-    while !person.abandoned() {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-async fn wait_for_admission(
-    waiting: &Waiting,
+    invite: &enrollment::Invite,
     identity: &NodeIdentity,
-    person: &Arc<dyn Person>,
-    invited: &Invited,
-) -> Result<Delivered, Refusal> {
-    let started = Instant::now();
-    let whole = Duration::from_secs(limits::WAIT_SECS);
-    let each = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
-
-    for attempt in 1..=limits::ATTEMPTS_PER_WAIT {
-        let left = whole.checked_sub(started.elapsed()).unwrap_or_default();
-        if left.is_zero() {
-            return Err(format!(
-                "nobody admitted this device within {} minutes. Nothing was written; run the \
-                 command again when the other machine is ready.",
-                whole.as_secs().saturating_div(60)
-            ));
-        }
-
-        // One exchange at a time, because two would mean two codes on one
-        // screen. Each with a deadline of its own, because the invite travels
-        // by message: without one, anybody who had seen it could open an exchange,
-        // say nothing, and hold the only slot for the whole wait.
-        let Ok(accepted) = tokio::time::timeout(left.min(each), waiting.accept()).await else {
-            continue;
-        };
-        let Ok(channel) = accepted else { continue };
-
-        match one_exchange(channel, identity, person, each, invited).await {
-            Ok(admitted) => return Ok(admitted),
-            Err(refusal) => {
-                // A failed exchange does not end the wait: a person who mistyped
-                // a code, or who was talking to the wrong machine, tries again.
-                // They are told, though — that is what `exchange_refused` is
-                // for, and the wait carrying on is not a reason to say nothing.
-                refused(person, &refusal).await;
-                note(person, &format!("attempt {attempt}: {refusal}")).await;
-            }
-        }
+) -> Result<Joined, Refusal> {
+    let mut roster = roster::roster::Roster::new();
+    for operation in Log::at(paths.roster()).read().map_err(|cause| cause.to_string())? {
+        roster.offer_bytes(&operation);
     }
-
-    Err(format!(
-        "this wait entertained {} attempts and none of them worked out. Nothing was written.",
-        limits::ATTEMPTS_PER_WAIT
-    ))
+    let state = roster.state().map_err(|_| {
+        "the network this join wrote does not read. Cancel the join and join again.".to_owned()
+    })?;
+    if state.network != invite.network || !state.devices.contains_key(&identity.device_id()) {
+        return Err("what is written here is not the invited network admitting this device. \
+                    Cancel the join and join again."
+            .to_owned());
+    }
+    Ok(Joined { suffix: state.params.suffix.clone(), devices: state.devices.len() })
 }
 
-/// One exchange, from the channel opening to a network being believed.
+/// One exchange, from the channel opening to the request received or a network
+/// believed.
 async fn one_exchange(
     mut channel: Channel,
     identity: &NodeIdentity,
-    person: &Arc<dyn Person>,
-    deadline: Duration,
-    invited: &Invited,
-) -> Result<Delivered, Refusal> {
+    proof: &Possession,
+    invite: &enrollment::Invite,
+    name: &str,
+) -> Result<Exchanged, Refusal> {
+    let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let material = channel.material().map_err(|cause| cause.to_string())?;
-    let peer = channel.peer().map_err(|cause| cause.to_string())?;
 
-    // The channel proves the peer holds its transport key. This proves the same
-    // about ours, which an invite's channel says nothing about — and a device's
-    // identity comes from its signing key, so without it an introduction could
-    // pair our identity with somebody else's transport key.
-    let possession = if identity.signing_key().answers_here() {
-        Possession::prove_detached(identity, &material).map_err(|cause| match cause {
-            enrollment::Error::NotProved(custody) => crate::control::declined(&custody),
-            other => other.to_string(),
-        })?
-    } else {
-        // The key is somewhere this process cannot reach — a machine key store
-        // that answers only in the session of the person who owns it. So the
-        // challenge is prepared here and somebody else signs it, and what comes
-        // back is checked against the key this device is presenting before it is
-        // sent. A device proving possession with a signature it did not verify
-        // would be vouching for whatever answered.
-        let request = Possession::request(&identity.signing_key().public_key(), &material)
-            .map_err(|cause| cause.to_string())?;
-        let signature = proved(person, &request)
-            .await
-            .ok_or_else(|| "nothing signed the proof that this device holds its own signing key. Nothing was written.".to_owned())?;
-        // `from_bytes` decides nothing, and says so. So the check is here, where
-        // a reader can see it: a device that sent a proof it had not verified
-        // would be vouching for whatever answered.
-        let proof = Possession::from_bytes(signature);
-        proof.verify(&identity.signing_key().public_key(), &material).map_err(|_| {
-            "what signed the proof does not hold this device's signing key. Nothing was sent."
-                .to_owned()
-        })?;
-        proof
-    };
-    // An invite's channel authenticates only the rendezvous key, so the device
-    // says what it is and proves its transport key too.
+    // The channel proves the peer holds its key. These prove the same about
+    // this device's: the transport key over this channel, the signing key over
+    // the request — made once, when the join began. Without them an
+    // introduction could pair this device's identity with somebody else's
+    // transport key.
     let transport_possession = Possession::prove(identity.transport_key().signer(), &material)
         .map_err(|cause| cause.to_string())?;
     let introduction = enrollment::exchange::Introduction {
         signing: identity.signing_key().public_key(),
         transport: identity.transport_key().public_key(),
         attestation: identity.attestation_key().public_key(),
-        name: invited.name.clone(),
-        possession,
+        name: name.to_owned(),
+        possession: proof.clone(),
         transport_possession,
     };
     send(&mut channel, &Message::Introduce(introduction), deadline).await?;
 
-    let ours = Side {
-        signing: identity.signing_key().public_key(),
-        transport: identity.transport_key().public_key(),
-        attestation: identity.attestation_key().public_key(),
-    };
-    // The admitting side's signing key is not known here and does not need to
-    // be: the code binds this device's three keys, the admitting side's
-    // transport key — which the channel authenticated — and the channel itself.
-    // The admin computes the same value from what its own role knows.
-    let code = Confirmation::derive(&ours, &peer, &material).map_err(|cause| cause.to_string())?;
-
-    let Some(entered) = ask(person, code.clone()).await else {
-        return Err("abandoned; nothing was written".to_owned());
-    };
-    if !code.matches(&entered) {
-        return Err("that is not the code this exchange produced. Either it was mistyped, or the \
-                    machine that answered is not the one showing you that code"
-            .to_owned());
-    }
-
-    // Said before the admission is waited for, and only once a person has
-    // compared: it is what tells the other side that somebody did. It carries
-    // nothing — the digits stay on this device, and both sides already derived
-    // the same code from the channel.
-    send(&mut channel, &Message::Accepted, deadline).await?;
-
-    // The state the admitting side's roster rests on, where it was compacted,
-    // and the pieces of its batches, in as many parts as they take; then the
-    // admission.
+    // The request received, and nothing more; or the state the admitting
+    // side's roster rests on, where it was compacted, and the pieces of its
+    // batches, in as many parts as they take; then the admission.
     let mut assembling: Option<(Vec<u8>, roster::transfer::StateAssembler)> = None;
     let mut parts = 0_usize;
     let mut pieces: Vec<Vec<u8>> = Vec::new();
     let mut batch_parts = 0_usize;
     let (operations, snapshot) = loop {
         match receive(&mut channel, deadline).await? {
+            Message::Received if parts == 0 && batch_parts == 0 => {
+                return Ok(Exchanged::Received);
+            }
             Message::Batch { pieces: part } => {
                 batch_parts = batch_parts.saturating_add(1);
                 if batch_parts > MOST_BATCH_PARTS {
-                    return Err(
-                        "the other machine sent more of its batches than any network has".to_owned()
-                    );
+                    return Err("the other machine sent more of its batches than any network has"
+                        .to_owned());
                 }
                 pieces.extend(part);
             }
@@ -664,7 +468,7 @@ async fn one_exchange(
                 }
             }
             Message::Admission { operations, snapshot } => break (operations, snapshot),
-            _ => return Err("the other machine said something other than an admission".to_owned()),
+            _ => return Err("the other machine said something out of turn".to_owned()),
         }
     };
     let base = match assembling {
@@ -685,18 +489,30 @@ async fn one_exchange(
     // dialled first could deliver a roster of another network, with this device
     // in it: the device adopts nothing, and says so.
     let adopted = match adopted {
-        Ok(adopted) if adopted.state.network != invited.network => Err(
-            "the network delivered is not the one the invite names: whoever dialled is not the \
-             admin that invited this device. Nothing was written."
-                .to_owned(),
-        ),
+        Ok(adopted) if adopted.state.network != invite.network => {
+            Err("the network delivered is not the one the invite names: whoever dialled is not a \
+             member of the invited network. Nothing was written."
+                .to_owned())
+        }
         other => other,
     };
     let taken = adopted.is_ok();
     let _ = send(&mut channel, &Message::Outcome { taken }, deadline).await;
+    // Held open until the other side has read it and gone, or a few seconds:
+    // closed at once, the endpoints took the answer with them.
+    let _gone = receive(&mut channel, ANSWER_LINGER).await;
 
-    Ok(Delivered { operations, pieces, snapshot, adopted: adopted?, base: base? })
+    Ok(Exchanged::Delivered(Box::new(Delivered {
+        operations,
+        pieces,
+        snapshot,
+        adopted: adopted?,
+        base: base?,
+    })))
 }
+
+/// How long an exchange is held open after its last answer.
+const ANSWER_LINGER: Duration = Duration::from_secs(5);
 
 /// How many parts of a base a join takes at most: more than the largest state
 /// a network may hold is cut into.
@@ -726,45 +542,6 @@ pub struct Delivered {
     pub base: Option<adopt::Base>,
 }
 
-/// Asks the person for the code, without stalling the connection.
-///
-/// The exchange is a live session and the runtime has to keep driving it
-/// while somebody reads a number off another screen and types it in. Doing this
-/// on the runtime's own thread killed the connection mid-question.
-async fn ask(person: &Arc<dyn Person>, ours: Confirmation) -> Option<String> {
-    let person = Arc::clone(person);
-    tokio::task::spawn_blocking(move || person.code_shown_by_the_admin(&ours)).await.ok().flatten()
-}
-
-/// Has somebody sign the proof, off the runtime for the same reason.
-async fn proved(
-    person: &Arc<dyn Person>,
-    request: &identity::detached::SigningRequest,
-) -> Option<Vec<u8>> {
-    let person = Arc::clone(person);
-    let request = request.clone();
-    tokio::task::spawn_blocking(move || person.signs_the_proof(&request)).await.ok().flatten()
-}
-
-/// Says the device waits, off the runtime for the same reason.
-async fn waits(person: &Arc<dyn Person>) {
-    let person = Arc::clone(person);
-    let _ = tokio::task::spawn_blocking(move || person.waiting()).await;
-}
-
-/// Says something to the person, off the runtime for the same reason.
-async fn refused(person: &Arc<dyn Person>, refusal: &str) {
-    let person = Arc::clone(person);
-    let refusal = refusal.to_owned();
-    let _ = tokio::task::spawn_blocking(move || person.exchange_refused(&refusal)).await;
-}
-
-async fn note(person: &Arc<dyn Person>, message: &str) {
-    let person = Arc::clone(person);
-    let message = message.to_owned();
-    let _ = tokio::task::spawn_blocking(move || person.note(&message)).await;
-}
-
 /// Sends one message within the deadline.
 async fn send(channel: &mut Channel, message: &Message, deadline: Duration) -> Result<(), Refusal> {
     tokio::time::timeout(deadline, channel.send(&message.encode()))
@@ -780,6 +557,39 @@ async fn receive(channel: &mut Channel, deadline: Duration) -> Result<Message, R
         .map_err(|_| "the exchange took too long".to_owned())?
         .map_err(|cause| cause.to_string())?;
     Message::decode(&bytes).map_err(|cause| cause.to_string())
+}
+
+/// Checks a delivered snapshot against the operations it came with, and keeps it.
+///
+/// **A snapshot that does not check costs the roster nothing.** The operations
+/// prove the membership and have already been written; the snapshot only dates
+/// it. Refusing the whole delivery over one would throw away a membership an
+/// admin has just approved, in order to punish a field that is allowed to be
+/// missing entirely.
+///
+/// What a device without one gets is a roster it cannot yet confirm — the same
+/// state as one that has been out of touch too long. That is worth saying rather
+/// than hiding, and the daemon says it as soon as the network is reported.
+fn keep_delivered_snapshot(
+    paths: &Paths,
+    base: Option<adopt::Base>,
+    operations: &[Vec<u8>],
+    pieces: &[Vec<u8>],
+    snapshot: Option<&[u8]>,
+) {
+    let Some(bytes) = snapshot else { return };
+
+    // Checked by the roster's own rules — signed by a device these operations
+    // name as an admin, over heads they contain — and never because of who sent
+    // it. The same roster the operations derive to is what does the checking.
+    let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
+    if adopt::fill(&mut roster, base, operations, pieces).is_err() {
+        return;
+    }
+    if !roster.offer_snapshot(bytes).is_accepted() {
+        return;
+    }
+    let _kept = crate::state::write_snapshot(paths, bytes, crate::state::wall_seconds());
 }
 
 /// An invite as a code a camera can read.
@@ -803,16 +613,6 @@ pub fn scannable(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A person who is not there.
-    struct Nobody;
-
-    impl Person for Nobody {
-        fn code_shown_by_the_admin(&self, _ours: &Confirmation) -> Option<String> {
-            None
-        }
-        fn note(&self, _message: &str) {}
-    }
-
     /// The two forms carry one invite. A scannable code that said something
     /// else would be a second format wearing one name.
     #[test]
@@ -829,45 +629,52 @@ mod tests {
         assert!(drawn.lines().count() > 8, "a code has to be big enough to scan: {drawn}");
     }
 
-    /// Joining a second network from a machine that already has one would
-    /// abandon the first. Refused, and it says how to do it on purpose.
-    #[tokio::test]
-    async fn joining_from_a_machine_that_already_has_a_network_is_refused() {
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let paths = Paths::under(scratch.path());
-        paths.create().expect("creates");
-
-        crate::founding::found(
-            &paths,
-            &crate::founding::Founding {
-                name: "nas".to_owned(),
-                suffix: "peerfectly.internal".to_owned(),
-                relay: None,
-                ipv4_range: None,
-                window: None,
-            },
-        )
-        .expect("founds");
-
-        let invite = enrollment::Invite::issue(
-            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@127.0.0.1:1",
-            roster::id::NetworkId::from_bytes([7; 32]),
-        )
-        .expect("issues");
-        let refusal =
-            join(&paths, &invite.to_text(), "laptop", Arc::new(Nobody), &crate::keys::PlatformKeys)
-                .await
-                .expect_err("already has a network");
-        assert!(refusal.contains("already holds a network"), "{refusal}");
-        assert!(refusal.contains("remove"), "{refusal}");
+    /// Twenty hexadecimal characters, in groups a person reads aloud, from the
+    /// key and nothing else.
+    #[test]
+    fn a_fingerprint_is_twenty_characters_of_the_key() {
+        let one = identity::NodeIdentity::generate().expect("generates");
+        let other = identity::NodeIdentity::generate().expect("generates");
+        let shown = fingerprint(&one.signing_key().public_key());
+        assert_eq!(shown.len(), 24, "five groups of four, and four dashes: {shown}");
+        assert_eq!(shown.chars().filter(char::is_ascii_hexdigit).count(), 20, "{shown}");
+        assert_eq!(shown, fingerprint(&one.signing_key().public_key()), "the same key, the same");
+        assert_ne!(shown, fingerprint(&other.signing_key().public_key()));
     }
 
-    /// The bounds are the ones the format crate states, not a second set.
+    fn invite() -> enrollment::Invite {
+        enrollment::Invite::issue(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
+            roster::id::NetworkId::from_bytes([7; 32]),
+        )
+        .expect("issues")
+    }
+
+    /// The proof made once, at the join, is the one an admin checks against
+    /// the invite; one made by another key, or for another invite, is refused.
     #[test]
-    fn the_wait_uses_the_bounds_the_format_states() {
-        assert_eq!(limits::WAIT_SECS, 600);
-        assert_eq!(limits::EXCHANGE_DEADLINE_SECS, 60);
-        assert_eq!(limits::ATTEMPTS_PER_WAIT, 10);
+    fn the_signing_keys_proof_names_the_invite_and_the_other_keys() {
+        let device = identity::NodeIdentity::generate().expect("generates");
+        let answered = invite();
+        let proof = prove_here(&answered, &device).expect("signs here");
+        let material = request_material(&answered, &device).expect("derives");
+        proof.verify(&device.signing_key().public_key(), &material).expect("verifies");
+        assert!(
+            proof
+                .verify(
+                    &device.signing_key().public_key(),
+                    &request_material(&invite(), &device).expect("derives")
+                )
+                .is_err(),
+            "not for another invite"
+        );
+
+        let request = proof_request(&answered, &device).expect("prepares");
+        let elsewhere = identity::NodeIdentity::generate().expect("generates");
+        let signed = elsewhere.signer().sign(request.message()).expect("signs");
+        assert!(proof_from(&answered, &device, signed).is_err(), "another key proves nothing");
+        let signed = device.signer().sign(request.message()).expect("signs");
+        assert!(proof_from(&answered, &device, signed).is_ok());
     }
 
     /// A network with one admin, its log, and a snapshot over it — what an

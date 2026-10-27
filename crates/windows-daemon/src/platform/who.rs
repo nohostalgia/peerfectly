@@ -424,6 +424,14 @@ fn holds_administrators(token: HANDLE) -> bool {
     asked != 0 && holds != 0
 }
 
+/// Whether this process holds administrators now: elevated, where an
+/// administrator's console must be to use the machine's key store.
+pub fn this_process_holds_administrators() -> bool {
+    // No token: the calling thread's, or this process's where it impersonates
+    // nobody, which is what `CheckTokenMembership` documents.
+    holds_administrators(core::ptr::null_mut())
+}
+
 /// The largest a SID can be.
 const SID_IS_AT_MOST: usize = 68;
 

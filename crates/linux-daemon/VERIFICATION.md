@@ -1292,15 +1292,107 @@ Then, for 13.2's counterpart where there is no tray: `c` founded `uff` on the te
 arrived, and is waiting at the code* with `peerfectly resume`; `resume` signed it, `a` adopted `uff`
 (2 devices), and the line left `status`.
 
-Left open:
+Two findings here were fixed after, and run again on 2026-10-26:
 - **Reaching a light member just after joining.** `c2`'s first packets to `b` (light) were dropped,
-  *no answer within 20s*, for about a minute after its join; then they passed. The admitter's next
-  root has to reach both before `b` can believe `c2`.
-- **The waiting list does not scale with batches or light members.** `status` on `a` lists every
-  board that has never connected under every operation signed here, and light members never say
-  they hold an operation, so `b` stays listed. Noted for 16.2.
+  *no answer within 20s*, for about a minute after its join. Two causes. The joining device was
+  delivered the root held before its admission, so it had no proof of itself to show; the admitter
+  now delivers the root that follows the admission, signed over what the device receives, following
+  its own. And `b`'s transport read only peers it had met: convesso holds a peer's messages until a
+  receiver is open for it, and a light member, holding no roster, opened none for a new member, so
+  the open was never read. A light node now reads whoever connects, and judges what it shows
+  (`transport-convesso`, `a_light_member_is_reached_by_a_full_one_it_never_met`). Run again with
+  `c` joining as `c7`: `up` at 14:42:05, and 6 of 6 pings to `b` answered by 14:42:10, the first
+  held about five seconds while the session opened.
+- **The waiting list did not scale with batches or light members.** `status` on `a` listed every
+  board that had never connected under every operation, and `b`, light, under all of them for
+  ever. Now a member never in contact is counted in one line (*4 devices have never been in
+  contact with this one*), and a light member says which root it holds after adopting one, which a
+  full member holding it counts as holding everything beneath. Run again: `status` on `a` shows
+  that line and no waiting list.
+
+Left open:
 - **Revoking an admin with a void.** Not run here: the testbed has no free machine left to admit
   as a second admin. Covered by `service::revoking_an_admin_says_what_it_voids_before_signing`.
+
+## S5. Enrolment that waits: requests, approval later, delivery by a member, and the rules
+
+`scalable-membership` 14.1–14.5 and 14.7. In the testbed of S3, rebuilt and recreated, so every node
+starts with nothing. The interactive steps driven through a pseudo-terminal (`script`), the
+passphrases fed on its input.
+
+1. On `a`, as `alice` with `sudo`: `peerfectly found casa --name a --relay https://relay:8444`;
+   `peerfectly up casa` without `sudo`. Without `sudo`: `invite tv`, `forget casa`, `pending`.
+2. On `a`: `peerfectly invite anchor --network casa` and `peerfectly invite b --network casa --expires
+   2h`. On `anchor`: `peerfectly join <invite>`, then `pending` on both; on `a`, `approve anchor`.
+3. The admin off: `docker compose stop a`; on `b`, `join <invite>`; `docker compose restart b` while
+   it waits; `start a`; `pending` on both; `restart a` with the request pending; `approve b`.
+4. The device off when approved, and the admin off when it comes back: `b` up; on `a`, `invite c`;
+   on `c`, `join`; once `pending` on `a` shows it, `stop c`; `approve c`; thirty seconds for the
+   admission to spread; `stop a`; `start c`.
+5. A request from somebody holding the invite: `a` started; `invite tv`; `c` (a member already)
+   joins with it as `tv`; on `a`, `pending`, `reject tv`, then `approve tv`; on `c`, `pending`,
+   `cancel joining`.
+6. An altered join: on `a`, `invite spare`; `b` joins with it; `join.json` edited (`spare` →
+   `planted`); `restart b`; `pending`; `cancel joining`. Then `c` up, and pings from `b` and `c` to
+   `a` and `b` over the tunnel.
+7. A planted request: the testbed recreated, `casa` founded again; `invite tv`, `c` joins, `reject
+   tv`; `invites.json` edited (`rejected` → `waiting`) while the daemon runs; `pending` a few seconds
+   later. Again for `tv3`, edited and `restart a` at once.
+
+**Expect**:
+- without `sudo`, `invite` and `forget` are refused before anything is asked of the daemon (*needs
+  sudo*); `up` and `pending` answer; the usage marks the same words;
+- `invite` prints the invite and returns, saying until when it is open and how to approve;
+- `join` prints the device's key and returns; `pending` on the joining device shows the join, and
+  *the request was received* once the admin's daemon has it; on the admin, the request with the same
+  key and when it arrived;
+- a request made while the admin is off is taken when it is back; restarts on either side change
+  nothing; the approved device gets the network within seconds, and the invite reads `used`;
+- the device off when approved gets the network from a member that is not the admin, with the admin
+  off;
+- a rejected request admits nobody, cannot be approved after, and the joining device waits until it
+  is cancelled;
+- an altered join is not resumed, is listed as one that cannot go on, and is cancelled;
+- a planted request is not listed, whether the daemon runs or restarts, and that is said in the log.
+
+**Result**: run, 2026-10-27, in the testbed, passed after one fix found here.
+- Step 1: `invite` and `forget` without `sudo` said *`peerfectly invite` needs sudo. Nothing was
+  asked of the daemon.*; `up` and `pending` (*nothing is waiting*) answered.
+- Step 2: `anchor`'s key `1283-C3A6-3243-57A1-5FD0` on both screens, the request taken within
+  seconds of the join, approved with one passphrase; `anchor` held `casa`, 2 devices; `anchor` *used*.
+- Step 3: `b` joined at 01:52 with `a` stopped, and waited through its restart; `a`, started, took
+  the request (`4630-D6B1-A00E-3546-3C44` on both), kept it across its own restart, and once
+  approved `b` held `casa`, 3 devices, `b` *used*, nothing waiting on `b`.
+- Step 4: `c` was approved while stopped; `anchor` and `b` held 4 devices thirty seconds later; `a`
+  stopped at 01:54:38 and `c` started; at 01:54:39 `b` logged *a new member, 257d-70cf-db63-0007,
+  was given the network from here* and `c` *this device was admitted into casa*. Nothing waiting on
+  `c`.
+- Step 5: the request for `tv` came with `c`'s second key; `reject` said *nothing was signed*; the
+  devices stayed 4; `approve tv` said *no request for `tv` is waiting*; `c`'s join waited, and
+  `cancel joining` removed it and its keys.
+- Step 6: `b` said *this device's join `joining`: it cannot go on — the join was changed outside the
+  daemon; it was not resumed*, and the log a warning; `cancel joining` removed it. `c` up; 4 of 4
+  pings from `c` to `a`, 3 of 3 to `b`, 3 of 3 from `b` to `a`.
+- **A planted request was believed, then fixed.** In the first run of step 7 the planted request
+  was listed, and still after a restart. The checkpoint hashed whatever `invites.json` held when it
+  was written, so the next checkpoint after a plant vouched for it. Now the checkpoint keeper
+  remembers the records the daemon itself wrote (named before each write) and vouches for those;
+  records that are not those are dropped when read and said once
+  (`service::a_request_planted_while_the_daemon_runs_is_not_believed`). Run again on the rebuilt
+  testbed: while the daemon ran, `pending` said *nothing is waiting* and the log *the invite records
+  were changed outside the daemon, so they are not used*; planted and restarted at once, the start
+  said *the invite records were not the ones its checkpoint names, and were dropped*.
+- A smaller one in that second run: after a drop at the start, the first read said the records were
+  changed outside a second time. The keeper is now told of the drop
+  (`service::a_planted_invite_admits_nobody`).
+
+Found by the same reading: a light member's state was vouched for the same way — the hash of the
+file when the checkpoint is written — with the same weakness while the daemon runs. Fixed the same
+way: the keeper holds the hash of what the daemon wrote, or found at start as the checkpoint names
+it, and the checkpoint names that (`checkpoint::a_light_member_is_vouched_for_as_the_daemon_wrote_it`,
+`node::light::a_light_member_planted_while_the_daemon_runs_is_not_vouched_for`). A planted file is
+not read while the daemon runs, and at the next start the network is refused as changed outside, as
+for a roster. Daemon tests only; not run in the testbed, which has no light member.
 
 ## S2. On a machine with a hardware TPM
 

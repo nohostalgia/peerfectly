@@ -123,16 +123,24 @@ Invite the second device from the admin:
 peerfectly invite nas
 ```
 
-It prints a QR code and an invite, and waits. On the second device:
+It prints a QR code and an invite, open for a day (`--expires 30m|24h|7d`), and returns. On the
+second device:
 
 ```sh
 peerfectly join peerfectly-invite-v1:… --name nas
 ```
 
-The device waits at the relay the invite names, and the admin's daemon reaches it there; if you stop
-waiting on the admin, the invite stays open and the daemon goes on dialling.
+It prints its key's fingerprint and returns. The admin's daemon takes the device's request on its
+own; nobody has to wait for anybody. When you choose, on the admin:
 
-Type the six digits the admin shows into the second device, confirm on the admin, and you're in:
+```sh
+peerfectly pending
+peerfectly approve nas
+```
+
+`pending` shows the request with the fingerprint the second device printed — compare them if you
+are both there. Once approved, the device is given the network as soon as it answers, even after
+a restart of either machine; then:
 
 ```sh
 peerfectly up home
@@ -145,8 +153,9 @@ is lowered, so `Laptop` and `laptop` are the same name. Anything else is refused
 would do. Without `--name`, the machine's name is used, made to fit. An admin renames a device with
 `peerfectly rename laptop studio`.
 
-`peerfectly` with no arguments lists every command. On Windows the commands that change the
-machine need an elevated console. On Linux, anything that signs needs `sudo`.
+`peerfectly` with no arguments lists every command. Reading — `status`, `peers`, `address`,
+`exposed`, `pending` — and turning your own networks on and off with `up` and `down` need nothing
+more; everything else needs an elevated console on Windows and `sudo` on Linux.
 
 A device talks to another only while something is going between them, so the network costs next to
 nothing when you're not using it. The trade is a short pause, usually well under a second, on the

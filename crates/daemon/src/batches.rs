@@ -86,10 +86,9 @@ pub(crate) fn prepared(
                 roster::batch::MAX_SERIAL_LEN
             ));
         }
-        let entry = BatchEntry { keys, name, serial: device.serial.as_bytes().to_vec(), ipv4: None };
-        let id = entry
-            .device_id()
-            .map_err(|cause| format!("entry {line}: {cause}"))?;
+        let entry =
+            BatchEntry { keys, name, serial: device.serial.as_bytes().to_vec(), ipv4: None };
+        let id = entry.device_id().map_err(|cause| format!("entry {line}: {cause}"))?;
         if !seen.insert(id) {
             return Err(format!("entry {line} names a device another entry already names"));
         }
@@ -209,7 +208,8 @@ mod tests {
     #[test]
     fn a_batch_is_prepared_with_an_address_each_from_its_block() {
         let devices: Vec<BatchDevice> = (0..5).map(|n| device(&format!("board-{n}"))).collect();
-        let (header, entries) = prepared(&state(), &devices, &wanted(Some("100.64.9.0/28"))).unwrap();
+        let (header, entries) =
+            prepared(&state(), &devices, &wanted(Some("100.64.9.0/28"))).unwrap();
         assert_eq!(header.count, 5);
         assert_eq!(header.mode, Mode::Light);
         let addresses: BTreeSet<[u8; 4]> = entries.iter().filter_map(|entry| entry.ipv4).collect();

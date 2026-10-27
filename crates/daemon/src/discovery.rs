@@ -386,10 +386,8 @@ impl Discovery {
             transport.learned(&record.key, &record.addresses);
         }
         // Newer news of where it is: a rest earned before it says nothing now.
-        let announcing = state.device_for_key_of_purpose(
-            &record.key.key_id(),
-            roster::types::KeyPurpose::Transport,
-        );
+        let announcing = state
+            .device_for_key_of_purpose(&record.key.key_id(), roster::types::KeyPurpose::Transport);
         if let Some(device) = announcing {
             self.node.announced(device.id);
         }

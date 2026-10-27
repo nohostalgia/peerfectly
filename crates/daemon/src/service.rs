@@ -39,7 +39,8 @@ use crate::state::{Choice, Paths};
 ///
 /// Named as one thing because there is only ever one: `Confirm` and `Abandon`
 /// apply to whatever is waiting, and a person confirming has one screen in front
-/// of them.
+/// of them. Enrolment is not here: an invite's request and a join wait on disk,
+/// for as long as they take, and are listed by `Command::Pending`.
 enum Pending {
     /// A relay change, waiting for a person to confirm the key the new relay's
     /// host answered with before anything is signed.
@@ -52,18 +53,6 @@ enum Pending {
         immediately: bool,
         /// Who asked, carried for the reason `Founding` gives.
         for_whom: crate::control::Caller,
-    },
-    /// A device is being admitted, and two screens must be compared.
-    Admitting {
-        /// Which network it is being admitted into.
-        ///
-        /// Remembered from the moment the enrolment opened. Asking again when the
-        /// person confirms would let the answer change between the two halves of
-        /// one act — the code shown for one network and the admission signed into
-        /// another.
-        label: Label,
-        /// The exchange itself.
-        pending: crate::admitting::Pending,
     },
     /// A network is being founded, and a relay key nobody has vouched for is
     /// waiting to be confirmed against the relay host.
@@ -79,17 +68,6 @@ enum Pending {
         /// who confirms is not necessarily the person who began. Reading it at
         /// the end would hand the network to whoever was at the keyboard when it
         /// completed.
-        for_whom: crate::control::Caller,
-    },
-    /// This device is waiting to be given a network.
-    Joining {
-        /// What this device will call the network, once it arrives.
-        label: Label,
-        /// Where the join has got to, and how to confirm it.
-        underway: crate::joining::Underway,
-        /// The join itself, so abandoning can end it.
-        task: tokio::task::JoinHandle<()>,
-        /// Who asked for it, carried for the reason `Founding` gives.
         for_whom: crate::control::Caller,
     },
 }
@@ -154,29 +132,17 @@ enum Resume {
         /// reason `Pending::Founding` gives.
         for_whom: crate::control::Caller,
     },
-    /// A joining device is proving it holds the signing key it presented.
-    ///
-    /// The only one of these whose signature goes back into a task rather than
-    /// into an operation: a join is already running, already waiting on a person
-    /// for the six digits, and this is a second thing it waits for. A batch of
+    /// A joining device is proving it holds the signing key it presents, over
+    /// the join's request: once, before the join starts waiting. A batch of
     /// one, and never anything else beside it.
-    Possession,
-    /// A device is being admitted: the admission, the revocation before it when
-    /// it takes over a name another device holds, and the snapshot the network is
-    /// then owed.
-    ///
-    /// The exchange stays in `pending` across the round trip rather than moving
-    /// in here: it holds an open endpoint, and `Command::Abandon` already knows
-    /// how to close one. Two places that could be holding a live socket is one
-    /// place too many.
-    ///
-    /// # A replacement is still revocation first
-    ///
-    /// Two operations signed against the same heads are concurrent, and one
-    /// author holding two branches is what equivocation is. So the admission in a
-    /// replacing batch names the revocation as its parent and is checked against
-    /// the state the revocation leaves — previewed, since neither is signed yet —
-    /// and the two are applied in that order.
+    JoinProof {
+        /// The join's directory.
+        label: Label,
+        /// The name it proposes.
+        name: String,
+        /// The invite, as text.
+        invite: String,
+    },
     /// A batch of devices is being admitted: its header, the entries it
     /// commits to, which travel as pieces once it is signed, and the snapshot
     /// the network is then owed.
@@ -188,9 +154,22 @@ enum Resume {
         /// Where its roster stood when the batch was built.
         prepared_against: crate::signing::Moment,
     },
+    /// A request is being approved: the admission, the revocation before it
+    /// when it takes over a name another device holds, the settings its invite
+    /// chose, and the snapshot the network is then owed.
+    ///
+    /// # A replacement is still revocation first
+    ///
+    /// Two operations signed against the same heads are concurrent, and one
+    /// author holding two branches is what equivocation is. So the admission in a
+    /// replacing batch names the revocation as its parent and is checked against
+    /// the state the revocation leaves — previewed, since neither is signed yet —
+    /// and the two are applied in that order.
     Admitting {
         /// Which network.
         label: Label,
+        /// The secret of the invite whose request this approves.
+        secret: [u8; enrollment::invite::SECRET_LEN],
         /// Whether the batch begins with the revocation of the device holding
         /// the name.
         replacing: bool,
@@ -241,13 +220,65 @@ fn reference_of(identity: &identity::NodeIdentity) -> String {
     identity.signing_key().custodian().map(|held| held.reference().to_owned()).unwrap_or_default()
 }
 
-/// The device already answering to a joining device's proposed name, as the
-/// report says it.
-fn taken_name(pending: &crate::admitting::Pending) -> Option<crate::control::TakenName> {
-    pending.taken().map(|taken| crate::control::TakenName {
+/// The device already answering to a name, as the pending list says it.
+fn taken_name(taken: &crate::admitting::Taken) -> crate::control::TakenName {
+    crate::control::TakenName {
         name: taken.name.clone(),
         id: crate::control::short_id(&taken.device),
-    })
+    }
+}
+
+/// The device a request was admitted as, found by the transport key it brought.
+fn admitted_device(
+    state: &roster::state::RosterState,
+    applicant: &crate::admitting::Applicant,
+) -> Option<roster::id::DeviceId> {
+    state
+        .devices
+        .iter()
+        .find(|(_, record)| {
+            record.keys.iter().any(|entry| {
+                entry.purpose == roster::types::KeyPurpose::Transport
+                    && entry.value == applicant.transport.as_bytes()
+            })
+        })
+        .map(|(device, _)| device)
+}
+
+/// A join this daemon runs.
+struct Joining {
+    /// Where it has got to, and how to end it.
+    underway: crate::joining::Underway,
+    /// The fingerprint of its signing key, as its person is shown it.
+    fingerprint: String,
+    /// When it began, in seconds since the epoch.
+    since: u64,
+    /// The join itself.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// When a new member is dialled next, and how long after that.
+struct Newcomer {
+    next: std::time::Instant,
+    delay: Duration,
+}
+
+impl Newcomer {
+    /// The first wait after a dial, doubled after each one that brings nothing.
+    const FIRST: Duration = Duration::from_secs(30);
+    /// The longest wait between two dials.
+    const LONGEST: Duration = Duration::from_secs(30 * 60);
+
+    /// One to dial now.
+    const fn due(now: std::time::Instant) -> Self {
+        Self { next: now, delay: Self::FIRST }
+    }
+
+    /// Dialled at `now`: the next is later, and later again after that.
+    fn tried(&mut self, now: std::time::Instant) {
+        self.next = now.checked_add(self.delay).unwrap_or(now);
+        self.delay = self.delay.saturating_mul(2).min(Self::LONGEST);
+    }
 }
 
 /// One network this device holds, with everything that belongs to it.
@@ -445,9 +476,23 @@ pub struct Service {
     /// one is an act waiting for a person to compare two screens, this one is an
     /// act waiting for a key. A founding can be in both at once.
     unsigned: Mutex<crate::signing::Waiting<Resume>>,
-    /// The request a running join is waiting to have signed, and the id it was
-    /// asked for under, so a poll does not ask again for the same one.
-    proving: Mutex<Option<(String, Vec<u8>)>>,
+    /// The joins this device is waiting in, by the name each is listed under.
+    ///
+    /// Not in `pending`: a join waits for as long as an admin takes, and while
+    /// it does a person founds, invites and admits as they would otherwise.
+    joins: Mutex<BTreeMap<Label, Joining>>,
+    /// Woken when a join ends, so the network it brings is taken on at once.
+    joined: Arc<tokio::sync::Notify>,
+    /// Held while an invite file is read and written back, so two requests
+    /// arriving at once do not each write the file without the other.
+    invites_lock: Mutex<()>,
+    /// The approved devices this device brings the network to, by their
+    /// invite's secret, and when each is dialled next.
+    delivering: Mutex<std::collections::HashMap<[u8; enrollment::invite::SECRET_LEN], Newcomer>>,
+    /// The new members this device brings the network to, and when each is
+    /// dialled next.
+    newcomers:
+        Mutex<std::collections::HashMap<(roster::id::NetworkId, roster::id::DeviceId), Newcomer>>,
     /// Who is asking, for the act being answered.
     ///
     /// Set by `handle_for` from what the platform read off the channel. It is
@@ -697,7 +742,11 @@ impl Service {
             pending: Mutex::new(None),
             staged: Mutex::new((None, Vec::new())),
             unsigned: Mutex::new(crate::signing::Waiting::default()),
-            proving: Mutex::new(None),
+            joins: Mutex::new(BTreeMap::new()),
+            joined: Arc::new(tokio::sync::Notify::new()),
+            invites_lock: Mutex::new(()),
+            delivering: Mutex::new(std::collections::HashMap::new()),
+            newcomers: Mutex::new(std::collections::HashMap::new()),
             asking: Mutex::new(crate::control::Caller::Unattributed),
             unkeyed: Mutex::new(None),
             stopping: Mutex::new(false),
@@ -761,12 +810,16 @@ impl Service {
             Some(Ok(written)) => Some(written.clone()),
             _ => None,
         };
+        let mut dropped = false;
         if let Some(written) = &written {
             match crate::checkpoint::restore(&paths, written) {
-                Ok(true) => tracing::warn!(
-                    network = %record.label,
-                    "the invite records were not the ones its checkpoint names, and were dropped"
-                ),
+                Ok(true) => {
+                    dropped = true;
+                    tracing::warn!(
+                        network = %record.label,
+                        "the invite records were not the ones its checkpoint names, and were dropped"
+                    );
+                }
                 Ok(false) => {}
                 Err(cause) => return Err((Trouble::ChangedOutside, cause.to_string())),
             }
@@ -781,6 +834,19 @@ impl Service {
                 network.paths.clone(),
                 written,
             ));
+            // Dropped just now: no file is what this daemon stands by, and
+            // reading none is not a second finding.
+            if dropped {
+                keeper.writing_invites(None);
+            }
+            // What a light member keeps was just checked against the
+            // checkpoint: that, and what the daemon writes after it, is what
+            // the next checkpoint vouches for.
+            if network.node().is_light()
+                && let Some(kept) = crate::checkpoint::file_hash(&network.paths.light())
+            {
+                keeper.holds_light(kept);
+            }
             network.node().keep_with(keeper);
         }
         Ok(network)
@@ -1591,8 +1657,9 @@ impl Service {
     /// to look at this device's interfaces: a machine that moves to another
     /// Wi-Fi may have a peer that did not conflict before and does now.
     pub async fn reconcile_forever(self: Arc<Self>) {
-        // The invites' dialling lives as long as this does.
+        // The invites' dialling lives as long as this does, and so do the joins.
         tokio::spawn(Arc::clone(&self).dial_invites_forever());
+        tokio::spawn(Arc::clone(&self).joins_forever());
         // In index order: the platform lists the same interfaces in a different
         // order from one call to the next, and compared as listed they read as a
         // change every few seconds — which, since a change of network makes a
@@ -1822,6 +1889,13 @@ impl Service {
             unusable,
             note,
             admin_refusal: self.keys.admin_refusal(),
+            // Only to whoever may cancel it: what somebody else began on this
+            // machine is not this person's to read.
+            waiting_on: if self.may_ask(&asking, &Command::Abandon).await.is_ok() {
+                self.waiting_described().await
+            } else {
+                None
+            },
             elsewhere,
             // The same question `may_ask` answers for `Command::Stop`, asked
             // once and handed back — rather than left for each surface to guess
@@ -1843,15 +1917,42 @@ impl Service {
         self.keys.custody_of(node.identity())
     }
 
-    /// The name a network's invite was issued under, where the device it
-    /// brought waits at the code for this device's person.
+    /// The name of a network's invite whose request waits for a person, if one
+    /// does: what a phone notifies about.
     async fn arrived_in(&self, label: &Label) -> Option<String> {
-        match &*self.pending.lock().await {
-            Some(Pending::Admitting { label: held, pending }) if held == label && pending.live() => {
-                Some(pending.invited_name().to_owned())
+        let network = self.named(label).await.ok()?;
+        let invites = Self::invites_of(&network).await.ok()?;
+        let now = crate::state::wall_seconds();
+        invites
+            .all()
+            .iter()
+            .find(|record| record.standing(now) == crate::invites::Standing::Requested)
+            .map(|record| record.invited.name.clone())
+    }
+
+    /// What waits on a person, in words, or `None` when nothing does.
+    async fn waiting_described(&self) -> Option<String> {
+        let held = self.pending.lock().await;
+        Some(match held.as_ref()? {
+            Pending::Founding { label, .. } => {
+                format!("the founding of `{label}`, waiting for its relay's key to be confirmed")
             }
-            _ => None,
-        }
+            Pending::ChangingRelay { label, relay, .. } => format!(
+                "the move of `{label}` to {}, waiting for that relay's key to be confirmed",
+                crate::control::shown(relay)
+            ),
+        })
+    }
+
+    /// The refusal of an act begun while another waits on a person: what waits,
+    /// and that it must be finished or cancelled first. `None` when nothing
+    /// waits.
+    async fn already_waiting(&self) -> Option<Outcome> {
+        let what = self.waiting_described().await?;
+        Some(Outcome::Failed {
+            message: format!("{what} already; {}", crate::control::ALREADY_WAITING),
+            left_behind: Vec::new(),
+        })
     }
 
     /// One network, as the report describes it.
@@ -1892,6 +1993,7 @@ impl Service {
                 revoked: Vec::new(),
                 waiting: Vec::new(),
                 waiting_unlisted: 0,
+                waiting_never_met: 0,
                 problem: node.problem(std::time::SystemTime::now()).await,
             };
         };
@@ -1980,6 +2082,7 @@ impl Service {
             revoked: membership.revoked,
             waiting: membership.waiting,
             waiting_unlisted: membership.waiting_unlisted,
+            waiting_never_met: membership.waiting_never_met,
             problem: node.problem(std::time::SystemTime::now()).await,
         }
     }
@@ -2105,33 +2208,25 @@ impl Service {
                 self.founding_signed(label, &genesis, &identity, &for_whom, &requests, signatures)
                     .await
             }
-            // Handed to the join as it arrived, and checked there.
-            //
-            // Every other act here verifies before assembling, and so does this
-            // one — but in the join, against the identity that prepared the
-            // challenge, which is the only place the key this must match is
-            // known. Nothing is sent on the strength of a signature that has not
-            // verified against that key.
-            Resume::Possession => {
+            // Checked against the identity that prepared the challenge, which is
+            // the only place the key it must match is known, before the join
+            // starts on the strength of it.
+            Resume::JoinProof { label, name, invite } => {
                 let _ = &requests;
-                let Some(signature) = signatures.first().cloned() else {
-                    return Outcome::refused("no proof came back".to_owned());
-                };
-                let held = self.pending.lock().await;
-                match &*held {
-                    Some(Pending::Joining { underway, .. }) if underway.proved(signature) => {
-                        Outcome::Enrolling
-                    }
-                    _ => Outcome::refused(
-                        "the join this signature belongs to is no longer waiting for it".to_owned(),
-                    ),
-                }
+                self.join_proof_signed(label, &name, invite, signatures).await
             }
-            Resume::Admitting { label, replacing, settling, spec_name, prepared_against } => {
+            Resume::Admitting {
+                label,
+                secret,
+                replacing,
+                settling,
+                spec_name,
+                prepared_against,
+            } => {
                 self.admission_signed(
-                    &label,
+                    (&label, &secret),
                     (replacing, settling),
-                    spec_name,
+                    &spec_name,
                     &prepared_against,
                     &requests,
                     signatures,
@@ -2204,44 +2299,42 @@ impl Service {
         Outcome::Reported(self.report().await)
     }
 
-    /// Delivers an admission that was signed where this process could not sign
-    /// it — after the revocation before it, when it is a replacement.
+    /// Finishes an approval whose batch came back signed.
     async fn admission_signed(
         &self,
-        label: &Label,
+        (label, secret): (&Label, &[u8; enrollment::invite::SECRET_LEN]),
         (replacing, settling): (bool, bool),
-        spec_name: String,
+        spec_name: &str,
         prepared_against: &crate::signing::Moment,
         requests: &[identity::detached::SigningRequest],
         signatures: &[Vec<u8>],
     ) -> Outcome {
-        let waiting = self.pending.lock().await.take();
-        let Some(Pending::Admitting { pending, .. }) = waiting else {
-            // The exchange is gone — abandoned, or expired while a person was at
-            // a prompt. Nothing is signed into the roster on the strength of an
-            // enrolment nobody is holding open any more.
-            return Outcome::refused(
-                "the enrolment this signature belongs to is no longer open. Nothing was signed; \
-                 start it again"
-                    .to_owned(),
-            );
-        };
-
         let network = match self.named(label).await {
             Ok(network) => network,
             Err(cause) => {
-                crate::admitting::abandon(pending).await;
                 return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
             }
+        };
+        let now = crate::state::wall_seconds();
+        let record = Self::invites_of(&network)
+            .await
+            .ok()
+            .and_then(|invites| {
+                invites.all().iter().find(|record| record.invite.secret == *secret).cloned()
+            })
+            .filter(|record| record.standing(now) == crate::invites::Standing::Requested);
+        let Some(record) = record else {
+            return Outcome::refused(
+                "the request this signature belongs to was withdrawn or answered meanwhile. \
+                 Nothing was signed into the roster."
+                    .to_owned(),
+            );
         };
 
         let artifacts =
             match self.verified_batch(&network, prepared_against, requests, signatures).await {
                 Ok(artifacts) => artifacts,
-                Err(refused) => {
-                    crate::admitting::abandon(pending).await;
-                    return refused;
-                }
+                Err(refused) => return refused,
             };
         let mut artifacts = artifacts.into_iter();
 
@@ -2249,11 +2342,9 @@ impl Service {
         // after. See `Resume::Admitting`.
         if replacing {
             let Some(revocation) = artifacts.next() else {
-                crate::admitting::abandon(pending).await;
                 return Outcome::refused("the batch held no revocation".to_owned());
             };
             if let Err(cause) = self.admit_to(&network, &revocation).await {
-                crate::admitting::abandon(pending).await;
                 return Outcome::Failed {
                     message: format!(
                         "the device holding that name could not be revoked, so nothing was \
@@ -2264,20 +2355,18 @@ impl Service {
             }
         }
         let Some(admission) = artifacts.next() else {
-            crate::admitting::abandon(pending).await;
             return Outcome::refused("the batch held no admission".to_owned());
         };
         let mut signed = vec![admission];
         if settling {
             let Some(settings) = artifacts.next() else {
-                crate::admitting::abandon(pending).await;
                 return Outcome::refused("the batch held no settings".to_owned());
             };
             signed.push(settings);
         }
 
-        let delivered = self.deliver_admission(&network, pending, signed, spec_name).await;
-        let delivered = match delivered {
+        let approved = self.approved(&network, &record, signed, spec_name).await;
+        let approved = match approved {
             // Said which acts took effect: the revocation is signed and in the
             // log, and cannot be unsaid, whatever happened to the admission.
             Outcome::Failed { message, left_behind } if replacing => Outcome::Failed {
@@ -2289,7 +2378,7 @@ impl Service {
             },
             other => other,
         };
-        self.with_the_snapshot(&network, delivered, artifacts.next()).await
+        self.with_the_snapshot(&network, approved, artifacts.next()).await
     }
 
     /// Puts a signed genesis in the log, takes the network on, and keeps its
@@ -2428,11 +2517,8 @@ impl Service {
                 };
             }
         };
-        if self.pending.lock().await.is_some() {
-            return Outcome::Failed {
-                message: "something is already waiting to be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            };
+        if let Some(refusal) = self.already_waiting().await {
+            return refusal;
         }
         let (relay, asked) = match given {
             crate::relay::Given::Written(relay) => (relay, false),
@@ -2551,11 +2637,8 @@ impl Service {
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
         }
-        if self.pending.lock().await.is_some() {
-            return Outcome::Failed {
-                message: "something is already waiting to be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            };
+        if let Some(refusal) = self.already_waiting().await {
+            return refusal;
         }
         let devices = {
             let staged = self.staged.lock().await;
@@ -2679,7 +2762,11 @@ impl Service {
     /// Each must be a full member: an anchor is one that light members turn
     /// to, and a light member holds nothing to answer them with. Refused before
     /// anything is signed otherwise, and where the list would not change.
-    async fn set_anchors(&self, which: Option<&Label>, named: &[crate::control::Target]) -> Outcome {
+    async fn set_anchors(
+        &self,
+        which: Option<&Label>,
+        named: &[crate::control::Target],
+    ) -> Outcome {
         const CHOOSE: &str = "Rename one of them first, so that each answers to a name of its own.";
         let network = match self.which(which).await {
             Ok(network) => network,
@@ -2707,11 +2794,8 @@ impl Service {
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
         }
-        if self.pending.lock().await.is_some() {
-            return Outcome::Failed {
-                message: "something is already waiting to be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            };
+        if let Some(refusal) = self.already_waiting().await {
+            return refusal;
         }
         let mut anchors: Vec<roster::id::DeviceId> = Vec::new();
         for target in named {
@@ -2874,7 +2958,9 @@ impl Service {
     /// reports a network the person never had.
     async fn tidy_after(&self, ended: Vec<Resume>) {
         for act in ended {
-            if let Resume::Founding { label, .. } = act {
+            // A founding or a join whose proof nobody signed leaves a
+            // directory holding keys and nothing else.
+            if let Resume::Founding { label, .. } | Resume::JoinProof { label, .. } = act {
                 let _discarded = self.home.discard_unfounded(&label);
             }
         }
@@ -2955,6 +3041,12 @@ impl Service {
         caller: &crate::control::Caller,
         command: &Command,
     ) -> core::result::Result<(), String> {
+        // An administrator first, for everything but reading and turning one's
+        // own networks on and off: one rule, the one the usage shows. Then whose
+        // network or act it is.
+        if command.needs_an_administrator() {
+            Self::on_the_machine(caller)?;
+        }
         match command.needs() {
             crate::control::Needs::Nobody => Ok(()),
 
@@ -3020,11 +3112,10 @@ impl Service {
 
     /// Whether the act this command finishes was begun by this caller.
     ///
-    /// Three things can be in flight and they are owned differently. An
-    /// **admission** is an act on a network, so it belongs to whoever the network
-    /// does. A **founding** or a **join** has no network yet, so the person who
-    /// began it is carried along with it. A **signature** belongs to whoever the
-    /// act waiting for it was issued to.
+    /// Three things can be in flight and they are owned differently. A
+    /// **founding** or a **relay move** carries the person who began it. A
+    /// **join** has no network yet, and its directory records whose it is. A
+    /// **signature** belongs to whoever the act waiting for it was issued to.
     ///
     /// Where nothing is in flight, this allows: the command will say so itself,
     /// and it says it better.
@@ -3052,23 +3143,24 @@ impl Service {
             };
         }
 
+        if let Command::CancelJoin { label } = command {
+            let Ok(label) = Label::new(label) else { return Ok(()) };
+            if !self.joins.lock().await.contains_key(&label) {
+                return Ok(());
+            }
+            let paths = self.home().paths_for(&label);
+            return Self::belongs_to(caller, &paths, &label);
+        }
+
         let waiting = self.pending.lock().await;
         match &*waiting {
             None => Ok(()),
-            Some(
-                Pending::Founding { for_whom, .. }
-                | Pending::Joining { for_whom, .. }
-                | Pending::ChangingRelay { for_whom, .. },
-            ) => {
+            Some(Pending::Founding { for_whom, .. } | Pending::ChangingRelay { for_whom, .. }) => {
                 if for_whom == caller {
                     Ok(())
                 } else {
                     Err(mistaken())
                 }
-            }
-            Some(Pending::Admitting { label, .. }) => {
-                let paths = self.home().paths_for(label);
-                Self::belongs_to(caller, &paths, label)
             }
         }
     }
@@ -3231,10 +3323,10 @@ impl Service {
                 *self.stopping.lock().await = true;
                 Self::said(self.take_all_down().await)
             }
-            Command::Invite { network, name, admin, light, groups, ipv4, hours } => {
+            Command::Invite { network, name, admin, light, groups, ipv4, minutes } => {
                 match Self::wanted(network) {
                     Ok(label) => {
-                        let asked = Inviting { name, admin, light, groups, ipv4, hours };
+                        let asked = Inviting { name, admin, light, groups, ipv4, minutes };
                         self.invite(label.as_ref(), asked).await
                     }
                     Err(cause) => Self::said(Err(cause)),
@@ -3244,10 +3336,19 @@ impl Service {
                 Ok(label) => self.withdraw(label.as_ref(), &name).await,
                 Err(cause) => Self::said(Err(cause)),
             },
-            Command::Invites { network } => match Self::wanted(network) {
-                Ok(label) => self.invites(label.as_ref()).await,
+            Command::Pending { network } => match Self::wanted(network) {
+                Ok(label) => self.pending_list(label.as_ref()).await,
                 Err(cause) => Self::said(Err(cause)),
             },
+            Command::Approve { network, name, replace } => match Self::wanted(network) {
+                Ok(label) => self.approve(label.as_ref(), &name, replace).await,
+                Err(cause) => Self::said(Err(cause)),
+            },
+            Command::Reject { network, name } => match Self::wanted(network) {
+                Ok(label) => self.reject(label.as_ref(), &name).await,
+                Err(cause) => Self::said(Err(cause)),
+            },
+            Command::CancelJoin { label } => self.cancel_join(&label).await,
             // A name is checked where it enters: refused before anything is made
             // or sent when it is not one a resolver can answer, and lowered when
             // it is.
@@ -3258,30 +3359,12 @@ impl Service {
                 }
             },
             Command::Confirm => self.confirm().await,
-            Command::ConfirmJoin { code } => self.confirm_join(code).await,
             Command::Abandon => {
                 // A batch being put together is let go with whatever else waits.
+                // A founding or a move that is abandoned has signed nothing and
+                // opened no socket: dropping it is the whole of it.
                 *self.staged.lock().await = (None, Vec::new());
-                match self.pending.lock().await.take() {
-                    Some(Pending::Admitting { pending, .. }) => {
-                        crate::admitting::abandon(pending).await;
-                    }
-                    // A founding that is abandoned has signed nothing and opened
-                    // no socket: dropping the parameters is the whole of it.
-                    Some(Pending::Founding { .. } | Pending::ChangingRelay { .. }) | None => {}
-                    // A join has a socket. Ending the task closes the endpoint it
-                    // opened, which is what takes the daemon back to silence —
-                    // §2.6c gives it no licence to stay registered at a relay for
-                    // a join nobody is coming back to.
-                    Some(Pending::Joining { mut task, underway, .. }) => {
-                        // Asked to stop, so it closes its endpoint; ended by force
-                        // only if it does not within a few seconds.
-                        underway.abandon();
-                        if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
-                            task.abort();
-                        }
-                    }
-                }
+                let _dropped = self.pending.lock().await.take();
                 Outcome::Done
             }
             Command::Revoke { network, target, reason } => match Self::wanted(network) {
@@ -3376,7 +3459,6 @@ impl Service {
                 self.tidy_after(ended.into_iter().collect()).await;
                 Outcome::Done
             }
-            Command::Replace => self.confirm_replacing().await,
             Command::Forget { label, last_admin } => self.forget(&label, last_admin).await,
             Command::Waiting => self.waiting_on().await,
             Command::Found { label, name, suffix, relay, ipv4_range, window_days } => {
@@ -3472,7 +3554,10 @@ impl Service {
         let voids = voided_note(&state, &expulsion, &anchor);
         let heads = anchor.heads;
         if let (Some(voids), false) = (&voids, voiding_agreed) {
-            return Outcome::WouldVoid { network: network.label().to_string(), voids: voids.clone() };
+            return Outcome::WouldVoid {
+                network: network.label().to_string(),
+                voids: voids.clone(),
+            };
         }
 
         // An admin role the roster gives a machine that cannot hold an admin's
@@ -3662,7 +3747,7 @@ impl Service {
         }
     }
 
-    /// Issues an invite into a network, and wakes the dialling.
+    /// Issues an invite, and keeps what the device it brings will be.
     async fn invite(&self, which: Option<&Label>, asked: Inviting) -> Outcome {
         let network = match self.which(which).await {
             Ok(network) => network,
@@ -3693,35 +3778,46 @@ impl Service {
             Ok(invited) => invited,
             Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was issued.")),
         };
-        let lifetime = match asked.hours {
+        let lifetime = match asked.minutes {
             None => crate::invites::DEFAULT_LIFETIME_SECS,
             Some(0) => {
                 return Outcome::refused(
                     "an invite open for no time admits nobody. Nothing was issued.".to_owned(),
                 );
             }
-            Some(hours) => u64::from(hours).saturating_mul(60 * 60),
+            Some(minutes) => u64::from(minutes).saturating_mul(60),
         };
+        if lifetime > crate::invites::LONGEST_LIFETIME_SECS {
+            return Outcome::refused(
+                "an invite stays open a week at most: a door left open longer is one nobody \
+                 remembers opening. Nothing was issued."
+                    .to_owned(),
+            );
+        }
 
+        let _held = self.invites_lock.lock().await;
         let now = crate::state::wall_seconds();
-        let file = crate::invites::InviteFile::beside(&network.paths.roster());
-        let mut invites = match file.load() {
+        let mut invites = match Self::invites_of(&network).await {
             Ok(invites) => invites,
             Err(cause) => return Self::said(Err(cause)),
         };
         invites.forget_ended(now);
-        if invites.open_named(&invited.name, now).is_some() {
+        if invites.live_named(&invited.name, now).is_some() {
             return Outcome::refused(format!(
-                "an invite for `{}` is already open. Withdraw it first, or wait for it to be \
-                 used. Nothing was issued.",
-                crate::control::shown(&invited.name)
+                "an invite for `{}` {}: approve or reject its request, or withdraw it, before \
+                 issuing another. Nothing was issued.",
+                crate::control::shown(&invited.name),
+                crate::control::INVITE_STILL_OPEN
             ));
         }
         if let Some(address) = invited.ipv4
-            && invites.open(now).any(|record| record.invited.ipv4 == Some(address))
+            && invites
+                .all()
+                .iter()
+                .any(|record| !record.standing(now).ended() && record.invited.ipv4 == Some(address))
         {
             return Outcome::refused(format!(
-                "{} is promised to another open invite. Nothing was issued.",
+                "{} is promised to another invite. Nothing was issued.",
                 std::net::Ipv4Addr::from(address)
             ));
         }
@@ -3734,7 +3830,7 @@ impl Service {
         let text = record.invite.to_text();
         let expires_at = record.expires_at;
         invites.add(record);
-        if let Err(cause) = file.save(&invites) {
+        if let Err(cause) = Self::save_invites(&network, &invites) {
             return Self::said(Err(cause));
         }
         Self::keep_checkpoint(&network, true).await;
@@ -3747,115 +3843,210 @@ impl Service {
         }
     }
 
-    /// Withdraws the open invite for `name`, and drops an admission it led to
-    /// that is still waiting for a person.
+    /// Withdraws the invite for `name`, while nothing has been signed through
+    /// it, dropping a request it brought.
     async fn withdraw(&self, which: Option<&Label>, name: &str) -> Outcome {
         let network = match self.which(which).await {
             Ok(network) => network,
             Err(cause) => return Self::said(Err(cause)),
         };
+        let _held = self.invites_lock.lock().await;
         let now = crate::state::wall_seconds();
-        let file = crate::invites::InviteFile::beside(&network.paths.roster());
-        let mut invites = match file.load() {
+        let mut invites = match Self::invites_of(&network).await {
             Ok(invites) => invites,
             Err(cause) => return Self::said(Err(cause)),
         };
-        let Some(secret) = invites.open_named(name, now).map(|record| record.invite.secret) else {
-            return Outcome::refused(format!(
-                "no invite for `{}` is open in `{}`",
-                crate::control::shown(name),
-                network.label()
-            ));
+        let withdrawable = invites
+            .all()
+            .iter()
+            .find(|record| {
+                record.invited.name == name
+                    && matches!(
+                        record.standing(now),
+                        crate::invites::Standing::Open | crate::invites::Standing::Requested
+                    )
+            })
+            .map(|record| record.invite.secret);
+        let Some(secret) = withdrawable else {
+            let approved = invites.named(name, crate::invites::Standing::Approved, now).is_some();
+            return Outcome::refused(if approved {
+                format!(
+                    "the request for `{}` was approved already: the device is in `{}`, and only \
+                     revoking it takes it out",
+                    crate::control::shown(name),
+                    network.label()
+                )
+            } else {
+                format!(
+                    "no invite for `{}` is open in `{}`",
+                    crate::control::shown(name),
+                    network.label()
+                )
+            });
         };
         invites.withdraw(&secret, now);
-        if let Err(cause) = file.save(&invites) {
+        if let Err(cause) = Self::save_invites(&network, &invites) {
             return Self::said(Err(cause));
         }
         Self::keep_checkpoint(&network, true).await;
-        let waiting = {
-            let mut held = self.pending.lock().await;
-            match held.take() {
-                Some(Pending::Admitting { pending, .. }) if *pending.invite_secret() == secret => {
-                    Some(pending)
-                }
-                other => {
-                    *held = other;
-                    None
-                }
-            }
-        };
-        if let Some(pending) = waiting {
-            crate::admitting::abandon(pending).await;
-        }
         Outcome::Done
     }
 
-    /// The invites issued into a network, open or ended.
-    async fn invites(&self, which: Option<&Label>) -> Outcome {
+    /// Everything waiting: the invites issued into the networks asked about,
+    /// with the requests they brought, this device's own joins, and an act
+    /// stopped on a person.
+    async fn pending_list(&self, which: Option<&Label>) -> Outcome {
+        let networks = match which {
+            Some(label) => match self.named(label).await {
+                Ok(network) => vec![network],
+                Err(cause) => return Self::said(Err(cause)),
+            },
+            None => {
+                // Only this person's, as `status` shows only theirs.
+                let asking = self.asking.lock().await.clone();
+                self.all()
+                    .await
+                    .into_iter()
+                    .filter(|network| {
+                        asking.is(crate::state::read_owner(&network.paths).as_deref())
+                    })
+                    .collect()
+            }
+        };
+        let now = crate::state::wall_seconds();
+        let mut invites = Vec::new();
+        for network in networks {
+            let Ok(held) = Self::invites_of(&network).await else {
+                continue;
+            };
+            let state = network.node().state().await.ok();
+            for record in held.all() {
+                let request = record.request.as_ref().map(|request| crate::control::RequestLine {
+                    proposed_name: request.applicant.name.clone(),
+                    fingerprint: crate::joining::fingerprint(&request.applicant.signing),
+                    arrived_at: request.arrived_at,
+                    taken: state
+                        .as_ref()
+                        .filter(|_| record.standing(now) == crate::invites::Standing::Requested)
+                        .and_then(|state| {
+                            crate::admitting::holder_of(
+                                &crate::admitting::admitted_name(&record.invited.name),
+                                state,
+                            )
+                        })
+                        .map(|taken| taken_name(&taken)),
+                });
+                invites.push(crate::control::InviteLine {
+                    network: network.label().to_string(),
+                    name: record.invited.name.clone(),
+                    standing: record.standing(now).as_str().to_owned(),
+                    expires_at: record.expires_at,
+                    request,
+                });
+            }
+        }
+        let asking = self.asking.lock().await.clone();
+        let mut joins = Vec::new();
+        for (label, joining) in &*self.joins.lock().await {
+            let paths = self.home.paths_for(label);
+            if !asking.is(crate::state::read_owner(&paths).as_deref()) {
+                continue;
+            }
+            let (standing, requested_at, failure) = match joining.underway.progress() {
+                crate::joining::Progress::Registering => ("registering", None, None),
+                crate::joining::Progress::Waiting => ("waiting", None, None),
+                crate::joining::Progress::Requested { at } => ("requested", Some(at), None),
+                // Being taken on: it leaves this list within a moment.
+                crate::joining::Progress::Joined { .. } => ("joined", None, None),
+                crate::joining::Progress::Failed(why) => ("failed", None, Some(why)),
+            };
+            joins.push(crate::control::JoinLine {
+                label: label.to_string(),
+                fingerprint: joining.fingerprint.clone(),
+                standing: standing.to_owned(),
+                since: joining.since,
+                requested_at,
+                problem: failure.or_else(|| joining.underway.last_refusal()),
+            });
+        }
+        Outcome::Pending(crate::control::PendingList {
+            invites,
+            joins,
+            stopped: self.waiting_described().await,
+        })
+    }
+
+    /// Rejects the request that arrived through the invite for `name`.
+    async fn reject(&self, which: Option<&Label>, name: &str) -> Outcome {
         let network = match self.which(which).await {
             Ok(network) => network,
             Err(cause) => return Self::said(Err(cause)),
         };
+        let _held = self.invites_lock.lock().await;
         let now = crate::state::wall_seconds();
-        match crate::invites::InviteFile::beside(&network.paths.roster()).load() {
-            Ok(invites) => Outcome::InvitesHeld(
-                invites
-                    .all()
-                    .iter()
-                    .map(|record| crate::control::InviteLine {
-                        name: record.invited.name.clone(),
-                        standing: match record.standing(now) {
-                            crate::invites::Standing::Open => "open",
-                            crate::invites::Standing::Used => "used",
-                            crate::invites::Standing::Expired => "expired",
-                            crate::invites::Standing::Withdrawn => "withdrawn",
-                        }
-                        .to_owned(),
-                        expires_at: record.expires_at,
-                    })
-                    .collect(),
-            ),
-            Err(cause) => Self::said(Err(cause)),
+        let mut invites = match Self::invites_of(&network).await {
+            Ok(invites) => invites,
+            Err(cause) => return Self::said(Err(cause)),
+        };
+        let Some(secret) = invites
+            .named(name, crate::invites::Standing::Requested, now)
+            .map(|record| record.invite.secret)
+        else {
+            return Outcome::refused(format!(
+                "no request for `{}` is waiting in `{}`",
+                crate::control::shown(name),
+                network.label()
+            ));
+        };
+        invites.reject(&secret, now);
+        if let Err(cause) = Self::save_invites(&network, &invites) {
+            return Self::said(Err(cause));
         }
+        Self::keep_checkpoint(&network, true).await;
+        Outcome::Done
     }
 
-    /// Why the invite with `secret` admits nobody now, where it does not.
-    async fn invite_refusal(
-        &self,
-        label: &Label,
-        secret: &[u8; enrollment::invite::SECRET_LEN],
-    ) -> Option<Outcome> {
-        let network = self.named(label).await.ok()?;
-        let file = crate::invites::InviteFile::beside(&network.paths.roster());
-        let admits =
-            file.load().is_ok_and(|held| held.still_admits(secret, crate::state::wall_seconds()));
-        (!admits).then(|| {
-            Outcome::refused(
-                "the invite this device came through was withdrawn or has ended, so it admits \
-                 nobody. Nothing was signed."
-                    .to_owned(),
-            )
-        })
-    }
-
-    /// Marks the invite with `secret` used.
-    async fn invite_used(
-        &self,
-        network: &Arc<Network>,
-        secret: &[u8; enrollment::invite::SECRET_LEN],
-    ) {
-        let file = crate::invites::InviteFile::beside(&network.paths.roster());
-        let Ok(mut invites) = file.load() else { return };
-        if invites.take(secret, crate::state::wall_seconds()).is_ok()
-            && let Err(cause) = file.save(&invites)
+    /// The invite records of `network`, believed only where they are what this
+    /// daemon wrote.
+    ///
+    /// Records changed outside the daemon while it runs are not used: they are
+    /// dropped, and that is said, as they are at a start whose checkpoint does
+    /// not name them. A request planted there is no request.
+    async fn invites_of(network: &Arc<Network>) -> Result<crate::invites::Invites> {
+        let path = network.paths.root().join(crate::invites::FILE_NAME);
+        if let Some(keeper) = network.node().keeper()
+            && !keeper.vouches_invites(crate::checkpoint::file_hash(&path).as_ref())
         {
-            network.node().record(crate::node::Severity::Problem, "invite", cause).await;
+            keeper.writing_invites(None);
+            let _dropped = std::fs::remove_file(&path);
+            network
+                .node()
+                .record(
+                    crate::node::Severity::Problem,
+                    "invite",
+                    "the invite records were changed outside the daemon, so they are not used: \
+                     every invite and request in them was dropped",
+                )
+                .await;
+            return Ok(crate::invites::Invites::default());
         }
-        Self::keep_checkpoint(network, true).await;
+        crate::invites::InviteFile::beside(&network.paths.roster()).load()
     }
 
-    /// Dials the devices open invites bring, every interval and whenever an
-    /// invite is issued, for as long as the daemon runs.
+    /// Writes the invite records of `network`, having said first what is being
+    /// written, so the checkpoint vouches for this and nothing else.
+    fn save_invites(network: &Network, invites: &crate::invites::Invites) -> Result<()> {
+        let file = crate::invites::InviteFile::beside(&network.paths.roster());
+        let encoded = file.encode(invites)?;
+        if let Some(keeper) = network.node().keeper() {
+            keeper.writing_invites(Some(*blake3::hash(&encoded).as_bytes()));
+        }
+        file.write(&encoded)
+    }
+
+    /// Dials what the invites and admissions of this device's networks are
+    /// waiting on, every interval and whenever something is issued or approved,
+    /// for as long as the daemon runs.
     async fn dial_invites_forever(self: Arc<Self>) {
         loop {
             tokio::select! {
@@ -3866,42 +4057,27 @@ impl Service {
                 return;
             }
             self.dial_invites().await;
+            self.bring_to_newcomers().await;
         }
     }
 
-    /// One round of dialling: the first invited device that answers becomes the
-    /// admission waiting for a person, and the person is told.
+    /// One round: the rendezvous of every open invite is dialled for its
+    /// device's request, and every approved device that does not have the
+    /// network yet is dialled to be given it.
     ///
-    /// Only while nothing else waits: there is one thing on a person's screen
-    /// at a time. An admission from an invite that expired before anybody came
-    /// back is dropped first, so its device — still waiting — is reached again
-    /// with a fresh exchange.
-    async fn dial_invites(&self) {
-        let expired = {
-            let mut held = self.pending.lock().await;
-            match held.take() {
-                Some(Pending::Admitting { pending, .. }) if !pending.live() => Some(pending),
-                other => {
-                    *held = other;
-                    None
-                }
-            }
-        };
-        if let Some(pending) = expired {
-            crate::admitting::abandon(pending).await;
-        }
-        if self.pending.lock().await.is_some() {
-            return;
-        }
-
+    /// Only an admin's invites are dialled: the roster is what says this device
+    /// may still admit anybody.
+    async fn dial_invites(self: &Arc<Self>) {
         let now = crate::state::wall_seconds();
+        let started = std::time::Instant::now();
+        // Every dial of a round at once: a device that is not there costs its
+        // own patience, never another's.
+        let mut dials = tokio::task::JoinSet::new();
         for network in self.all().await {
-            let Ok(invites) = crate::invites::InviteFile::beside(&network.paths.roster()).load()
-            else {
-                continue;
-            };
+            let Ok(invites) = Self::invites_of(&network).await else { continue };
             let open: Vec<crate::invites::Record> = invites.open(now).cloned().collect();
-            if open.is_empty() {
+            let approved: Vec<crate::invites::Record> = invites.delivering(now).cloned().collect();
+            if open.is_empty() && approved.is_empty() {
                 continue;
             }
             let node = Arc::clone(network.node());
@@ -3910,82 +4086,549 @@ impl Service {
                 continue;
             }
             for record in open {
-                // Reaching, then the introduction a person may have to sign for:
-                // each step bounds itself, and this bounds the whole.
-                let dialled = tokio::time::timeout(
-                    crate::limits::INVITE_DIAL_PATIENCE.saturating_add(
-                        std::time::Duration::from_secs(enrollment::limits::EXCHANGE_DEADLINE_SECS),
-                    ),
-                    crate::admitting::open_invited(node.identity(), &state, &record),
-                )
-                .await;
-                let Ok(Ok(pending)) = dialled else { continue };
-                let mut held = self.pending.lock().await;
-                if held.is_some() {
-                    // Something else began meanwhile; this device is dialled
-                    // again once it is over.
-                    drop(held);
-                    crate::admitting::abandon(pending).await;
-                    return;
+                let this = Arc::clone(self);
+                let network = Arc::clone(&network);
+                dials.spawn(async move {
+                    // Reaching, then the request: each step bounds itself, and
+                    // this bounds the whole.
+                    let collected = tokio::time::timeout(
+                        crate::limits::INVITE_DIAL_PATIENCE.saturating_add(Duration::from_secs(
+                            enrollment::limits::EXCHANGE_DEADLINE_SECS,
+                        )),
+                        crate::admitting::collect(&record.invite),
+                    )
+                    .await;
+                    if let Ok(Ok(applicant)) = collected {
+                        this.request_arrived(&network, &record, applicant).await;
+                    }
+                });
+            }
+            for record in approved {
+                // With backoff: a device switched off for a week is not
+                // dialled every few seconds of it.
+                {
+                    let mut delivering = self.delivering.lock().await;
+                    let attempt = delivering
+                        .entry(record.invite.secret)
+                        .or_insert_with(|| Newcomer::due(started));
+                    if attempt.next > started {
+                        continue;
+                    }
+                    attempt.tried(started);
                 }
-                *held = Some(Pending::Admitting { label: network.label().clone(), pending });
-                drop(held);
-                node.record(
+                let this = Arc::clone(self);
+                let network = Arc::clone(&network);
+                dials.spawn(async move { this.deliver_approved(&network, &record).await });
+            }
+        }
+        while dials.join_next().await.is_some() {}
+    }
+
+    /// Keeps a request that arrived, asking nobody, and says so.
+    async fn request_arrived(
+        &self,
+        network: &Arc<Network>,
+        record: &crate::invites::Record,
+        applicant: crate::admitting::Applicant,
+    ) {
+        let held = self.invites_lock.lock().await;
+        let Ok(mut invites) = Self::invites_of(network).await else { return };
+        let fingerprint = crate::joining::fingerprint(&applicant.signing);
+        if !invites.arrived(&record.invite.secret, applicant, crate::state::wall_seconds()) {
+            return;
+        }
+        let saved = Self::save_invites(network, &invites);
+        drop(held);
+        if let Err(cause) = saved {
+            network.node().record(crate::node::Severity::Problem, "invite", cause).await;
+            return;
+        }
+        Self::keep_checkpoint(network, true).await;
+        network
+            .node()
+            .record(
+                crate::node::Severity::Event,
+                "invite",
+                format!(
+                    "a request arrived through the invite for `{}`, with the key {fingerprint}: \
+                     approve or reject it from the pending list",
+                    crate::control::shown(&record.invited.name)
+                ),
+            )
+            .await;
+    }
+
+    /// Dials an approved device to give it the network: at the rendezvous,
+    /// where it waits from its join's first moment, and at its own transport
+    /// key. Stops being dialled once it has the network — said by the device,
+    /// or shown by a session with it. Not by when it was last in contact: that
+    /// is a wall-clock value, and nothing that dials reads it (`contacts`).
+    async fn deliver_approved(&self, network: &Arc<Network>, record: &crate::invites::Record) {
+        let Some(request) = &record.request else { return };
+        let Ok(state) = network.node().state().await else { return };
+        let state = &state;
+        let Some(relay) = state.params.relay.as_deref() else { return };
+        // A session with it says it has the network as well as its own word
+        // does: only a member is let into one.
+        let met = match admitted_device(state, &request.applicant) {
+            Some(device) => network.node().has_session(&device).await,
+            None => false,
+        };
+        let mut taken = met;
+        if !taken {
+            let Ok(delivery) = self.delivery_of(network).await else { return };
+            let rendezvous =
+                transport_convesso::enrolment::rendezvous_key(&record.invite.rendezvous_seed());
+            let mut destinations = Vec::new();
+            if let Ok(rendezvous) = rendezvous {
+                destinations.push(rendezvous);
+            }
+            destinations.push(request.applicant.transport.clone());
+            for dialled in destinations {
+                let destination = crate::admitting::Destination {
+                    dialled,
+                    relay,
+                    signing: &request.applicant.signing,
+                    transport: &request.applicant.transport,
+                };
+                if let Ok(true) = crate::admitting::deliver(&destination, &delivery).await {
+                    taken = true;
+                    break;
+                }
+            }
+        }
+        if !taken {
+            return;
+        }
+        self.delivering.lock().await.remove(&record.invite.secret);
+        let held = self.invites_lock.lock().await;
+        let Ok(mut invites) = Self::invites_of(network).await else { return };
+        let saved = invites.delivered(&record.invite.secret)
+            && Self::save_invites(network, &invites).is_ok();
+        drop(held);
+        if saved {
+            Self::keep_checkpoint(network, true).await;
+            network
+                .node()
+                .record(
                     crate::node::Severity::Event,
                     "invite",
-                    format!(
-                        "the device invited as `{}` has arrived: compare the code to admit it",
-                        crate::control::shown(&record.invited.name)
-                    ),
+                    format!("`{}` has the network", crate::control::shown(&record.invited.name)),
                 )
                 .await;
-                return;
-            }
         }
     }
 
-    /// Finishes whatever is waiting on this device's own person.
+    /// What a device is given when it is brought the network: everything this
+    /// device holds, as an admin delivers it.
+    async fn delivery_of(
+        &self,
+        network: &Arc<Network>,
+    ) -> core::result::Result<crate::admitting::Delivery, String> {
+        let paths = &network.paths;
+        let node = network.node();
+        let operations =
+            crate::state::Log::at(paths.roster()).read().map_err(|cause| cause.to_string())?;
+        let pieces = crate::state::Log::at(paths.pieces()).read().unwrap_or_default();
+        let held = crate::state::read_snapshot(paths).map(|(bytes, _at)| bytes);
+        let base = node
+            .base()
+            .await
+            .map(|(root, state)| enrollment::adopt::Base { root: root.to_bytes(), state });
+        // An admin delivers the root over what it delivers, following the one
+        // it holds: the device then arrives holding a proof of itself, and a
+        // light member believes it from its first session instead of once the
+        // next root has spread. Signed with the attestation key, which asks
+        // nobody. A member that is not an admin delivers the root it holds.
+        let admin =
+            node.state().await.is_ok_and(|state| state.is_admin(&node.identity().device_id()));
+        let snapshot = if admin {
+            root_after(node.identity(), base.clone(), &operations, &pieces, held.as_deref(), &[])
+                .ok()
+                .or(held)
+        } else {
+            held
+        };
+        Ok(crate::admitting::Delivery { operations, pieces, snapshot, base })
+    }
+
+    /// Brings the network to new members this device has never been in contact
+    /// with, where it is one of those that should: an anchor of the new member,
+    /// or a member that would choose it as a neighbour.
     ///
-    /// A join is not one of those. Its person supplies six digits read off
-    /// another machine, so it is confirmed through [`Self::confirm_join`] and a
-    /// bare confirmation is refused here rather than treated as agreement — the
-    /// agreement being exactly what this change removes.
+    /// A device approved while it was off does not know it was admitted: it
+    /// waits under its own transport key, and a full member holding its
+    /// admission dials it there. Each is dialled with backoff, and only for
+    /// [`crate::limits::NEWCOMER_PATIENCE`] after its admission was signed;
+    /// never again once this device has had a session with it. Only from a
+    /// network that is up: a member whose person turned it off speaks to
+    /// nobody.
+    async fn bring_to_newcomers(self: &Arc<Self>) {
+        let now = std::time::Instant::now();
+        let mut dials = tokio::task::JoinSet::new();
+        let patience =
+            u64::try_from(crate::limits::NEWCOMER_PATIENCE.as_millis()).unwrap_or(u64::MAX);
+        for network in self.all().await {
+            if !network.is_driving().await {
+                continue;
+            }
+            let node = Arc::clone(network.node());
+            let Ok(state) = node.state().await else { continue };
+            let me = node.identity().device_id();
+            if state.settings_of(&me).mode != roster::leaf::Mode::Full {
+                continue;
+            }
+            let Some(relay) = state.params.relay.clone() else { continue };
+            let mut owed = Vec::new();
+            // The cheap questions first, asked of every member: whether this
+            // device is one that brings it the network at all. Only those are
+            // asked when they were admitted, and whether they were met.
+            let choices = node.choices(&state);
+            for (device, record) in state.devices.iter() {
+                if device == me {
+                    continue;
+                }
+                let anchor =
+                    crate::seeking::anchors_for(&device, &state.params.anchors).contains(&me);
+                if !anchor && !choices.as_ref().is_some_and(|held| held.could_choose(&device)) {
+                    continue;
+                }
+                let recent = node
+                    .signed_at(&record.added_by)
+                    .await
+                    .is_some_and(|signed| crate::clock::now_ms().saturating_sub(signed) < patience);
+                if !recent {
+                    continue;
+                }
+                // Met: a session with it is the end of this, for good. Not
+                // when it was last in contact: that is a wall-clock value, and
+                // nothing that dials reads it (`contacts`).
+                if node.has_session(&device).await {
+                    let met = Newcomer {
+                        next: now.checked_add(crate::limits::NEWCOMER_PATIENCE).unwrap_or(now),
+                        delay: Newcomer::LONGEST,
+                    };
+                    self.newcomers.lock().await.insert((state.network, device), met);
+                    continue;
+                }
+                owed.push((device, record.keys.clone()));
+            }
+            for (device, keys) in owed {
+                let key = (state.network, device);
+                {
+                    let mut newcomers = self.newcomers.lock().await;
+                    let attempt = newcomers.entry(key).or_insert_with(|| Newcomer::due(now));
+                    if attempt.next > now {
+                        continue;
+                    }
+                    attempt.tried(now);
+                }
+                let find = |purpose: roster::types::KeyPurpose| {
+                    keys.iter().find(|entry| entry.purpose == purpose).and_then(|entry| {
+                        roster::sign::PublicKey::new(entry.alg, entry.value.clone()).ok()
+                    })
+                };
+                let (Some(signing), Some(transport)) = (
+                    find(roster::types::KeyPurpose::Signing),
+                    find(roster::types::KeyPurpose::Transport),
+                ) else {
+                    continue;
+                };
+                let this = Arc::clone(self);
+                let network = Arc::clone(&network);
+                let relay = relay.clone();
+                dials.spawn(async move {
+                    let Ok(delivery) = this.delivery_of(&network).await else { return };
+                    let destination = crate::admitting::Destination {
+                        dialled: transport.clone(),
+                        relay: &relay,
+                        signing: &signing,
+                        transport: &transport,
+                    };
+                    if let Ok(true) = crate::admitting::deliver(&destination, &delivery).await {
+                        this.newcomers.lock().await.remove(&key);
+                        network
+                            .node()
+                            .record(
+                                crate::node::Severity::Event,
+                                "invite",
+                                format!(
+                                    "a new member, {}, was given the network from here",
+                                    crate::control::short_id(&device)
+                                ),
+                            )
+                            .await;
+                    }
+                });
+            }
+        }
+        while dials.join_next().await.is_some() {}
+    }
+
+    /// Approves the request that arrived through the invite for `name`: signs
+    /// its admission, and the settings the invite chose, and records them. The
+    /// device is given the network when it answers.
+    ///
+    /// `replacing` is the admin's answer to a name the network already uses: the
+    /// device holding it is revoked, first, and the new one takes the name.
+    /// Without it, the new device is admitted under a name nobody holds.
+    async fn approve(&self, which: Option<&Label>, name: &str, replacing: bool) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => return Self::said(Err(cause)),
+        };
+        let label = network.label().clone();
+        let node = Arc::clone(network.node());
+        if let Some(refusal) = self.keys.admin_refusal() {
+            return Outcome::refused(format!(
+                "admitting a device is an admin's act, and {refusal}. Nothing was signed."
+            ));
+        }
+        let Ok(state) = node.state().await else {
+            return Outcome::refused(format!("`{label}` has no state to admit into"));
+        };
+        if !state.is_admin(&node.identity().device_id()) {
+            return Outcome::refused(format!(
+                "only an admin of `{label}` can admit a device into it. Nothing was signed."
+            ));
+        }
+        let now = crate::state::wall_seconds();
+        let record = match Self::invites_of(&network).await {
+            Ok(invites) => invites.named(name, crate::invites::Standing::Requested, now).cloned(),
+            Err(cause) => return Self::said(Err(cause)),
+        };
+        let Some((record, request)) =
+            record.and_then(|record| record.request.clone().map(|request| (record, request)))
+        else {
+            return Outcome::refused(format!(
+                "no request for `{}` is waiting in `{label}`",
+                crate::control::shown(name)
+            ));
+        };
+        let taken = if replacing {
+            crate::admitting::holder_of(
+                &crate::admitting::admitted_name(&record.invited.name),
+                &state,
+            )
+        } else {
+            None
+        };
+
+        // Where the key is out of reach, the whole admission — the revocation
+        // too, when there is one — is prepared as one batch and signed at once.
+        if !node.identity().signing_key().answers_here() {
+            return self.approving_batch(&network, &record, &request, taken).await;
+        }
+
+        // The device whose name is being taken over, revoked **first**, and
+        // everything the admission is built from read **after**.
+        //
+        // # Why the order is the whole of it
+        //
+        // Two operations signed against the same heads are concurrent: neither is
+        // an ancestor of the other, and one author holding two branches is what
+        // equivocation *is*. The roster then voids what that author signed —
+        // `state::judge_one` exempts revocations and nothing else — so a
+        // replacement built this way splits in the worst possible direction: the
+        // revocation stands and the admission does not. The device holding the
+        // name is expelled and the device meant to take it never becomes a
+        // member, on a log that cannot be unsaid.
+        //
+        // That is not a hypothetical. It was built this way, run between a
+        // desktop and a phone, and the desktop accused itself of equivocation
+        // over exactly these two operations. So the admission is signed on top of
+        // the revocation, and everything it is built from is read once the
+        // revocation is in.
+        //
+        // When the key is out of reach the two are still in that order, as one
+        // batch: see `approving_batch`.
+        let keeping_the_name = taken.is_some();
+        if let Some(taken) = &taken
+            && let Err(refusal) = self.expel_for_replacement(&network, taken).await
+        {
+            return refusal;
+        }
+        let Ok(state) = node.state().await else {
+            return Outcome::refused(format!("`{label}` has no state to admit into"));
+        };
+        let heads = node.heads().await;
+        let identity = node.identity();
+        let prepared = crate::admitting::admission_core(
+            &request.applicant,
+            &record.invited,
+            identity,
+            &state,
+            heads,
+            keeping_the_name,
+        )
+        .and_then(|(operation, spec_name)| {
+            crate::admitting::settings_core(&record.invited, identity, &state, &operation)
+                .map(|settings| (operation, spec_name, settings))
+        });
+        let (operation, spec_name, settings) = match prepared {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Outcome::refused(refusal),
+        };
+        let mut signed = Vec::new();
+        for each in core::iter::once(&operation).chain(settings.as_ref()) {
+            match identity.sign_operation(each) {
+                Ok(bytes) => signed.push(bytes),
+                Err(cause) => return Outcome::refused(crate::control::declined(&cause)),
+            }
+        }
+        self.approved(&network, &record, signed, &spec_name).await
+    }
+
+    /// Prepares an approval as one batch, where the key is out of reach.
+    ///
+    /// The revocation of the device holding the name, when it is a replacement;
+    /// the admission, built on top of it; the settings its invite chose; and the
+    /// snapshot the network is then owed. None is signed, so the admission is
+    /// built against a **preview** of the roster once the revocation is in —
+    /// the same state the direct path reads, with the same checks — and names
+    /// the revocation as its parent.
+    async fn approving_batch(
+        &self,
+        network: &Arc<Network>,
+        record: &crate::invites::Record,
+        request: &crate::invites::Request,
+        taken: Option<crate::admitting::Taken>,
+    ) -> Outcome {
+        let label = network.label().clone();
+        let node = network.node();
+        let identity = node.identity();
+        let Ok(state) = node.state().await else {
+            return Outcome::refused(format!("`{label}` has no state to admit into"));
+        };
+        let prepared_against = node.moment().await;
+
+        let mut cores = Vec::new();
+        let (state, heads) = match &taken {
+            None => (state, prepared_against.heads.clone()),
+            Some(taken) => {
+                let expulsion = expulsion_of(taken);
+                let revocation = match crate::revoking::core(
+                    &expulsion,
+                    identity,
+                    &state,
+                    prepared_against.heads.clone(),
+                ) {
+                    Ok(core) => core,
+                    Err(refusal) => return Outcome::refused(refusal),
+                };
+                let after = match node.preview(core::slice::from_ref(&revocation)).await {
+                    Ok(after) => after,
+                    Err(cause) => {
+                        return Outcome::refused(format!(
+                            "the device holding that name could not be revoked, so nothing was \
+                             admitted: {cause}"
+                        ));
+                    }
+                };
+                cores.push(revocation);
+                (after.state, after.heads)
+            }
+        };
+        let prepared = crate::admitting::admission_core(
+            &request.applicant,
+            &record.invited,
+            identity,
+            &state,
+            heads,
+            taken.is_some(),
+        )
+        .and_then(|(admission, spec_name)| {
+            crate::admitting::settings_core(&record.invited, identity, &state, &admission)
+                .map(|settings| (admission, spec_name, settings))
+        });
+        let (admission, spec_name, settings) = match prepared {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Outcome::refused(refusal),
+        };
+        let replacing = !cores.is_empty();
+        cores.push(admission);
+        let settling = settings.is_some();
+        cores.extend(settings);
+
+        let requests = Self::with_owed_snapshot(node, &cores).await;
+        let resume = Resume::Admitting {
+            label: label.clone(),
+            secret: record.invite.secret,
+            replacing,
+            settling,
+            spec_name,
+            prepared_against,
+        };
+        self.wants_signatures(requests, identity, &label, resume).await
+    }
+
+    /// Records an approval whose operations are signed: into the roster, and
+    /// into the invite's record, so its device is dialled to be given the
+    /// network.
+    async fn approved(
+        &self,
+        network: &Arc<Network>,
+        record: &crate::invites::Record,
+        signed: Vec<Vec<u8>>,
+        spec_name: &str,
+    ) -> Outcome {
+        let held = self.invites_lock.lock().await;
+        let now = crate::state::wall_seconds();
+        let mut invites = match Self::invites_of(network).await {
+            Ok(invites) => invites,
+            Err(cause) => return Self::said(Err(cause)),
+        };
+        // Withdrawn or answered while a person was signing: nothing is recorded
+        // on the strength of a request nobody is approving any more.
+        if invites.all().iter().all(|held| {
+            held.invite.secret != record.invite.secret
+                || held.standing(now) != crate::invites::Standing::Requested
+        }) {
+            return Outcome::refused(
+                "that request was withdrawn or answered while this was being signed. Nothing \
+                 was admitted."
+                    .to_owned(),
+            );
+        }
+        for operation in &signed {
+            if let Err(cause) = self.admit_to(network, operation).await {
+                return Outcome::Failed {
+                    message: format!("the device was not admitted: {cause}"),
+                    left_behind: Vec::new(),
+                };
+            }
+        }
+        invites.approve(&record.invite.secret, now);
+        let saved = Self::save_invites(network, &invites);
+        drop(held);
+        if let Err(cause) = saved {
+            return Self::said(Err(cause));
+        }
+        Self::keep_checkpoint(network, true).await;
+        // Dialled at once: a device waiting has the network within seconds.
+        self.delivering.lock().await.remove(&record.invite.secret);
+        self.inviting.notify_one();
+        let mut said = format!(
+            "`{}` is admitted, and is given the network as soon as it answers",
+            crate::control::shown(spec_name)
+        );
+        if let Some(renamed) = crate::admitting::renamed_note(spec_name, &record.invited.name) {
+            said = format!("{said}; {renamed}");
+        }
+        Outcome::Reported(self.report().await.with_note(&said))
+    }
+
+    /// Finishes whatever is waiting on this device's own person: a founding or
+    /// a move, once its relay's key was checked.
     async fn confirm(&self) -> Outcome {
-        self.confirm_with(false).await
-    }
-
-    /// Confirms an admission and revokes the device already holding that name.
-    ///
-    /// Two operations, signed as one act and with nothing waited for in between,
-    /// because that is what a person answered. The revocation is definitive:
-    /// whoever is asked has been told so before they choose.
-    async fn confirm_replacing(&self) -> Outcome {
-        self.confirm_with(true).await
-    }
-
-    /// Confirms whatever is waiting. `keeping_the_name` is the admin's answer to
-    /// a proposed name the network already uses, and means nothing otherwise.
-    async fn confirm_with(&self, keeping_the_name: bool) -> Outcome {
         let waiting = self.pending.lock().await.take();
         match waiting {
-            Some(Pending::Admitting { label, pending }) => {
-                self.finish_admitting(label, pending, keeping_the_name).await
-            }
             Some(Pending::Founding { label, wanted, for_whom }) => {
                 self.finish_founding(label, wanted, &for_whom).await
             }
             Some(Pending::ChangingRelay { label, relay, immediately, .. }) => {
                 self.finish_changing_relay(&label, &relay, immediately).await
             }
-            Some(Pending::Joining { label, underway, task, for_whom }) => {
-                *self.pending.lock().await =
-                    Some(Pending::Joining { label, underway, task, for_whom });
-                Outcome::Failed {
-                    message: "a join is confirmed with the code shown on the other machine, not with a yes"
-                        .to_owned(),
-                    left_behind: Vec::new(),
-                }
-            }
             None => Outcome::Failed {
                 message: "nothing is waiting to be confirmed".to_owned(),
                 left_behind: Vec::new(),
@@ -3993,40 +4636,11 @@ impl Service {
         }
     }
 
-    /// Finishes a join with the digits a person read off the admitting machine.
+    /// Starts a join: checks the invite, makes the directory and the keys,
+    /// proves the signing key, and leaves the join waiting.
     ///
-    /// The code comes from the person and goes to the join, which compares it
-    /// with the one it derived. Nothing here may substitute a code of its own:
-    /// reading the join's own code and handing it back was what made the
-    /// comparison always succeed.
-    async fn confirm_join(&self, code: String) -> Outcome {
-        let waiting = self.pending.lock().await.take();
-        match waiting {
-            Some(Pending::Joining { label, underway, task, for_whom }) => {
-                self.finish_joining(label, underway, task, &code, &for_whom).await
-            }
-            Some(other) => {
-                *self.pending.lock().await = Some(other);
-                Outcome::Failed {
-                    message: "no join is waiting for a code on this device".to_owned(),
-                    left_behind: Vec::new(),
-                }
-            }
-            None => Outcome::Failed {
-                message: "nothing is waiting to be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            },
-        }
-    }
-
-    /// Starts waiting, at the rendezvous an invite implies, for the admin that
-    /// issued it to dial.
-    ///
-    /// The join runs as a task here rather than in the process that typed the
-    /// command, so the roster it receives is the one this daemon is using. It
-    /// answers at once, and the rest of the conversation is asked for with
-    /// `Waiting`. The invite is read before anything is made, so one that does
-    /// not read costs nothing.
+    /// It answers at once. The invite is read before anything is made, so one
+    /// that does not read costs nothing.
     async fn begin_joining(&self, text: &str, name: &str) -> Outcome {
         let text = text.trim();
         if let Err(cause) = enrollment::Invite::from_text(text) {
@@ -4034,11 +4648,9 @@ impl Service {
         }
         // The daemon names the directory, because nobody else can. A person
         // starting a join has not seen the network, does not know its suffix, and
-        // would be inventing a name for something that has not arrived — a
-        // question with no right answer, whose default became a real directory on
-        // a test phone whether or not anybody meant it. What the network is
-        // called here is decided once it is here, from its own suffix.
-        let label = match self.home.free_label(None) {
+        // would be inventing a name for something that has not arrived. What the
+        // network is called here is decided once it is here, from its own suffix.
+        let label = match self.free_join_label().await {
             Ok(label) => label,
             Err(cause) => {
                 return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
@@ -4047,15 +4659,9 @@ impl Service {
         if let Err(refusal) = self.free(&label).await {
             return refusal;
         }
-        if self.pending.lock().await.is_some() {
-            return Outcome::Failed {
-                message: "something is already waiting to be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            };
-        }
-        // **Before the endpoint is opened, not after.** A join that reached a
-        // relay and then stopped to ask for a key would have spoken on behalf of
-        // a device that does not exist yet.
+        // **Before anything is sent, not after.** A join that reached a relay and
+        // then stopped to ask for a key would have spoken on behalf of a device
+        // that does not exist yet.
         let paths = self.home.paths_for(&label);
         let asked = self
             .wants_a_key(
@@ -4073,42 +4679,269 @@ impl Service {
         self.join_under(label, name, text.to_owned()).await
     }
 
-    /// The join itself, once this device has an identity to join with.
+    /// The join, once this device has an identity to join with: the signing
+    /// key's proof, made here or asked for where the key is out of reach.
     async fn join_under(&self, label: Label, name: &str, invite: String) -> Outcome {
-        let (person, underway) = crate::joining::AcrossTheChannel::new();
         let paths = self.home.paths_for(&label);
-        let name = name.to_owned();
-
-        // The endpoint this opens is one of the two things that license the
-        // daemon to reach anything, and it exists only until the join ends.
-        let keys = Arc::clone(&self.keys);
-        let home = self.home.clone();
-        let joining = label.clone();
-        let task = tokio::spawn(async move {
-            // In the directory made for this join: whatever identity it holds
-            // was made for it a moment ago.
-            let outcome =
-                crate::joining::join_fresh(&paths, &invite, &name, person.clone(), keys.as_ref())
-                    .await;
-            if outcome.is_err() {
-                // A join that ended without a network leaves no directory behind.
-                let _discarded = home.discard_unfounded(&joining);
+        let identity = match paths.create().and_then(|()| self.keys.identity(&paths)) {
+            Ok(identity) => identity,
+            Err(cause) => {
+                let _discarded = self.home.discard_unfounded(&label);
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
             }
-            person.finished(outcome);
-        });
-
-        // Answered at once, before the relay has been reached. Waiting here for
-        // the registration would block the daemon on however long a relay takes to
-        // answer — up to thirty seconds — with every other command queued behind
-        // it. The command line asks what this has got to, which it has to do
-        // anyway for the code that appears later.
-        let progress = underway.progress();
+        };
+        let Ok(read) = enrollment::Invite::from_text(&invite) else {
+            let _discarded = self.home.discard_unfounded(&label);
+            return Outcome::refused("that is not an invite this build reads".to_owned());
+        };
+        // Who it is for, written before anything else: a join belongs to whoever
+        // began it, and so does the network it becomes.
         let for_whom = self.asking.lock().await.clone();
-        *self.pending.lock().await = Some(Pending::Joining { label, underway, task, for_whom });
+        if let Err(refusal) = self.record_who_it_is_for(&paths, &for_whom).await {
+            let _discarded = self.home.discard_unfounded(&label);
+            return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+        }
+        if !identity.signing_key().answers_here() {
+            // The key is somewhere this process cannot reach — a key store that
+            // answers only in the session of the person who owns it. So the
+            // challenge is prepared here and somebody else signs it.
+            let request = match crate::joining::proof_request(&read, &identity) {
+                Ok(request) => request,
+                Err(refusal) => {
+                    let _discarded = self.home.discard_unfounded(&label);
+                    return Outcome::refused(refusal);
+                }
+            };
+            let by = self.asking.lock().await.clone();
+            let id = self.unsigned.lock().await.issue_for(
+                vec![request.clone()],
+                Resume::JoinProof { label, name: name.to_owned(), invite },
+                crate::clock::now_ms(),
+                by,
+            );
+            return Outcome::NeedsSignatures(crate::control::SignaturesWanted {
+                id,
+                key: reference_of(&identity),
+                // The network being joined has no name here yet; see `wants_a_key`.
+                network: String::new(),
+                // A batch of one, and never anything beside it. A proof of
+                // possession has no artifact but its signature.
+                items: vec![crate::control::ToSign {
+                    kind: request.kind().into(),
+                    message: request.message().to_vec(),
+                    payload: Vec::new(),
+                }],
+            });
+        }
+        let proof = match crate::joining::prove_here(&read, &identity) {
+            Ok(proof) => proof,
+            Err(refusal) => {
+                let _discarded = self.home.discard_unfounded(&label);
+                return Outcome::refused(refusal);
+            }
+        };
+        self.start_join(label, name, invite, &identity, &proof).await
+    }
 
-        match progress {
-            crate::joining::Progress::Failed(why) => Outcome::refused(why),
-            _ => Outcome::Joining,
+    /// A label for a join no network and no other join uses.
+    async fn free_join_label(&self) -> Result<Label> {
+        let taken = self.joins.lock().await.keys().cloned().collect::<BTreeSet<_>>();
+        for attempt in 1..1000_u32 {
+            let wanted =
+                if attempt == 1 { "joining".to_owned() } else { format!("joining-{attempt}") };
+            let label = Label::new(&wanted)?;
+            if !taken.contains(&label) && !self.home.paths_for(&label).root().exists() {
+                return Ok(label);
+            }
+        }
+        Err(crate::error::Error::Label {
+            label: "joining".to_owned(),
+            cause: "this device has too many joins waiting".to_owned(),
+        })
+    }
+
+    /// Finishes a join whose proof came back signed from where the key is.
+    async fn join_proof_signed(
+        &self,
+        label: Label,
+        name: &str,
+        invite: String,
+        signatures: &[Vec<u8>],
+    ) -> Outcome {
+        let paths = self.home.paths_for(&label);
+        let (Ok(identity), Ok(read)) =
+            (self.keys.identity(&paths), enrollment::Invite::from_text(&invite))
+        else {
+            let _discarded = self.home.discard_unfounded(&label);
+            return Outcome::refused("the join this proof belongs to is gone".to_owned());
+        };
+        let Some(signature) = signatures.first().cloned() else {
+            let _discarded = self.home.discard_unfounded(&label);
+            return Outcome::refused("no proof came back".to_owned());
+        };
+        match crate::joining::proof_from(&read, &identity, signature) {
+            Ok(proof) => self.start_join(label, name, invite, &identity, &proof).await,
+            Err(refusal) => {
+                let _discarded = self.home.discard_unfounded(&label);
+                Outcome::refused(refusal)
+            }
+        }
+    }
+
+    /// Keeps a join on disk, signed by this machine, and starts it.
+    async fn start_join(
+        &self,
+        label: Label,
+        name: &str,
+        invite: String,
+        identity: &identity::NodeIdentity,
+        proof: &enrollment::exchange::Possession,
+    ) -> Outcome {
+        let join = crate::joins::Join {
+            invite,
+            name: name.to_owned(),
+            proof: roster::hex::encode(proof.as_bytes()),
+            started_at: crate::state::wall_seconds(),
+            requested_at: None,
+        };
+        let paths = self.home.paths_for(&label);
+        if let Some(machine) = &self.machine
+            && let Err(cause) = crate::joins::write(&paths, machine.as_ref(), &join)
+        {
+            let _discarded = self.home.discard_unfounded(&label);
+            return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+        }
+        let fingerprint = crate::joining::fingerprint(&identity.signing_key().public_key());
+        self.run_join(label.clone(), join).await;
+        Outcome::JoinStarted { label: label.to_string(), fingerprint }
+    }
+
+    /// Runs a join kept on disk, as a task that ends with it.
+    ///
+    /// **Once per join.** The check and the insertion are one step under the
+    /// lock: resuming at start and starting a new join can reach the same join
+    /// at once, and two runs of one join register its keys at the relay twice,
+    /// each pushing the other off, so neither ever answers.
+    async fn run_join(&self, label: Label, join: crate::joins::Join) {
+        let mut joins = self.joins.lock().await;
+        if joins.contains_key(&label) {
+            return;
+        }
+        let paths = self.home.paths_for(&label);
+        let identity = match self.keys.identity(&paths) {
+            Ok(identity) => identity,
+            Err(cause) => {
+                joins.insert(label, Self::cannot_go_on(join.started_at, &cause.to_string()));
+                return;
+            }
+        };
+        let fingerprint = crate::joining::fingerprint(&identity.signing_key().public_key());
+        let (underway, reporting) =
+            crate::joining::Underway::new(crate::joining::Progress::Registering);
+        let machine = self.machine.clone();
+        let joined = Arc::clone(&self.joined);
+        let since = join.started_at;
+        let task = tokio::spawn(async move {
+            let kept = |at: u64| {
+                if let Some(machine) = &machine {
+                    let requested = crate::joins::Join { requested_at: Some(at), ..join.clone() };
+                    let _kept = crate::joins::write(&paths, machine.as_ref(), &requested);
+                }
+            };
+            let outcome = crate::joining::run(&paths, &join, &identity, &reporting, kept).await;
+            reporting.reached(match outcome {
+                Ok(done) => {
+                    crate::joining::Progress::Joined { suffix: done.suffix, devices: done.devices }
+                }
+                Err(refusal) => crate::joining::Progress::Failed(refusal),
+            });
+            joined.notify_one();
+        });
+        joins.insert(label, Joining { underway, fingerprint, since, task });
+    }
+
+    /// A join that cannot go on, listed for a person to cancel.
+    fn cannot_go_on(since: u64, why: &str) -> Joining {
+        let (underway, _reporting) =
+            crate::joining::Underway::new(crate::joining::Progress::Failed(why.to_owned()));
+        Joining { underway, fingerprint: String::new(), since, task: tokio::spawn(async {}) }
+    }
+
+    /// Resumes every join kept on disk, at start. One whose file was changed
+    /// outside the daemon is not resumed: it is listed, for a person to cancel.
+    async fn resume_joins(&self) {
+        let Some(machine) = self.machine.clone() else { return };
+        let Ok(entries) = std::fs::read_dir(self.home.networks()) else { return };
+        for entry in entries.flatten() {
+            let Ok(label) = Label::new(&entry.file_name().to_string_lossy()) else { continue };
+            let paths = self.home.paths_for(&label);
+            if !crate::joins::in_progress(&paths) {
+                continue;
+            }
+            match crate::joins::read(&paths, machine.as_ref()) {
+                Ok(Some(join)) => self.run_join(label, join).await,
+                Ok(None) => {}
+                Err(why) => {
+                    tracing::warn!(join = %label, why, "a join was not resumed");
+                    let failed = Self::cannot_go_on(0, &format!("{why}; it was not resumed"));
+                    self.joins.lock().await.entry(label).or_insert(failed);
+                }
+            }
+        }
+    }
+
+    /// Resumes the joins kept on disk, then takes on each network a join
+    /// brings, as it arrives, for as long as the daemon runs.
+    async fn joins_forever(self: Arc<Self>) {
+        self.resume_joins().await;
+        loop {
+            let finished: Vec<Label> = self
+                .joins
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, joining)| {
+                    matches!(joining.underway.progress(), crate::joining::Progress::Joined { .. })
+                })
+                .map(|(label, _)| label.clone())
+                .collect();
+            for label in finished {
+                let _taken = self.take_the_network_on(&label).await;
+            }
+            tokio::select! {
+                () = self.joined.notified() => {}
+                () = tokio::time::sleep(crate::limits::INVITE_DIAL_INTERVAL) => {}
+            }
+            if *self.stopping.lock().await {
+                return;
+            }
+        }
+    }
+
+    /// Cancels a join: it stops waiting, and its directory and keys go.
+    async fn cancel_join(&self, label: &str) -> Outcome {
+        let Ok(label) = Label::new(label) else {
+            return Outcome::refused(format!("no join called `{label}` is waiting"));
+        };
+        let Some(joining) = self.joins.lock().await.remove(&label) else {
+            return Outcome::refused(format!("no join called `{label}` is waiting"));
+        };
+        // Asked to stop, so it closes its endpoints; ended by force only if it
+        // does not within a few seconds.
+        let Joining { underway, mut task, .. } = joining;
+        underway.cancel();
+        if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+            task.abort();
+        }
+        let paths = self.home.paths_for(&label);
+        let _forgotten = self.keys.forget(&paths);
+        match std::fs::remove_dir_all(paths.root()) {
+            Ok(()) => Outcome::Done,
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => Outcome::Done,
+            Err(cause) => Outcome::Failed {
+                message: format!("the join was cancelled, and its directory stays: {cause}"),
+                left_behind: vec![paths.root().display().to_string()],
+            },
         }
     }
 
@@ -4288,23 +5121,6 @@ impl Service {
             };
         }
 
-        // An enrolment still open for it: the exchange would have its directory
-        // pulled out from under it while a person is looking at a code.
-        let enrolling = matches!(
-            &*self.pending.lock().await,
-            Some(Pending::Admitting { label: waiting, .. } | Pending::Joining { label: waiting, .. })
-                if *waiting == wanted
-        );
-        if enrolling {
-            return Outcome::Failed {
-                message: format!(
-                    "an enrolment for `{label}` is waiting for a person. Finish it or abandon it \
-                     first; nothing was removed."
-                ),
-                left_behind: Vec::new(),
-            };
-        }
-
         // The only admin, asked first. A broken network is not judged: its
         // roster cannot say who its admins are.
         if !last_admin
@@ -4375,64 +5191,15 @@ impl Service {
             && !state.devices.keys().any(|device| device != me && state.is_admin(&device))
     }
 
-    /// What a waiting enrolment has got to.
-    ///
-    /// # Asking is also how a join finishes
-    ///
-    /// A join is completed by whoever next notices it has arrived, and this is
-    /// usually that: a surface asks every couple of seconds, and the answer is
-    /// what a person is shown.
-    ///
-    /// It used to **report** a join as adopted and do nothing about it. The
-    /// network arrived, the roster was written, this said `Adopted`, the screen
-    /// said *"you are now a device in casa"* — and no record was ever written, so
-    /// the daemon carried nothing and the directory sat there stranded. A success
-    /// reported without being performed is worse than a failure: nothing looks
-    /// wrong until much later, somewhere else.
-    ///
-    /// Completing it here also takes the weight off the confirming request. That
-    /// request waits on a person reading prompts **at the other machine**, which
-    /// is unbounded by nature; it is a fast path now rather than the only path.
+    /// What the act waiting on a person has got to.
     async fn waiting_on(&self) -> Outcome {
-        // Read without holding the lock across the work that may follow.
-        let joining = {
-            let held = self.pending.lock().await;
-            match &*held {
-                Some(Pending::Joining { underway, label, .. }) => {
-                    Some((underway.progress(), label.clone()))
-                }
-                _ => None,
-            }
-        };
-        if let Some((progress, label)) = joining {
-            return match progress {
-                crate::joining::Progress::Registering | crate::joining::Progress::Waiting => {
-                    Outcome::Joining
-                }
-                crate::joining::Progress::Confirming => Outcome::Enrolling,
-                crate::joining::Progress::Signing { request, .. } => {
-                    self.wants_proving(&request, &self.joining_key(&label)).await
-                }
-                crate::joining::Progress::Joined { .. } => self.take_the_network_on().await,
-                crate::joining::Progress::Failed(why) => Outcome::refused(why),
-            };
-        }
-
         let held = self.pending.lock().await;
         match &*held {
-            Some(Pending::Joining { .. }) => Outcome::Joining,
-            Some(Pending::Admitting { pending, .. }) => Outcome::Admitting {
-                proposed_name: pending.proposed_name().to_owned(),
-                fingerprint: pending.fingerprint(),
-                code: pending.code().to_string(),
-                taken: taken_name(pending),
-                accepted: pending.accepted(),
-            },
             // A founding or a move waiting on a relay's key is waiting.
             // Answering that nothing was would be a lie with a consequence: it is
-            // a pending like any other, it refuses the next enrolment like any
-            // other, and a surface told there is nothing there has nothing to
-            // offer a person but the refusal.
+            // a pending like any other, it refuses the next one like any other,
+            // and a surface told there is nothing there has nothing to offer a
+            // person but the refusal.
             Some(Pending::ChangingRelay { label, relay, .. }) => Outcome::ConfirmingRelay {
                 relay: relay.clone(),
                 key: crate::relay::grouped_key(relay),
@@ -4447,10 +5214,7 @@ impl Service {
                 }
             }
             // Nothing waiting is not a failure, and it must not arrive looking
-            // like one. A surface asking what is open needs to tell "nothing" from
-            // "an enrolment that ended badly and is still held" — the second is
-            // what blocks the next join, and telling them apart by reading the
-            // words of a refusal is not telling them apart.
+            // like one.
             None => Outcome::Done,
         }
     }
@@ -4543,48 +5307,40 @@ impl Service {
 
     /// Takes on a network a join has finished delivering.
     ///
-    /// Idempotent by construction: it takes the pending out first, so whichever
-    /// of the two callers gets there first does the work and the other finds
-    /// nothing waiting.
-    async fn take_the_network_on(&self) -> Outcome {
-        let waiting = self.pending.lock().await.take();
-        let Some(Pending::Joining { label, underway, task, for_whom }) = waiting else {
-            // Somebody else finished it between the look and the take. Put back
-            // whatever was there — it is not this one's to discard.
-            if let Some(other) = waiting {
-                *self.pending.lock().await = Some(other);
-            }
+    /// Idempotent by construction: it takes the join out first, so whichever
+    /// caller gets there first does the work and another finds nothing.
+    async fn take_the_network_on(&self, provisional: &Label) -> Outcome {
+        let Some(joining) = self.joins.lock().await.remove(provisional) else {
             return Outcome::Reported(self.report().await);
         };
-        let crate::joining::Progress::Joined { suffix, devices } = underway.progress() else {
-            *self.pending.lock().await = Some(Pending::Joining { label, underway, task, for_whom });
-            return Outcome::Failed {
-                message: "that join has not finished".to_owned(),
-                left_behind: Vec::new(),
-            };
+        let crate::joining::Progress::Joined { suffix, .. } = joining.underway.progress() else {
+            self.joins.lock().await.insert(provisional.clone(), joining);
+            return Outcome::refused("that join has not finished".to_owned());
         };
+        let _ = crate::joins::remove(&self.home.paths_for(provisional));
 
         // The network is known now — its id and its suffix — so this is where the
         // directory stops being provisional.
-        let label = self.settle(label, &suffix).await;
+        let label = self.settle(provisional.clone(), &suffix).await;
         let paths = self.home.paths_for(&label);
-        // **Whose it is, before it is usable** — as founding does. A joined
-        // network with no owner recorded belongs to nobody, and nobody can bring
-        // it up: the Linux testbed's first join ended exactly there, `adopted`
-        // and then refused to the person who had just joined it.
-        if let Err(refusal) = self.record_who_it_is_for(&paths, &for_whom).await {
-            return Outcome::Failed { message: refusal, left_behind: Vec::new() };
-        }
         if let Err(cause) = self.acquire(label.clone(), paths.clone()).await {
             return Outcome::Failed {
                 message: format!("the network arrived but this daemon did not take it on: {cause}"),
                 left_behind: Vec::new(),
             };
         }
-
-        let carrying = self.raise_if_chosen(&label).await;
-
-        Outcome::Adopted { suffix, devices, carrying }
+        let _carrying = self.raise_if_chosen(&label).await;
+        if let Ok(network) = self.named(&label).await {
+            network
+                .node()
+                .record(
+                    crate::node::Severity::Event,
+                    "invite",
+                    format!("this device was admitted into `{label}`"),
+                )
+                .await;
+        }
+        Outcome::Reported(self.report().await)
     }
 
     /// Raises a network this device has just taken on, where a standing
@@ -4625,91 +5381,6 @@ impl Service {
                 .await;
         }
         network.tunnel().await == Tunnel::Up
-    }
-
-    /// Hands a waiting join the code a person typed, and takes on what arrives.
-    async fn finish_joining(
-        &self,
-        label: Label,
-        underway: crate::joining::Underway,
-        task: tokio::task::JoinHandle<()>,
-        code: &str,
-        for_whom: &crate::control::Caller,
-    ) -> Outcome {
-        let crate::joining::Progress::Confirming = underway.progress() else {
-            *self.pending.lock().await =
-                Some(Pending::Joining { label, underway, task, for_whom: for_whom.clone() });
-            return Outcome::Failed {
-                message: "no code has appeared yet; nobody has come to this device".to_owned(),
-                left_behind: Vec::new(),
-            };
-        };
-
-        // The digits a person typed, and nothing this device worked out for
-        // itself. The join compares them with its own code and refuses a
-        // mismatch; this only carries them.
-        if !underway.confirm(code) {
-            return Outcome::Failed {
-                message: "the join ended before it could be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            };
-        }
-
-        // The join writes the log; this takes the network on, which is what makes
-        // a restart unnecessary.
-        //
-        // # How long this may wait, and why it is not a round number
-        //
-        // Derived from the exchange's own deadline rather than chosen. Between a
-        // person typing the six digits here and the admission arriving, there is
-        // a person at the *other* machine reading and answering — and everything
-        // they are asked fits inside one exchange deadline, because the exchange
-        // refuses itself after that. Giving up sooner than the exchange does is
-        // giving up on something still in flight.
-        //
-        // That is not theory: this was 60 seconds flat, the admitting side gained
-        // a second question to answer, and a real enrolment landed its roster on
-        // the joining device **after** this loop had stopped watching. The log was
-        // written and the record was not, which is precisely the stranded
-        // directory this change exists to clean up — produced, here, by this
-        // timeout. Twice the deadline leaves room for a person to read.
-        let budget =
-            Duration::from_secs(enrollment::limits::EXCHANGE_DEADLINE_SECS.saturating_mul(2));
-        let step = Duration::from_millis(100);
-        let rounds = budget.as_millis().checked_div(step.as_millis()).unwrap_or(0);
-        for _ in 0..rounds {
-            // A refused exchange does not end the wait — a person who mistyped
-            // tries again — so there is no failure here to wait for. What there
-            // is, is somebody standing in front of six digits they just typed,
-            // who has to be told now.
-            if let Some(refusal) = underway.refusal() {
-                *self.pending.lock().await =
-                    Some(Pending::Joining { label, underway, task, for_whom: for_whom.clone() });
-                return Outcome::refused(refusal);
-            }
-            match underway.progress() {
-                crate::joining::Progress::Joined { .. } => {
-                    // Put back what was taken at the top of this function, so the
-                    // one place that finishes a join is the one that does it.
-                    *self.pending.lock().await = Some(Pending::Joining {
-                        label,
-                        underway,
-                        task,
-                        for_whom: for_whom.clone(),
-                    });
-                    return self.take_the_network_on().await;
-                }
-                crate::joining::Progress::Failed(why) => return Outcome::refused(why),
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
-            }
-        }
-
-        // Not a failure: the wait is still open, the roster may be seconds away,
-        // and whoever asks next finishes it. Saying "it did not work" here is how
-        // a person comes to abandon something that was about to succeed.
-        *self.pending.lock().await =
-            Some(Pending::Joining { label, underway, task, for_whom: for_whom.clone() });
-        Outcome::Enrolling
     }
 
     /// Takes on a network this device has just acquired.
@@ -4783,6 +5454,9 @@ impl Service {
             let values = crate::checkpoint::Values::of(&node, &paths, label.as_str())
                 .await
                 .ok_or(Error::NoNetwork)?;
+            if let Some(kept) = values.light {
+                keeper.holds_light(kept);
+            }
             keeper.keep(values, true)?;
             node.keep_with(keeper);
         }
@@ -4841,11 +5515,8 @@ impl Service {
         if let Err(refusal) = self.namespace_free(&wanted.suffix).await {
             return refusal;
         }
-        if self.pending.lock().await.is_some() {
-            return Outcome::Failed {
-                message: "something is already waiting to be confirmed".to_owned(),
-                left_behind: Vec::new(),
-            };
+        if let Some(refusal) = self.already_waiting().await {
+            return refusal;
         }
 
         let (host, written, port) = match given {
@@ -5048,408 +5719,6 @@ impl Service {
         Ok(())
     }
 
-    async fn finish_admitting(
-        &self,
-        label: Label,
-        pending: crate::admitting::Pending,
-        keeping_the_name: bool,
-    ) -> Outcome {
-        // An invite withdrawn or ended while its device's code was on a screen
-        // admits nobody: checked before anything is signed.
-        if let Some(refusal) = self.invite_refusal(&label, pending.invite_secret()).await {
-            crate::admitting::abandon(pending).await;
-            return refusal;
-        }
-        // Put back where it was. An admission may now stop in the middle — twice,
-        // when it is also a replacement — and across those pauses the exchange has
-        // to be somewhere a person abandoning it can still reach, which is here.
-        *self.pending.lock().await = Some(Pending::Admitting { label: label.clone(), pending });
-        self.admitting_step(label, keeping_the_name).await
-    }
-
-    /// Carries an admission as far as it can go before it needs a signature.
-    async fn admitting_step(&self, label: Label, keeping_the_name: bool) -> Outcome {
-        let network = match self.named(&label).await {
-            Ok(network) => network,
-            Err(cause) => {
-                self.abandon_admission().await;
-                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
-            }
-        };
-        let node = Arc::clone(network.node());
-        let paths = network.paths.clone();
-
-        // Where the key is out of reach, the whole admission — the revocation
-        // too, when there is one — is prepared as one batch and signed at once.
-        if !node.identity().signing_key().answers_here() {
-            return self.admitting_batch(label, &network, keeping_the_name).await;
-        }
-
-        // The device whose name is being taken over, revoked **first**, and
-        // everything the admission is built from read **after**.
-        //
-        // # Why the order is the whole of it
-        //
-        // Two operations signed against the same heads are concurrent: neither is
-        // an ancestor of the other, and one author holding two branches is what
-        // equivocation *is*. The roster then voids what that author signed —
-        // `state::judge_one` exempts revocations and nothing else — so a
-        // replacement built this way splits in the worst possible direction: the
-        // revocation stands and the admission does not. The device holding the
-        // name is expelled and the device meant to take it never becomes a
-        // member, on a log that cannot be unsaid.
-        //
-        // That is not a hypothetical. It was built this way, run between a
-        // desktop and a phone, and the desktop accused itself of equivocation
-        // over exactly these two operations. So the admission is signed on top of
-        // the revocation, and everything it is built from — the heads it names as
-        // parents, the state it is checked against, and the log the joining
-        // device is given — is read once the revocation is in.
-        //
-        // When the key is out of reach the two are still in that order, as one
-        // batch: see `admitting_batch`.
-        if keeping_the_name {
-            let taken = {
-                let held = self.pending.lock().await;
-                match held.as_ref() {
-                    Some(Pending::Admitting { pending, .. }) => pending.taken().cloned(),
-                    _ => None,
-                }
-            };
-            if let Some(taken) = taken
-                && let Err(refusal) = self.expel_for_replacement(&network, &taken).await
-            {
-                self.abandon_admission().await;
-                return refusal;
-            }
-        }
-
-        if let Some(refusal) = self.keys.admin_refusal() {
-            self.abandon_admission().await;
-            return Outcome::refused(format!(
-                "admitting a device is an admin's act, and {refusal}. Nothing was signed."
-            ));
-        }
-
-        let Ok(state) = node.state().await else {
-            self.abandon_admission().await;
-            return Outcome::Failed {
-                message: "this device holds no network".to_owned(),
-                left_behind: Vec::new(),
-            };
-        };
-        let heads = node.heads().await;
-
-        let mut held = self.pending.lock().await;
-        let Some(Pending::Admitting { pending, .. }) = held.as_mut() else {
-            drop(held);
-            return Outcome::refused("nothing is waiting to be admitted".to_owned());
-        };
-
-        let prepared =
-            match crate::admitting::core(pending, node.identity(), &state, heads, keeping_the_name)
-                .await
-            {
-                // What an invite chose besides, signed with it.
-                Ok((operation, spec_name)) => {
-                    crate::admitting::settings_core(pending, node.identity(), &state, &operation)
-                        .map(|settings| (operation, spec_name, settings))
-                }
-                Err(refusal) => Err(refusal),
-            };
-        drop(held);
-
-        let (operation, spec_name, settings) = match prepared {
-            Ok(prepared) => prepared,
-            Err(refusal) => {
-                self.abandon_admission().await;
-                return Outcome::refused(refusal);
-            }
-        };
-
-        let identity = node.identity();
-        let mut signed = Vec::new();
-        for each in core::iter::once(&operation).chain(settings.as_ref()) {
-            match identity.sign_operation(each) {
-                Ok(bytes) => signed.push(bytes),
-                Err(cause) => {
-                    self.abandon_admission().await;
-                    return Outcome::refused(crate::control::declined(&cause));
-                }
-            }
-        }
-
-        let Some(Pending::Admitting { pending, .. }) = self.pending.lock().await.take() else {
-            return Outcome::refused("nothing is waiting to be admitted".to_owned());
-        };
-        let _ = paths;
-        self.deliver_admission(&network, pending, signed, spec_name).await
-    }
-
-    /// Prepares an admission as one batch, where the key is out of reach.
-    ///
-    /// The revocation of the device holding the name, when it is a replacement;
-    /// the admission, built on top of it; and the snapshot the network will then
-    /// be owed. None is signed, so the admission is built against a **preview**
-    /// of the roster once the revocation is in — the same state `admitting_step`
-    /// reads, with the same checks, the IPv4 collision among them — and names the
-    /// revocation as its parent, which is the order the replacement comment above
-    /// is about.
-    async fn admitting_batch(
-        &self,
-        label: Label,
-        network: &Arc<Network>,
-        keeping_the_name: bool,
-    ) -> Outcome {
-        if let Some(refusal) = self.keys.admin_refusal() {
-            self.abandon_admission().await;
-            return Outcome::refused(format!(
-                "admitting a device is an admin's act, and {refusal}. Nothing was signed."
-            ));
-        }
-        let node = network.node();
-        let identity = node.identity();
-        let Ok(state) = node.state().await else {
-            self.abandon_admission().await;
-            return Outcome::Failed {
-                message: "this device holds no network".to_owned(),
-                left_behind: Vec::new(),
-            };
-        };
-        let prepared_against = node.moment().await;
-
-        let taken = if keeping_the_name {
-            let held = self.pending.lock().await;
-            match held.as_ref() {
-                Some(Pending::Admitting { pending, .. }) => pending.taken().cloned(),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let mut cores = Vec::new();
-        let (state, heads) = match taken {
-            None => (state, prepared_against.heads.clone()),
-            Some(taken) => {
-                let expulsion = expulsion_of(&taken);
-                let revocation = match crate::revoking::core(
-                    &expulsion,
-                    identity,
-                    &state,
-                    prepared_against.heads.clone(),
-                ) {
-                    Ok(core) => core,
-                    Err(refusal) => {
-                        self.abandon_admission().await;
-                        return Outcome::refused(refusal);
-                    }
-                };
-                let after = match node.preview(core::slice::from_ref(&revocation)).await {
-                    Ok(after) => after,
-                    Err(cause) => {
-                        self.abandon_admission().await;
-                        return Outcome::refused(format!(
-                            "the device holding that name could not be revoked, so nothing was \
-                             admitted: {cause}"
-                        ));
-                    }
-                };
-                cores.push(revocation);
-                (after.state, after.heads)
-            }
-        };
-
-        let prepared = {
-            let mut held = self.pending.lock().await;
-            let Some(Pending::Admitting { pending, .. }) = held.as_mut() else {
-                drop(held);
-                return Outcome::refused("nothing is waiting to be admitted".to_owned());
-            };
-            match crate::admitting::core(pending, identity, &state, heads, keeping_the_name).await {
-                Ok((admission, spec_name)) => {
-                    crate::admitting::settings_core(pending, identity, &state, &admission)
-                        .map(|settings| (admission, spec_name, settings))
-                }
-                Err(refusal) => Err(refusal),
-            }
-        };
-        let (admission, spec_name, settings) = match prepared {
-            Ok(prepared) => prepared,
-            Err(refusal) => {
-                self.abandon_admission().await;
-                return Outcome::refused(refusal);
-            }
-        };
-        let replacing = !cores.is_empty();
-        cores.push(admission);
-        let settling = settings.is_some();
-        cores.extend(settings);
-
-        let requests = Self::with_owed_snapshot(node, &cores).await;
-        let resume = Resume::Admitting {
-            label: label.clone(),
-            replacing,
-            settling,
-            spec_name,
-            prepared_against,
-        };
-        self.wants_signatures(requests, identity, &label, resume).await
-    }
-
-    /// Hands a signed admission to the device waiting for it, and records it here.
-    ///
-    /// Reached by both paths, because by the time the bytes exist it no longer
-    /// matters which of them signed them.
-    async fn deliver_admission(
-        &self,
-        network: &Arc<Network>,
-        pending: crate::admitting::Pending,
-        signed: Vec<Vec<u8>>,
-        spec_name: String,
-    ) -> Outcome {
-        let paths = network.paths.clone();
-        let secret = *pending.invite_secret();
-        if let Some(refusal) = self.invite_refusal(network.label(), &secret).await {
-            crate::admitting::abandon(pending).await;
-            return refusal;
-        }
-        let log = match crate::state::Log::at(paths.roster()).read() {
-            Ok(held) => held,
-            Err(cause) => {
-                crate::admitting::abandon(pending).await;
-                return Outcome::Failed {
-                    message: format!("the roster could not be read: {cause}"),
-                    left_behind: Vec::new(),
-                };
-            }
-        };
-
-        // What this device holds, if anything. An admin with none sends none,
-        // and the joiner is told so by its absence rather than by a field that
-        // says nothing.
-        let snapshot = crate::state::read_snapshot(&paths).map(|(bytes, _at)| bytes);
-        // Where this roster was compacted, the state its log rests on goes too.
-        // The root as the bytes it was signed over, which its encoding
-        // reproduces: what `state::write_base` keeps on disk too.
-        let base = network
-            .node()
-            .base()
-            .await
-            .map(|(root, state)| enrollment::adopt::Base { root: root.to_bytes(), state });
-
-        // The pieces of its batches, kept beside the log: a batch delivered as
-        // its header alone would hold back everything signed after it.
-        let pieces = crate::state::Log::at(paths.pieces()).read().unwrap_or_default();
-
-        match crate::admitting::finish_with_all(
-            pending, signed, spec_name, &log, &pieces, snapshot, base,
-        )
-        .await
-        {
-            Ok((operations, said)) => {
-                // Used, once its device has the network: it admits nobody else.
-                self.invite_used(network, &secret).await;
-                // Recorded here as well as delivered. The daemon holds the
-                // roster it is running on, so an admission that reached the
-                // other device and not this one would leave a member this node
-                // refuses to talk to.
-                // Into the network this admission was opened for. Recording it into
-                // "the only network" failed on every device holding more than one,
-                // after the other device had already been given the network — found
-                // admitting a phone from a desktop holding three.
-                for operation in &operations {
-                    if let Err(cause) = self.admit_to(network, operation).await {
-                        return Outcome::Failed {
-                            message: format!(
-                                "the device was admitted but this node did not record \
-                                              it: {cause}"
-                            ),
-                            left_behind: Vec::new(),
-                        };
-                    }
-                }
-                Outcome::Reported(self.report().await.with_note(&said))
-            }
-            Err(refusal) => Outcome::refused(refusal),
-        }
-    }
-
-    /// Ends the admission that is waiting, closing the endpoint it opened.
-    ///
-    /// §2.6c gives the daemon no licence to stay registered at a relay for an
-    /// enrolment nobody is coming back to, so an admission that will not finish
-    /// is closed rather than left to time out.
-    async fn abandon_admission(&self) {
-        let waiting = self.pending.lock().await.take();
-        if let Some(Pending::Admitting { pending, .. }) = waiting {
-            crate::admitting::abandon(pending).await;
-        }
-    }
-
-    /// Asks for the signature a join is waiting on, once.
-    ///
-    /// The command line polls, so this is reached every half second for as long
-    /// as somebody is at a prompt. Issuing a request each time would leave a
-    /// trail of them and hand out an id a moment before handing out another. So
-    /// the id is remembered against the request it belongs to, and the same one
-    /// goes back until it is answered.
-    /// The name the key store knows a joining device's signing key by.
-    ///
-    /// **Named, or the proof cannot be made.** A key held elsewhere is reached
-    /// by its name, and the command line asked to prove possession with none had
-    /// nothing to sign with — a join from the command line of a machine whose key
-    /// is held elsewhere could not finish. Read from the identity the join wrote,
-    /// which is the one the challenge was prepared with. Empty where the key is
-    /// held here, which signs without being asked.
-    fn joining_key(&self, label: &Label) -> String {
-        self.keys
-            .identity(&self.home.paths_for(label))
-            .ok()
-            .and_then(|identity| {
-                identity.signing_key().custodian().map(|held| held.reference().to_owned())
-            })
-            .unwrap_or_default()
-    }
-
-    async fn wants_proving(
-        &self,
-        request: &identity::detached::SigningRequest,
-        key: &str,
-    ) -> Outcome {
-        let mut asked = self.proving.lock().await;
-        let id = match asked.as_ref() {
-            Some((id, message)) if message == request.message() => id.clone(),
-            _ => {
-                let by = self.asking.lock().await.clone();
-                let id = self.unsigned.lock().await.issue_for(
-                    vec![request.clone()],
-                    Resume::Possession,
-                    crate::clock::now_ms(),
-                    by,
-                );
-                *asked = Some((id.clone(), request.message().to_vec()));
-                id
-            }
-        };
-        drop(asked);
-
-        Outcome::NeedsSignatures(crate::control::SignaturesWanted {
-            id,
-            key: key.to_owned(),
-            // The network being joined has no name here yet; see `wants_a_key`.
-            network: String::new(),
-            // A batch of one, and never anything beside it. A proof of possession
-            // has no artifact but its signature, and is not an administrative act
-            // a person authorises separately.
-            items: vec![crate::control::ToSign {
-                kind: request.kind().into(),
-                message: request.message().to_vec(),
-                payload: Vec::new(),
-            }],
-        })
-    }
-
     /// Turns a result into something to send back.
     ///
     /// A failure carries what is still on the machine, because after a failed
@@ -5477,7 +5746,7 @@ struct Inviting {
     light: bool,
     groups: Vec<String>,
     ipv4: Option<String>,
-    hours: Option<u32>,
+    minutes: Option<u32>,
 }
 
 /// What the device an invite brings will be, checked against `state`: a name
@@ -5525,6 +5794,38 @@ fn invited_from(
 /// the loopback.
 fn carries_traffic(listed: &[crate::connectivity::LocalInterface]) -> bool {
     listed.iter().any(|interface| interface.up && interface.running && !interface.loopback)
+}
+
+/// The root an admin signs over `log` and `signed` together, resting on `base`
+/// with `pieces` for its batches: what a device admitted by `signed` receives.
+///
+/// # Errors
+///
+/// Why none could be signed, in words.
+///
+/// It follows `held`, the root this device holds now, as the root this device
+/// signs next would: a light member adopts only the root that follows its own,
+/// and one that followed nothing would be believed by full members alone.
+fn root_after(
+    identity: &identity::NodeIdentity,
+    base: Option<enrollment::adopt::Base>,
+    log: &[Vec<u8>],
+    pieces: &[Vec<u8>],
+    held: Option<&[u8]>,
+    signed: &[Vec<u8>],
+) -> core::result::Result<Vec<u8>, String> {
+    let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
+    enrollment::adopt::fill(&mut roster, base, log, pieces).map_err(|cause| cause.to_string())?;
+    if let Some(held) = held {
+        let taken = roster.offer_snapshot(held);
+        if !taken.is_accepted() {
+            return Err(format!("the root held here was not taken again: {taken:?}"));
+        }
+    }
+    for operation in signed {
+        roster.offer_bytes(operation);
+    }
+    crate::snapshots::sign_over_heads(&roster, identity)
 }
 
 /// What a revocation of an admin voids of that admin's acts, in a person's
@@ -5831,103 +6132,233 @@ mod tests {
         (Arc::new(service), scratch)
     }
 
-    /// What the admin's daemon says is waiting, once `ready` says it is the
-    /// awaited answer.
-    async fn waiting_for(service: &Service, ready: impl Fn(&Outcome) -> bool) -> Outcome {
-        let deadline =
-            std::time::Instant::now().checked_add(Duration::from_secs(90)).expect("representable");
-        loop {
-            let outcome = service.handle(Command::Waiting).await;
-            if ready(&outcome) {
-                return outcome;
-            }
-            assert!(std::time::Instant::now() < deadline, "never came: last {outcome:?}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Pending as a list, for the tests below.
+    async fn listed(service: &Service) -> crate::control::PendingList {
+        match service.handle(Command::Pending { network: None }).await {
+            Outcome::Pending(list) => list,
+            other => panic!("a list: {other:?}"),
         }
     }
 
-    /// The whole of an invite on the admin's daemon: issued by one command that
-    /// then closes; the device joining later and dialled by the daemon on its
-    /// own; the person told, coming back to the code, and confirming; the device
-    /// admitted as the invite said, and the invite used.
+    /// **A request planted while the daemon runs is no request.** The next
+    /// checkpoint vouches for the records the daemon wrote, not for what the
+    /// file holds then; the planted file is dropped when it is read, and a
+    /// restart finds nothing either. Found in the testbed: the checkpoint used
+    /// to hash whatever the file held, and so vouched for the plant.
+    #[tokio::test]
+    async fn a_request_planted_while_the_daemon_runs_is_not_believed() {
+        let (service, scratch) = admin_at(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@127.0.0.1:1",
+        );
+        let issued = service.handle(inviting("laptop", false, &[], None)).await;
+        assert!(matches!(issued, Outcome::Invited { .. }), "{issued:?}");
+        let network = service.all().await.first().map(Arc::clone).expect("the network");
+        Service::keep_checkpoint(&network, true).await;
+
+        let file = crate::invites::InviteFile::beside(&network.paths.roster());
+        let mut invites = file.load().expect("reads");
+        let secret = invites.all().first().expect("the invite").invite.secret;
+        let stranger = NodeIdentity::generate().expect("generates");
+        let applicant = crate::admitting::Applicant {
+            signing: stranger.signing_key().public_key(),
+            transport: stranger.transport_key().public_key(),
+            attestation: stranger.attestation_key().public_key(),
+            name: "laptop".to_owned(),
+        };
+        assert!(invites.arrived(&secret, applicant, crate::state::wall_seconds()));
+        file.save(&invites).expect("planted");
+        // A checkpoint written after the plant names what the daemon wrote.
+        Service::keep_checkpoint(&network, true).await;
+
+        assert!(listed(&service).await.invites.is_empty(), "the planted records are not used");
+        assert!(!network.paths.root().join(crate::invites::FILE_NAME).exists(), "and are gone");
+        let told = network.node().fault().await.expect("said");
+        assert!(told.cause.contains("changed outside the daemon"), "{told:?}");
+
+        // Planted again, behind a daemon that is then stopped: the next start
+        // does not believe it either.
+        file.save(&invites).expect("planted");
+        Service::keep_checkpoint(&network, true).await;
+        drop(network);
+        drop(service);
+        let again = started(&Home::under(scratch.path()));
+        assert!(listed(&again).await.invites.is_empty(), "nor after a restart");
+    }
+
+    /// And what the daemon wrote is what a restart finds.
+    #[tokio::test]
+    async fn the_invites_the_daemon_wrote_outlive_a_restart() {
+        let (service, scratch) = admin_at(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@127.0.0.1:1",
+        );
+        let issued = service.handle(inviting("laptop", false, &[], None)).await;
+        assert!(matches!(issued, Outcome::Invited { .. }), "{issued:?}");
+        let network = service.all().await.first().map(Arc::clone).expect("the network");
+        Service::keep_checkpoint(&network, true).await;
+        drop(network);
+        drop(service);
+        let again = started(&Home::under(scratch.path()));
+        let list = listed(&again).await;
+        assert_eq!(list.invites.first().map(|line| line.name.as_str()), Some("laptop"));
+    }
+
+    /// A daemon on a device holding nothing, with this machine's key: what
+    /// a device that is about to join runs.
+    fn joiner_over(home: &Home) -> Arc<Service> {
+        home.create().expect("creates");
+        let service = Service::over(
+            home.clone(),
+            Lifecycle::new(Arc::new(Recording::new()) as Arc<dyn Machine>),
+            Arc::new(InProcess::new()) as Arc<dyn Connectivity>,
+            Arc::new(Names::new()) as Arc<dyn Resolving>,
+        )
+        .expect("assembles");
+        Arc::new(service)
+    }
+
+    /// A daemon over `home` again, as after a restart, with its loops running.
+    fn restarted(home: &Home) -> Arc<Service> {
+        let service = Arc::new(
+            Service::over(
+                home.clone(),
+                Lifecycle::new(Arc::new(Recording::new()) as Arc<dyn Machine>),
+                Arc::new(InProcess::new()) as Arc<dyn Connectivity>,
+                Arc::new(Names::new()) as Arc<dyn Resolving>,
+            )
+            .expect("assembles"),
+        );
+        let _running = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        service
+    }
+
+    /// Stops a daemon's loops and its joins, as switching the machine off does.
+    async fn switched_off(service: &Arc<Service>) {
+        *service.stopping.lock().await = true;
+        service.inviting.notify_one();
+        service.joined.notify_one();
+        for (_, joining) in std::mem::take(&mut *service.joins.lock().await) {
+            joining.task.abort();
+        }
+    }
+
+    /// What is waiting on `service`, once `ready` says it is the awaited list.
+    async fn pending_until(
+        service: &Service,
+        ready: impl Fn(&crate::control::PendingList) -> bool,
+    ) -> crate::control::PendingList {
+        let deadline =
+            std::time::Instant::now().checked_add(Duration::from_secs(180)).expect("representable");
+        loop {
+            let outcome = service.handle(Command::Pending { network: None }).await;
+            let Outcome::Pending(list) = outcome else { panic!("a list: {outcome:?}") };
+            if ready(&list) {
+                return list;
+            }
+            assert!(std::time::Instant::now() < deadline, "never came: last {list:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Waits until `service` holds a network.
+    async fn holding_a_network(service: &Service) -> Arc<Network> {
+        let deadline =
+            std::time::Instant::now().checked_add(Duration::from_secs(180)).expect("representable");
+        loop {
+            if let Some(network) = service.all().await.first() {
+                return Arc::clone(network);
+            }
+            assert!(std::time::Instant::now() < deadline, "no network arrived");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// The standing of the invite for `name`, in a pending list.
+    fn standing_of<'a>(list: &'a crate::control::PendingList, name: &str) -> Option<&'a str> {
+        list.invites.iter().find(|line| line.name == name).map(|line| line.standing.as_str())
+    }
+
+    fn inviting(name: &str, light: bool, groups: &[&str], ipv4: Option<&str>) -> Command {
+        Command::Invite {
+            network: None,
+            name: name.to_owned(),
+            admin: false,
+            light,
+            groups: groups.iter().map(|group| (*group).to_owned()).collect(),
+            ipv4: ipv4.map(str::to_owned),
+            minutes: Some(120),
+        }
+    }
+
+    /// The whole of an invite, with nobody waiting for anybody: issued by one
+    /// command that then closes; the device's request taken by the daemon on its
+    /// own and kept, asking nobody; the person coming back to the list and
+    /// approving after checking the fingerprint; the device, still waiting,
+    /// given the network as the invite said; the invite used.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_invite_is_dialled_on_its_own_and_resumed_at_the_code() {
+    async fn an_invite_brings_a_request_a_person_approves_later() {
         let relay = transport_convesso::fixture::TestRelay::start().await;
         let (service, _scratch) = admin_at(&relay.written());
         let _dialling = tokio::spawn(Arc::clone(&service).reconcile_forever());
 
-        let issued = service
-            .handle(Command::Invite {
-                network: None,
-                name: "sensor".to_owned(),
-                admin: false,
-                light: true,
-                groups: vec!["sensori".to_owned()],
-                ipv4: Some("100.64.0.9".to_owned()),
-                hours: Some(2),
-            })
-            .await;
+        let issued =
+            service.handle(inviting("sensor", true, &["sensori"], Some("100.64.0.9"))).await;
         let Outcome::Invited { invite, name, scannable, .. } = issued else {
             panic!("expected an invite, got {issued:?}");
         };
         assert_eq!(name, "sensor");
         assert!(!scannable.is_empty());
         // A second invite for the same device is refused while this one is open.
-        let again = service
-            .handle(Command::Invite {
-                network: None,
-                name: "sensor".to_owned(),
-                admin: false,
-                light: false,
-                groups: Vec::new(),
-                ipv4: None,
-                hours: None,
-            })
-            .await;
-        assert!(matches!(again, Outcome::Failed { .. }), "{again:?}");
+        let again = service.handle(inviting("sensor", false, &[], None)).await;
+        assert!(
+            matches!(&again, Outcome::Failed { message, .. }
+                if message.contains(crate::control::INVITE_STILL_OPEN)),
+            "refused as still open: {again:?}"
+        );
+        assert_eq!(service.handle(Command::Waiting).await, Outcome::Done, "nothing on a person");
 
-        // The command has closed. Nothing waits until the device joins.
-        assert_eq!(service.handle(Command::Waiting).await, Outcome::Done);
-        let joiner = tempfile::tempdir().expect("a scratch directory");
-        let joining = Paths::under(joiner.path());
-        let (person, underway) = crate::joining::AcrossTheChannel::new();
-        let at = joining.clone();
-        let task = tokio::spawn(async move {
-            crate::joining::join(&at, &invite, "board", person, &crate::keys::PlatformKeys).await
-        });
+        // The device joins later, and is answered at once with its fingerprint.
+        let elsewhere = tempfile::tempdir().expect("a scratch directory");
+        let joiner = joiner_over(&Home::under(elsewhere.path()));
+        let _joining = tokio::spawn(Arc::clone(&joiner).reconcile_forever());
+        let started = joiner.handle(Command::Join { invite, name: "board".to_owned() }).await;
+        let Outcome::JoinStarted { fingerprint, .. } = started else { panic!("{started:?}") };
+        assert_eq!(fingerprint.len(), 24, "{fingerprint}");
 
-        // The daemon dials it on its own, and says so.
-        let arrived =
-            waiting_for(&service, |outcome| matches!(outcome, Outcome::Admitting { .. })).await;
-        let Outcome::Admitting { code, proposed_name, .. } = arrived else { unreachable!() };
-        assert_eq!(proposed_name, "sensor", "the name the invite's record gives");
+        // The admin's daemon takes the request on its own, and keeps it.
+        let listed =
+            pending_until(&service, |list| standing_of(list, "sensor") == Some("requested")).await;
+        let request =
+            listed.invites.first().and_then(|line| line.request.clone()).expect("the request");
+        assert_eq!(request.proposed_name, "board");
+        assert_eq!(request.fingerprint, fingerprint, "the fingerprint both screens show");
+        assert_eq!(request.taken, None);
         let network = service.all().await.first().map(Arc::clone).expect("the network");
         let told = network.node().event().await.expect("an event");
-        assert!(told.cause.contains("has arrived"), "{told:?}");
-        // And the report names it, for a tray to tell the person and offer it.
+        assert!(told.cause.contains("request arrived"), "{told:?}");
         let arrived_in = |outcome: Outcome| match outcome {
             Outcome::Reported(report) => report.networks.first().and_then(|n| n.arrived.clone()),
             other => panic!("{other:?}"),
         };
-        assert_eq!(
-            arrived_in(service.handle(Command::Status).await).as_deref(),
-            Some("sensor")
-        );
-
-        // The person comes back, the code is typed on the device, and confirmed.
-        assert!(underway.confirm(&code));
-        let _accepted = waiting_for(&service, |outcome| {
-            matches!(outcome, Outcome::Admitting { accepted: true, .. })
+        assert_eq!(arrived_in(service.handle(Command::Status).await).as_deref(), Some("sensor"));
+        // And the device is told its request was received.
+        let _received = pending_until(&joiner, |list| {
+            list.joins.first().is_some_and(|join| join.standing == "requested")
         })
         .await;
-        let confirmed = service.handle(Command::Confirm).await;
-        assert!(matches!(confirmed, Outcome::Reported(_)), "{confirmed:?}");
-        let joined = tokio::time::timeout(Duration::from_secs(60), task)
-            .await
-            .expect("ends")
-            .expect("runs")
-            .expect("joins");
-        assert_eq!(joined.devices, 2);
+        assert!(joiner.all().await.is_empty(), "a member of nothing yet");
+
+        let approved = service
+            .handle(Command::Approve { network: None, name: "sensor".to_owned(), replace: false })
+            .await;
+        assert!(matches!(approved, Outcome::Reported(_)), "{approved:?}");
+
+        // The device, still waiting, is given the network and takes it on.
+        let arrived = holding_a_network(&joiner).await;
+        let joined = pending_until(&joiner, |list| list.joins.is_empty()).await;
+        assert!(joined.joins.is_empty(), "the join is over");
+        let used =
+            pending_until(&service, |list| standing_of(list, "sensor") == Some("used")).await;
+        assert_eq!(standing_of(&used, "sensor"), Some("used"));
         assert_eq!(arrived_in(service.handle(Command::Status).await), None, "dealt with");
 
         // Admitted as the invite said, on both sides.
@@ -5938,60 +6369,256 @@ mod tests {
         assert_eq!(settings.mode, roster::leaf::Mode::Light);
         assert_eq!(settings.groups, vec![roster::leaf::Group::new("sensori").expect("a group")]);
         assert_eq!(settings.ipv4, Some([100, 64, 0, 9]));
+        assert_eq!(arrived.node().identity().device_id(), device, "the device that asked");
 
-        // And the invite is used: it admits nobody else.
-        let listed = service.handle(Command::Invites { network: None }).await;
-        let Outcome::InvitesHeld(lines) = listed else {
-            panic!("expected invites, got {listed:?}")
-        };
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines.first().map(|line| line.standing.as_str()), Some("used"));
+        // It arrived holding a root over its own admission, following one the
+        // admitter held: a light member believes it from its first session, and
+        // adopts it after its own.
+        let mut held = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
+        for operation in crate::state::Log::at(arrived.paths.roster()).read().expect("its log") {
+            held.offer_bytes(&operation);
+        }
+        let (root, _at) = crate::state::read_snapshot(&arrived.paths).expect("a root delivered");
+        assert!(held.offer_snapshot(&root).is_accepted(), "signed by an admin it holds");
+        assert!(held.evidence_for(&device).is_some(), "a proof of itself, in what it holds");
+        let body = roster::snapshot::RawSnapshot::decode(&root).expect("decodes");
+        assert_eq!(body.body().previous.len(), 1, "it follows the admitter's root");
     }
 
-    /// A withdrawn invite admits nobody, and an admission it led to that was
-    /// waiting for a person is dropped.
+    /// Restarts on both sides in the middle: the request stays pending on the
+    /// admin's machine, the join goes on waiting on the device's, and a call
+    /// from somebody who brings a roster that does not admit the device costs
+    /// one refused exchange.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_withdrawn_invite_drops_the_admission_it_led_to() {
+    async fn a_request_and_a_join_outlive_restarts() {
+        let relay = transport_convesso::fixture::TestRelay::start().await;
+        let (service, scratch) = admin_at(&relay.written());
+        let _dialling = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        let Outcome::Invited { invite, .. } =
+            service.handle(inviting("laptop", false, &[], None)).await
+        else {
+            panic!("an invite")
+        };
+        let elsewhere = tempfile::tempdir().expect("a scratch directory");
+        let joiner_home = Home::under(elsewhere.path());
+        let joiner = joiner_over(&joiner_home);
+        let _joining = tokio::spawn(Arc::clone(&joiner).reconcile_forever());
+        let started = joiner.handle(Command::Join { invite, name: "laptop".to_owned() }).await;
+        assert!(matches!(started, Outcome::JoinStarted { .. }), "{started:?}");
+        let _requested =
+            pending_until(&service, |list| standing_of(list, "laptop") == Some("requested")).await;
+        let _told = pending_until(&joiner, |list| {
+            list.joins.first().is_some_and(|join| join.standing == "requested")
+        })
+        .await;
+
+        // Both machines go off and come back.
+        switched_off(&joiner).await;
+        switched_off(&service).await;
+        let joiner = restarted(&joiner_home);
+        let service = restarted(&Home::under(scratch.path()));
+        let resumed = pending_until(&joiner, |list| !list.joins.is_empty()).await;
+        assert_eq!(
+            resumed.joins.first().map(|join| join.standing.as_str()),
+            Some("requested"),
+            "it remembers it was received"
+        );
+        let kept =
+            pending_until(&service, |list| standing_of(list, "laptop") == Some("requested")).await;
+        assert!(
+            kept.invites.first().is_some_and(|line| line.request.is_some()),
+            "the request is still pending"
+        );
+
+        // Somebody brings a roster that does not admit the device.
+        let network = service.all().await.first().map(Arc::clone).expect("the network");
+        let applicant = crate::invites::InviteFile::beside(&network.paths.roster())
+            .load()
+            .expect("reads")
+            .all()
+            .first()
+            .and_then(|record| record.request.clone())
+            .expect("the request")
+            .applicant;
+        let delivery = service.delivery_of(&network).await.expect("a delivery");
+        let written = relay.written();
+        let destination = crate::admitting::Destination {
+            dialled: applicant.transport.clone(),
+            relay: &written,
+            signing: &applicant.signing,
+            transport: &applicant.transport,
+        };
+        let deadline =
+            std::time::Instant::now().checked_add(Duration::from_secs(60)).expect("representable");
+        let taken = loop {
+            if let Ok(taken) = crate::admitting::deliver(&destination, &delivery).await {
+                break taken;
+            }
+            assert!(std::time::Instant::now() < deadline, "the device was never reached");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        assert!(!taken, "a roster that does not admit it is refused");
+        let refused = pending_until(&joiner, |list| {
+            list.joins.first().is_some_and(|join| join.problem.is_some())
+        })
+        .await;
+        assert_eq!(refused.joins.len(), 1, "and the join goes on");
+        assert!(joiner.all().await.is_empty());
+
+        // Approved after the restarts, it is admitted.
+        let approved = service
+            .handle(Command::Approve { network: None, name: "laptop".to_owned(), replace: false })
+            .await;
+        assert!(matches!(approved, Outcome::Reported(_)), "{approved:?}");
+        let _arrived = holding_a_network(&joiner).await;
+    }
+
+    /// Approved while the device is off, and the admin off when it comes back:
+    /// a full member holding the admission, which has never been in contact
+    /// with the device, dials it and brings it the network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_member_brings_the_network_when_the_admin_is_off() {
         let relay = transport_convesso::fixture::TestRelay::start().await;
         let (service, _scratch) = admin_at(&relay.written());
         let _dialling = tokio::spawn(Arc::clone(&service).reconcile_forever());
-        let issued = service
-            .handle(Command::Invite {
-                network: None,
-                name: "sensor".to_owned(),
-                admin: false,
-                light: false,
-                groups: Vec::new(),
-                ipv4: None,
-                hours: None,
-            })
-            .await;
-        let Outcome::Invited { invite, .. } = issued else { panic!("{issued:?}") };
+        let Outcome::Invited { invite: board, .. } =
+            service.handle(inviting("board", false, &[], None)).await
+        else {
+            panic!("an invite")
+        };
+        let Outcome::Invited { invite: desk, .. } =
+            service.handle(inviting("desk", false, &[], None)).await
+        else {
+            panic!("an invite")
+        };
 
-        let joiner = tempfile::tempdir().expect("a scratch directory");
-        let joining = Paths::under(joiner.path());
-        let (person, underway) = crate::joining::AcrossTheChannel::new();
-        let at = joining.clone();
-        let task = tokio::spawn(async move {
-            crate::joining::join(&at, &invite, "board", person, &crate::keys::PlatformKeys).await
-        });
-        let _arrived =
-            waiting_for(&service, |outcome| matches!(outcome, Outcome::Admitting { .. })).await;
+        // The board asks, and goes off.
+        let board_dir = tempfile::tempdir().expect("a scratch directory");
+        let board_home = Home::under(board_dir.path());
+        let first = joiner_over(&board_home);
+        let _joining = tokio::spawn(Arc::clone(&first).reconcile_forever());
+        let started = first.handle(Command::Join { invite: board, name: "board".to_owned() }).await;
+        assert!(matches!(started, Outcome::JoinStarted { .. }), "{started:?}");
+        let _requested =
+            pending_until(&service, |list| standing_of(list, "board") == Some("requested")).await;
+        switched_off(&first).await;
+        drop(first);
+
+        // Approved while it is off: nobody can give it the network yet.
+        let approved = service
+            .handle(Command::Approve { network: None, name: "board".to_owned(), replace: false })
+            .await;
+        assert!(matches!(approved, Outcome::Reported(_)), "{approved:?}");
+
+        // A desk joins and is admitted, receiving a roster that holds the
+        // board's admission; then the admin goes off.
+        let desk_dir = tempfile::tempdir().expect("a scratch directory");
+        let member = joiner_over(&Home::under(desk_dir.path()));
+        let _member_running = tokio::spawn(Arc::clone(&member).reconcile_forever());
+        let started = member.handle(Command::Join { invite: desk, name: "desk".to_owned() }).await;
+        assert!(matches!(started, Outcome::JoinStarted { .. }), "{started:?}");
+        let _requested =
+            pending_until(&service, |list| standing_of(list, "desk") == Some("requested")).await;
+        let approved = service
+            .handle(Command::Approve { network: None, name: "desk".to_owned(), replace: false })
+            .await;
+        assert!(matches!(approved, Outcome::Reported(_)), "{approved:?}");
+        let _desk = holding_a_network(&member).await;
+        switched_off(&service).await;
+
+        // The board comes back, waiting; the desk's person turns its network on.
+        let board = restarted(&board_home);
+        let _waiting = pending_until(&board, |list| !list.joins.is_empty()).await;
+        let up = member.handle(Command::Up { network: None }).await;
+        assert!(matches!(up, Outcome::Done), "{up:?}");
+        member.inviting.notify_one();
+
+        let arrived = holding_a_network(&board).await;
+        let desk = member.all().await.first().map(Arc::clone).expect("the desk's network");
+        let told = desk.node().event().await.expect("an event");
+        assert!(told.cause.contains("given the network from here"), "by the desk: {told:?}");
+        let state = arrived.node().state().await.expect("derives");
+        assert!(state.devices.iter().any(|(_, record)| record.name == "desk"));
+        assert!(state.devices.contains_key(&arrived.node().identity().device_id()));
+    }
+
+    /// A request from somebody holding the invite is seen in the list and
+    /// rejected: nothing is signed, and the invite takes no other request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rejected_request_admits_nobody() {
+        let relay = transport_convesso::fixture::TestRelay::start().await;
+        let (service, _scratch) = admin_at(&relay.written());
+        let _dialling = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        let Outcome::Invited { invite, .. } =
+            service.handle(inviting("laptop", false, &[], None)).await
+        else {
+            panic!("an invite")
+        };
+        let elsewhere = tempfile::tempdir().expect("a scratch directory");
+        let impostor = joiner_over(&Home::under(elsewhere.path()));
+        let _joining = tokio::spawn(Arc::clone(&impostor).reconcile_forever());
+        let started = impostor.handle(Command::Join { invite, name: "laptop".to_owned() }).await;
+        assert!(matches!(started, Outcome::JoinStarted { .. }), "{started:?}");
+        let _requested =
+            pending_until(&service, |list| standing_of(list, "laptop") == Some("requested")).await;
+        let held = service.all().await.first().map(Arc::clone).expect("the network");
+        let before = held.node().state().await.expect("derives").devices.len();
+
+        let rejected =
+            service.handle(Command::Reject { network: None, name: "laptop".to_owned() }).await;
+        assert_eq!(rejected, Outcome::Done);
+        let listed = pending_until(&service, |_| true).await;
+        assert_eq!(standing_of(&listed, "laptop"), Some("rejected"));
+        let approved = service
+            .handle(Command::Approve { network: None, name: "laptop".to_owned(), replace: false })
+            .await;
+        assert!(matches!(approved, Outcome::Failed { .. }), "{approved:?}");
+        assert_eq!(held.node().state().await.expect("derives").devices.len(), before);
+        let withdrawn =
+            service.handle(Command::Withdraw { network: None, name: "laptop".to_owned() }).await;
+        assert!(matches!(withdrawn, Outcome::Failed { .. }), "nothing to withdraw: {withdrawn:?}");
+
+        // The impostor's join waits until it is cancelled.
+        let label = pending_until(&impostor, |list| !list.joins.is_empty())
+            .await
+            .joins
+            .first()
+            .map(|join| join.label.clone())
+            .expect("a join");
+        assert_eq!(impostor.handle(Command::CancelJoin { label }).await, Outcome::Done);
+        assert!(pending_until(&impostor, |_| true).await.joins.is_empty());
+    }
+
+    /// A withdrawn invite takes no request, and one it brought is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_withdrawn_invite_drops_the_request_it_brought() {
+        let relay = transport_convesso::fixture::TestRelay::start().await;
+        let (service, _scratch) = admin_at(&relay.written());
+        let _dialling = tokio::spawn(Arc::clone(&service).reconcile_forever());
+        let Outcome::Invited { invite, .. } =
+            service.handle(inviting("sensor", false, &[], None)).await
+        else {
+            panic!("an invite")
+        };
+        let elsewhere = tempfile::tempdir().expect("a scratch directory");
+        let joiner = joiner_over(&Home::under(elsewhere.path()));
+        let _joining = tokio::spawn(Arc::clone(&joiner).reconcile_forever());
+        let _started = joiner.handle(Command::Join { invite, name: "board".to_owned() }).await;
+        let _requested =
+            pending_until(&service, |list| standing_of(list, "sensor") == Some("requested")).await;
 
         let withdrawn =
             service.handle(Command::Withdraw { network: None, name: "sensor".to_owned() }).await;
         assert_eq!(withdrawn, Outcome::Done);
-        assert_eq!(service.handle(Command::Waiting).await, Outcome::Done, "the admission is gone");
-        let listed = service.handle(Command::Invites { network: None }).await;
-        let Outcome::InvitesHeld(lines) = listed else { panic!("{listed:?}") };
-        assert_eq!(lines.first().map(|line| line.standing.as_str()), Some("withdrawn"));
+        let listed = pending_until(&service, |_| true).await;
+        assert_eq!(standing_of(&listed, "sensor"), Some("withdrawn"));
+        let approved = service
+            .handle(Command::Approve { network: None, name: "sensor".to_owned(), replace: false })
+            .await;
+        assert!(matches!(approved, Outcome::Failed { .. }), "{approved:?}");
         let again =
             service.handle(Command::Withdraw { network: None, name: "sensor".to_owned() }).await;
         assert!(matches!(again, Outcome::Failed { .. }), "nothing open to withdraw: {again:?}");
-
-        underway.abandon();
-        let _ended = tokio::time::timeout(Duration::from_secs(30), task).await;
-        assert!(Log::at(joining.roster()).read().expect("reads").is_empty());
     }
 
     /// What an invite asks for is checked before anything is issued.
@@ -6001,26 +6628,28 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@127.0.0.1:1",
         );
         let asking =
-            |admin: bool, light: bool, ipv4: Option<&str>, hours: Option<u32>| Command::Invite {
+            |admin: bool, light: bool, ipv4: Option<&str>, minutes: Option<u32>| Command::Invite {
                 network: None,
                 name: "sensor".to_owned(),
                 admin,
                 light,
                 groups: Vec::new(),
                 ipv4: ipv4.map(str::to_owned),
-                hours,
+                minutes,
             };
         for refused in [
             asking(true, true, None, None),
             asking(false, false, Some("10.0.0.1"), None),
             asking(false, false, Some("not an address"), None),
             asking(false, false, None, Some(0)),
+            asking(false, false, None, Some(8 * 24 * 60)),
         ] {
             let outcome = service.handle(refused.clone()).await;
             assert!(matches!(outcome, Outcome::Failed { .. }), "{refused:?}: {outcome:?}");
         }
-        let listed = service.handle(Command::Invites { network: None }).await;
-        assert_eq!(listed, Outcome::InvitesHeld(Vec::new()), "nothing was issued");
+        let listed = service.handle(Command::Pending { network: None }).await;
+        let Outcome::Pending(list) = listed else { panic!("{listed:?}") };
+        assert!(list.invites.is_empty(), "nothing was issued");
     }
 
     // ---- local integrity: what a directory says is believed only through a
@@ -6272,8 +6901,50 @@ mod tests {
         let service = started(&home);
         assert_eq!(carried_and_refused(&service).await.0, vec!["casa"], "the network stays up");
         assert!(!invites.exists(), "the records it does not name are dropped");
-        let listed = service.handle(Command::Invites { network: None }).await;
-        assert_eq!(listed, Outcome::InvitesHeld(Vec::new()));
+        let listed = service.handle(Command::Pending { network: None }).await;
+        let Outcome::Pending(list) = listed else { panic!("{listed:?}") };
+        assert!(list.invites.is_empty(), "and a planted request is no request");
+        let network = service.all().await.first().map(Arc::clone).expect("carried");
+        assert!(
+            network
+                .node()
+                .fault()
+                .await
+                .is_none_or(|fault| !fault.cause.contains("changed outside")),
+            "dropped once, at the start, and not found again when read"
+        );
+    }
+
+    /// **A join whose file was changed outside the daemon is not resumed**: it
+    /// is listed, for a person to cancel, and cancelling removes it.
+    #[tokio::test]
+    async fn an_altered_join_is_not_resumed() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let home = Home::under(scratch.path());
+        let joiner = joiner_over(&home);
+        let started = joiner
+            .handle(Command::Join { invite: invited_at("127.0.0.1:1"), name: "laptop".to_owned() })
+            .await;
+        assert!(matches!(started, Outcome::JoinStarted { .. }), "{started:?}");
+        let label = joiner.joins.lock().await.keys().next().cloned().expect("a join");
+        switched_off(&joiner).await;
+        drop(joiner);
+
+        let kept = crate::joins::path(&home.paths_for(&label));
+        let text = std::fs::read_to_string(&kept).expect("kept");
+        std::fs::write(&kept, text.replace("laptop", "planted")).expect("altered");
+        assert!(home.survey().expect("surveys").unreadable.is_empty(), "not a broken network");
+
+        let joiner = restarted(&home);
+        let listed = pending_until(&joiner, |list| !list.joins.is_empty()).await;
+        let join = listed.joins.first().expect("the join");
+        assert_eq!(join.standing, "failed");
+        let problem = join.problem.clone().unwrap_or_default();
+        assert!(problem.contains("changed outside"), "{problem}");
+
+        let cancelled = joiner.handle(Command::CancelJoin { label: label.to_string() }).await;
+        assert_eq!(cancelled, Outcome::Done);
+        assert!(!home.paths_for(&label).root().exists(), "its directory and keys are gone");
     }
 
     /// A service on a device that has never been founded or joined.
@@ -6713,26 +7384,32 @@ mod tests {
     /// leave the device registered at a relay with the tunnel down, which is a
     /// §2.6c breach that nothing in the report would show.
     #[tokio::test]
-    async fn abandoning_a_join_leaves_no_roster_and_no_enrolment() {
-        let (service, _machine, scratch) = unjoined().await;
+    async fn cancelling_a_join_leaves_no_roster_and_no_join() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let home = Home::under(scratch.path());
+        let joiner = joiner_over(&home);
 
         // A relay nobody is listening on: the join gets no further than trying,
-        // which is all this needs — what is asserted is what abandoning leaves.
-        let outcome = service
+        // which is all this needs — what is asserted is what cancelling leaves.
+        let outcome = joiner
             .handle(Command::Join { invite: invited_at("127.0.0.1:1"), name: "laptop".to_owned() })
             .await;
-        assert!(
-            matches!(outcome, Outcome::Failed { .. } | Outcome::Joining),
-            "either it is waiting or it could not start; both are fine here"
+        assert!(matches!(outcome, Outcome::JoinStarted { .. }), "{outcome:?}");
+        let listed = pending_until(&joiner, |list| !list.joins.is_empty()).await;
+        let label = listed.joins.first().map(|join| join.label.clone()).expect("a join");
+        assert!(joiner.pending.lock().await.is_none(), "a join holds nothing else back");
+
+        assert_eq!(
+            joiner.handle(Command::CancelJoin { label: label.clone() }).await,
+            Outcome::Done
         );
 
-        service.handle(Command::Abandon).await;
-
-        assert!(service.pending.lock().await.is_none(), "nothing is left waiting");
-        assert!(!service.has_network().await, "and no network was adopted");
-
-        let log = crate::state::Log::at(Paths::under(scratch.path()).roster());
-        assert!(log.read().expect("readable").is_empty(), "the roster is still empty");
+        assert!(joiner.joins.lock().await.is_empty(), "nothing is left waiting");
+        assert!(!joiner.has_network().await, "and no network was adopted");
+        let paths = home.paths_for(&Label::new(&label).expect("a label"));
+        assert!(!paths.root().exists(), "and its directory is gone");
+        let again = joiner.handle(Command::CancelJoin { label }).await;
+        assert!(matches!(again, Outcome::Failed { .. }), "{again:?}");
     }
 
     /// A directory this device cannot carry and cannot recover either.
@@ -6978,29 +7655,6 @@ mod tests {
         assert!(matches!(done, Outcome::Reported(_)), "no question to ask: {done:?}");
     }
 
-    /// **Removing is refused while an enrolment for the network waits for a
-    /// person**, and nothing is touched.
-    #[tokio::test]
-    async fn removing_is_refused_during_an_enrolment() {
-        let (service, _machine, _scratch) = two_networks().await;
-        let going = service.all().await.first().expect("a network").label().clone();
-        let paths = service.home.paths_for(&going);
-        let (_person, underway) = crate::joining::AcrossTheChannel::new();
-        *service.pending.lock().await = Some(Pending::Joining {
-            label: going.clone(),
-            underway,
-            task: tokio::spawn(async {}),
-            for_whom: crate::control::Caller::Unattributed,
-        });
-
-        let refused =
-            service.handle(Command::Forget { label: going.to_string(), last_admin: true }).await;
-        let Outcome::Failed { message, .. } = refused else { panic!("refused: {refused:?}") };
-        assert!(message.contains("enrolment"), "{message}");
-        assert!(paths.root().exists(), "nothing was removed");
-        assert_eq!(2, service.all().await.len());
-    }
-
     /// Keys kept as this platform keeps them, with a `forget` that can be made
     /// to refuse, and that records what it was asked about.
     struct Stubborn {
@@ -7131,9 +7785,9 @@ mod tests {
 
     /// The ordering that avoids it, pinned at the source.
     ///
-    /// A behavioural test of `finish_admitting` needs a live exchange over a
-    /// relay, which is `tests/enrolling.rs`. What can be pinned here is the one
-    /// thing that went wrong: everything the admission is built from must be read
+    /// A behavioural test of `approve` needs a live exchange over a relay,
+    /// which is `tests/enrolling.rs`. What can be pinned here is the one thing
+    /// that went wrong: everything the admission is built from must be read
     /// **after** the revocation is in, or the two are siblings.
     ///
     /// Found on real hardware, on a log that cannot be unsaid.
@@ -7141,7 +7795,7 @@ mod tests {
     fn the_admission_is_built_after_the_revocation_it_replaces() {
         let source = crate::code_of(include_str!("service.rs"));
         let body = source
-            .split("async fn finish_admitting")
+            .split("async fn approve(")
             .nth(1)
             .expect("present")
             .split(
@@ -7152,12 +7806,18 @@ mod tests {
             .next()
             .expect("its body");
 
+        // What is read before the revocation decides whether there is one;
+        // what the admission is built from is read again after it.
         let revokes = body.find("expel_for_replacement").expect("it revokes");
-        for built_after in ["let heads = node.heads()", "node.state()", "Log::at(paths.roster())"] {
-            let at = body.find(built_after).unwrap_or_else(|| panic!("{built_after} is read"));
+        let built = body.find("admission_core(").expect("it builds the admission");
+        for built_after in ["let heads = node.heads()", "node.state()"] {
+            let at = body[revokes..]
+                .find(built_after)
+                .map(|at| at + revokes)
+                .unwrap_or_else(|| panic!("{built_after} is read after the revocation"));
             assert!(
-                at > revokes,
-                "`{built_after}` must be read after the revocation, or the admission is signed against the same heads and the two are siblings"
+                at < built,
+                "`{built_after}` must be read after the revocation and before the admission is built, or the admission is signed against the same heads and the two are siblings"
             );
         }
     }
@@ -7463,9 +8123,10 @@ mod tests {
         let home = Home::under(scratch.path());
         home.create().expect("creates");
 
-        let provisional = home.free_label(None).expect("a name");
+        let provisional = Label::new("joining").expect("a name");
+        let paths = home.paths_for(&provisional);
         crate::founding::found_with(
-            &home.paths_for(&provisional),
+            &paths,
             &crate::founding::Founding {
                 name: "laptop".to_owned(),
                 suffix: "casa.internal".to_owned(),
@@ -7476,32 +8137,34 @@ mod tests {
             &crate::keys::PlatformKeys,
         )
         .expect("a roster to have been given");
+        // Written when the join began, by the person who began it.
+        crate::state::write_owner(&paths, "1000").expect("writes");
 
-        let (person, underway) = crate::joining::AcrossTheChannel::new();
-        person.reached(crate::joining::Progress::Joined {
+        let (underway, reporting) =
+            crate::joining::Underway::new(crate::joining::Progress::Registering);
+        reporting.reached(crate::joining::Progress::Joined {
             suffix: "casa.internal".to_owned(),
             devices: 2,
         });
-        let alice = crate::control::Caller::Identified {
-            name: "1000".to_owned(),
-            privileged: true,
-            could_be_privileged: false,
-        };
-        *service.pending.lock().await = Some(Pending::Joining {
-            label: provisional,
-            underway,
-            task: tokio::spawn(async {}),
-            for_whom: alice,
-        });
+        service.joins.lock().await.insert(
+            provisional.clone(),
+            Joining {
+                underway,
+                fingerprint: String::new(),
+                since: 0,
+                task: tokio::spawn(async {}),
+            },
+        );
 
-        let adopted = service.take_the_network_on().await;
-        assert!(matches!(adopted, Outcome::Adopted { .. }), "{adopted:?}");
+        let adopted = service.take_the_network_on(&provisional).await;
+        assert!(matches!(adopted, Outcome::Reported(_)), "{adopted:?}");
         let casa = Label::new("casa").expect("a label");
         assert_eq!(
             Some("1000".to_owned()),
             crate::state::read_owner(&home.paths_for(&casa)),
             "recorded for the person who joined"
         );
+        assert!(service.joins.lock().await.is_empty());
     }
 
     /// Asked what is waiting when nothing is, the daemon says so as a plain
@@ -7576,22 +8239,40 @@ mod tests {
         });
 
         let outcome = service
-            .handle(Command::Join { invite: invited_at("127.0.0.1:1"), name: "laptop".to_owned() })
+            .handle(Command::Found {
+                label: "lavoro".to_owned(),
+                name: "nas".to_owned(),
+                suffix: "lavoro.internal".to_owned(),
+                relay: None,
+                ipv4_range: None,
+                window_days: None,
+            })
             .await;
 
+        // Refused in words that name what waits, so a person knows what to cancel.
         match outcome {
             Outcome::Failed { message, .. } => {
-                assert!(message.contains("already waiting"), "{message}");
+                assert!(message.contains(crate::control::ALREADY_WAITING), "{message}");
+                assert!(message.contains("the founding of"), "it says what waits: {message}");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+
+        // The report says it too, and cancelling clears it.
+        let waiting_on = |outcome: Outcome| match outcome {
+            Outcome::Reported(report) => report.waiting_on,
+            other => panic!("{other:?}"),
+        };
+        assert!(waiting_on(service.handle(Command::Status).await).is_some());
+        assert_eq!(service.handle(Command::Abandon).await, Outcome::Done);
+        assert_eq!(waiting_on(service.handle(Command::Status).await), None);
     }
 
     /// A join is confirmed with digits read off the other machine, never with a
     /// bare yes. The daemon refuses the bare one rather than treating it as
     /// agreement — agreement being exactly what used to make the check pass.
     #[tokio::test]
-    async fn a_join_is_not_confirmed_by_agreeing() {
+    async fn confirming_with_nothing_waiting_is_refused() {
         let (service, _machine, _scratch) = unjoined().await;
 
         match service.handle(Command::Confirm).await {
@@ -7600,35 +8281,6 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
-    }
-
-    /// And the digits go where a person's digits go: to the join. Nothing on
-    /// this path may read the code the device derived — the service cannot even
-    /// see it, because the progress it reads no longer carries one.
-    #[tokio::test]
-    async fn confirming_a_join_that_is_not_waiting_is_refused() {
-        let (service, _machine, _scratch) = unjoined().await;
-
-        match service.handle(Command::ConfirmJoin { code: "123456".to_owned() }).await {
-            Outcome::Failed { message, .. } => {
-                assert!(message.contains("nothing is waiting"), "{message}");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-    }
-
-    /// The daemon never hands a joining device its own code: what it reports
-    /// while waiting for a person carries no digits at all.
-    #[test]
-    fn what_a_joining_device_reports_carries_no_code() {
-        // Nothing here asserts what the service does not read: it cannot read a
-        // field that does not exist, and the compiler is the check for that.
-        // What is worth pinning is that the field stays gone.
-        let joining = include_str!("joining.rs");
-        assert!(
-            joining.lines().any(|line| line.trim_end() == "    Confirming,"),
-            "the variant a joining device reports while a person types carries nothing"
-        );
     }
 
     /// An empty log is not a corrupt one.
@@ -8485,7 +9137,7 @@ mod tests {
             light: false,
             groups: Vec::new(),
             ipv4: None,
-            hours: None,
+            minutes: None,
         };
 
         // With no network named and more than one held, the daemon refuses with
@@ -9904,9 +10556,10 @@ mod tests {
     #[tokio::test]
     async fn taking_a_network_needs_leave_to_act_on_the_machine() {
         let (service, _machine, _scratch) = unjoined().await;
+        // An administrator founds it: founding needs one.
         let alice = crate::control::Caller::Identified {
             name: "S-1-5-21-alice".to_owned(),
-            privileged: false,
+            privileged: true,
             could_be_privileged: false,
         };
         let bob = crate::control::Caller::Identified {
@@ -9943,9 +10596,10 @@ mod tests {
     #[tokio::test]
     async fn a_network_that_was_taken_says_it_was_taken() {
         let (service, _machine, _scratch) = unjoined().await;
+        // An administrator founds it: founding needs one.
         let alice = crate::control::Caller::Identified {
             name: "S-1-5-21-alice".to_owned(),
-            privileged: false,
+            privileged: true,
             could_be_privileged: false,
         };
         let root = crate::control::Caller::Identified {
@@ -9987,9 +10641,10 @@ mod tests {
     async fn enrolment_is_still_serial_when_two_arrive_at_once() {
         let (service, _machine, _scratch) = unjoined().await;
         let service = Arc::new(service);
+        // An administrator founds it: founding needs one.
         let alice = crate::control::Caller::Identified {
             name: "S-1-5-21-alice".to_owned(),
-            privileged: false,
+            privileged: true,
             could_be_privileged: false,
         };
         service.handle_for(&alice, founding_casa()).await;
@@ -10034,14 +10689,16 @@ mod tests {
         tempfile::TempDir,
     ) {
         let (service, _machine, scratch) = unjoined().await;
+        // Both administrators of the machine: founding and acting on a roster
+        // need one, and what is under test here is whose network it is.
         let alice = crate::control::Caller::Identified {
             name: "S-1-5-21-alice".to_owned(),
-            privileged: false,
+            privileged: true,
             could_be_privileged: false,
         };
         let bob = crate::control::Caller::Identified {
             name: "S-1-5-21-bob".to_owned(),
-            privileged: false,
+            privileged: true,
             could_be_privileged: false,
         };
 
@@ -10103,7 +10760,7 @@ mod tests {
                 light: false,
                 groups: Vec::new(),
                 ipv4: None,
-                hours: None,
+                minutes: None,
             },
             Command::Revoke {
                 network: Some("casa".to_owned()),
@@ -10120,13 +10777,58 @@ mod tests {
         }
     }
 
+    /// **One rule for administrators.** The owner of a network, without one,
+    /// reads it, lists what waits and turns it on and off; everything else —
+    /// inviting, approving, forgetting it — is refused before it starts, in
+    /// words that say the administrator is what is missing.
+    #[tokio::test]
+    async fn an_owner_without_an_administrator_reads_and_turns_on_and_off_and_nothing_else() {
+        let (service, _alice, _bob, paths, _scratch) = alices_casa().await;
+        let alice = person("alice", false);
+
+        for reading in [
+            Command::Status,
+            Command::Pending { network: None },
+            Command::Up { network: None },
+            Command::Down { network: None },
+        ] {
+            let answered = service.handle_for(&alice, reading.clone()).await;
+            assert!(!matches!(answered, Outcome::NotAllowed { .. }), "{reading:?}: {answered:?}");
+        }
+        for acting in [
+            Command::Invite {
+                network: None,
+                name: "laptop".to_owned(),
+                admin: false,
+                light: false,
+                groups: Vec::new(),
+                ipv4: None,
+                minutes: None,
+            },
+            Command::Approve { network: None, name: "laptop".to_owned(), replace: false },
+            Command::Forget { label: "casa".to_owned(), last_admin: true },
+        ] {
+            let refused = service.handle_for(&alice, acting.clone()).await;
+            let Outcome::NotAllowed { message } = refused else {
+                panic!("{acting:?}: {refused:?}")
+            };
+            assert!(
+                message.contains("administrator"),
+                "the elevation is what is missing: {message}"
+            );
+        }
+        assert!(paths.root().exists(), "and nothing was removed");
+    }
+
     /// **Stopping the daemon is an administrator's, and it keeps running.**
     ///
     /// The refusal is worth nothing if the daemon stops anyway — so what is
     /// asserted is the machine afterwards, not only the answer.
     #[tokio::test]
     async fn stopping_is_refused_to_anybody_who_may_not_act_on_the_machine() {
-        let (service, alice, bob, _paths, _scratch) = alices_casa().await;
+        let (service, _alice, _bob, _paths, _scratch) = alices_casa().await;
+        let alice = person("alice", false);
+        let bob = person("bob", false);
 
         for who in [&alice, &bob] {
             let refused = service.handle_for(who, Command::Stop).await;
@@ -10332,9 +11034,10 @@ mod tests {
     #[tokio::test]
     async fn a_network_founded_by_somebody_named_says_whose_it_is() {
         let (service, _machine, _scratch) = unjoined().await;
+        // An administrator founds it: founding needs one.
         let alice = crate::control::Caller::Identified {
             name: "S-1-5-21-alice".to_owned(),
-            privileged: false,
+            privileged: true,
             could_be_privileged: false,
         };
 
@@ -10635,7 +11338,12 @@ mod tests {
             .map(|index| {
                 let board = NodeIdentity::generate().expect("generates");
                 let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
-                BatchEntry { keys: spec.keys, name: format!("board-{index}"), serial: Vec::new(), ipv4: None }
+                BatchEntry {
+                    keys: spec.keys,
+                    name: format!("board-{index}"),
+                    serial: Vec::new(),
+                    ipv4: None,
+                }
             })
             .collect();
         let header =
@@ -10666,7 +11374,9 @@ mod tests {
             }
         };
         let asked = fixture.service.handle(revoke(false)).await;
-        let Outcome::WouldVoid { voids, .. } = asked else { panic!("it must ask first: {asked:?}") };
+        let Outcome::WouldVoid { voids, .. } = asked else {
+            panic!("it must ask first: {asked:?}")
+        };
         assert!(voids.contains("voids 1 act"), "{voids}");
         assert!(node.state().await.expect("derives").revoked.is_empty(), "nothing was signed");
 
@@ -11424,7 +12134,10 @@ mod tests {
             let mut unsigned = service.unsigned.lock().await;
             let _later = unsigned.issue_for(
                 Vec::new(),
-                Resume::Possession,
+                Resume::Renaming {
+                    label: Label::new("later").expect("a label"),
+                    prepared_against: crate::signing::Moment { heads: Vec::new(), snapshot: None },
+                },
                 crate::clock::now_ms().saturating_add(crate::signing::WAITS_FOR + 1),
                 crate::control::Caller::Unattributed,
             );
@@ -11557,7 +12270,7 @@ mod tests {
         let firewall = Arc::new(Firewalled::default());
         let service =
             service.with_exposing(Arc::clone(&firewall) as Arc<dyn crate::exposing::Exposing>);
-        service.handle_for(&person("alice", false), founding_casa()).await;
+        service.handle_for(&person("alice", true), founding_casa()).await;
         service.handle_for(&person("alice", false), Command::Up { network: None }).await;
 
         let unelevated =
@@ -11886,10 +12599,7 @@ mod tests {
         let held = node.held_operations().await;
         assert!(held < RENAMES, "the graph holds {held} operations, not the whole history");
         let paths = service.home().paths_for(&Label::new("casa").expect("valid"));
-        assert!(
-            paths.base_snapshot().exists() && paths.base_store().exists(),
-            "the base is kept"
-        );
+        assert!(paths.base_snapshot().exists() && paths.base_store().exists(), "the base is kept");
         let logged = crate::state::Log::at(paths.roster()).read().expect("reads").len();
         assert!(logged < RENAMES, "and the log keeps {logged} operations, not the whole history");
         let before = node.state().await.expect("derives");
@@ -12081,12 +12791,11 @@ mod tests {
         service.admit_to(&lavoro, &signed).await.expect("recorded in its own network");
         assert_eq!(node.state().await.expect("derives").devices.len(), 2);
 
-        // The guard follows what it guards. The recording used to sit in
-        // `finish_admitting`; an admission may now stop in the middle waiting for
-        // a signature, so the half that records moved to `deliver_admission` —
+        // The guard follows what it guards. An approval may stop in the middle
+        // waiting for a signature, so the half that records is `approved` —
         // which both paths reach — and this reads that one.
         let source = include_str!("service.rs");
-        let delivering = source.split("async fn deliver_admission").nth(1).expect("present");
+        let delivering = source.split("async fn approved(").nth(1).expect("present");
         let delivering = delivering
             .split(
                 "

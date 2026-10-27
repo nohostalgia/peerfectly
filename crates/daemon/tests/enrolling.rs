@@ -1,10 +1,9 @@
-//! One device joining another's network from an invite, end to end.
+//! One device joining another's network from an invite, end to end, at the
+//! level of the modules the daemon calls.
 //!
-//! Two machines, a relay in this process, and a person in the middle who
-//! compares two screens. Everything below the person is real: real endpoints,
-//! a real relay, real signed operations, and the same modules the commands call.
-//!
-//! This is the test the whole change exists to make pass.
+//! Two machines and a relay in this process. Everything is real: real
+//! endpoints, a real relay, real signed operations. The service-level runs —
+//! the pending list, approval, restarts — are in the daemon's own tests.
 
 #![allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 
@@ -17,17 +16,15 @@ use std::time::Duration;
 /// enrolment itself already bounds at sixty seconds; a test bounded at the same
 /// number is racing the thing it is watching, and under a full parallel run it
 /// loses that race often enough to fail for reasons that have nothing to do with
-/// what it asserts. Three minutes is long enough that reaching it means something
-/// is genuinely stuck.
+/// what it asserts.
 const A_STEP: Duration = Duration::from_secs(180);
 
+use daemon::admitting::{self, Applicant, Delivery, Destination};
 use daemon::founding::{Founding, found};
 use daemon::invites::{Invited, Record};
-use daemon::joining::{Person, join};
+use daemon::joining::{Joined, Progress, Underway};
+use daemon::keys::Keys;
 use daemon::state::{Log, Paths};
-use daemon::{admitting, relay as relay_module};
-use enrollment::code::Confirmation;
-use tokio::sync::Mutex;
 use transport_convesso::fixture::TestRelay;
 
 /// A convesso relay in this process, and how a network writes it.
@@ -35,53 +32,6 @@ async fn relay() -> (TestRelay, String) {
     let relay = TestRelay::start().await;
     let written = relay.written();
     (relay, written)
-}
-
-/// How long a scripted person will stand there before giving up.
-///
-/// Every wait in a test is bounded. A person who waited for ever would take the
-/// whole run down with them, on a blocking thread the runtime cannot reclaim —
-/// which is exactly what an unbounded one did before this was written.
-const PATIENCE: Duration = Duration::from_secs(20);
-
-/// A person at the joining device, who types back what they read off the
-/// admin's screen.
-///
-/// Deliberately holds no way to type into itself. A sender kept here would keep
-/// the channel open for ever, and the blocking read waiting on it would never
-/// end — so a test that meant to abandon an enrolment would hang instead.
-struct Scripted {
-    /// What the admin's screen says, once there is an admin.
-    from_the_admin: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
-    /// What this side computed, recorded so a test can compare the two.
-    ours: Mutex<Option<String>>,
-    /// Whatever can reach this device's signing key, when this process cannot.
-    ///
-    /// `None` on a device that signs its own proof, which is every device until
-    /// one keeps its key in a store that answers only to a person.
-    reaches_the_key: Option<Arc<dyn roster::sign::Signer + Send + Sync>>,
-}
-
-impl Person for Scripted {
-    fn code_shown_by_the_admin(&self, ours: &Confirmation) -> Option<String> {
-        if let Ok(mut held) = self.ours.try_lock() {
-            *held = Some(ours.to_string());
-        }
-        // What the person reads off the other machine and types in here. Bounded,
-        // so a test that never types walks away instead of standing there.
-        self.from_the_admin.lock().ok()?.recv_timeout(PATIENCE).ok()
-    }
-
-    fn signs_the_proof(&self, request: &identity::detached::SigningRequest) -> Option<Vec<u8>> {
-        // The component that can reach the key. In the product it is the command
-        // line running as the person, with the key store asking them first; here
-        // it is the key itself, reached the same way — through the request and
-        // nothing else.
-        let signer = self.reaches_the_key.as_ref()?;
-        Some(roster::sign::Signer::sign(signer.as_ref(), request.message()).expect("signs"))
-    }
-
-    fn note(&self, _message: &str) {}
 }
 
 /// An invite into the network `state` describes, at `url`, for a member called
@@ -95,30 +45,6 @@ fn invite_into(state: &roster::state::RosterState, url: &str) -> Record {
         ipv4: None,
     };
     Record::issue(url, state.network, invited, 1, 1_000_000).expect("issues")
-}
-
-/// Starts a device joining from an invite into the network `state` describes.
-///
-/// Returns the invite's record, the person standing at the device, and the task
-/// doing the waiting.
-fn start_waiting(paths: &Paths, url: &str, state: &roster::state::RosterState) -> Waiting {
-    let (types, from_the_admin) = std::sync::mpsc::channel();
-    let person = Arc::new(Scripted {
-        from_the_admin: std::sync::Mutex::new(from_the_admin),
-        ours: Mutex::new(None),
-        reaches_the_key: None,
-    });
-    let record = invite_into(state, url);
-
-    let task = {
-        let person = Arc::clone(&person);
-        let paths = paths.clone();
-        let invite = record.invite.to_text();
-        tokio::spawn(async move {
-            join(&paths, &invite, "laptop", person, &daemon::keys::PlatformKeys).await
-        })
-    };
-    Waiting { record, person, types, task }
 }
 
 /// A signing key this process cannot reach, as a machine key store is.
@@ -191,84 +117,64 @@ impl daemon::keys::Keys for Elsewhere {
     }
 }
 
-/// Starts a device whose signing key this process cannot reach.
-fn start_waiting_out_of_reach(
+/// A device joining from `record`'s invite with `proof` made by its signing
+/// key, however that was reached: where it has got to, and the join itself.
+fn waiting(
     paths: &Paths,
-    url: &str,
-    state: &roster::state::RosterState,
-) -> Waiting {
-    let (types, from_the_admin) = std::sync::mpsc::channel();
-
-    let key = roster::sign::P256Signer::from_scalar([0x44; 32]).expect("inside the order");
-    let reachable =
-        Arc::new(roster::sign::P256Signer::from_scalar([0x44; 32]).expect("inside the order"));
-    let keys = Elsewhere { custodian: Arc::new(OutOfReach { key }) };
-
-    let person = Arc::new(Scripted {
-        from_the_admin: std::sync::Mutex::new(from_the_admin),
-        ours: Mutex::new(None),
-        reaches_the_key: Some(reachable),
-    });
-    let record = invite_into(state, url);
-
-    let task = {
-        let person = Arc::clone(&person);
-        let paths = paths.clone();
-        let invite = record.invite.to_text();
-        tokio::spawn(async move { join(&paths, &invite, "laptop", person, &keys).await })
+    record: &Record,
+    proof: &enrollment::exchange::Possession,
+    keys: Arc<dyn Keys>,
+) -> (Underway, tokio::task::JoinHandle<Result<Joined, String>>) {
+    let join = daemon::joins::Join {
+        invite: record.invite.to_text(),
+        name: "laptop".to_owned(),
+        proof: roster::hex::encode(proof.as_bytes()),
+        started_at: 1,
+        requested_at: None,
     };
-    Waiting { record, person, types, task }
+    let (underway, reporting) = Underway::new(Progress::Registering);
+    let paths = paths.clone();
+    let task = tokio::spawn(async move {
+        let identity = keys.identity(&paths).unwrap();
+        daemon::joining::run(&paths, &join, &identity, &reporting, |_| {}).await
+    });
+    (underway, task)
 }
 
-/// A device that is waiting to join, and the person standing at it.
-struct Waiting {
-    /// The record of the invite it joins from, as the inviting admin keeps it.
-    record: Record,
-    /// The person, for reading back what the machine displayed.
-    person: Arc<Scripted>,
-    /// What the person types into it. Dropping this is walking away.
-    types: std::sync::mpsc::Sender<String>,
-    /// The wait itself.
-    task: tokio::task::JoinHandle<Result<daemon::joining::Joined, String>>,
-}
-
-impl Waiting {
-    /// Dials the device as `admin`, holding `state`, until it is there — as the
-    /// admin's daemon does while the invite is open.
-    async fn reached(
-        &self,
-        admin: &identity::NodeIdentity,
-        state: &roster::state::RosterState,
-    ) -> admitting::Pending {
-        tokio::time::timeout(A_STEP, async {
-            loop {
-                if let Ok(pending) = admitting::open_invited(admin, state, &self.record).await {
-                    return pending;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+/// Dials an invite's rendezvous until the device there makes its request.
+async fn requested(record: &Record) -> Applicant {
+    tokio::time::timeout(A_STEP, async {
+        loop {
+            if let Ok(applicant) = admitting::collect(&record.invite).await {
+                return applicant;
             }
-        })
-        .await
-        .expect("the invited device is reached")
-    }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the invited device makes its request")
 }
 
-/// Waits until the device being enrolled has said the code matched.
-///
-/// The admin's side refuses to sign before that — nothing may be signed while
-/// the other machine has not confirmed — and the *person* driving it waits by
-/// looking at the screen, which is what `Outcome::Admitting { accepted }` is
-/// for. A test that skipped the wait was relying on the other task getting there
-/// first, which it did until this file grew a relay or two more and it did not.
-async fn until_accepted(pending: &admitting::Pending) {
-    let started = std::time::Instant::now();
-    while !pending.accepted() {
-        assert!(
-            started.elapsed() < PATIENCE,
-            "the device being enrolled never said the code matched"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+/// Delivers at the rendezvous of `record` to the device `applicant` is.
+async fn delivered(url: &str, record: &Record, applicant: &Applicant, delivery: &Delivery) -> bool {
+    let rendezvous =
+        transport_convesso::enrolment::rendezvous_key(&record.invite.rendezvous_seed()).unwrap();
+    let destination = Destination {
+        dialled: rendezvous,
+        relay: url,
+        signing: &applicant.signing,
+        transport: &applicant.transport,
+    };
+    tokio::time::timeout(A_STEP, async {
+        loop {
+            if let Ok(taken) = admitting::deliver(&destination, delivery).await {
+                return taken;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the device is reached")
 }
 
 /// A founder, and the state it holds.
@@ -292,436 +198,42 @@ fn founded(paths: &Paths, relay: &str) -> roster::state::RosterState {
     roster.state().expect("derives")
 }
 
-/// The whole ceremony: a device with nothing ends up holding the network.
+/// Taking a request gives the device nothing, and changes nothing on the
+/// admin's side: a device becomes a member because a signed operation says so,
+/// and until a person approves there is no such operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_with_nothing_is_admitted_and_holds_the_whole_network() {
+async fn taking_a_request_changes_nothing_until_a_person_approves() {
     let (_server, url) = relay().await;
-
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
     let state = founded(&admin_paths, &url);
-    let admin_identity =
-        identity::store::load(&admin_paths.identity()).expect("the founder's identity");
-
-    let joiner_home = tempfile::tempdir().expect("a scratch directory");
-    let joiner_paths = Paths::under(joiner_home.path());
-
-    // The device that is joining: it waits behind the admin's invite.
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-
-    // The admin dials it, and stops before signing.
-    let pending = joiner.reached(&admin_identity, &state).await;
-
-    assert_eq!(pending.proposed_name(), "laptop");
-    assert!(!pending.fingerprint().is_empty());
-
-    // A person reads the admin's screen and types it into the other machine.
-    let admin_code = pending.code().to_string();
-    joiner.types.send(admin_code.clone()).expect("the person types it");
-    until_accepted(&pending).await;
-
-    let heads = {
-        let mut roster = roster::roster::Roster::new();
-        for operation in &Log::at(admin_paths.roster()).read().expect("reads") {
-            roster.offer_bytes(operation);
-        }
-        roster.heads()
-    };
-    let log = Log::at(admin_paths.roster()).read().expect("reads");
-
-    let (operation, said) = tokio::time::timeout(
-        A_STEP,
-        admitting::confirm(
-            pending,
-            &admin_identity,
-            &state,
-            heads,
-            &log,
-            daemon::state::read_snapshot(&admin_paths).map(|(bytes, _at)| bytes),
-            false,
-        ),
-    )
-    .await
-    .expect("the admission completes")
-    .expect("it is signed and delivered");
-
-    let joined = tokio::time::timeout(A_STEP, joiner.task)
-        .await
-        .expect("the joining device finishes")
-        .expect("the task did not panic")
-        .expect("it joined");
-
-    // Both computed the same six digits, each from its own inputs.
-    let ours = joiner.person.ours.lock().await.clone().expect("the joining device showed a code");
-    assert_eq!(ours, admin_code, "both machines must show one code");
-    assert_eq!(ours.len(), 6);
-
-    assert_eq!(joined.devices, 2, "every device appears together, not only the admin");
-    assert_eq!(joined.suffix, "peerfectly.internal");
-    assert!(said.contains("adopted"), "{said}");
-
-    // The joining device wrote the network, and it is the same network.
-    let held = Log::at(joiner_paths.roster()).read().expect("reads");
-    assert!(held.contains(&operation), "the admission it was given is in its own log");
-
-    let mut roster = roster::roster::Roster::new();
-    for entry in &held {
-        assert!(roster.offer_bytes(entry).is_accepted(), "everything delivered must load");
-    }
-    let joined_state = roster.state().expect("derives");
-    assert_eq!(joined_state.network, state.network, "the same network, not a lookalike");
-    assert_eq!(joined_state.devices.len(), 2);
-
-    // And it arrived with the snapshot, which is what a device with no roster
-    // needs and what the admission is for.
-    let (kept, at) =
-        daemon::state::read_snapshot(&joiner_paths).expect("the network's snapshot came with it");
-    let mut dated = roster::roster::Roster::with_clock(Box::new(daemon::state::WallClock));
-    for entry in &held {
-        assert!(dated.offer_bytes(entry).is_accepted());
-    }
-    assert!(dated.restore_snapshot(&kept, at).is_accepted(), "and it checks against what arrived");
-
-    // It is **not** dated yet, and that is honest rather than a gap. Freshness
-    // comes from an attestation, which an admin sends over a session — and a
-    // device that has just joined has none yet, because §2.6b leaves its network
-    // off until a person turns it on.
-    //
-    // The obligation this used to assert — that a device which has just joined
-    // must not look like one out of touch too long — is met elsewhere now, and
-    // better: the two read differently. A device that was away reads `Stale`,
-    // having had an attestation that aged. This one reads `NeverAttested`, which
-    // is exactly what it is. The moment it meets an admin it is dated, which is
-    // `a_session_opening_dates_the_peer` in `assembled.rs`.
-    assert_eq!(
-        roster::roster::Freshness::Unknown,
-        dated.freshness(),
-        "a device that has just joined has never been attested, and says so"
-    );
-    assert!(
-        daemon::state::read_attestation(&joiner_paths).is_none(),
-        "the admission delivers no attestation, and is not the place for one"
-    );
-
-    // The admission carries the minute it was signed, not a counter that renders
-    // as January 1970.
-    let ts = roster::sign::RawOperation::decode(&operation).expect("decodes").core().ts;
-    assert_eq!(ts % 60_000, 0, "the minute and nothing below it");
-    let now_ms = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("after 1970")
-            .as_millis(),
-    )
-    .expect("fits");
-    assert!(now_ms.saturating_sub(ts) <= 5 * 60_000, "{ts} is when it was signed");
-
-    // An enrolment exchange is not a session with a member, and it recorded no
-    // contact: the admin's node, assembled from the directory the admission was
-    // written to, holds none for the device that joined.
-    let joined_device = joined_state
-        .devices
-        .keys()
-        .find(|device| *device != admin_identity.device_id())
-        .expect("the joined device");
-    let admin_node = daemon::node::Node::from_log(
-        std::sync::Arc::new(admin_identity),
-        Log::at(admin_paths.roster()),
-        daemon::state::read_snapshot(&admin_paths),
-        daemon::state::read_attestation(&admin_paths),
-        daemon::state::read_dating_attestation(&admin_paths),
-    )
-    .expect("loads")
-    .expect("holds a network");
-    assert_eq!(
-        admin_node.last_contact(&joined_device).await,
-        daemon::control::Contact::NoneRecorded,
-        "an enrolment is not contact"
-    );
-    assert!(!admin_home.path().join("contacts.json").exists(), "and nothing was written for it");
-}
-
-/// Declining signs nothing and writes nothing, on either machine.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn abandoning_leaves_both_machines_as_they_were() {
-    let (_server, url) = relay().await;
-
-    let admin_home = tempfile::tempdir().expect("a scratch directory");
-    let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url);
-    let admin_identity =
-        identity::store::load(&admin_paths.identity()).expect("the founder's identity");
     let before = Log::at(admin_paths.roster()).read().expect("reads");
 
     let joiner_home = tempfile::tempdir().expect("a scratch directory");
     let joiner_paths = Paths::under(joiner_home.path());
-
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-    let pending = joiner.reached(&admin_identity, &state).await;
-
-    // The codes did not match, or the person did not like what they saw.
-    admitting::abandon(pending).await;
-    // Nobody types anything: abandoning is what the person does instead.
-    drop(joiner.types);
-
-    // The joining device keeps waiting — a refused exchange does not end a wait,
-    // so a person can try again — and that is why this checks the machines
-    // rather than waiting the full ten minutes for it to give up.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    assert_eq!(
-        Log::at(admin_paths.roster()).read().expect("reads"),
-        before,
-        "the admin signed nothing"
-    );
-    assert!(
-        Log::at(joiner_paths.roster()).read().expect("reads").is_empty(),
-        "the joining device holds no network"
-    );
-    assert!(!joiner.task.is_finished(), "and it is still waiting, ready for another attempt");
-
-    // Closing the terminal is what ends a wait early.
-    joiner.task.abort();
-}
-
-/// The fingerprint the admin shows is the joining device's signing key, in the
-/// same shape a person compares everything else in.
-#[test]
-fn the_fingerprint_shown_is_the_signing_key() {
-    let device = identity::NodeIdentity::generate().expect("generates");
-    let printed = relay_module::fingerprint(device.signing_key().public_key().as_bytes());
-
-    assert_eq!(printed.matches(':').count(), 31, "colon-separated, like openssl prints");
-    assert!(printed.chars().all(|c| c.is_ascii_hexdigit() || c == ':'), "{printed}");
-}
-
-// ---------------------------------------------------------------------------
-// The boundary
-// ---------------------------------------------------------------------------
-
-/// Reaching an invited device gives it nothing.
-///
-/// The exchange opens, the code is worked out, and the admin's roster is
-/// untouched. A device becomes a member because a signed operation says so, and
-/// until a person confirms there is no such operation.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opening_an_exchange_changes_nothing_until_a_person_confirms() {
-    let (_server, url) = relay().await;
-
-    let admin_home = tempfile::tempdir().expect("a scratch directory");
-    let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url);
-    let admin_identity =
-        identity::store::load(&admin_paths.identity()).expect("the founder's identity");
-    let before = Log::at(admin_paths.roster()).read().expect("reads");
-
-    let joiner_home = tempfile::tempdir().expect("a scratch directory");
-    let joiner_paths = Paths::under(joiner_home.path());
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-    let pending = joiner.reached(&admin_identity, &state).await;
-
-    assert_eq!(
-        Log::at(admin_paths.roster()).read().expect("reads"),
-        before,
-        "nothing is signed by reaching a device"
-    );
-    assert!(
-        Log::at(joiner_paths.roster()).read().expect("reads").is_empty(),
-        "and the device waiting is a member of nothing"
-    );
-
-    admitting::abandon(pending).await;
-    joiner.task.abort();
-}
-
-/// A stranger who reaches the waiting device cannot get past the code.
-///
-/// An invite travels by message, so anyone who has seen it can reach the device
-/// waiting behind it. They get as far as offering a network of their own — and the person, typing the
-/// digits the real admin is showing, refuses it. Nothing is written and the wait
-/// stays open.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stranger_offering_its_own_network_is_refused_at_the_code() {
-    let (_server, url) = relay().await;
-
-    // The stranger has a perfectly good network of its own.
-    let stranger_home = tempfile::tempdir().expect("a scratch directory");
-    let stranger_paths = Paths::under(stranger_home.path());
-    let stranger_state = founded(&stranger_paths, &url);
-    let stranger =
-        identity::store::load(&stranger_paths.identity()).expect("the stranger's identity");
-
-    // The network the device was really invited into.
-    let admin_home = tempfile::tempdir().expect("a scratch directory");
-    let state = founded(&Paths::under(admin_home.path()), &url);
-
-    let joiner_home = tempfile::tempdir().expect("a scratch directory");
-    let joiner_paths = Paths::under(joiner_home.path());
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-
-    // Anyone who has seen the invite can open an exchange.
-    let pending = joiner.reached(&stranger, &stranger_state).await;
-
-    // The person is reading the real admin's screen, which shows something else.
-    let typed = "000000".to_owned();
-    assert_ne!(
-        typed,
-        pending.code().to_string(),
-        "the stranger's code is not what is on the \
-                                                   other screen"
-    );
-    joiner.types.send(typed).expect("the person types it");
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(
-        Log::at(joiner_paths.roster()).read().expect("reads").is_empty(),
-        "a stranger's network must not be adopted"
-    );
-    assert!(!joiner.task.is_finished(), "and the wait stays open for the real admin");
-
-    admitting::abandon(pending).await;
-    joiner.task.abort();
-}
-
-/// The admitting side signs nothing until the device being enrolled says the
-/// code matched.
-///
-/// Its own person answering is not enough, and this is what makes that true
-/// rather than merely intended: the joining side is left with nobody typing into
-/// it, so it never sends its acceptance, and the admission ends with nothing
-/// signed and nothing delivered.
-#[tokio::test]
-async fn nothing_is_signed_while_the_other_side_has_not_confirmed() {
-    let (_server, url) = relay().await;
-
-    let admin_home = tempfile::tempdir().expect("a scratch directory");
-    let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url);
-    let admin = identity::store::load(&admin_paths.identity()).expect("the admin's identity");
-    let before = Log::at(admin_paths.roster()).read().expect("reads").len();
-
-    let joiner_home = tempfile::tempdir().expect("a scratch directory");
-    let joiner_paths = Paths::under(joiner_home.path());
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-    let pending = joiner.reached(&admin, &state).await;
-    let heads = Vec::new();
-    let log = Log::at(admin_paths.roster()).read().expect("reads");
-
-    // Nobody types into the joining device, so it sends no acceptance. The
-    // admitting side's own person has said yes — which is what `confirm` means —
-    // and that must not be enough on its own.
-    let outcome = admitting::confirm(pending, &admin, &state, heads, &log, None, false).await;
-    let refusal = outcome.expect_err("nothing may be signed without the other side");
-    // And it says what was missing, rather than surfacing as whatever the
-    // channel did afterwards: a person reading this has to know to go and type
-    // the digits into the other machine.
-    assert!(
-        refusal.contains("has not said the code was accepted"),
-        "the refusal should name what was missing: {refusal}"
-    );
-
-    assert_eq!(
-        Log::at(admin_paths.roster()).read().expect("reads").len(),
-        before,
-        "no admission was written"
-    );
-    assert!(
-        Log::at(joiner_paths.roster()).read().expect("reads").is_empty(),
-        "and nothing was delivered"
-    );
-    joiner.task.abort();
-}
-
-/// A wrong code is answered **at once**, and the wait stays open.
-///
-/// Both halves matter, and they pull in opposite directions. The exchange is
-/// refused, but a refused exchange does not end the wait — a person who mistyped
-/// tries again — so there is no failure for the daemon to report. Without
-/// somewhere to put that refusal, a person who has just typed six digits waits
-/// out a minute of polling and is told the join "did not finish", which is how
-/// this was found: on a phone, where it read as the device freezing.
-#[tokio::test]
-async fn a_wrong_code_is_answered_at_once_and_the_wait_stays_open() {
-    use daemon::joining::AcrossTheChannel;
-
-    let (_server, url) = relay().await;
-
-    let admin_home = tempfile::tempdir().expect("a scratch directory");
-    let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url);
-    let admin = identity::store::load(&admin_paths.identity()).expect("the admin's identity");
-
-    // The daemon's own person, not the scripted one: what is under test is the
-    // bridge between a waiting join and whoever is standing at the device.
-    let joiner_home = tempfile::tempdir().expect("a scratch directory");
-    let joiner_paths = Paths::under(joiner_home.path());
-    let (person, underway) = AcrossTheChannel::new();
+    joiner_paths.create().unwrap();
     let record = invite_into(&state, &url);
-    let task = {
-        let paths = joiner_paths.clone();
-        let invite = record.invite.to_text();
-        let person = person.clone();
-        tokio::spawn(async move {
-            join(&paths, &invite, "laptop", person, &daemon::keys::PlatformKeys).await
-        })
-    };
+    let identity = daemon::keys::PlatformKeys.identity(&joiner_paths).unwrap();
+    let proof = daemon::joining::prove_here(&record.invite, &identity).unwrap();
+    let (underway, task) =
+        waiting(&joiner_paths, &record, &proof, Arc::new(daemon::keys::PlatformKeys));
 
-    // Wait for it to be waiting, then let the admin reach it.
-    let mut waits = false;
-    for _ in 0..600_u32 {
-        if matches!(underway.progress(), daemon::joining::Progress::Waiting) {
-            waits = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(waits, "the joining device says it waits");
-    let pending = tokio::time::timeout(A_STEP, async {
-        loop {
-            if let Ok(pending) = admitting::open_invited(&admin, &state, &record).await {
-                return pending;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+    let applicant = requested(&record).await;
+    assert_eq!(
+        daemon::joining::fingerprint(&applicant.signing),
+        daemon::joining::fingerprint(&identity.signing_key().public_key()),
+        "the fingerprint the admin reviews is the one the device shows"
+    );
+    assert_eq!(before, Log::at(admin_paths.roster()).read().expect("reads"), "nothing signed");
+    assert!(Log::at(joiner_paths.roster()).read().expect("reads").is_empty(), "nothing given");
+    tokio::time::timeout(A_STEP, async {
+        while !matches!(underway.progress(), Progress::Requested { .. }) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the invited device is reached");
-    assert_ne!("000000", pending.code().to_string(), "the wrong code is wrong");
-
-    // Wait until the join is asking for a code, then type the wrong one.
-    for _ in 0..600_u32 {
-        if matches!(underway.progress(), daemon::joining::Progress::Confirming) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let started = std::time::Instant::now();
-    assert!(underway.confirm("000000"), "the digits reach the join");
-
-    // The answer must arrive in the time a person would call immediate.
-    let mut refusal = None;
-    for _ in 0..50_u32 {
-        if let Some(said) = underway.refusal() {
-            refusal = Some(said);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let took = started.elapsed();
-
-    let refusal = refusal.unwrap_or_else(|| panic!("no answer after {took:?}"));
-    assert!(refusal.contains("not the code"), "and it says which of the two it was: {refusal}");
-    assert!(took < Duration::from_secs(3), "it took {took:?} to say so");
-
-    // And the wait is still open, because a person who mistyped tries again.
-    assert!(!task.is_finished(), "a refused exchange does not end the wait");
-    assert!(
-        Log::at(joiner_paths.roster()).read().expect("reads").is_empty(),
-        "nothing was written"
-    );
-
-    admitting::abandon(pending).await;
-    underway.abandon();
+    .expect("and the device is told its request is kept");
+    assert!(!task.is_finished(), "it goes on waiting for the approval");
     task.abort();
 }
 
@@ -757,91 +269,12 @@ fn enrolment_keeps_no_membership_of_its_own() {
     }
 }
 
-/// The same ceremony, with the admin's signing key somewhere its own process
-/// cannot reach.
-///
-/// The admission is decided, stops at its signature, is signed by somebody else,
-/// and is then delivered. What matters here is what a unit test cannot show: the
-/// **exchange survives the pause**. A joining device is still on the other end of
-/// an open channel while a person answers a prompt, and it has to still be there
-/// afterwards.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_admission_signed_out_of_reach_still_reaches_the_joining_device() {
-    let (_server, url) = relay().await;
-
-    let admin_home = tempfile::tempdir().expect("a scratch directory");
-    let admin_paths = Paths::under(admin_home.path());
-    let state = founded(&admin_paths, &url);
-    let admin_identity =
-        identity::store::load(&admin_paths.identity()).expect("the founder's identity");
-
-    let joiner_home = tempfile::tempdir().expect("a scratch directory");
-    let joiner_paths = Paths::under(joiner_home.path());
-
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-    let mut pending = joiner.reached(&admin_identity, &state).await;
-
-    joiner.types.send(pending.code().to_string()).expect("the person types it");
-    until_accepted(&pending).await;
-
-    let heads = {
-        let mut roster = roster::roster::Roster::new();
-        for operation in &Log::at(admin_paths.roster()).read().expect("reads") {
-            roster.offer_bytes(operation);
-        }
-        roster.heads()
-    };
-    let log = Log::at(admin_paths.roster()).read().expect("reads");
-
-    // Decided, and stopped at the signature. Nothing has been signed.
-    let (operation, spec_name) = tokio::time::timeout(
-        A_STEP,
-        admitting::core(&mut pending, &admin_identity, &state, heads, false),
-    )
-    .await
-    .expect("the admission is decided")
-    .expect("there is something to sign");
-
-    // Somebody else signs the exact bytes that were prepared — here, the same key
-    // reached by the path a component holding it would take.
-    let key = admin_identity.signing_key().public_key();
-    let request = identity::detached::prepare_operation(&operation, &key);
-    let signature =
-        roster::sign::Signer::sign(admin_identity.signing_key().signer(), request.message())
-            .expect("signs");
-    let signed = identity::detached::finish(&request, &key, &signature).expect("assembles");
-
-    let (delivered, said) = tokio::time::timeout(
-        A_STEP,
-        admitting::finish_with(pending, signed, spec_name, &log, None),
-    )
-    .await
-    .expect("the admission is delivered")
-    .expect("it reached the other device");
-
-    let joined = tokio::time::timeout(A_STEP, joiner.task)
-        .await
-        .expect("the joining device finishes")
-        .expect("the task did not panic")
-        .expect("it joined");
-
-    assert_eq!(joined.devices, 2, "every device appears together");
-    assert!(said.contains("adopted"), "{said}");
-
-    let held = Log::at(joiner_paths.roster()).read().expect("reads");
-    assert!(
-        held.contains(&delivered),
-        "the admission it was given is the one that was signed out of reach"
-    );
-}
-
 /// A device joins with its signing key in a store this process cannot reach.
 ///
-/// The proof of possession is what a device does to show the identity it is
-/// presenting is its own, and it happens **inside** the live exchange, before a
-/// code is shown. So on such a device the join stops there, asks, and goes on
-/// with what comes back — and what comes back is checked against the key being
-/// presented before a single byte of it is sent.
+/// The proof of its signing key is made once, before the join waits: prepared
+/// here, signed by whatever reaches the key, and checked against the key being
+/// presented before the join is started with it. The admin's side checks it
+/// again when it takes the request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_whose_key_is_out_of_reach_still_proves_it_holds_it() {
     let (_server, url) = relay().await;
@@ -849,59 +282,53 @@ async fn a_device_whose_key_is_out_of_reach_still_proves_it_holds_it() {
     let admin_home = tempfile::tempdir().expect("a scratch directory");
     let admin_paths = Paths::under(admin_home.path());
     let state = founded(&admin_paths, &url);
-    let admin_identity =
-        identity::store::load(&admin_paths.identity()).expect("the founder's identity");
+    let admin = identity::store::load(&admin_paths.identity()).expect("the founder's identity");
+    let record = invite_into(&state, &url);
 
     let joiner_home = tempfile::tempdir().expect("a scratch directory");
     let joiner_paths = Paths::under(joiner_home.path());
+    let key = roster::sign::P256Signer::from_scalar([0x44; 32]).expect("inside the order");
+    let reachable = roster::sign::P256Signer::from_scalar([0x44; 32]).expect("inside the order");
+    let keys = Arc::new(Elsewhere { custodian: Arc::new(OutOfReach { key }) });
+    let identity = keys.identity(&joiner_paths).expect("an identity");
+    assert!(!identity.signing_key().answers_here());
 
-    let joiner = start_waiting_out_of_reach(&joiner_paths, &url, &state);
-    // The exchange opens only if the proof verified.
-    let pending = joiner.reached(&admin_identity, &state).await;
+    // Prepared here; signed by what reaches the key; checked before it is used.
+    let request = daemon::joining::proof_request(&record.invite, &identity).expect("prepares");
+    let signature = roster::sign::Signer::sign(&reachable, request.message()).expect("signs");
+    let proof =
+        daemon::joining::proof_from(&record.invite, &identity, signature).expect("it verifies");
+    let wrong = roster::sign::Signer::sign(&reachable, b"something else").expect("signs");
+    assert!(daemon::joining::proof_from(&record.invite, &identity, wrong).is_err());
 
-    joiner.types.send(pending.code().to_string()).expect("the person types it");
-    until_accepted(&pending).await;
+    let (_underway, task) = waiting(&joiner_paths, &record, &proof, keys);
+    let applicant = requested(&record).await;
+    assert_eq!(applicant.signing, identity.signing_key().public_key(), "the key it proved");
 
-    let heads = {
+    let (heads, mut log) = {
+        let log = Log::at(admin_paths.roster()).read().expect("reads");
         let mut roster = roster::roster::Roster::new();
-        for operation in &Log::at(admin_paths.roster()).read().expect("reads") {
+        for operation in &log {
             roster.offer_bytes(operation);
         }
-        roster.heads()
+        (roster.heads(), log)
     };
-    let log = Log::at(admin_paths.roster()).read().expect("reads");
+    let (core, _name) =
+        admitting::admission_core(&applicant, &record.invited, &admin, &state, heads, false)
+            .expect("prepares");
+    let admission = admin.sign_operation(&core).expect("signs");
+    log.push(admission.clone());
+    let delivery = Delivery { operations: log, pieces: Vec::new(), snapshot: None, base: None };
+    assert!(delivered(&url, &record, &applicant, &delivery).await, "it adopted the network");
 
-    let (operation, _said) = tokio::time::timeout(
-        A_STEP,
-        admitting::confirm(
-            pending,
-            &admin_identity,
-            &state,
-            heads,
-            &log,
-            daemon::state::read_snapshot(&admin_paths).map(|(bytes, _at)| bytes),
-            false,
-        ),
-    )
-    .await
-    .expect("the admission completes")
-    .expect("it is signed and delivered");
-
-    let joined = tokio::time::timeout(A_STEP, joiner.task)
+    let joined = tokio::time::timeout(A_STEP, task)
         .await
         .expect("the joining device finishes")
         .expect("the task did not panic")
         .expect("it joined");
-
     assert_eq!(joined.devices, 2, "it is in the network it proved itself to");
-
     let held = Log::at(joiner_paths.roster()).read().expect("reads");
-    assert!(held.contains(&operation), "and holds the admission it was given");
-
-    // The identity it kept names a custodian and carries no private signing
-    // material, which is the point of keeping the key out of reach.
-    let stored = std::fs::read(joiner_paths.identity()).expect("reads its identity");
-    assert!(!stored.is_empty());
+    assert!(held.contains(&admission), "and holds the admission it was given");
 }
 
 /// **A replacement is one batch, and the admission is built on the revocation.**
@@ -913,8 +340,7 @@ async fn a_device_whose_key_is_out_of_reach_still_proves_it_holds_it() {
 /// the revocation in, and names the revocation as its parent, so the two are
 /// never concurrent. This drives exactly that preparation through the same
 /// modules the daemon calls, signs the batch once, applies it in order, and
-/// checks that the joining device got the network and the admin's roster took
-/// every item — the snapshot over both included.
+/// checks that the joining device got the network.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replacement_is_one_batch_built_on_its_revocation() {
     use roster::types::{OperationBody, OperationCore, Role};
@@ -951,11 +377,15 @@ async fn a_replacement_is_one_batch_built_on_its_revocation() {
 
     let joiner_home = tempfile::tempdir().expect("a scratch directory");
     let joiner_paths = Paths::under(joiner_home.path());
-    let joiner = start_waiting(&joiner_paths, &url, &state);
-    let mut pending = joiner.reached(&admin, &state).await;
-    let taken = pending.taken().cloned().expect("the name is held by the old laptop");
-    joiner.types.send(pending.code().to_string()).expect("the person types it");
-    until_accepted(&pending).await;
+    joiner_paths.create().unwrap();
+    let record = invite_into(&state, &url);
+    let identity = daemon::keys::PlatformKeys.identity(&joiner_paths).unwrap();
+    let proof = daemon::joining::prove_here(&record.invite, &identity).unwrap();
+    let (_underway, task) =
+        waiting(&joiner_paths, &record, &proof, Arc::new(daemon::keys::PlatformKeys));
+    let applicant = requested(&record).await;
+    let taken = admitting::holder_of(&admitting::admitted_name(&record.invited.name), &state)
+        .expect("the name is held by the old laptop");
 
     // The batch, as the daemon prepares it: nothing signed yet.
     let expulsion = daemon::revoking::Expulsion {
@@ -966,21 +396,23 @@ async fn a_replacement_is_one_batch_built_on_its_revocation() {
     let revocation =
         daemon::revoking::core(&expulsion, &admin, &state, roster.heads()).expect("a revocation");
     let after = roster.preview(core::slice::from_ref(&revocation)).expect("previews");
-    let (admission, spec_name) = tokio::time::timeout(
-        A_STEP,
-        admitting::core(&mut pending, &admin, &after.state, after.heads.clone(), true),
+    let (admission, spec_name) = admitting::admission_core(
+        &applicant,
+        &record.invited,
+        &admin,
+        &after.state,
+        after.heads.clone(),
+        true,
     )
-    .await
-    .expect("the admission is decided")
     .expect("there is something to sign");
+    assert_eq!(spec_name, "laptop", "the name carries over");
     assert_eq!(
         vec![revocation.id()],
         admission.parents,
         "built on the revocation, never beside it"
     );
 
-    // Signed once, as one batch, by whatever reaches the key. The root that
-    // follows is not in it: the daemon signs that with the attestation key.
+    // Signed once, as one batch, by whatever reaches the key.
     let key = admin.signing_key().public_key();
     let requests = vec![
         identity::detached::prepare_operation(&revocation, &key),
@@ -996,31 +428,22 @@ async fn a_replacement_is_one_batch_built_on_its_revocation() {
     let artifacts =
         identity::detached::finish_all(&requests, &key, &signatures).expect("the batch verifies");
 
-    // Applied in order: the revocation, then the admission delivered, then the
-    // root over both.
-    let revoked = artifacts.first().expect("the revocation").clone();
-    Log::at(admin_paths.roster()).append(&revoked).expect("appends");
-    assert!(roster.offer_bytes(&revoked).is_accepted(), "the revocation is taken");
-    let log = Log::at(admin_paths.roster()).read().expect("reads");
-
-    let (delivered, _said) = tokio::time::timeout(
-        A_STEP,
-        admitting::finish_with(
-            pending,
-            artifacts.get(1).expect("the admission").clone(),
-            spec_name,
-            &log,
-            None,
-        ),
-    )
-    .await
-    .expect("the admission is delivered")
-    .expect("it reached the other device");
-    assert!(roster.offer_bytes(&delivered).is_accepted(), "the admission is taken");
+    // Applied in order: the revocation, then the admission, then delivered.
+    for artifact in &artifacts {
+        Log::at(admin_paths.roster()).append(artifact).expect("appends");
+        assert!(roster.offer_bytes(artifact).is_accepted(), "taken in order");
+    }
+    let delivery = Delivery {
+        operations: Log::at(admin_paths.roster()).read().expect("reads"),
+        pieces: Vec::new(),
+        snapshot: None,
+        base: None,
+    };
+    assert!(delivered(&url, &record, &applicant, &delivery).await, "it adopted the network");
     let root = daemon::snapshots::sign_over_heads(&roster, &admin).expect("the root follows");
     assert!(roster.offer_snapshot(&root).is_accepted(), "and so is the root over both");
 
-    let joined = tokio::time::timeout(A_STEP, joiner.task)
+    let joined = tokio::time::timeout(A_STEP, task)
         .await
         .expect("the joining device finishes")
         .expect("the task did not panic")

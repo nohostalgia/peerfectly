@@ -11,7 +11,7 @@ rust-version.workspace = true
 default = []
 # A network and a relay in this process, for this crate's own tests. Off in any
 # ordinary build.
-fixture = ["dep:convesso-relay", "dep:rcgen"]
+fixture = ["dep:convesso-relay", "dep:rcgen", "dep:windows-sys"]
 
 [dependencies]
 roster = { path = "../roster" }
@@ -31,6 +31,11 @@ convesso-relay = { workspace = true, optional = true }
 # A self-signed certificate for a TLS-wrapped relay link in the fixture. TLS
 # there authenticates nothing; the relay's pinned key is what is trusted.
 rcgen = { version = "0.14", optional = true }
+
+# The fixture's relay socket on Windows, which otherwise ends at the first
+# datagram that could not be delivered.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"], optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

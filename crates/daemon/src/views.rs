@@ -124,6 +124,17 @@ impl fmt::Display for Report {
             write!(f, "{block}")?;
         }
 
+        // What waits on this person refuses the next founding, join or invite:
+        // said here, so a refused person can see what it is and cancel it.
+        if let Some(waiting) = &self.waiting_on {
+            writeln!(f)?;
+            let mut block = Block::headed("waiting on you".to_owned());
+            block.note(waiting.clone());
+            block.plain("Nothing else starts until it is finished or cancelled.");
+            block.plain("  to cancel it:  peerfectly cancel");
+            write!(f, "{block}")?;
+        }
+
         // A fact about the machine rather than about any one network, and the
         // answer to why founding was refused — so it is said even on a device
         // that holds nothing, where there is no network block to hang it on.
@@ -414,6 +425,20 @@ fn warnings(network: &Network, block: &mut Block) {
         }
     }
 
+    // Not a warning: a device that has never been in contact holds nothing yet
+    // to be missing anything from, and takes the current state when it first is.
+    match network.waiting_never_met {
+        0 => {}
+        1 => block.plain(
+            "1 device has never been in contact with this one; it takes everything signed here \
+             when it first is.",
+        ),
+        count => block.plain(format!(
+            "{count} devices have never been in contact with this one; each takes everything \
+             signed here when it first is."
+        )),
+    }
+
     if !network.revoked.is_empty() {
         block.blank();
         block.plain("revoked — the revocations this device holds:");
@@ -507,6 +532,7 @@ mod tests {
             revoked: Vec::new(),
             waiting: Vec::new(),
             waiting_unlisted: 0,
+            waiting_never_met: 0,
             problem: None,
         }
     }
@@ -544,6 +570,29 @@ mod tests {
         assert!(drawn.contains("peerfectly resume"), "{drawn}");
     }
 
+    /// **What waits on this person is said, with how to cancel it.**
+    #[test]
+    fn status_says_what_waits_and_how_to_cancel_it() {
+        let mut report = two_networks();
+        assert!(!report.to_string().contains("waiting on you"));
+        report.waiting_on = Some("the founding of `prova`, waiting for its relay's key".to_owned());
+        let drawn = report.to_string();
+        assert!(drawn.contains("the founding of `prova`"), "{drawn}");
+        assert!(drawn.contains("peerfectly cancel"), "{drawn}");
+    }
+
+    /// **Devices never in contact are a count, not a list under each act.**
+    #[test]
+    fn status_counts_the_devices_never_met() {
+        let mut report = two_networks();
+        if let Some(casa) = report.networks.first_mut() {
+            casa.waiting_never_met = 1000;
+        }
+        let drawn = report.to_string();
+        assert!(drawn.contains("1000 devices have never been in contact"), "{drawn}");
+        assert!(!drawn.contains("waiting: signed operations"), "and no warning for them: {drawn}");
+    }
+
     fn two_networks() -> Report {
         Report {
             networks: vec![
@@ -556,6 +605,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -722,6 +772,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -739,6 +790,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -764,6 +816,7 @@ mod tests {
                 unusable: Vec::new(),
                 note: None,
                 admin_refusal: None,
+                waiting_on: None,
                 elsewhere: 0,
                 may_stop_the_daemon: true,
                 could_stop_the_daemon: false,
@@ -784,6 +837,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,

@@ -3,19 +3,16 @@
 //! Each of the person's networks, with its state, turned on and off from its own
 //! submenu; quitting, which turns off this person's networks and closes the tray;
 //! starting the service when it is stopped; and, to an administrator, stopping
-//! it. And when a device one of their invites brought has arrived, a notice, and
-//! a console opened at the code. Nothing else.
+//! it. Nothing else.
 //!
 //! # It offers no administrative action
 //!
 //! No approving a device, no revoking one, nothing that puts a key to work. Those
 //! are consequential acts that change who is in a person's network, and a menu
 //! next to the clock — hit by accident, with no confirmation and no context — is
-//! the wrong place for them.
-//!
-//! An invited device that arrived is offered as a console, not as an act: the
-//! command line opened there shows the code, asks, and asks for the key, as it
-//! would had the person typed `peerfectly resume` themselves.
+//! the wrong place for them. Nor does it show what waits — invites, requests
+//! to approve, joins: that is `peerfectly pending`, where each comes with what
+//! to do about it.
 //!
 //! # It is not the only way to control the daemon
 //!
@@ -72,9 +69,6 @@ pub struct Row {
     pub devices: Vec<Device>,
     /// How many more there are than were listed.
     pub more: usize,
-    /// The device one of its invites brought, waiting at the code: the name it
-    /// was invited under, neutralised before it is drawn.
-    pub arrived: Option<String>,
 }
 
 /// How many of a network's devices the menu lists before it says how many more.
@@ -188,9 +182,7 @@ impl Offers {
                     .collect();
                 let more = devices.len().saturating_sub(DEVICES_LISTED);
                 let devices = devices.into_iter().take(DEVICES_LISTED).collect();
-                let arrived =
-                    network.arrived.as_deref().map(|name| daemon::control::shown(name).to_string());
-                Row { label: network.label.clone(), state, on, devices, more, arrived }
+                Row { label: network.label.clone(), state, on, devices, more }
             })
             .collect();
         // Offered to whoever may stop it now, and to whoever could after
@@ -239,43 +231,21 @@ impl Offers {
         said
     }
 
-    /// The invited devices waiting at the code, as (network, name).
-    #[must_use]
-    pub fn arrivals(&self) -> Vec<(&str, &str)> {
-        self.networks
-            .iter()
-            .filter_map(|row| Some((row.label.as_str(), row.arrived.as_deref()?)))
-            .collect()
-    }
-
     /// What decides whether the menu is rebuilt rather than updated: which
-    /// networks, which devices in each, and which invited devices wait. A
-    /// device's state changing is only an update, so an open menu is not
-    /// replaced under the pointer.
+    /// networks, and which devices in each. A device's state changing is only
+    /// an update, so an open menu is not replaced under the pointer.
     #[allow(clippy::type_complexity, reason = "compared, never read")]
-    fn shape(&self) -> (bool, bool, Vec<(&str, Vec<&str>, usize, Option<&str>)>) {
+    fn shape(&self) -> (bool, bool, Vec<(&str, Vec<&str>, usize)>) {
         let networks = self
             .networks
             .iter()
             .map(|row| {
                 let names = row.devices.iter().map(|device| device.name.as_str()).collect();
-                (row.label.as_str(), names, row.more, row.arrived.as_deref())
+                (row.label.as_str(), names, row.more)
             })
             .collect();
         (self.answered, self.stopping, networks)
     }
-}
-
-/// The notice for an invited device that has arrived: a title and a line.
-#[must_use]
-pub fn arrival_notice(network: &str, name: &str) -> (String, String) {
-    (
-        format!("{name} has arrived in {network}"),
-        format!(
-            "The device invited as {name} is waiting. Open the {} menu to compare the code.",
-            limits::PRODUCT
-        ),
-    )
 }
 
 /// What the person asked for through the tray.
@@ -294,8 +264,6 @@ pub enum Wish {
     StartService,
     /// Start the tray at login, or not.
     StartAtLogin(bool),
-    /// Open a console at the code of an invited device that arrived.
-    Resume,
 }
 
 /// What a wish comes to.
@@ -309,9 +277,6 @@ pub enum Sends {
     StartTheService,
     /// Writing or removing this person's login entry.
     AtLogin(bool),
-    /// `peerfectly resume`, in a console of its own, as this person: the
-    /// command line shows the code and asks there.
-    ResumeInAConsole,
 }
 
 /// What a wish sends, given what was offered.
@@ -342,7 +307,6 @@ pub fn sends(wish: &Wish, offers: &Offers) -> Sends {
         Wish::StopService => Sends::ElevatedStop,
         Wish::StartService => Sends::StartTheService,
         Wish::StartAtLogin(on) => Sends::AtLogin(*on),
-        Wish::Resume => Sends::ResumeInAConsole,
     }
 }
 
@@ -356,7 +320,6 @@ pub fn by_hand(wish: &Wish) -> String {
         Wish::StopService => "peerfectly stop (as an administrator)".to_owned(),
         Wish::StartService => "sc start peerfectly".to_owned(),
         Wish::StartAtLogin(_) => "Settings › Apps › Startup".to_owned(),
-        Wish::Resume => "peerfectly resume".to_owned(),
     }
 }
 
@@ -365,13 +328,6 @@ pub fn by_hand(wish: &Wish) -> String {
 pub enum Entry {
     /// The overall state, not clickable.
     Header(String),
-    /// An invited device waiting at the code: opens a console there.
-    Arrived {
-        /// The network, as this device calls it.
-        network: String,
-        /// The name it was invited under.
-        name: String,
-    },
     /// A separator.
     Separator,
     /// A network's submenu.
@@ -394,14 +350,6 @@ pub enum Entry {
 #[must_use]
 pub fn layout(offers: &Offers, at_login: bool) -> Vec<Entry> {
     let mut entries = vec![Entry::Header(offers.header()), Entry::Separator];
-    let arrivals = offers.arrivals();
-    for (network, name) in &arrivals {
-        entries
-            .push(Entry::Arrived { network: (*network).to_owned(), name: (*name).to_owned() });
-    }
-    if !arrivals.is_empty() {
-        entries.push(Entry::Separator);
-    }
     if offers.answered {
         if !offers.networks.is_empty() {
             entries.extend(offers.networks.iter().cloned().map(Entry::Network));
@@ -559,7 +507,6 @@ const QUIT: &str = "quit";
 const STOP: &str = "stop-service";
 const START: &str = "start-service";
 const LOGIN: &str = "start-at-login";
-const RESUME: &str = "resume";
 const NETWORK: &str = "network:";
 
 impl Tray {
@@ -579,21 +526,7 @@ impl Tray {
             .with_icon(Self::icon_for(offers.overall())?)
             .build()
             .map_err(|cause| Self::failed(&cause))?;
-        let tray = Self { icon, header, networks, at_login: login, built_for: offers.clone() };
-        // One that was already waiting when the tray started is news too: the
-        // person has not been told.
-        for (network, name) in offers.arrivals() {
-            tray.tell(network, name);
-        }
-        Ok(tray)
-    }
-
-    /// Says that an invited device has arrived, beside the icon.
-    ///
-    /// **Best effort.** Where Windows shows nothing, the menu still offers it.
-    fn tell(&self, network: &str, name: &str) {
-        let (title, text) = arrival_notice(network, name);
-        let _ = super::desktop::notice(self.icon.window_handle(), &title, &text);
+        Ok(Self { icon, header, networks, at_login: login, built_for: offers.clone() })
     }
 
     /// Shows what the daemon now says.
@@ -604,13 +537,6 @@ impl Tray {
     pub fn showing(&mut self, offers: &Offers) {
         if offers == &self.built_for {
             return;
-        }
-        // Told once, when it arrives, and not at every ask while it waits.
-        let before = self.built_for.arrivals();
-        for (network, name) in offers.arrivals() {
-            if !before.contains(&(network, name)) {
-                self.tell(network, name);
-            }
         }
         if offers.shape() != self.built_for.shape() {
             let at_login = self.at_login.is_checked();
@@ -656,7 +582,6 @@ impl Tray {
         match id {
             QUIT => Some(Wish::Quit),
             STOP => Some(Wish::StopService),
-            RESUME => Some(Wish::Resume),
             START => Some(Wish::StartService),
             // The item has already toggled itself; what it says now is the wish.
             LOGIN => Some(Wish::StartAtLogin(self.at_login.is_checked())),
@@ -690,12 +615,6 @@ impl Tray {
                     Box::new(header.clone())
                 }
                 Entry::Separator => Box::new(PredefinedMenuItem::separator()),
-                Entry::Arrived { network, name } => Box::new(MenuItem::with_id(
-                    RESUME,
-                    format!("{name} has arrived in {network}: compare the code…"),
-                    true,
-                    None,
-                )),
                 Entry::Network(row) => {
                     let submenu = Submenu::new(&row.label, true);
                     submenu.set_icon(Self::menu_icon(row.state));
@@ -945,49 +864,12 @@ mod tests {
             Wish::StopService,
             Wish::StartService,
             Wish::StartAtLogin(false),
-            Wish::Resume,
         ] {
             let typed = by_hand(&wish);
             assert!(!typed.is_empty(), "{wish:?}");
         }
         assert_eq!("peerfectly up casa", by_hand(&Wish::On("casa".to_owned())));
         assert!(by_hand(&Wish::StopService).starts_with("peerfectly stop"));
-    }
-
-    /// **A device an invite brought is told, and offered as a console**: first
-    /// in the menu, opening `peerfectly resume` and nothing else, and its name
-    /// neutralised like any other device's.
-    #[test]
-    fn an_invited_device_that_arrived_is_offered_as_a_console() {
-        let mut report = told(&[("casa", true, false), ("ufficio", true, false)], false);
-        report.networks[0].arrived = Some("tv\u{202e}gnp".to_owned());
-        let offers = Offers::from(&report);
-
-        assert_eq!(1, offers.arrivals().len());
-        let (network, name) = offers.arrivals()[0];
-        assert_eq!("casa", network);
-        assert!(!name.contains('\u{202e}'), "{name:?}");
-
-        let entries = layout(&offers, false);
-        assert!(
-            matches!(&entries[2], Entry::Arrived { network, .. } if network == "casa"),
-            "first, under the header: {entries:?}"
-        );
-        assert_eq!(super::Sends::ResumeInAConsole, sends(&Wish::Resume, &offers));
-        assert_eq!("peerfectly resume", by_hand(&Wish::Resume));
-
-        let (title, text) = super::arrival_notice(network, name);
-        assert!(title.contains("casa") && text.contains("compare the code"), "{title} {text}");
-    }
-
-    /// **Arriving, and being dealt with, rebuild the menu**: the item comes and
-    /// goes with the device.
-    #[test]
-    fn an_arrival_changes_the_shape() {
-        let waiting = told(&[("casa", true, false)], false);
-        let mut arrived = waiting.clone();
-        arrived.networks[0].arrived = Some("tv".to_owned());
-        assert_ne!(Offers::from(&waiting).shape(), Offers::from(&arrived).shape());
     }
 
     /// `casa`, up, with these devices as (name, reachable, path).

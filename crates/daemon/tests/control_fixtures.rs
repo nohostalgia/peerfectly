@@ -156,6 +156,7 @@ fn report() -> Report {
             },
         ],
         waiting_unlisted: 3,
+        waiting_never_met: 3,
         problem: Some(Fault {
             subsystem: "relay".to_owned(),
             cause: "certificate not trusted".to_owned(),
@@ -208,6 +209,7 @@ fn report() -> Report {
         revoked: Vec::new(),
         waiting: Vec::new(),
         waiting_unlisted: 0,
+        waiting_never_met: 0,
         problem: None,
     };
     Report {
@@ -217,6 +219,7 @@ fn report() -> Report {
             cause: daemon::control::Trouble::IdentityWillNotOpen,
         }],
         admin_refusal: None,
+        waiting_on: None,
         note: Some("the other machine confirmed the relay".to_owned()),
         elsewhere: 0,
         may_stop_the_daemon: true,
@@ -233,6 +236,7 @@ fn outcomes() -> Vec<Outcome> {
             unusable: Vec::new(),
             note: Some("one network on this machine belongs to somebody else, and none to you".to_owned()),
             admin_refusal: None,
+            waiting_on: None,
             // What the second person on a desktop is shown. Zero on a phone,
             // which has one person — and in the fixture precisely because the
             // mirror has to be able to read the case it will never produce.
@@ -245,22 +249,11 @@ fn outcomes() -> Vec<Outcome> {
             could_stop_the_daemon: false,
         }),
         Outcome::Done,
-        Outcome::Admitting {
-            proposed_name: "tablet".to_owned(),
-            fingerprint: "AB:CD".to_owned(),
-            code: "418209".to_owned(),
-            // A name this network already uses, with the identity the decision
-            // falls on: a renderer has both spellings of this field to draw.
-            taken: Some(daemon::control::TakenName {
-                name: "tablet".to_owned(),
-                id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
-            }),
-            accepted: true,
+        // A join begun: the fingerprint both screens show, and nothing else.
+        Outcome::JoinStarted {
+            label: "joining".to_owned(),
+            fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
         },
-        // The joining side's answer, which carries nothing at all: a client it
-        // reached cannot show a person the digits they must read elsewhere.
-        Outcome::Enrolling,
-        Outcome::Joining,
         // An invite issued, which the daemon goes on dialling once the command
         // that issued it has closed.
         Outcome::Invited {
@@ -269,23 +262,44 @@ fn outcomes() -> Vec<Outcome> {
             name: "sensor".to_owned(),
             expires_at: 1_758_300_000,
         },
-        Outcome::InvitesHeld(vec![
-            daemon::control::InviteLine {
-                name: "sensor".to_owned(),
-                standing: "open".to_owned(),
-                expires_at: 1_758_300_000,
-            },
-            daemon::control::InviteLine {
-                name: "laptop".to_owned(),
-                standing: "used".to_owned(),
-                expires_at: 1_758_200_000,
-            },
-        ]),
-        Outcome::Adopted {
-            suffix: "studio.internal".to_owned(),
-            devices: 3,
-            carrying: false,
-        },
+        // Everything waiting: an invite open, a request to review — with a
+        // name already in use and the identity the decision falls on — a join
+        // of this device's, and an act stopped on a person.
+        Outcome::Pending(daemon::control::PendingList {
+            invites: vec![
+                daemon::control::InviteLine {
+                    network: "casa".to_owned(),
+                    name: "sensor".to_owned(),
+                    standing: "open".to_owned(),
+                    expires_at: 1_758_300_000,
+                    request: None,
+                },
+                daemon::control::InviteLine {
+                    network: "casa".to_owned(),
+                    name: "tablet".to_owned(),
+                    standing: "requested".to_owned(),
+                    expires_at: 1_758_200_000,
+                    request: Some(daemon::control::RequestLine {
+                        proposed_name: "Mario's tablet".to_owned(),
+                        fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                        arrived_at: 1_758_190_000,
+                        taken: Some(daemon::control::TakenName {
+                            name: "tablet".to_owned(),
+                            id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
+                        }),
+                    }),
+                },
+            ],
+            joins: vec![daemon::control::JoinLine {
+                label: "joining".to_owned(),
+                fingerprint: "9F00-1E2D-3C4B-5A69-7887".to_owned(),
+                standing: "requested".to_owned(),
+                since: 1_758_100_000,
+                requested_at: Some(1_758_100_060),
+                problem: Some("the exchange took too long".to_owned()),
+            }],
+            stopped: Some("the founding of `casa`, waiting for its relay's key to be confirmed".to_owned()),
+        }),
         Outcome::ConfirmingRelay {
             relay: "1c23b31d465a430ab24cc9e7990dd18ed67800950f7c3d035c3f6cb7747e5a89@relay.example:8443"
                 .to_owned(),
@@ -408,9 +422,11 @@ fn shown_table() -> Vec<(String, String)> {
 
 #[test]
 fn the_fixture_is_what_the_types_write() {
-    let written = serde_json::to_string_pretty(
-        &serde_json::json!({ "outcomes": outcomes(), "shown": shown_table() }),
-    )
+    let written = serde_json::to_string_pretty(&serde_json::json!({
+        "outcomes": outcomes(),
+        "shown": shown_table(),
+        "administrator": administrator_table(),
+    }))
     .unwrap();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/control.json");
     if std::env::var_os("PEERFECTLY_BLESS").is_some() {
@@ -423,6 +439,69 @@ fn the_fixture_is_what_the_types_write() {
         written,
         "tests/fixtures/control.json is not what the control types write; rerun with PEERFECTLY_BLESS=1 and update the Kotlin mirror"
     );
+}
+
+/// Every command a phone sends, and whether it needs an administrator — on a
+/// phone, the lock — by the daemon's one rule. The Kotlin mirror asks the lock
+/// for exactly these.
+fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
+    use daemon::control::Command;
+
+    let casa = || Some("casa".to_owned());
+    [
+        Command::Status,
+        Command::Waiting,
+        Command::Up { network: casa() },
+        Command::Down { network: casa() },
+        Command::Pending { network: None },
+        Command::Exposed { network: None },
+        Command::Invite {
+            network: casa(),
+            name: "tv".to_owned(),
+            admin: false,
+            light: true,
+            groups: Vec::new(),
+            ipv4: None,
+            minutes: Some(30),
+        },
+        Command::Withdraw { network: casa(), name: "tv".to_owned() },
+        Command::Approve { network: casa(), name: "tv".to_owned(), replace: false },
+        Command::Reject { network: casa(), name: "tv".to_owned() },
+        Command::Join { invite: "peerfectly-invite-v1:abc".to_owned(), name: "phone".to_owned() },
+        Command::CancelJoin { label: "joining".to_owned() },
+        Command::Confirm,
+        Command::Abandon,
+        Command::Forget { label: "casa".to_owned(), last_admin: false },
+        Command::Found {
+            label: "casa".to_owned(),
+            name: "pixel".to_owned(),
+            suffix: "casa.internal".to_owned(),
+            relay: None,
+            ipv4_range: None,
+            window_days: None,
+        },
+        Command::Revoke {
+            network: casa(),
+            target: daemon::control::Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()),
+            reason: "stolen".to_owned(),
+        },
+        Command::RevokeVoiding {
+            network: casa(),
+            target: daemon::control::Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()),
+            reason: "stolen".to_owned(),
+        },
+        Command::SetAnchors {
+            network: casa(),
+            anchors: vec![daemon::control::Target::Name("nas".to_owned())],
+        },
+        Command::ChangeRelay { network: casa(), relay: "r.example".to_owned(), immediately: false },
+    ]
+    .into_iter()
+    .map(|command| {
+        let needs = command.needs_an_administrator();
+        (command, needs)
+    })
+    .collect()
 }
 
 /// The variants `control::Outcome` declares, read from its source.

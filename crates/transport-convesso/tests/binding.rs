@@ -789,6 +789,25 @@ async fn a_light_member_and_a_full_one_authenticate_each_other_both_ways() {
     assert_eq!(accepted.peer(), network.founder.device_id(), "known by its evidence");
 }
 
+/// A light member holds no roster, so it knows nobody it has not met: a member
+/// admitted a moment ago, dialling it first, is still read, and judged by what
+/// it shows.
+#[tokio::test]
+async fn a_light_member_is_reached_by_a_full_one_it_never_met() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let (dialled, accepted) = session(&full, &joiner).await;
+    assert_eq!(dialled.peer(), network.joiner.device_id());
+    assert_eq!(accepted.peer(), network.founder.device_id(), "known by its evidence");
+}
+
 #[tokio::test]
 async fn a_light_member_refuses_a_proof_of_another_devices_leaf() {
     let relay = TestRelay::start().await;

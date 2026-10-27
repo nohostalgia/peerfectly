@@ -40,14 +40,14 @@ fn nothing_here_depends_on_a_platform_or_a_transport() {
 /// The two derivations are separated from each other and from everything else.
 ///
 /// A signature made to prove possession must not be usable as anything else, and
-/// the confirmation code must not be reachable by any other derivation in the
-/// system. Both are one string away from being wrong, so both are asserted.
+/// a join's request must not be reachable by any other derivation in the system.
+/// Both are one string away from being wrong, so both are asserted.
 #[test]
 fn the_two_domains_are_distinct_and_specific() {
-    assert_ne!(enrollment::DOMAIN_CODE, enrollment::DOMAIN_POSSESSION);
+    assert_ne!(enrollment::DOMAIN_REQUEST, enrollment::DOMAIN_POSSESSION);
 
-    for domain in [enrollment::DOMAIN_CODE, enrollment::DOMAIN_POSSESSION] {
-        assert!(domain.starts_with("peerfectly enrolment"), "{domain} must name this ceremony");
+    for domain in [enrollment::DOMAIN_REQUEST, enrollment::DOMAIN_POSSESSION] {
+        assert!(domain.starts_with("peerfectly "), "{domain} must name this system");
         assert!(domain.ends_with("v1"), "{domain} must carry a version");
     }
 }
@@ -88,7 +88,10 @@ fn the_document_states_the_order_the_encoder_uses() {
 #[test]
 fn the_document_quotes_the_domains_exactly() {
     let format = include_str!("../FORMAT.md");
-    assert!(format.contains(enrollment::DOMAIN_CODE), "FORMAT.md must quote the code's context");
+    assert!(
+        format.contains(enrollment::DOMAIN_REQUEST),
+        "FORMAT.md must quote the request's context"
+    );
     assert!(
         format.contains(enrollment::DOMAIN_POSSESSION),
         "FORMAT.md must quote the possession context"
@@ -112,15 +115,15 @@ fn the_readme_covers_what_it_must() {
         ("why the admin dials", "thirty-two bytes, which nobody types"),
         ("where the exception lands", "nothing to lose"),
         ("why admitting never listens", "listener at all"),
-        ("why the code is bound to the channel", "does not exist\nuntil the channel does"),
-        ("the grinding attack it prevents", "space of one\nmillion"),
-        ("what the joiner's confirmation defends", "would accept it"),
-        ("what the admin's confirmation defends", "substituted on its way"),
+        ("why there is no code", "second bearer secret"),
+        ("the grinding that ruled one out", "2^20"),
+        ("what replaces it in person", "cannot be ground"),
+        ("that the invite is a bearer token", "A bearer token"),
+        ("why a join is paced rather than counted", "never ends it"),
         ("why both keys are proved", "first** admission of a device id"),
         ("that delivery proves nothing", "Delivery proves nothing"),
         ("why the relay needs no check", "nothing is ever accepted on sight"),
         ("what the bounds do not buy", "Denial of the enrolment remains possible"),
-        ("the limit that stays", "accepted\nlimit"),
     ] {
         assert!(readme.contains(marker), "the README must explain {topic}");
     }

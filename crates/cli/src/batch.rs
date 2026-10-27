@@ -89,6 +89,7 @@ fn typed_label(asked: &Command) -> Option<&str> {
         | Command::SetAnchors { network, .. }
         | Command::AdmitBatch { network, .. }
         | Command::Rename { network, .. }
+        | Command::Approve { network, .. }
         | Command::Invite { network, .. } => network.as_deref(),
         _ => None,
     }
@@ -109,8 +110,7 @@ fn typed_label(asked: &Command) -> Option<&str> {
 /// is compared as the daemon keeps it, in lower case: `Laptop` typed is
 /// `laptop` signed, and a name that is no name matches nothing.
 ///
-/// A command that is not one of the acts below imposes no expectation: an
-/// admission is confirmed rather than named, and there is nothing to compare.
+/// A command that is not one of the acts below imposes no expectation.
 pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) -> bool {
     match command {
         Command::Revoke { reason, .. } | Command::RevokeVoiding { reason, .. } => matches!(
@@ -146,6 +146,20 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
             &core.body,
             OperationBody::SetNetwork(params) if anchors_named(anchors, &params.anchors)
         ),
+        // An approval admits a device, under the name its invite gave or one
+        // made from it where that name is held; where it replaces, the
+        // revocation of the device holding the name comes first.
+        Command::Approve { name, replace, .. } => match &core.body {
+            OperationBody::AddDevice(spec) => {
+                is_named(&spec.name, name)
+                    || spec.name.strip_prefix(name.as_str()).is_some_and(|rest| {
+                        rest.strip_prefix('-').is_some_and(|n| n.parse::<u32>().is_ok())
+                    })
+                    || !*replace
+            }
+            OperationBody::RevokeDevice { .. } => *replace,
+            _ => false,
+        },
         _ => true,
     }
 }
@@ -268,8 +282,7 @@ pub(crate) fn holds_together(
     // admits: part of the same act.
     let acts = match operations.as_slice() {
         [acts @ .., admission, settings]
-            if matches!(asked, Command::Confirm | Command::Replace)
-                && settles(admission, settings) =>
+            if matches!(asked, Command::Approve { .. }) && settles(admission, settings) =>
         {
             let mut acts = acts.to_vec();
             acts.push(admission);
@@ -282,7 +295,7 @@ pub(crate) fn holds_together(
         [before, after] => {
             let replacing = matches!(before.body, OperationBody::RevokeDevice { .. })
                 && matches!(after.body, OperationBody::AddDevice(_))
-                && matches!(asked, Command::Confirm | Command::Replace);
+                && matches!(asked, Command::Approve { replace: true, .. });
             if !replacing {
                 return Err("two acts were asked for where this command signs one".to_owned());
             }

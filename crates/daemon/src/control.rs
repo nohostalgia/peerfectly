@@ -650,6 +650,11 @@ pub struct Network {
     pub waiting: Vec<Waiting>,
     /// How many further operations are waiting and not listed.
     pub waiting_unlisted: usize,
+    /// How many members this device was never in contact with, owed what it
+    /// signed: counted here rather than listed under every operation. They
+    /// receive the current state at their first contact.
+    #[serde(default)]
+    pub waiting_never_met: usize,
     /// What is wrong in it now: the latest fault, if recent.
     ///
     /// One, and no history. The history is the service's log; a surface needs
@@ -664,12 +669,11 @@ pub struct Network {
     /// a surface that did not show it would leave a person watching their devices
     /// stop answering with nothing anywhere saying why.
     pub confirmation: Option<Unconfirmed>,
-    /// The device one of this network's invites brought, waiting at the code
-    /// for this device's person: the name it was invited under.
+    /// A request one of this network's invites brought, waiting for a person
+    /// to approve or reject it: the name it was invited under.
     ///
-    /// So that a surface can say so and offer to come back to it: the command
-    /// that issued the invite may have ended hours ago. `None` when nothing
-    /// waits.
+    /// So that a phone can notify, and offer the pending list: the command that
+    /// issued the invite may have ended hours ago. `None` when nothing waits.
     #[serde(default)]
     pub arrived: Option<String>,
     /// The network's anchors: the full members its light members turn to
@@ -902,7 +906,24 @@ pub struct Report {
     /// holds no network at all still needs it: it is the answer to why founding
     /// was refused.
     pub admin_refusal: Option<String>,
+
+    /// What this daemon holds waiting on this person, in words: a founding or a
+    /// move stopped on a relay's key, a join, an admission at the code. `None`
+    /// when nothing waits, or when what waits is somebody else's.
+    ///
+    /// It is what refuses the next founding, join or invite, so a person who
+    /// was refused can read here what it is, and cancel it.
+    #[serde(default)]
+    pub waiting_on: Option<String>,
 }
+
+/// How a refusal says an invite for the same name is still open: a surface
+/// that finds it there can offer to come back to it, or to withdraw it.
+pub const INVITE_STILL_OPEN: &str = "is still open or waiting for approval";
+
+/// How a refusal ends when something already waits on a person: a surface
+/// that finds it there can offer the way to cancel it.
+pub const ALREADY_WAITING: &str = "nothing else starts until it is finished or cancelled";
 
 impl Report {
     /// The same report, with a line about what just happened.
@@ -1205,12 +1226,14 @@ impl Command {
         match self {
             // Reading. What comes back is bounded by what the reader may see.
             Self::Status | Self::Waiting => Needs::Nobody,
-            Self::Peers { network } | Self::Address { network } => match network {
-                // Naming none is asking about everything this person holds,
-                // which is the same question as `Status`.
-                None => Needs::Nobody,
-                Some(_) => Needs::TheOwnerOf(network.clone()),
-            },
+            Self::Peers { network } | Self::Address { network } | Self::Pending { network } => {
+                match network {
+                    // Naming none is asking about everything this person holds,
+                    // which is the same question as `Status`.
+                    None => Needs::Nobody,
+                    Some(_) => Needs::TheOwnerOf(network.clone()),
+                }
+            }
 
             // Making a network. There is nobody for it to belong to yet: the
             // owner is recorded as it comes into being, by whoever asked.
@@ -1221,7 +1244,8 @@ impl Command {
             | Self::Down { network }
             | Self::Invite { network, .. }
             | Self::Withdraw { network, .. }
-            | Self::Invites { network }
+            | Self::Approve { network, .. }
+            | Self::Reject { network, .. }
             | Self::Revoke { network, .. }
             | Self::RevokeVoiding { network, .. }
             | Self::StageBatch { network, .. }
@@ -1241,8 +1265,7 @@ impl Command {
 
             // Finishing something already begun.
             Self::Confirm
-            | Self::Replace
-            | Self::ConfirmJoin { .. }
+            | Self::CancelJoin { .. }
             | Self::Abandon
             | Self::Signed { .. }
             | Self::KeyMade { .. }
@@ -1290,12 +1313,11 @@ pub enum Command {
     ///
     /// Issues an invite — the network's relay, its id and a secret — and keeps,
     /// on this device only, what the device it brings will be: its name, role,
-    /// mode, groups and address. From then on the daemon dials the device the
-    /// invite brings, on its own, until the invite is used, withdrawn or
-    /// expires. So the flow outlives the command: when the device arrives, its
-    /// daemon has opened the exchange, checked the keys the device presented and
-    /// worked out the code — and stopped there. The admission waits, reported by
-    /// [`Command::Waiting`] with the code, signed by [`Command::Confirm`].
+    /// mode, groups and address. From then on the daemon dials the rendezvous
+    /// the invite implies, on its own, until a request arrives or the invite
+    /// expires or is withdrawn. So the flow outlives the command: the request is
+    /// kept, asking nobody, and listed by [`Command::Pending`] until a person
+    /// answers it with [`Command::Approve`] or [`Command::Reject`].
     Invite {
         /// Which network, or `None` when only one could be meant.
         network: Option<String>,
@@ -1309,13 +1331,15 @@ pub enum Command {
         groups: Vec<String>,
         /// The IPv4 address it is assigned, inside the network's range.
         ipv4: Option<String>,
-        /// How long the invite stays open, or `None` for a day.
-        hours: Option<u32>,
+        /// How long the invite waits for its device's request, in minutes, or
+        /// `None` for a day.
+        minutes: Option<u32>,
     },
 
-    /// Withdraw the open invite for the device to be called `name`.
+    /// Withdraw the invite for the device to be called `name`, while nothing has
+    /// been signed through it.
     ///
-    /// It admits nobody from then on, and an admission it led to that is still
+    /// It takes no request from then on, and a request it brought that was
     /// waiting for a person is dropped.
     Withdraw {
         /// Which network, or `None` when only one could be meant.
@@ -1324,20 +1348,48 @@ pub enum Command {
         name: String,
     },
 
-    /// The invites this device issued into a network, open or ended.
-    Invites {
+    /// Everything waiting: the invites this device issued and the requests
+    /// they brought, this device's own joins, and an act stopped on a person.
+    Pending {
+        /// Which network's invites, or `None` for every network this person
+        /// holds.
+        network: Option<String>,
+    },
+
+    /// Approve the request that arrived through the invite for `name`.
+    ///
+    /// Signs the admission, and the settings the invite chose, as any
+    /// administrative act; the device is then given the network when it
+    /// answers, by this device or by any full member the admission reaches.
+    Approve {
         /// Which network, or `None` when only one could be meant.
         network: Option<String>,
+        /// The name the invite was issued for.
+        name: String,
+        /// Whether to take the name over from the device already holding it,
+        /// **revoking that device** in the same act. A surface asks first, and
+        /// shows the identifier it falls on.
+        replace: bool,
+    },
+
+    /// Reject the request that arrived through the invite for `name`. Nothing
+    /// is signed, and the invite takes no other.
+    Reject {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The name the invite was issued for.
+        name: String,
     },
 
     /// Join a network from an invite one of its admins issued.
     ///
     /// Through the daemon for the same reason founding is: the roster that
-    /// arrives has to be the one the daemon is using. A device that joined in
-    /// another process would hold a network its own daemon could not see until
-    /// it restarted. The device makes fresh keys and waits at the rendezvous the
-    /// invite implies for the admin to dial; the code is typed with
-    /// [`Command::ConfirmJoin`].
+    /// arrives has to be the one the daemon is using. The device makes fresh
+    /// keys, proves it holds them, and waits — at the rendezvous the invite
+    /// implies and under its own transport key — until it is admitted or the
+    /// join is cancelled. The command returns at once with the fingerprint a
+    /// person may compare with the admin's; the join is listed by
+    /// [`Command::Pending`] while it waits.
     Join {
         /// The invite, as text.
         invite: String,
@@ -1345,43 +1397,22 @@ pub enum Command {
         name: String,
     },
 
-    /// Confirm whatever is waiting on this device's own person.
-    ///
-    /// Two things wait that way: an **admission**, after a person has looked at
-    /// the device being enrolled and seen it say the code was accepted; and a
-    /// **founding** or a **relay change**, after a person has checked the key a
-    /// relay's host said it serves. Neither carries a value, because in both the person is
-    /// answering a question about something already on screen.
-    ///
-    /// A **join** is the one that does not belong here: what its person supplies
-    /// is digits read off another machine. That is [`Self::ConfirmJoin`].
+    /// Confirm whatever is waiting on this device's own person: a **founding**
+    /// or a **relay change**, after a person has checked the key a relay's host
+    /// said it serves. It carries no value, because the person is answering a
+    /// question about something already on screen.
     Confirm,
 
-    /// Confirm an admission **and revoke the device already holding that name**.
-    ///
-    /// The other answer to the question [`Outcome::Admitting::taken`] asks.
-    /// [`Self::Confirm`] admits under a name no device holds; this one keeps the
-    /// name and expels whoever had it.
-    ///
-    /// It is a revocation, and a revocation is definitive: the device it names
-    /// never returns to the network. A surface asks before sending it, and shows
-    /// the identifier it falls on — a name is not an identity, and this decision
-    /// is being taken on the strength of one.
-    Replace,
-
-    /// Confirm a join with the digits a person read off the admitting machine.
-    ///
-    /// Sent by the **joining** side. The code travels here, from the person, and
-    /// is compared with the one this device derived. A command carrying no code
-    /// would leave the daemon comparing its own answer with itself — which is
-    /// what this replaces, and what made the check always pass.
-    ConfirmJoin {
-        /// The six digits a person typed.
-        code: String,
-    },
-
-    /// Drop an enrolment that is waiting, leaving both machines as they were.
+    /// Drop the act that is waiting on a person, leaving the machine as it was.
     Abandon,
+
+    /// Cancel a join in progress: it stops waiting, and its directory and keys
+    /// go. An admission signed for it meanwhile stays in the network, for an
+    /// admin to revoke.
+    CancelJoin {
+        /// The join, by the name the pending list gives it.
+        label: String,
+    },
 
     /// Remove a network from this device, carried or not.
     ///
@@ -1404,14 +1435,9 @@ pub enum Command {
         last_admin: bool,
     },
 
-    /// Ask what a waiting enrolment has got to.
+    /// Ask what the act waiting on a person has got to.
     ///
-    /// A join has two pauses in it — waiting for the admin to dial, and
-    /// comparing six digits — and the control channel is one request and one
-    /// answer. So the command line asks, rather than being told.
-    ///
-    /// It also answers the other question a surface has: **is anything held at
-    /// all**. The daemon keeps one pending, and it is what refuses the next
+    /// It answers the question a surface has: **is anything held at all**. The daemon keeps one pending, and it is what refuses the next
     /// enrolment, so a surface whose own screens have ended needs to know whether
     /// the daemon still holds something before it offers to start another.
     /// [`Outcome::Done`] means nothing is held; every other answer names what is.
@@ -1676,8 +1702,8 @@ impl Command {
         // only in the tests — found by writing the verification step for it and
         // discovering the word did not work.
         ("takeownership", true),
-        // The invites issued into a network, open or ended.
-        ("invites", true),
+        // Everything waiting: invites and their requests, joins, a stopped act.
+        ("pending", true),
     ];
 
     /// The usage line for forgetting a network this device cannot carry.
@@ -1719,6 +1745,75 @@ impl Command {
             }
         }
         Ok(Self::Withdraw { network, name: name.ok_or_else(usage)? })
+    }
+
+    /// The usage line for approving a request.
+    pub const APPROVE_USAGE: &'static str = "peerfectly approve <name> [--replace] [--network N]";
+
+    /// The usage line for rejecting a request.
+    pub const REJECT_USAGE: &'static str = "peerfectly reject <name> [--network N]";
+
+    /// Reads an approval from the words after `approve`: the name the invite
+    /// was issued for, and whether to take that name over from the device
+    /// already holding it.
+    ///
+    /// # Errors
+    ///
+    /// When no name is given, or more than one, or an option it does not take.
+    pub fn approval(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::APPROVE_USAGE);
+        let mut name = None;
+        let mut network = None;
+        let mut replace = false;
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                "--replace" => replace = true,
+                flag if flag.starts_with("--") => return Err(usage()),
+                given if name.is_none() && !given.is_empty() => name = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(Self::Approve { network, name: name.ok_or_else(usage)?, replace })
+    }
+
+    /// Reads a rejection from the words after `reject`.
+    ///
+    /// # Errors
+    ///
+    /// When no name is given, or more than one, or an option it does not take.
+    pub fn rejection(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::REJECT_USAGE);
+        match Self::withdrawal(words) {
+            Ok(Self::Withdraw { network, name }) => Ok(Self::Reject { network, name }),
+            _ => Err(usage()),
+        }
+    }
+
+    /// Reads how long an invite waits for its request: a number with `m`, `h`
+    /// or `d` — `30m`, `24h`, `7d` — in minutes.
+    ///
+    /// # Errors
+    ///
+    /// When it is none of those, or is zero.
+    pub fn expiry(text: &str) -> core::result::Result<u32, String> {
+        let refused =
+            || format!("`{text}` is not how long an invite stays open: say it as 30m, 24h or 7d");
+        let Some(unit) = text.chars().last() else { return Err(refused()) };
+        let number = text.strip_suffix(unit).unwrap_or_default();
+        let per: u32 = match unit {
+            'm' => 1,
+            'h' => 60,
+            'd' => 24 * 60,
+            _ => return Err(refused()),
+        };
+        number
+            .parse::<u32>()
+            .ok()
+            .filter(|count| *count > 0)
+            .and_then(|count| count.checked_mul(per))
+            .ok_or_else(refused)
     }
 
     /// The usage lines for setting a network's anchors, and clearing them.
@@ -1933,7 +2028,7 @@ impl Command {
             "address" => Ok(Self::Address { network }),
             "stop" => Ok(Self::Stop),
             "takeownership" => Ok(Self::TakeOwnership { network }),
-            "invites" => Ok(Self::Invites { network }),
+            "pending" => Ok(Self::Pending { network }),
             _ => Err(Unknown { name: name.to_owned() }),
         }
     }
@@ -1947,39 +2042,71 @@ impl Command {
         Self::ALL.iter().any(|(word, takes)| *word == name && *takes)
     }
 
-    /// Whether this command changes the machine, and so needs Administrator.
+    /// Whether this command needs an administrator: an elevated console on
+    /// Windows, `sudo` on Linux, the phone's lock on a phone.
     ///
-    /// **It was aspirational and is not any more.** While the daemon created its
-    /// channel with a default descriptor, a medium-integrity process could not
-    /// write to a pipe a high-integrity one had made, so *every* command needed
-    /// an elevated console whatever this said. The channel carries an explicit
-    /// descriptor now, with an integrity label an ordinary process may write to,
-    /// and reading state needs no elevation at all.
+    /// **One rule, decided by the daemon and shown by every surface.** Reading,
+    /// and turning one's own networks on and off, need none: `status`, `peers`,
+    /// `address`, `exposed`, the pending list, `up` and `down`, and the question
+    /// of what waits. Everything else does — founding, joining, inviting,
+    /// approving, revoking, forgetting a network, moving a relay, exposing a
+    /// port, stopping the service — because it changes a roster, the machine,
+    /// or what this device is a member of. The daemon refuses anybody else
+    /// before the act starts ([`Self::needs`] says whose network it must be
+    /// besides), a command line refuses before it asks, and the usage marks the
+    /// same words.
     ///
-    /// **It is not the authorisation table**, and must not be read as one. That
-    /// is [`Self::needs`], which is decided by the daemon against the caller it
-    /// identified. This is a hint the command line prints beside a word, so that
-    /// somebody reading the usage knows which ones will want an elevated console
-    /// — and where the two ever disagree, the daemon's answer is the one that
-    /// happens.
+    /// Exhaustive, with no wildcard: a command added without deciding is a
+    /// build failure.
     #[must_use]
-    pub const fn needs_administrator(&self) -> bool {
-        matches!(
-            self,
-            Self::Up { .. }
-                | Self::Down { .. }
-                | Self::Revoke { .. }
-                // The same revocation, after its person was told what it voids.
-                | Self::RevokeVoiding { .. }
-                | Self::Rename { .. }
-                | Self::Found { .. }
-                | Self::Join { .. }
-                // The two that are the machine's rather than a network's.
-                | Self::Stop
-                | Self::TakeOwnership { .. }
-                | Self::Expose { .. }
-                | Self::Unexpose { .. }
-        )
+    pub const fn needs_an_administrator(&self) -> bool {
+        match self {
+            Self::Status
+            | Self::Peers { .. }
+            | Self::Address { .. }
+            | Self::Exposed { .. }
+            | Self::Pending { .. }
+            | Self::Waiting
+            | Self::Up { .. }
+            | Self::Down { .. } => false,
+            Self::Stop
+            | Self::Invite { .. }
+            | Self::Withdraw { .. }
+            | Self::Approve { .. }
+            | Self::Reject { .. }
+            | Self::Join { .. }
+            | Self::Confirm
+            | Self::Abandon
+            | Self::CancelJoin { .. }
+            | Self::Forget { .. }
+            | Self::Found { .. }
+            | Self::Revoke { .. }
+            | Self::StageBatch { .. }
+            | Self::AdmitBatch { .. }
+            | Self::RevokeVoiding { .. }
+            | Self::Rename { .. }
+            | Self::SetAnchors { .. }
+            | Self::Signed { .. }
+            | Self::TakeOwnership { .. }
+            | Self::ChangeRelay { .. }
+            | Self::Expose { .. }
+            | Self::Unexpose { .. }
+            | Self::KeyMade { .. }
+            | Self::NotSigned { .. } => true,
+        }
+    }
+
+    /// Whether the word a person types needs an administrator, by the rule
+    /// [`Self::needs_an_administrator`] states: for a word that is a command on
+    /// its own, asked of that command; every word that takes more acts, except
+    /// `exposed`, which reads.
+    #[must_use]
+    pub fn word_needs_an_administrator(word: &str) -> bool {
+        match Self::parse(word, None) {
+            Ok(command) => command.needs_an_administrator(),
+            Err(_) if word == "exposed" => Self::Exposed { network: None }.needs_an_administrator(),
+            Err(_) => true,
+        }
     }
 
     /// Whether this command is part of enrolling a device.
@@ -1992,7 +2119,14 @@ impl Command {
     pub const fn is_enrolment(&self) -> bool {
         matches!(
             self,
-            Self::Invite { .. } | Self::Confirm | Self::Abandon | Self::Join { .. } | Self::Waiting
+            Self::Invite { .. }
+                | Self::Approve { .. }
+                | Self::Reject { .. }
+                | Self::CancelJoin { .. }
+                | Self::Confirm
+                | Self::Abandon
+                | Self::Join { .. }
+                | Self::Waiting
         )
     }
 
@@ -2011,7 +2145,7 @@ impl Command {
             Self::Address { .. } => "address",
             Self::Stop => "stop",
             Self::TakeOwnership { .. } => "takeownership",
-            Self::Invites { .. } => "invites",
+            Self::Pending { .. } => "pending",
             _ => "",
         }
     }
@@ -2031,17 +2165,18 @@ impl Command {
             | Self::Peers { .. }
             | Self::Address { .. }
             | Self::Waiting
-            | Self::Invites { .. }
+            | Self::Pending { .. }
             | Self::Exposed { .. } => return None,
             Self::Up { network } => ("up", network.as_deref()),
             Self::Down { network } => ("down", network.as_deref()),
             Self::Stop => ("stop", None),
             Self::Invite { network, .. } => ("invite", network.as_deref()),
             Self::Withdraw { network, .. } => ("withdraw", network.as_deref()),
+            Self::Approve { network, .. } => ("approve", network.as_deref()),
+            Self::Reject { network, .. } => ("reject", network.as_deref()),
             Self::Confirm => ("confirm", None),
-            Self::Replace => ("replace", None),
-            Self::ConfirmJoin { code: _ } => ("confirm join", None),
             Self::Abandon => ("abandon", None),
+            Self::CancelJoin { .. } => ("cancel join", None),
             Self::Join { .. } => ("join", None),
             Self::Forget { label, .. } => ("forget", Some(label.as_str())),
             Self::Found { label, .. } => ("found", Some(label.as_str())),
@@ -2072,12 +2207,9 @@ impl Outcome {
         match self {
             Self::Reported(_) => "reported",
             Self::Done => "done",
-            Self::Admitting { .. } => "admitting",
             Self::Invited { .. } => "invited",
-            Self::InvitesHeld(_) => "invites",
-            Self::Enrolling => "enrolling",
-            Self::Joining { .. } => "joining",
-            Self::Adopted { .. } => "adopted",
+            Self::JoinStarted { .. } => "joining",
+            Self::Pending(_) => "pending",
             Self::ConfirmingRelay { .. } => "confirming a relay",
             Self::NeedsSignatures(_) => "needs signatures",
             Self::Declined { .. } => "declined",
@@ -2241,12 +2373,70 @@ pub struct SkippedLine {
 /// One invite, as listed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteLine {
+    /// The network it admits into, by the name it is reported under.
+    pub network: String,
     /// The name the device is admitted under.
     pub name: String,
-    /// `open`, `used`, `expired` or `withdrawn`.
+    /// `open`, `requested`, `approved`, `used`, `rejected`, `expired` or
+    /// `withdrawn`.
     pub standing: String,
-    /// When it ends or ended, in seconds since the epoch.
+    /// When it stops taking a request, in seconds since the epoch.
     pub expires_at: u64,
+    /// The request that arrived through it, if one has.
+    #[serde(default)]
+    pub request: Option<RequestLine>,
+}
+
+/// A request that arrived through an invite: what a person reviews before
+/// approving it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestLine {
+    /// The name the device proposed for itself. The invite's decides.
+    pub proposed_name: String,
+    /// The fingerprint of its signing key, which its own screen shows too.
+    pub fingerprint: String,
+    /// When it arrived, in seconds since the epoch.
+    pub arrived_at: u64,
+    /// The device already answering to the name it would be admitted under,
+    /// if one does: approving then either admits it under another name, or
+    /// replaces that device, revoking it.
+    #[serde(default)]
+    pub taken: Option<TakenName>,
+}
+
+/// One of this device's own joins, waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinLine {
+    /// The name the join is known by here until its network arrives.
+    pub label: String,
+    /// The fingerprint of this device's new signing key, for a person to
+    /// compare with the admin's list.
+    pub fingerprint: String,
+    /// `registering`, `waiting`, `requested`, or `failed`.
+    pub standing: String,
+    /// When it began, in seconds since the epoch.
+    pub since: u64,
+    /// When the admin's daemon said it has the request, once it has.
+    #[serde(default)]
+    pub requested_at: Option<u64>,
+    /// What last went wrong, if anything: an exchange refused, or why the join
+    /// cannot go on.
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+/// Everything waiting on this device, for the pending list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingList {
+    /// The invites this device issued, open or ended a short while ago, with
+    /// the requests they brought.
+    pub invites: Vec<InviteLine>,
+    /// This device's own joins.
+    pub joins: Vec<JoinLine>,
+    /// An act stopped on a person — a founding or a relay move waiting on a
+    /// relay's key, a signature — described, if there is one.
+    #[serde(default)]
+    pub stopped: Option<String>,
 }
 
 /// What the daemon sends back over the control channel.
@@ -2258,48 +2448,17 @@ pub enum Outcome {
     /// The command succeeded and there is nothing to say.
     Done,
 
-    /// An enrolment is open and waiting for a person to compare two screens.
+    /// A join has begun, and waits until it is admitted or cancelled.
     ///
-    /// Nothing has been signed. The device this describes is a member of
-    /// nothing, and will stay one unless a person confirms.
-    Admitting {
-        /// The name the joining device proposed for itself.
-        proposed_name: String,
-        /// Its signing key's fingerprint, in the shape a person can compare.
+    /// Nothing has been signed and this device is a member of nothing yet.
+    JoinStarted {
+        /// The name the join is listed under until its network arrives: what
+        /// cancelling it names.
+        label: String,
+        /// The fingerprint of this device's new signing key, which the admin
+        /// reviewing the request is shown too.
         fingerprint: String,
-        /// The code to display, which the other device's person must type.
-        code: String,
-        /// The device already answering to the proposed name, if one does.
-        ///
-        /// `Some` means the admission stops here for an answer:
-        /// [`Command::Confirm`] admits under a name no device holds, and
-        /// [`Command::Replace`] keeps the name and revokes the device named
-        /// below. Before this, the second device quietly became `name-2` and the
-        /// admin learned of it from the device list.
-        taken: Option<TakenName>,
-        /// Whether that device has said the code was accepted.
-        ///
-        /// False until it does. What this side's person is asked depends on it:
-        /// until the far side has confirmed, there is nothing to ask about, and
-        /// asking anyway is how a person answers a question about a screen that
-        /// has not changed yet.
-        accepted: bool,
     },
-
-    /// An admin has reached this device, and a person must type what that
-    /// machine is showing.
-    ///
-    /// It carries **no code**. The device derived one, and telling the person
-    /// what it is would turn typing back into agreeing: they would read it from
-    /// this screen instead of the admin's, and this screen is the one an
-    /// attacker who dialled first controls. A client cannot display what it is
-    /// never given.
-    Enrolling,
-    /// A join is waiting, at the rendezvous its invite implies, for the admin
-    /// that issued it to dial.
-    ///
-    /// Nothing has been signed and this device is a member of nothing.
-    Joining,
 
     /// An invite was issued, and the daemon dials the device it brings.
     Invited {
@@ -2309,29 +2468,13 @@ pub enum Outcome {
         scannable: String,
         /// The name the device will be admitted under.
         name: String,
-        /// When it ends, in seconds since the epoch, unless used or withdrawn
-        /// first.
+        /// When it stops taking a request, in seconds since the epoch, unless
+        /// withdrawn first.
         expires_at: u64,
     },
 
-    /// The invites this device issued into a network.
-    InvitesHeld(Vec<InviteLine>),
-
-    /// A join ended with a network adopted.
-    Adopted {
-        /// The suffix every name in it sits under.
-        suffix: String,
-        /// How many devices it has, this one included.
-        devices: usize,
-        /// Whether that network is carrying traffic once the join has ended.
-        ///
-        /// A first join leaves it down: §2.6b makes turning a network on the
-        /// person's own act. A join that **replaced** this device's membership
-        /// inherits the choice made about that network, so one that was up is up
-        /// again — and a surface that ended every join by saying how to turn the
-        /// tunnel on would be telling the person to do what has already been done.
-        carrying: bool,
-    },
+    /// Everything waiting on this device.
+    Pending(PendingList),
 
     /// A relay's key, asked of its host, is waiting to be confirmed before it is
     /// signed.
@@ -2519,7 +2662,7 @@ mod exposure_words {
             Command::Unexpose { network: casa.clone(), protocol: Protocol::Tcp, port: 1 };
         assert_eq!(Needs::TheOwnerOfAsAdministrator(casa.clone()), expose.needs());
         assert_eq!(Needs::TheOwnerOfAsAdministrator(casa.clone()), unexpose.needs());
-        assert!(expose.needs_administrator() && unexpose.needs_administrator());
+        assert!(expose.needs_an_administrator() && unexpose.needs_an_administrator());
         assert_eq!(Needs::TheOwnerOf(casa.clone()), Command::Exposed { network: casa }.needs());
         assert_eq!(Needs::Nobody, Command::Exposed { network: None }.needs());
     }
@@ -2556,6 +2699,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -2594,6 +2738,7 @@ mod tests {
             revoked: Vec::new(),
             waiting,
             waiting_unlisted: 0,
+            waiting_never_met: 0,
             problem: None,
         }
     }
@@ -2953,20 +3098,99 @@ mod tests {
     }
 
     /// If reading status needed Administrator, a person would run everything
-    /// elevated — worse than the problem elevation solves.
+    /// elevated — worse than the problem elevation solves. And a member may turn
+    /// its own networks on and off; everything that changes a roster, the
+    /// machine or a membership needs one, forgetting a network included.
     #[test]
-    fn reading_does_not_need_administrator_and_changing_does() {
-        assert!(!Command::Status.needs_administrator());
-        assert!(!Command::Peers { network: None }.needs_administrator());
-        assert!(!Command::Address { network: None }.needs_administrator());
+    fn reading_and_up_and_down_need_no_administrator_and_everything_else_does() {
+        for reading in [
+            Command::Status,
+            Command::Peers { network: None },
+            Command::Address { network: None },
+            Command::Exposed { network: None },
+            Command::Pending { network: None },
+            Command::Waiting,
+            Command::Up { network: None },
+            Command::Down { network: None },
+        ] {
+            assert!(!reading.needs_an_administrator(), "{reading:?}");
+        }
+        for acting in [
+            Command::Stop,
+            Command::TakeOwnership { network: None },
+            Command::Forget { label: "casa".to_owned(), last_admin: false },
+            Command::Join { invite: String::new(), name: "laptop".to_owned() },
+            Command::Approve { network: None, name: "laptop".to_owned(), replace: false },
+            Command::Reject { network: None, name: "laptop".to_owned() },
+            Command::Withdraw { network: None, name: "laptop".to_owned() },
+            Command::CancelJoin { label: "joining".to_owned() },
+            Command::Abandon,
+        ] {
+            assert!(acting.needs_an_administrator(), "{acting:?}");
+        }
+    }
 
-        assert!(Command::Up { network: None }.needs_administrator());
-        assert!(Command::Down { network: None }.needs_administrator());
+    /// An approval, a rejection and an expiry read what was typed and refuse
+    /// what was not meant.
+    #[test]
+    fn approving_rejecting_and_expiring_read_what_was_typed() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::approval(&words("laptop --replace --network casa")),
+            Ok(Command::Approve {
+                network: Some("casa".to_owned()),
+                name: "laptop".to_owned(),
+                replace: true
+            })
+        );
+        assert_eq!(
+            Command::approval(&words("laptop")),
+            Ok(Command::Approve { network: None, name: "laptop".to_owned(), replace: false })
+        );
+        assert!(Command::approval(&[]).is_err());
+        assert!(Command::approval(&words("laptop desk")).is_err());
+        assert_eq!(
+            Command::rejection(&words("laptop")),
+            Ok(Command::Reject { network: None, name: "laptop".to_owned() })
+        );
+        assert!(Command::rejection(&words("laptop --replace")).is_err());
 
-        // The two the daemon decides against the machine rather than against a
-        // network, so the hint and the table agree on them.
-        assert!(Command::Stop.needs_administrator());
-        assert!(Command::TakeOwnership { network: None }.needs_administrator());
+        assert_eq!(Command::expiry("30m"), Ok(30));
+        assert_eq!(Command::expiry("24h"), Ok(24 * 60));
+        assert_eq!(Command::expiry("7d"), Ok(7 * 24 * 60));
+        for refused in ["0h", "h", "", "3", "1w", "-1d", "1.5h", "3é"] {
+            assert!(Command::expiry(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// The words a person types follow the same rule as the commands they send,
+    /// so the usage and the command line's own refusal say what the daemon does.
+    #[test]
+    fn the_words_follow_the_commands() {
+        for word in ["status", "peers", "address", "exposed", "pending", "up", "down"] {
+            assert!(!Command::word_needs_an_administrator(word), "{word}");
+        }
+        for word in [
+            "found",
+            "join",
+            "invite",
+            "approve",
+            "reject",
+            "withdraw",
+            "cancel",
+            "revoke",
+            "rename",
+            "forget",
+            "relay",
+            "set-anchors",
+            "expose",
+            "unexpose",
+            "admit",
+            "stop",
+            "takeownership",
+        ] {
+            assert!(Command::word_needs_an_administrator(word), "{word}");
+        }
     }
 
     /// **Taking a network is reachable by typing it.**
@@ -3031,10 +3255,13 @@ mod tests {
                 light: true,
                 groups: vec!["sensori".to_owned()],
                 ipv4: Some("100.64.0.9".to_owned()),
-                hours: Some(2),
+                minutes: Some(120),
             },
             Command::Withdraw { network: None, name: "sensor".to_owned() },
-            Command::Invites { network: None },
+            Command::Pending { network: None },
+            Command::Approve { network: None, name: "sensor".to_owned(), replace: true },
+            Command::Reject { network: None, name: "sensor".to_owned() },
+            Command::CancelJoin { label: "network".to_owned() },
             Command::Join {
                 invite: "peerfectly-invite-v1:abcdef".to_owned(),
                 name: "board".to_owned(),
@@ -3079,29 +3306,40 @@ mod tests {
         assert_eq!("only admin", back.kind());
     }
 
-    /// The admitting side's answer carries three things a person reads off a
-    /// screen, and all three have to arrive.
+    /// What a person reviews before approving survives the pipe: the names, the
+    /// fingerprint, when it arrived, and the device holding the name.
     #[test]
-    fn an_admitting_answer_round_trips() {
-        let sent = Outcome::Admitting {
-            proposed_name: "laptop".to_owned(),
-            fingerprint: "AB:CD:EF".to_owned(),
-            code: "004217".to_owned(),
-            // The device already answering to that name, with the identifier the
-            // decision falls on — a name is not an identity.
-            taken: Some(TakenName {
+    fn a_pending_list_round_trips() {
+        let sent = Outcome::Pending(PendingList {
+            invites: vec![InviteLine {
+                network: "casa".to_owned(),
                 name: "laptop".to_owned(),
-                id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
-            }),
-            accepted: false,
-        };
-
+                standing: "requested".to_owned(),
+                expires_at: 1_800_000_000,
+                request: Some(RequestLine {
+                    proposed_name: "Mario's laptop".to_owned(),
+                    fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                    arrived_at: 1_799_990_000,
+                    taken: Some(TakenName {
+                        name: "laptop".to_owned(),
+                        id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
+                    }),
+                }),
+            }],
+            joins: vec![JoinLine {
+                label: "network".to_owned(),
+                fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                standing: "requested".to_owned(),
+                since: 1_799_980_000,
+                requested_at: Some(1_799_990_000),
+                problem: None,
+            }],
+            stopped: None,
+        });
         let bytes = serde_json::to_vec(&sent).expect("encodes");
         let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
         assert_eq!(back, sent);
-
-        let Outcome::Admitting { code, .. } = back else { panic!("the shape must survive") };
-        assert_eq!(code, "004217", "a leading zero is part of the code, not formatting");
+        assert_eq!("pending", back.kind());
     }
 
     /// The request a person is asked to authorise has to survive the pipe with
@@ -3288,32 +3526,9 @@ mod tests {
         assert_eq!(SigningKind::Possession, SigningKind::from(RequestKind::Possession));
     }
 
-    /// And the joining side's answer carries no code at all, which is the whole
-    /// of it: a client cannot show a person the number they are supposed to be
-    /// reading off the other machine.
-    #[test]
-    fn the_joining_answer_carries_no_code() {
-        let bytes = serde_json::to_vec(&Outcome::Enrolling).expect("encodes");
-        let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
-        assert_eq!(back, Outcome::Enrolling);
-
-        let text = String::from_utf8(bytes).expect("json is text");
-        assert!(!text.contains("code"), "the joining side's answer names no code: {text}");
-    }
-
-    /// The digits a person typed travel to the daemon, and a leading zero is
-    /// part of them.
-    #[test]
-    fn a_typed_code_round_trips() {
-        let sent = Command::ConfirmJoin { code: "004217".to_owned() };
-        let bytes = serde_json::to_vec(&sent).expect("encodes");
-        let back: Command = serde_json::from_slice(&bytes).expect("decodes");
-        assert_eq!(back, sent);
-    }
-
-    /// The admitting side's enrolment commands are not among the words a person
-    /// types, and they need no elevation: the daemon is already running as
-    /// whatever it runs as, and admitting changes nothing on the machine.
+    /// The enrolment commands that carry an invite or its details are not among
+    /// the single words a person types, and they need an administrator, as
+    /// every act does.
     #[test]
     fn the_enrolment_commands_are_not_typed_by_name() {
         for command in [
@@ -3324,13 +3539,13 @@ mod tests {
                 light: false,
                 groups: Vec::new(),
                 ipv4: None,
-                hours: None,
+                minutes: None,
             },
             Command::Confirm,
             Command::Abandon,
         ] {
             assert!(command.is_enrolment());
-            assert!(!command.needs_administrator());
+            assert!(command.needs_an_administrator());
             assert!(
                 !Command::ALL
                     .iter()
@@ -3612,7 +3827,9 @@ mod tests {
     #[test]
     fn a_batch_file_is_read_and_its_format_held_to() {
         let device = r#"{ "name": "s1", "serial": "SN1", "signing": "aa", "transport": "bb", "attestation": "cc" }"#;
-        let file = format!(r#"{{ "format": "peerfectly-batch-v1", "label": "lot", "devices": [{device}] }}"#);
+        let file = format!(
+            r#"{{ "format": "peerfectly-batch-v1", "label": "lot", "devices": [{device}] }}"#
+        );
         let read = BatchFile::read(&file).unwrap();
         assert_eq!((read.label.as_str(), read.devices.len()), ("lot", 1));
 
@@ -3643,10 +3860,7 @@ mod tests {
             Command::anchors_setting(&words("nas server --network casa")).unwrap(),
             Command::SetAnchors {
                 network: Some("casa".to_owned()),
-                anchors: vec![
-                    Target::Name("nas".to_owned()),
-                    Target::Name("server".to_owned())
-                ],
+                anchors: vec![Target::Name("nas".to_owned()), Target::Name("server".to_owned())],
             }
         );
         assert_eq!(
@@ -3716,7 +3930,7 @@ mod tests {
             reason: "lost".to_owned(),
         };
         assert_eq!(rename.needs(), revoke.needs());
-        assert_eq!(rename.needs_administrator(), revoke.needs_administrator());
+        assert_eq!(rename.needs_an_administrator(), revoke.needs_an_administrator());
     }
 
     #[test]

@@ -1289,7 +1289,11 @@ async fn a_rename_is_in_force_on_both_members() {
     let signed = sign_operation(&rename, fixture.founder.signer()).expect("signs");
     let before = joiner.node.state().await.expect("derives");
     assert_eq!(
-        before.devices.get(&fixture.joiner.device_id()).map(|record| record.name.clone()).as_deref(),
+        before
+            .devices
+            .get(&fixture.joiner.device_id())
+            .map(|record| record.name.clone())
+            .as_deref(),
         Some("joiner"),
         "named `joiner` before"
     );

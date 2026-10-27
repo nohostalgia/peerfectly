@@ -272,8 +272,12 @@ mod tests {
 
         let mut keys = board.device_spec("board", Role::Member, false, vec![]).expect("spec").keys;
         keys.sort_by_key(KeyEntry::order_key);
-        let entries =
-            vec![BatchEntry { keys, name: "board".to_owned(), serial: b"SN1".to_vec(), ipv4: None }];
+        let entries = vec![BatchEntry {
+            keys,
+            name: "board".to_owned(),
+            serial: b"SN1".to_vec(),
+            ipv4: None,
+        }];
         let header =
             BatchHeader::for_entries(&entries, roster::leaf::Mode::Full, vec![], None, "lot")
                 .expect("header");

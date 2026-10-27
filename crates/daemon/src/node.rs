@@ -802,6 +802,20 @@ impl Node {
         self.syncer.lock().await.roster().dag().contains(operation)
     }
 
+    /// When `operation` was signed, in milliseconds since the epoch on its
+    /// author's clock, while the roster still holds it.
+    pub async fn signed_at(&self, operation: &roster::id::OperationId) -> Option<u64> {
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        dag.position(operation).and_then(|index| dag.operation(index)).map(|held| held.core().ts)
+    }
+
+    /// The neighbours this device could choose in `state`: which new members
+    /// it brings the network to.
+    pub(crate) fn choices(&self, state: &RosterState) -> Option<crate::neighbours::Choices> {
+        self.choices_in(state)
+    }
+
     /// The network a light member's node belongs to.
     #[must_use]
     pub fn light_network(&self) -> Option<roster::id::NetworkId> {
@@ -824,6 +838,15 @@ impl Node {
     /// Says a write named beforehand has landed.
     fn landed(&self) {
         if let Some(keeper) = self.keeper.get() {
+            keeper.landed();
+        }
+    }
+
+    /// The same, for what a light member keeps: and that it is what the
+    /// checkpoint vouches for from now on, whatever the file is made to hold.
+    fn light_landed(&self, member: &roster::member::LightMember) {
+        if let Some(keeper) = self.keeper.get() {
+            keeper.holds_light(crate::checkpoint::light_hash(member));
             keeper.landed();
         }
     }
@@ -891,7 +914,7 @@ impl Node {
             self.record(Severity::Problem, "state", cause).await;
             return false;
         }
-        self.landed();
+        self.light_landed(&member);
         {
             let _guard = self.log_guard.lock().await;
             if let Ok(mut held) = self.base.lock() {
@@ -1094,6 +1117,9 @@ impl Node {
     async fn received_lookup(&self, peer: DeviceId, body: &[u8]) {
         match crate::lookup::Message::decode(body) {
             Some(crate::lookup::Message::Request { id, query }) => {
+                if let crate::lookup::Query::Holds(root) = &query {
+                    self.light_holds(peer, root).await;
+                }
                 let evidence = self.answer_lookup(&query).await;
                 let answer = crate::lookup::Message::Answer { id, evidence };
                 self.send_to(peer, Channel::Lookup, &answer.encode()).await;
@@ -1175,6 +1201,51 @@ impl Node {
         body.ok()?.ok()
     }
 
+    /// Records that the light member `peer` holds `root`, as it says after
+    /// adopting one: where that is the root this node holds, everything beneath
+    /// it is held by the member, as a full member's own offer would say. An older
+    /// or unknown root says nothing here, and nothing is taken back.
+    ///
+    /// The member's word, as an offer is: what it feeds is the list of what has
+    /// not reached whom. Never the operation that revokes it, for the reason
+    /// [`Self::confirmable`] gives.
+    async fn light_holds(&self, peer: DeviceId, root: &[u8; 32]) {
+        if self.is_light() {
+            return;
+        }
+        let ids = {
+            let syncer = self.syncer.lock().await;
+            let roster = syncer.roster();
+            let Some(held) = roster.snapshot() else { return };
+            if held.body().root != *root {
+                return;
+            }
+            beneath(roster, &held.body().heads, &peer)
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let changed = self.confirmed.lock().await.confirm(peer, ids);
+        if changed {
+            self.persist_confirmations().await;
+        }
+    }
+
+    /// Says to every member this light member holds a session with which root
+    /// it holds now, so that what each signed reads as having reached it. Not
+    /// waited on: nothing comes back worth waiting for.
+    async fn announce_root(&self) {
+        let Some(member) = self.light() else { return };
+        let Some(root) = member.lock().ok().and_then(|member| member.current()) else { return };
+        let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
+        for peer in peers {
+            let id = self.next_lookup.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let said =
+                crate::lookup::Message::Request { id, query: crate::lookup::Query::Holds(root) };
+            self.send_to(peer, Channel::Lookup, &said.encode()).await;
+        }
+    }
+
     /// Asks `peer`, a full member that has just brought newer roots, what this
     /// light member stands on: the parameters under them — an anchor list or a
     /// relay changed since — and the full members to turn to. Takes what holds.
@@ -1229,7 +1300,7 @@ impl Node {
             return;
         }
         match crate::state::write_light(&paths, member) {
-            Ok(()) => self.landed(),
+            Ok(()) => self.light_landed(member),
             Err(cause) => self.record(Severity::Problem, "state", cause).await,
         }
     }
@@ -1272,7 +1343,8 @@ impl Node {
         }
         let adopted = self.adopted_from.lock().ok().and_then(|mut from| from.take());
         if let Some(peer) = adopted {
-            let kept = self.light().and_then(|member| member.lock().ok().map(|member| member.clone()));
+            let kept =
+                self.light().and_then(|member| member.lock().ok().map(|member| member.clone()));
             if let Some(kept) = kept {
                 self.keep_light(&kept).await;
                 if !self.take_footing_from(peer).await {
@@ -1281,6 +1353,7 @@ impl Node {
                     self.footing_due.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 self.enforce_roster().await;
+                self.announce_root().await;
             }
         }
         if owed.renewal {
@@ -1309,6 +1382,7 @@ impl Node {
             if kept.needs_renewal() {
                 self.renew().await;
             }
+            self.announce_root().await;
         }
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
@@ -2338,8 +2412,13 @@ impl Node {
                     .filter(|anchor| state.devices.contains_key(anchor))
                     .collect();
             let kept = member.known_fulls();
-            let order =
-                crate::seeking::first_start_order(&anchors, Some(member.contact()), &kept, &[], &[]);
+            let order = crate::seeking::first_start_order(
+                &anchors,
+                Some(member.contact()),
+                &kept,
+                &[],
+                &[],
+            );
             return order.into_iter().filter(|device| *device != member.device()).take(2).collect();
         }
         let Some(choices) = self.choices_in(&state) else {
@@ -2647,11 +2726,7 @@ fn udp_source_port(packet: &[u8]) -> Option<u16> {
 
 /// Every member but this device, as the router needs them.
 fn others(state: &roster::state::RosterState, me: &DeviceId) -> Vec<DeviceId> {
-    state
-        .devices
-        .keys()
-        .filter(|device| device != me && !state.revoked.contains(device))
-        .collect()
+    state.devices.keys().filter(|device| device != me && !state.revoked.contains(device)).collect()
 }
 
 /// A device's transport key, as the roster declares it.
@@ -3204,11 +3279,9 @@ impl Node {
     async fn open_for_waiting(self: Arc<Self>, device: DeviceId) {
         let key = {
             let syncer = self.syncer.lock().await;
-            syncer
-                .roster()
-                .state()
-                .ok()
-                .and_then(|state| state.devices.get(&device).and_then(|leaf| transport_key_of(&leaf)))
+            syncer.roster().state().ok().and_then(|state| {
+                state.devices.get(&device).and_then(|leaf| transport_key_of(&leaf))
+            })
         };
         let outcome = match key {
             Some(key) => self.connect(&key).await,
@@ -3480,7 +3553,7 @@ impl Node {
         let accused = crate::describing::accused(&directory, roster);
         let revoked = crate::describing::revoked(&directory, state, &valid, &contacts);
         let authored = authored_by(roster, state, &me);
-        let (waiting, waiting_unlisted) = crate::describing::waiting(
+        let (waiting, waiting_unlisted, waiting_never_met) = crate::describing::waiting(
             &directory, state, &authored, &me, &confirmed, &connected, &contacts,
         );
         drop(syncer);
@@ -3491,6 +3564,7 @@ impl Node {
             accused,
             waiting,
             waiting_unlisted,
+            waiting_never_met,
             contacts,
         }
     }
@@ -3717,6 +3791,35 @@ impl Node {
     }
 }
 
+/// The operations beneath `heads` in `roster`, the heads among them, that may
+/// be counted as held by `member`: every one but one that revokes it.
+fn beneath(
+    roster: &roster::roster::Roster,
+    heads: &[roster::id::OperationId],
+    member: &DeviceId,
+) -> Vec<roster::id::OperationId> {
+    let operations = roster.dag().operations();
+    let by_id: std::collections::HashMap<
+        roster::id::OperationId,
+        &roster::sign::VerifiedOperation,
+    > = operations.iter().map(|operation| (operation.id(), operation)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<roster::id::OperationId> = heads.to_vec();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(operation) = by_id.get(&id) {
+            stack.extend(operation.core().parents.iter().copied());
+        }
+    }
+    operations
+        .iter()
+        .filter(|operation| seen.contains(&operation.id()))
+        .filter(|operation| crate::describing::owed_to(operation, member))
+        .map(roster::sign::VerifiedOperation::id)
+        .collect()
+}
 #[cfg(test)]
 mod tests {
 
@@ -3992,7 +4095,10 @@ mod borrowing {
 
         assert_eq!(membership.accused, expected_accused);
         assert_eq!(membership.revoked, expected_revoked);
-        assert_eq!((membership.waiting, membership.waiting_unlisted), expected_waiting);
+        assert_eq!(
+            (membership.waiting, membership.waiting_unlisted, membership.waiting_never_met),
+            expected_waiting
+        );
         assert!(
             expected_revoked.len() >= 10,
             "the fixture really does revoke: {}",
@@ -4296,8 +4402,7 @@ impl Node {
 /// Where there is no base, or it does not check out, the roster is left empty
 /// and the whole log is returned, to be replayed as it always was.
 /// What a base that does not check out is said to be.
-pub const CHANGED_OUTSIDE: &str =
-    "the base store does not check out against its signed root: it was changed outside      this daemon";
+pub const CHANGED_OUTSIDE: &str = "the base store does not check out against its signed root: it was changed outside      this daemon";
 
 /// Up to how many devices a base store is checked whole before the log rests
 /// on it: a few seconds at most.
@@ -4535,7 +4640,9 @@ mod light {
             let core = OperationCore::new(
                 ts,
                 founder.signing_key().algorithm(),
-                OperationBody::AddDevice(device.device_spec(name, Role::Member, false, vec![]).unwrap()),
+                OperationBody::AddDevice(
+                    device.device_spec(name, Role::Member, false, vec![]).unwrap(),
+                ),
                 roster.heads(),
                 founder.signing_key().key_id(),
                 network,
@@ -4563,7 +4670,72 @@ mod light {
         // The next one: adopted, and the peer believed.
         assert!(judge(&next, &next_leaf), "believed against the root it showed");
         let member = node.light().unwrap();
-        assert_eq!(member.lock().unwrap().current(), Some(next.body().root), "which is now its own");
+        assert_eq!(
+            member.lock().unwrap().current(),
+            Some(next.body().root),
+            "which is now its own"
+        );
+    }
+
+    /// What a light member keeps, changed behind the running daemon, is not
+    /// what the next checkpoint vouches for; what the daemon writes after is.
+    #[tokio::test]
+    async fn a_light_member_planted_while_the_daemon_runs_is_not_vouched_for() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (roster, _) = founded(&founder, &sensor);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path().join("casa"));
+        paths.create().unwrap();
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().expect("a light member");
+        let (machine, _) = crate::checkpoint::SoftwareKey::at(scratch.path()).unwrap();
+        let keeper =
+            Arc::new(crate::checkpoint::Keeper::new(Arc::new(machine), paths.clone(), None));
+        let started = crate::checkpoint::file_hash(&paths.light()).unwrap();
+        // As the service does at start, once the file was checked.
+        keeper.holds_light(started);
+        node.keep_with(Arc::clone(&keeper));
+        let vouched = || {
+            let (machine, _) = crate::checkpoint::SoftwareKey::at(scratch.path()).unwrap();
+            crate::checkpoint::read(&paths, &machine).unwrap().unwrap()
+        };
+
+        std::fs::write(paths.light(), b"planted").unwrap();
+        let planted = crate::checkpoint::file_hash(&paths.light()).unwrap();
+        let values = crate::checkpoint::Values::of(&node, &paths, "casa").await.unwrap();
+        keeper.keep(values, true).unwrap();
+        assert!(!vouched().allows_light(&planted), "the planted file is not named");
+        assert!(vouched().allows_light(&started), "what the daemon holds is");
+
+        // A root taken is written by the daemon, and that is what is named.
+        let mut later = roster;
+        let extra = NodeIdentity::generate().unwrap();
+        let core = OperationCore::new(
+            2,
+            founder.signing_key().algorithm(),
+            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, false, vec![]).unwrap()),
+            later.heads(),
+            founder.signing_key().key_id(),
+            later.state().unwrap().network,
+        )
+        .unwrap();
+        assert!(later.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted());
+        let second = crate::snapshots::sign_over_heads(&later, &founder).unwrap();
+        let message = roster_sync::message::Message::Snapshot(second).encode();
+        node.received_roster(founder.device_id(), &message).await;
+        let written = crate::checkpoint::file_hash(&paths.light()).unwrap();
+        assert_ne!(written, planted, "the daemon wrote over it");
+        let values = crate::checkpoint::Values::of(&node, &paths, "casa").await.unwrap();
+        keeper.keep(values, true).unwrap();
+        assert!(vouched().allows_light(&written), "what it wrote is named");
+        assert!(!vouched().allows_light(&started), "and what it replaced is gone");
     }
 
     #[tokio::test]
@@ -4652,6 +4824,45 @@ mod light {
         );
         let nobody = crate::lookup::Query::Name("nobody".to_owned());
         assert!(full.answer_lookup(&nobody).await.is_empty(), "nothing known is said as nothing");
+    }
+
+    /// A light member that says it holds the root a full member holds has every
+    /// operation beneath it counted as reached, as a full member's offer would;
+    /// a root the full member does not hold says nothing.
+    #[tokio::test]
+    async fn a_light_member_holding_the_root_has_what_is_beneath_it() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let sensor = NodeIdentity::generate().unwrap();
+        let (roster, _) = founded(&founder, &sensor);
+        let root = roster.snapshot().unwrap().body().root;
+        let operations: Vec<roster::id::OperationId> =
+            roster.dag().operations().iter().map(roster::sign::VerifiedOperation::id).collect();
+        let state = roster.state().unwrap();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let full = Node::new(
+            Arc::clone(&founder),
+            roster_sync::Syncer::new(roster),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(
+                prefix,
+                founder.device_id(),
+            ))),
+            crate::router::Router::new(prefix),
+            crate::state::Log::at(scratch.path().join("roster.log")),
+            crate::schedule::Schedule::provisional(),
+        );
+        let said = |root: [u8; 32]| {
+            crate::lookup::Message::Request { id: 1, query: crate::lookup::Query::Holds(root) }
+                .encode()
+        };
+
+        full.received_lookup(sensor.device_id(), &said([7; 32])).await;
+        let confirmed = full.confirmed.lock().await.clone();
+        assert!(operations.iter().all(|id| !confirmed.holds(&sensor.device_id(), id)), "not ours");
+
+        full.received_lookup(sensor.device_id(), &said(root)).await;
+        let confirmed = full.confirmed.lock().await.clone();
+        assert!(operations.iter().all(|id| confirmed.holds(&sensor.device_id(), id)));
     }
 
     /// A light member's upkeep owes nothing on a clock: a month with no root
@@ -4857,10 +5068,7 @@ mod light {
         let member = node.light().unwrap();
         let kept = member.lock().unwrap().known_fulls();
         assert_eq!(kept, vec![laptop.device_id()], "the laptop, besides the admin");
-        assert!(
-            node.chosen_neighbours().await.contains(&laptop.device_id()),
-            "and turns to it"
-        );
+        assert!(node.chosen_neighbours().await.contains(&laptop.device_id()), "and turns to it");
     }
 
     #[tokio::test]
