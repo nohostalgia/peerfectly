@@ -211,6 +211,102 @@
                     }
                   }
                 }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": "Founds"
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Promotes": [
+                      {
+                        "id": "0a1b-2c3d-4e5f-6a7b",
+                        "name": "nas"
+                      },
+                      true
+                    ]
+                  }
+                }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": {
+                    "Demotes": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
+                  }
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Renames": [
+                      {
+                        "id": "1b2c-3d4e-5f6a-7b8c",
+                        "name": "laptop"
+                      },
+                      "tablet"
+                    ]
+                  }
+                }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": "SetsParameters"
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "ChangesSettings": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
+                  }
+                }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": {
+                    "AdmitsBatch": {
+                      "count": 3,
+                      "label": "lot 2026-10 A"
+                    }
+                  }
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Admits": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
+                  }
+                }
               }
             ],
             "address": "fd00::4",
@@ -320,118 +416,7 @@
               }
             ],
             "standing": "Current",
-            "tunnel": "Up",
-            "waiting": [
-              {
-                "does": {
-                  "Revokes": {
-                    "id": "2c3d-4e5f-6a7b-8c9d",
-                    "name": null
-                  }
-                },
-                "owed": [
-                  {
-                    "connected": true,
-                    "device": {
-                      "id": "0a1b-2c3d-4e5f-6a7b",
-                      "name": "nas"
-                    },
-                    "last_contact": {
-                      "Recorded": {
-                        "at": {
-                          "nanos_since_epoch": 0,
-                          "secs_since_epoch": 1757700000
-                        }
-                      }
-                    }
-                  },
-                  {
-                    "connected": false,
-                    "device": {
-                      "id": "1b2c-3d4e-5f6a-7b8c",
-                      "name": "laptop"
-                    },
-                    "last_contact": "NoneRecorded"
-                  }
-                ],
-                "signed_here": {
-                  "At": {
-                    "time": {
-                      "nanos_since_epoch": 0,
-                      "secs_since_epoch": 1757000060
-                    }
-                  }
-                }
-              },
-              {
-                "does": "Founds",
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "Promotes": [
-                    {
-                      "id": "0a1b-2c3d-4e5f-6a7b",
-                      "name": "nas"
-                    },
-                    true
-                  ]
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "Demotes": {
-                    "id": "0a1b-2c3d-4e5f-6a7b",
-                    "name": "nas"
-                  }
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "Renames": [
-                    {
-                      "id": "1b2c-3d4e-5f6a-7b8c",
-                      "name": "laptop"
-                    },
-                    "tablet"
-                  ]
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": "SetsParameters",
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "ChangesSettings": {
-                    "id": "0a1b-2c3d-4e5f-6a7b",
-                    "name": "nas"
-                  }
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "AdmitsBatch": {
-                    "count": 3,
-                    "label": "lot 2026-10 A"
-                  }
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              }
-            ],
-            "waiting_never_met": 3,
-            "waiting_unlisted": 3
+            "tunnel": "Up"
           },
           {
             "accused": [
@@ -516,10 +501,7 @@
                 }
               }
             },
-            "tunnel": "Down",
-            "waiting": [],
-            "waiting_never_met": 0,
-            "waiting_unlisted": 0
+            "tunnel": "Down"
           }
         ],
         "note": "the other machine confirmed the relay",

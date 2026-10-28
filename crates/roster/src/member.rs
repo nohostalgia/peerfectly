@@ -147,6 +147,41 @@ impl LightMember {
         self.view.current()
     }
 
+    /// Where a peer's evidence rests on `root`, a root of this network this
+    /// member knows nothing of: the root to ask the peer the chain after —
+    /// its own current one. `None` for a root it knows, or of another network.
+    #[must_use]
+    pub fn behind(&self, root: &RawSnapshot) -> Option<Hash> {
+        let body = root.body();
+        if body.network != self.network || self.view.knows(&body.root) {
+            return None;
+        }
+        self.view.current()
+    }
+
+    /// Takes a chain of roots a peer sent, in the order sent, and again while
+    /// any of those that could not be placed yet can now: a peer's chain is in
+    /// the order it took them, which need not be the order they follow each
+    /// other. Whether any was taken.
+    pub fn take_chain(&mut self, roots: &[Vec<u8>]) -> bool {
+        let mut waiting: Vec<&[u8]> = roots.iter().map(Vec::as_slice).collect();
+        let mut taken = false;
+        loop {
+            let before = waiting.len();
+            waiting.retain(|bytes| match self.offer_root(bytes) {
+                Ok(RootOutcome::Adopted | RootOutcome::Switched | RootOutcome::KeptAside) => {
+                    taken = true;
+                    false
+                }
+                Ok(RootOutcome::NeedsChain) => true,
+                Ok(RootOutcome::AlreadyKnown | RootOutcome::Refused(_)) | Err(_) => false,
+            });
+            if waiting.is_empty() || waiting.len() == before {
+                return taken;
+            }
+        }
+    }
+
     /// The full members this one can turn to besides its contact: the peers it
     /// checked whose leaf says they are full. Sorted.
     #[must_use]

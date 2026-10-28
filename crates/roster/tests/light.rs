@@ -146,6 +146,61 @@ fn siblings_converge_and_the_revocation_holds_on_either_branch() {
     }
 }
 
+/// The branch a member set aside grows heavier than the one it follows: the
+/// member switches to it, believes proofs made on it, and keeps the
+/// revocation the branch it leaves carried. Found in the testbed (18.1),
+/// where the member set every root of the other branch aside and believed
+/// nobody.
+#[test]
+fn a_branch_set_aside_that_grows_heavier_is_switched_to() {
+    let mut history = founded();
+    let (base, base_state) = root_at(&history, "m3", 1, None);
+    history.op(
+        "revoke2",
+        1,
+        &["m3"],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
+    );
+    history.op(
+        "rename3",
+        9,
+        &["m3"],
+        OperationBody::Rename { device: device_id(3), name: "cam".into() },
+    );
+    let revoking = root_at(&history, "revoke2", 1, Some((&base, &base_state)));
+    let renaming = root_at(&history, "rename3", 9, Some((&base, &base_state)));
+    // Of the two siblings, the lighter is the one that goes on.
+    let ((lighter, lighter_state), lighter_label, lighter_seed, (heavier, _)) =
+        if (revoking.0.generation, revoking.0.root) < (renaming.0.generation, renaming.0.root) {
+            (revoking, "revoke2", 1, renaming)
+        } else {
+            (renaming, "rename3", 9, revoking)
+        };
+    history.op(
+        "onward",
+        lighter_seed,
+        &[lighter_label],
+        OperationBody::Rename { device: device_id(3), name: "camera-2".into() },
+    );
+    let (onward, onward_state) =
+        root_at(&history, "onward", lighter_seed, Some((&lighter, &lighter_state)));
+
+    let mut view = LightView::starting_from(&base, 16);
+    assert_eq!(view.offer(&heavier), RootOutcome::Adopted);
+    assert_eq!(view.offer(&lighter), RootOutcome::KeptAside);
+    assert_eq!(view.offer(&onward), RootOutcome::Switched, "the chain it was handed is enough");
+    assert_eq!(view.current(), Some(onward.root));
+
+    // Device 9, whose leaf neither branch changed: one both changed stays
+    // refused until a root joins them, as every invalidation not yet joined.
+    assert_eq!(judged(&view, &onward_state, 9), ProofVerdict::Accepted, "believed on the branch");
+    assert_eq!(
+        judged(&view, &base_state, 2),
+        ProofVerdict::Refused,
+        "the revocation holds, from whichever branch carried it"
+    );
+}
+
 #[test]
 fn a_root_signed_by_an_admin_a_sibling_demoted_is_refused() {
     let mut history = founded();

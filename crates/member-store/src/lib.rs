@@ -89,6 +89,10 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A key's id and its device's id, with the key's purpose: one row of the
+/// key index.
+type KeyHeld = (([u8; 32], [u8; 32]), u8);
+
 fn database(cause: impl core::fmt::Display) -> Error {
     Error::Database(cause.to_string())
 }
@@ -352,7 +356,7 @@ impl Store {
                 for (position, id) in placed {
                     positions.insert(position, id).map_err(database)?;
                 }
-                let mut held: Vec<(([u8; 32], [u8; 32]), u8)> = batch
+                let mut held: Vec<KeyHeld> = batch
                     .iter()
                     .flat_map(|leaf| {
                         leaf.record.keys.iter().map(|entry| {
@@ -379,9 +383,7 @@ impl Store {
                 }
                 let mut named: Vec<(String, [u8; 32])> = batch
                     .iter()
-                    .map(|leaf| {
-                        (leaf.record.name.to_ascii_lowercase(), *leaf.record.id.as_bytes())
-                    })
+                    .map(|leaf| (leaf.record.name.to_ascii_lowercase(), *leaf.record.id.as_bytes()))
                     .collect();
                 named.sort_unstable();
                 for (name, id) in &named {

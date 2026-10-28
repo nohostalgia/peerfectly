@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::id::{KeyId, NetworkId, OperationId};
+use crate::id::{DeviceId, KeyId, NetworkId, OperationId};
 use crate::limits;
 use crate::sign::VerifiedOperation;
 use crate::snapshot::SignedSnapshot;
@@ -112,6 +112,33 @@ impl BitSet {
     }
 }
 
+/// A whole batch a graph holds: its entries, and the device each admits.
+///
+/// The devices are worked out once, as the batch goes in. Derivation reads
+/// them every time it resolves a state, and working out a device's id checks
+/// every one of its keys: done there, two thousand boards cost a daemon minutes
+/// of start-up (found in the testbed, 18.1).
+#[derive(Debug, Clone)]
+struct HeldBatch {
+    entries: Vec<crate::batch::BatchEntry>,
+    /// Each device an entry admits, with the entry's place, in device order.
+    /// The first entry naming a device is the one kept.
+    devices: Vec<(DeviceId, usize)>,
+}
+
+impl HeldBatch {
+    fn of(entries: Vec<crate::batch::BatchEntry>) -> Self {
+        let mut devices: Vec<(DeviceId, usize)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(place, entry)| entry.device_id().ok().map(|device| (device, place)))
+            .collect();
+        devices.sort_unstable();
+        devices.dedup_by_key(|(device, _)| *device);
+        Self { entries, devices }
+    }
+}
+
 /// A causally ordered set of verified operations.
 ///
 /// Operations are stored in a topological order: an operation's parents always
@@ -144,7 +171,7 @@ pub struct Dag {
     ///
     /// A header is inserted only once every entry is in, so every batch here
     /// is whole.
-    batch_entries: HashMap<OperationId, Vec<crate::batch::BatchEntry>>,
+    batch_entries: HashMap<OperationId, HeldBatch>,
     /// Forks whose operations compaction would otherwise have discarded.
     ///
     /// Kept whole — body, signature and all — because they are the evidence of an
@@ -406,14 +433,41 @@ impl Dag {
     ) -> Result<()> {
         let id = operation.id();
         self.insert(operation)?;
-        self.batch_entries.insert(id, entries);
+        self.batch_entries.insert(id, HeldBatch::of(entries));
         Ok(())
     }
 
     /// The entries of a batch this graph holds.
     #[must_use]
     pub fn entries_of(&self, batch: &OperationId) -> Option<&[crate::batch::BatchEntry]> {
-        self.batch_entries.get(batch).map(Vec::as_slice)
+        self.batch_entries.get(batch).map(|held| held.entries.as_slice())
+    }
+
+    /// The devices a batch this graph holds admits, each with its entry, in
+    /// device order. Entries that break the rules every device keeps are not
+    /// among them.
+    pub fn batch_devices(
+        &self,
+        batch: &OperationId,
+    ) -> impl Iterator<Item = (DeviceId, &crate::batch::BatchEntry)> {
+        self.batch_entries.get(batch).into_iter().flat_map(|held| {
+            held.devices.iter().filter_map(|(device, place)| {
+                held.entries.get(*place).map(|entry| (*device, entry))
+            })
+        })
+    }
+
+    /// The entry admitting `device` in a batch this graph holds.
+    #[must_use]
+    pub fn batch_entry(
+        &self,
+        batch: &OperationId,
+        device: &DeviceId,
+    ) -> Option<&crate::batch::BatchEntry> {
+        let held = self.batch_entries.get(batch)?;
+        let found = held.devices.binary_search_by_key(device, |(device, _)| *device).ok()?;
+        let (_, place) = held.devices.get(found)?;
+        held.entries.get(*place)
     }
 
     /// The snapshot this graph rests on, if it has compacted.

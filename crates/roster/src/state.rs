@@ -115,12 +115,7 @@ impl RosterState {
     /// A state of `network` under `params`, with no devices.
     #[must_use]
     pub fn empty(network: crate::id::NetworkId, params: NetworkParams) -> Self {
-        Self {
-            network,
-            params,
-            devices: crate::members::Members::new(),
-            revoked: BTreeSet::new(),
-        }
+        Self { network, params, devices: crate::members::Members::new(), revoked: BTreeSet::new() }
     }
 
     /// The device holding a key of any purpose.
@@ -491,11 +486,7 @@ impl Base {
                 let id = device.device_id()?;
                 let mut state = RosterState::empty(network, params.clone());
                 state.devices.insert(id, device.clone().into_record(operation.id())?);
-                Ok(Self {
-                    state,
-                    rank: Rank::new(0, operation.id()),
-                    genesis: Some(*index),
-                })
+                Ok(Self { state, rank: Rank::new(0, operation.id()), genesis: Some(*index) })
             }
             Foundation::Snapshot(footing) => {
                 let body = footing.snapshot.body();
@@ -967,8 +958,8 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
         match &operation.core().body {
             OperationBody::AddDevice(spec) => touched.extend(spec.device_id().ok()),
             OperationBody::AdmitBatch(_) => {
+                touched.extend(dag.batch_devices(&operation.id()).map(|(device, _)| device));
                 for entry in dag.entries_of(&operation.id()).unwrap_or_default() {
-                    touched.extend(entry.device_id().ok());
                     assigning.extend(entry.ipv4);
                 }
             }
@@ -1025,20 +1016,18 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
         // ancestors hold: those are skipped, and the rest stand.
         if let OperationBody::AdmitBatch(header) = &operation.core().body {
             let rank = Rank::new(dag.depth(index), operation.id());
-            let entries = dag.entries_of(&operation.id()).unwrap_or_default();
-            let skips = crate::batch::skipped(
+            let skips = crate::batch::skipped_among(
                 ancestor_state(dag, base, mask, index, memo)?,
                 header,
-                entries,
+                dag.batch_devices(&operation.id()),
             );
-            for entry in entries {
-                let (Ok(id), Ok(spec)) = (entry.device_id(), entry.spec()) else { continue };
+            for (id, entry) in dag.batch_devices(&operation.id()) {
                 if skips.contains_key(&id) || !survives(&id, Some(index)) {
                     continue;
                 }
                 let replace = added.get(&id).is_none_or(|(existing, _, _)| rank < *existing);
                 if replace {
-                    added.insert(id, (rank, spec, operation.id()));
+                    added.insert(id, (rank, entry.admitted_spec(), operation.id()));
                 }
             }
             continue;
@@ -1296,10 +1285,7 @@ const IPV4_FIELD: u8 = 2;
 fn batch_settings(dag: &Dag, added_by: &OperationId, device: &DeviceId) -> Option<DeviceSettings> {
     let operation = dag.operation(dag.position(added_by)?)?;
     let OperationBody::AdmitBatch(header) = &operation.core().body else { return None };
-    let entry = dag
-        .entries_of(added_by)?
-        .iter()
-        .find(|entry| entry.device_id().is_ok_and(|id| id == *device))?;
+    let entry = dag.batch_entry(added_by, device)?;
     DeviceSettings::new(header.mode, header.groups.clone(), entry.ipv4, None).ok()
 }
 

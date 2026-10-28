@@ -161,9 +161,10 @@ pub trait NodeSource: Send + Sync {
 }
 
 /// One node of the tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum Node {
     /// Nothing below.
+    #[default]
     Empty,
     /// One leaf, standing for its whole subtree.
     Leaf {
@@ -540,12 +541,6 @@ pub struct Tree {
     dropped: Vec<Hash>,
 }
 
-impl Default for Node {
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
 impl core::fmt::Debug for Tree {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Tree").field("root", &self.root()).finish_non_exhaustive()
@@ -572,7 +567,12 @@ impl Tree {
     /// The tree with this root, its nodes kept in `source`.
     #[must_use]
     pub fn stored(root: Hash, source: Arc<dyn NodeSource>) -> Self {
-        Self { root: Node::stub(root), source: Some(source), stored: Some(root), dropped: Vec::new() }
+        Self {
+            root: Node::stub(root),
+            source: Some(source),
+            stored: Some(root),
+            dropped: Vec::new(),
+        }
     }
 
     /// The root the tree was rooted at in its source, if it was: what tells
@@ -1020,10 +1020,7 @@ mod tests {
         // The leaf of 7 swapped for one holding another value, kept under the
         // same hash: the store says it is the node asked for, and it is not.
         let leaf_hash = leaf_hash(&key(7), &value(7));
-        kept.nodes
-            .lock()
-            .unwrap()
-            .insert(leaf_hash, Stored::Leaf { key: key(7), value: value(8) });
+        kept.nodes.lock().unwrap().insert(leaf_hash, Stored::Leaf { key: key(7), value: value(8) });
         assert_eq!(tree.get(&key(7)), None, "not believed");
         assert_eq!(tree.prove(&key(7)), None);
         assert!(kept.tampered.load(std::sync::atomic::Ordering::SeqCst) > 0, "and reported");

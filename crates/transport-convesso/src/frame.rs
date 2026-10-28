@@ -16,6 +16,8 @@
 //! CLOSE    4 | id | reason: u8
 //! PAYLOAD  5 | id | bytes                  (a convesso message)
 //! PACKET   6 | id | fragment               (a convesso datagram)
+//! BEHIND   7 | id | root: 32 bytes
+//! ROOTS    8 | id | roots
 //! ```
 //!
 //! Every frame but `PACKET` travels as a reliable message. A payload of the
@@ -27,6 +29,13 @@
 //! proof of it and the root they rest on, as `roster::membership::Evidence`
 //! bytes — or nothing, where it holds no root. A peer holding no roster judges
 //! the sender by it; one holding a roster judges by that.
+//!
+//! `BEHIND` and `ROOTS` are how a peer holding no roster catches up while a
+//! session opens. Shown evidence resting on a root it cannot place, it says
+//! the root it holds instead of refusing; the other side answers with the
+//! roots taken after it, and the evidence is judged again once they are
+//! taken. `roots` is opaque here: what the serving side's source gives, and
+//! what the taking side reads.
 //!
 //! Decoding never panics: a frame that is truncated or of an unknown kind is
 //! refused whole.
@@ -52,6 +61,9 @@ convesso_stream::config! {
 
 /// The largest convesso message the node carries.
 pub const MAX_MESSAGE: usize = <Stream as StreamConfig>::MAX_MESSAGE;
+
+/// The most bytes of roots one `ROOTS` frame carries.
+pub const MAX_ROOTS: usize = MAX_MESSAGE - PAYLOAD_HEADER;
 
 /// A session's id, chosen at random by the dialler.
 pub type SessionId = u64;
@@ -148,6 +160,21 @@ pub enum Frame {
         /// The fragment, its own header included.
         fragment: Vec<u8>,
     },
+    /// The side holding no roster cannot place the root the other's evidence
+    /// rests on, and asks for the roots taken after the one it holds.
+    Behind {
+        /// The session's id.
+        id: SessionId,
+        /// The root it holds.
+        root: [u8; 32],
+    },
+    /// The roots asked for.
+    Roots {
+        /// The session's id.
+        id: SessionId,
+        /// The roots, as the answering side's source gives them.
+        roots: Vec<u8>,
+    },
 }
 
 const OPEN: u8 = 1;
@@ -156,6 +183,8 @@ const REFUSE: u8 = 3;
 const CLOSE: u8 = 4;
 const PAYLOAD: u8 = 5;
 const PACKET: u8 = 6;
+const BEHIND: u8 = 7;
+const ROOTS: u8 = 8;
 
 impl Frame {
     /// The frame's bytes.
@@ -196,6 +225,16 @@ impl Frame {
                 out.extend_from_slice(&id.to_be_bytes());
                 out.extend_from_slice(fragment);
             }
+            Self::Behind { id, root } => {
+                out.push(BEHIND);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(root);
+            }
+            Self::Roots { id, roots } => {
+                out.push(ROOTS);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(roots);
+            }
         }
         out
     }
@@ -234,6 +273,14 @@ impl Frame {
                     return None;
                 }
                 Some(Self::Packet { id, fragment: fragment.to_vec() })
+            }
+            BEHIND => {
+                let (id, root) = id_and_rest(rest)?;
+                Some(Self::Behind { id, root: root.try_into().ok()? })
+            }
+            ROOTS => {
+                let (id, roots) = id_and_rest(rest)?;
+                Some(Self::Roots { id, roots: roots.to_vec() })
             }
             _ => None,
         }
@@ -275,6 +322,9 @@ mod tests {
             Frame::Payload { id: 3, bytes: b"bytes".to_vec() },
             Frame::Payload { id: 3, bytes: Vec::new() },
             Frame::Packet { id: 4, fragment: vec![9; 30] },
+            Frame::Behind { id: 5, root: [6; 32] },
+            Frame::Roots { id: 6, roots: vec![1, 2, 3] },
+            Frame::Roots { id: 6, roots: Vec::new() },
         ]
     }
 
@@ -296,6 +346,7 @@ mod tests {
                 Frame::Open { .. } => 10,
                 Frame::Accept { .. } => 9,
                 Frame::Packet { .. } => PACKET_HEADER.saturating_add(1),
+                Frame::Roots { .. } => 9,
                 _ => bytes.len(),
             };
             for cut in 0..header {
@@ -307,7 +358,7 @@ mod tests {
     #[test]
     fn an_unknown_kind_is_refused() {
         assert_eq!(Frame::decode(&[0, 0, 0, 0, 0, 0, 0, 0, 0]), None);
-        assert_eq!(Frame::decode(&[7, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(Frame::decode(&[9, 0, 0, 0, 0, 0, 0, 0, 0]), None);
     }
 
     #[test]

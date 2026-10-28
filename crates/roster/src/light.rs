@@ -35,7 +35,7 @@ use crate::snapshot::Snapshot;
 pub const LIGHT_VIEW_SCHEMA: &[&str] = &["aside", "chain", "budget", "network", "unjoined"];
 
 /// Canonical key order of a remembered root.
-pub const REMEMBERED_SCHEMA: &[&str] = &["root", "delta", "generation"];
+pub const REMEMBERED_SCHEMA: &[&str] = &["root", "delta", "previous", "generation"];
 
 /// Canonical key order of an invalidation not yet joined.
 pub const UNJOINED_SCHEMA: &[&str] = &["root", "device"];
@@ -53,16 +53,62 @@ struct Remembered {
     generation: u64,
     /// The devices it invalidated.
     delta: Vec<DeviceId>,
+    /// The roots it follows: what a branch set aside is climbed back by, to
+    /// the root where it left the chain.
+    previous: Vec<Hash>,
 }
 
 impl Remembered {
     fn of(snapshot: &Snapshot) -> Self {
-        Self { root: snapshot.root, generation: snapshot.generation, delta: snapshot.delta.clone() }
+        Self {
+            root: snapshot.root,
+            generation: snapshot.generation,
+            delta: snapshot.delta.clone(),
+            previous: snapshot.previous.clone(),
+        }
     }
 
     /// The order siblings are weighed by.
     fn weight(&self) -> (u64, Hash) {
         (self.generation, self.root)
+    }
+
+    fn encode(&self, writer: &mut crate::cbor::Writer) {
+        writer.map(4);
+        writer.key("root").bytes(&self.root);
+        writer.key("delta").array(self.delta.len() as u64);
+        for device in &self.delta {
+            writer.bytes(device.as_bytes());
+        }
+        writer.key("previous").array(self.previous.len() as u64);
+        for root in &self.previous {
+            writer.bytes(root);
+        }
+        writer.key("generation").u64(self.generation);
+    }
+
+    fn decode(reader: &mut crate::cbor::Reader<'_>) -> crate::error::Result<Self> {
+        use crate::error::Error;
+        let hash = |reader: &mut crate::cbor::Reader<'_>| -> crate::error::Result<Hash> {
+            Hash::try_from(reader.fixed_bytes(32)?).map_err(|_| Error::IdentifierLength)
+        };
+        let mut entry = reader.map(REMEMBERED_SCHEMA)?;
+        let root = hash(entry.key("root")?)?;
+        let devices = entry.key("delta")?;
+        let many = devices.array(crate::limits::MAX_OPERATION_SIZE, "delta")?;
+        let mut delta = Vec::with_capacity(many);
+        for _ in 0..many {
+            delta.push(DeviceId::from_bytes(hash(devices)?));
+        }
+        let roots = entry.key("previous")?;
+        let many = roots.array(MAX_REMEMBERED, "roots followed")?;
+        let mut previous = Vec::with_capacity(many);
+        for _ in 0..many {
+            previous.push(hash(roots)?);
+        }
+        let generation = entry.key("generation")?.u64()?;
+        entry.finish()?;
+        Ok(Self { root, generation, delta, previous })
     }
 }
 
@@ -122,11 +168,12 @@ pub struct LightView {
     /// root that carried it.
     unjoined: Vec<(DeviceId, Hash)>,
     /// Roots valid but not on the chain — siblings kept aside, or the branch
-    /// left for a heavier one — remembered by hash, most recent last.
+    /// left for a heavier one — most recent last.
     ///
-    /// A hash is all a proof needs: a root joining two branches proves its
-    /// signer against one of them, which may be the one set aside.
-    aside: VecDeque<Hash>,
+    /// A root joining two branches proves its signer against one of them,
+    /// which may be the one set aside. A heavier root continuing a branch set
+    /// aside is switched to by climbing that branch back to the chain.
+    aside: VecDeque<Remembered>,
 }
 
 impl LightView {
@@ -153,6 +200,12 @@ impl LightView {
         self.chain.back().map(|remembered| remembered.root)
     }
 
+    /// Whether `root` is one this member remembers, on the chain or set aside.
+    #[must_use]
+    pub fn knows(&self, root: &Hash) -> bool {
+        self.position(root).is_some() || self.is_aside(root)
+    }
+
     /// How many roots are remembered.
     #[must_use]
     pub fn remembered(&self) -> usize {
@@ -170,13 +223,13 @@ impl LightView {
         if root.network != self.network {
             return RootOutcome::Refused(RootRefusal::ForeignNetwork);
         }
-        if self.position(&root.root).is_some() || self.aside.contains(&root.root) {
+        if self.position(&root.root).is_some() || self.is_aside(&root.root) {
             return RootOutcome::AlreadyKnown;
         }
         // The root its signer is proved in must be one this member remembers,
         // on the chain or set aside.
         let proved_against = root.proved_against();
-        if self.position(&proved_against).is_none() && !self.aside.contains(&proved_against) {
+        if self.position(&proved_against).is_none() && !self.is_aside(&proved_against) {
             return RootOutcome::NeedsChain;
         }
         if !root.signer_proved(&proved_against) {
@@ -215,7 +268,7 @@ impl LightView {
                     for device in &dropped.delta {
                         self.unjoined.push((*device, dropped.root));
                     }
-                    self.set_aside(dropped.root);
+                    self.set_aside(dropped);
                 }
             }
             self.adopt(offered, &root.previous);
@@ -224,25 +277,103 @@ impl LightView {
             for device in &offered.delta {
                 self.unjoined.push((*device, offered.root));
             }
-            self.set_aside(offered.root);
+            self.set_aside(offered);
             RootOutcome::KeptAside
         }
     }
 
-    /// A valid root continuing a branch set aside: its revocations hold; to
-    /// switch to it, the chain of that branch is needed first.
+    /// A valid root continuing a branch set aside: its revocations hold.
+    ///
+    /// Heavier than the current root, it is switched to: the branch it
+    /// continues is climbed back to the chain, the chain from there goes
+    /// aside, and the branch takes its place. Where the branch cannot be
+    /// climbed back, the chain between is needed first. Found in the
+    /// testbed (18.1): a light member following one admin's branch, handed
+    /// the other's chain, set every root of it aside and believed nobody.
     fn continue_aside(&mut self, root: &Snapshot) -> RootOutcome {
         let offered = Remembered::of(root);
         let heavier = self.chain.back().is_none_or(|current| offered.weight() > current.weight());
-        for device in &offered.delta {
-            self.unjoined.push((*device, offered.root));
+        if heavier && let Some((fork, branch)) = self.branch_back(&offered.previous) {
+            // Its signer may be named by nothing on the chain it leaves, nor
+            // by an invalidation from anywhere but the branch it continues.
+            let signer = root.signer.record.id;
+            let named_on_chain = self
+                .chain
+                .iter()
+                .skip(fork.saturating_add(1))
+                .any(|remembered| remembered.delta.contains(&signer));
+            let named_elsewhere = self
+                .unjoined
+                .iter()
+                .any(|(device, carrier)| *device == signer && !branch.contains(carrier));
+            if named_on_chain || named_elsewhere {
+                return RootOutcome::Refused(RootRefusal::SignerInvalidated);
+            }
+            while self.chain.len() > fork.saturating_add(1) {
+                if let Some(dropped) = self.chain.pop_back() {
+                    for device in &dropped.delta {
+                        self.unjoined.push((*device, dropped.root));
+                    }
+                    self.set_aside(dropped);
+                }
+            }
+            for hash in &branch {
+                let Some(at) = self.aside.iter().position(|aside| aside.root == *hash) else {
+                    continue;
+                };
+                if let Some(taken) = self.aside.remove(at) {
+                    // On the chain now: its delta counts from there.
+                    self.unjoined.retain(|(_, carrier)| carrier != hash);
+                    self.chain.push_back(taken);
+                }
+            }
+            let follows = offered.previous.clone();
+            self.adopt(offered, &follows);
+            return RootOutcome::Switched;
         }
-        self.set_aside(offered.root);
-        if heavier { RootOutcome::NeedsChain } else { RootOutcome::KeptAside }
+        // Its revocations hold either way, once each.
+        for device in &offered.delta {
+            if !self.unjoined.contains(&(*device, offered.root)) {
+                self.unjoined.push((*device, offered.root));
+            }
+        }
+        if heavier {
+            // Not set aside: still unknown, it is what a peer is asked the
+            // chain to.
+            return RootOutcome::NeedsChain;
+        }
+        self.set_aside(offered);
+        RootOutcome::KeptAside
+    }
+
+    /// The branch set aside that ends at one of `previous`, oldest first, and
+    /// where on the chain it starts: climbed back through the roots set aside
+    /// until one follows a root on the chain. `None` where it never gets there.
+    fn branch_back(&self, previous: &[Hash]) -> Option<(usize, Vec<Hash>)> {
+        let mut branch: Vec<Hash> = Vec::new();
+        let mut at = previous.iter().find(|hash| self.is_aside(hash)).copied()?;
+        // Every step is a root set aside, and there are no more of those.
+        for _ in 0..=self.aside.len() {
+            let remembered = self.aside.iter().find(|aside| aside.root == at)?;
+            branch.push(at);
+            if let Some(fork) =
+                remembered.previous.iter().filter_map(|hash| self.position(hash)).max()
+            {
+                branch.reverse();
+                return Some((fork, branch));
+            }
+            at = remembered.previous.iter().find(|hash| self.is_aside(hash)).copied()?;
+        }
+        None
+    }
+
+    /// Whether a root is one set aside.
+    fn is_aside(&self, root: &Hash) -> bool {
+        self.aside.iter().any(|aside| aside.root == *root)
     }
 
     /// Remembers a root set aside, within budget.
-    fn set_aside(&mut self, root: Hash) {
+    fn set_aside(&mut self, root: Remembered) {
         self.aside.push_back(root);
         while self.aside.len() > self.budget {
             self.aside.pop_front();
@@ -300,18 +431,12 @@ impl LightView {
     pub(crate) fn encode(&self, writer: &mut crate::cbor::Writer) {
         writer.map(5);
         writer.key("aside").array(self.aside.len() as u64);
-        for root in &self.aside {
-            writer.bytes(root);
+        for remembered in &self.aside {
+            remembered.encode(writer);
         }
         writer.key("chain").array(self.chain.len() as u64);
         for remembered in &self.chain {
-            writer.map(3);
-            writer.key("root").bytes(&remembered.root);
-            writer.key("delta").array(remembered.delta.len() as u64);
-            for device in &remembered.delta {
-                writer.bytes(device.as_bytes());
-            }
-            writer.key("generation").u64(remembered.generation);
+            remembered.encode(writer);
         }
         writer.key("budget").u64(self.budget as u64);
         writer.key("network").bytes(self.network.as_bytes());
@@ -334,23 +459,13 @@ impl LightView {
         let count = field.array(MAX_REMEMBERED, "roots set aside")?;
         let mut aside = VecDeque::with_capacity(count);
         for _ in 0..count {
-            aside.push_back(hash(field)?);
+            aside.push_back(Remembered::decode(field)?);
         }
         let field = map.key("chain")?;
         let count = field.array(MAX_REMEMBERED, "roots remembered")?;
         let mut chain = VecDeque::with_capacity(count);
         for _ in 0..count {
-            let mut entry = field.map(REMEMBERED_SCHEMA)?;
-            let root = hash(entry.key("root")?)?;
-            let devices = entry.key("delta")?;
-            let many = devices.array(crate::limits::MAX_OPERATION_SIZE, "delta")?;
-            let mut delta = Vec::with_capacity(many);
-            for _ in 0..many {
-                delta.push(DeviceId::from_bytes(hash(devices)?));
-            }
-            let generation = entry.key("generation")?.u64()?;
-            entry.finish()?;
-            chain.push_back(Remembered { root, generation, delta });
+            chain.push_back(Remembered::decode(field)?);
         }
         let budget = usize::try_from(map.key("budget")?.u64()?).map_err(|_| Error::NonCanonical)?;
         let network = NetworkId::from_bytes(hash(map.key("network")?)?);
@@ -375,7 +490,7 @@ impl LightView {
     fn adopt(&mut self, offered: Remembered, follows: &[Hash]) {
         // Invalidations carried by a root this one follows are joined into it.
         self.unjoined.retain(|(_, carrier)| !follows.contains(carrier));
-        self.aside.retain(|root| !follows.contains(root));
+        self.aside.retain(|aside| !follows.contains(&aside.root));
         self.chain.push_back(offered);
         while self.chain.len() > self.budget {
             self.chain.pop_front();

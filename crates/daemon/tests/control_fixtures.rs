@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime};
 
 use daemon::Fault;
 use daemon::control::{
-    Accused, Act, Branch, Contact, Ipv4State, Named, Network, Outcome, Owed, Peer, Report,
-    Revocation, Revoked, Signed, Standing, Tunnel, Unusable, Waiting,
+    Accused, Act, Branch, Contact, Ipv4State, Named, Network, Outcome, Peer, Report, Revocation,
+    Revoked, Signed, Standing, Tunnel, Unusable,
 };
 
 fn at(seconds: u64) -> SystemTime {
@@ -57,12 +57,45 @@ fn report() -> Report {
             relay: "https://old-relay.example:443".to_owned(),
             until: at(1_758_300_000),
         }),
-        accused: vec![Accused {
-            device: nas.clone(),
-            pairs: 2,
-            first: Branch { does: Act::Admits(laptop.clone()), depth: Some(41) },
-            second: Branch { does: Act::Revokes(laptop.clone()), depth: None },
-        }],
+        // Every act a branch can show, two to an equivocation.
+        accused: vec![
+            Accused {
+                device: nas.clone(),
+                pairs: 2,
+                first: Branch { does: Act::Admits(laptop.clone()), depth: Some(41) },
+                second: Branch { does: Act::Revokes(laptop.clone()), depth: None },
+            },
+            Accused {
+                device: nas.clone(),
+                pairs: 1,
+                first: Branch { does: Act::Founds, depth: None },
+                second: Branch { does: Act::Promotes(nas.clone(), true), depth: None },
+            },
+            Accused {
+                device: nas.clone(),
+                pairs: 1,
+                first: Branch { does: Act::Demotes(nas.clone()), depth: None },
+                second: Branch {
+                    does: Act::Renames(laptop.clone(), "tablet".to_owned()),
+                    depth: None,
+                },
+            },
+            Accused {
+                device: nas.clone(),
+                pairs: 1,
+                first: Branch { does: Act::SetsParameters, depth: None },
+                second: Branch { does: Act::ChangesSettings(nas.clone()), depth: None },
+            },
+            Accused {
+                device: nas.clone(),
+                pairs: 1,
+                first: Branch {
+                    does: Act::AdmitsBatch { count: 3, label: "lot 2026-10 A".to_owned() },
+                    depth: None,
+                },
+                second: Branch { does: Act::Admits(nas.clone()), depth: None },
+            },
+        ],
         peers: vec![
             Peer {
                 name: "nas.home.internal".to_owned(),
@@ -106,57 +139,6 @@ fn report() -> Report {
             ],
             last_contact: Contact::NoneRecorded,
         }],
-        waiting: vec![
-            Waiting {
-                does: Act::Revokes(gone),
-                signed_here: Signed::At { time: at(1_757_000_060) },
-                owed: vec![
-                    Owed {
-                        device: nas.clone(),
-                        connected: true,
-                        last_contact: Contact::Recorded { at: at(1_757_700_000) },
-                    },
-                    Owed {
-                        device: laptop.clone(),
-                        connected: false,
-                        last_contact: Contact::NoneRecorded,
-                    },
-                ],
-            },
-            Waiting { does: Act::Founds, signed_here: Signed::NotRecorded, owed: Vec::new() },
-            Waiting {
-                does: Act::Promotes(nas.clone(), true),
-                signed_here: Signed::NotRecorded,
-                owed: Vec::new(),
-            },
-            Waiting {
-                does: Act::Demotes(nas.clone()),
-                signed_here: Signed::NotRecorded,
-                owed: Vec::new(),
-            },
-            Waiting {
-                does: Act::Renames(laptop, "tablet".to_owned()),
-                signed_here: Signed::NotRecorded,
-                owed: Vec::new(),
-            },
-            Waiting {
-                does: Act::SetsParameters,
-                signed_here: Signed::NotRecorded,
-                owed: Vec::new(),
-            },
-            Waiting {
-                does: Act::ChangesSettings(nas.clone()),
-                signed_here: Signed::NotRecorded,
-                owed: Vec::new(),
-            },
-            Waiting {
-                does: Act::AdmitsBatch { count: 3, label: "lot 2026-10 A".to_owned() },
-                signed_here: Signed::NotRecorded,
-                owed: Vec::new(),
-            },
-        ],
-        waiting_unlisted: 3,
-        waiting_never_met: 3,
         problem: Some(Fault {
             subsystem: "relay".to_owned(),
             cause: "certificate not trusted".to_owned(),
@@ -207,9 +189,6 @@ fn report() -> Report {
             last_contact: Contact::Recorded { at: at(1_757_600_000) },
         }],
         revoked: Vec::new(),
-        waiting: Vec::new(),
-        waiting_unlisted: 0,
-        waiting_never_met: 0,
         problem: None,
     };
     Report {

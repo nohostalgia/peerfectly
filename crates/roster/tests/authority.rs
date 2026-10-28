@@ -44,7 +44,12 @@ fn member_acting_from_before_its_own_admission(body: OperationBody) -> (Roster, 
 /// The founding device and the member it admitted, and nothing else, whatever
 /// the member signed.
 fn only_the_founder_and_the_member(state: &RosterState) {
-    assert_eq!(state.devices.len(), 2, "no third device: {:?}", state.devices.keys().collect::<Vec<_>>());
+    assert_eq!(
+        state.devices.len(),
+        2,
+        "no third device: {:?}",
+        state.devices.keys().collect::<Vec<_>>()
+    );
     assert_eq!(
         state.devices.get(&device_id(2)).map(|record| record.role),
         Some(Role::Member),

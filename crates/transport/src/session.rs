@@ -184,7 +184,55 @@ pub trait Transport: Send + Sync {
     async fn path_to(&self, _peer: &DeviceId) -> Option<Path> {
         None
     }
+
+    /// Hands a node holding a roster what to answer a peer that cannot place
+    /// the root this node rests on: the roots taken after the one the peer
+    /// names, as `roots` gives them.
+    ///
+    /// The default ignores it, which is right for a transport whose peers all
+    /// hold a roster.
+    fn serve_roots(&self, _roots: RootsAfter) {}
+
+    /// Hands a node holding no roster how to catch up while a session opens,
+    /// when the root a peer's evidence rests on is one it cannot place.
+    ///
+    /// Without it such a peer is refused, and a member that missed roots —
+    /// off while two were published, or following another admin's branch —
+    /// refuses every member that holds them, for good: found in the testbed
+    /// (18.1). The default ignores it, which is right for a transport whose
+    /// peers all hold a roster.
+    fn catch_up_by(&self, _catching: CatchingUp) {}
 }
+
+/// The roots a node holding a roster took after the one named, as the bytes
+/// [`CatchingUp::take`] reads, no more than one answer holds.
+pub type RootsAfter = std::sync::Arc<
+    dyn Fn([u8; 32]) -> core::pin::Pin<Box<dyn core::future::Future<Output = Vec<u8>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How a node holding no roster catches up while a session opens.
+///
+/// Nothing a peer sends is believed for being sent: every root taken is
+/// verified against the one before it, and the peer's evidence is judged
+/// again only afterwards.
+#[derive(Clone)]
+pub struct CatchingUp {
+    /// For evidence resting on a root this node cannot place, the root to
+    /// ask after: its own current one. `None` where the root is placed, or
+    /// the evidence is not worth asking about.
+    pub behind: Behind,
+    /// Takes the roots a peer sent, for the evidence it showed. Whether
+    /// anything was taken.
+    pub take: TakeRoots,
+}
+
+/// [`CatchingUp::behind`].
+pub type Behind = std::sync::Arc<dyn Fn(&[u8]) -> Option<[u8; 32]> + Send + Sync>;
+
+/// [`CatchingUp::take`].
+pub type TakeRoots = std::sync::Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
 /// How a session's bytes travel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -63,11 +63,7 @@ impl MemberStore for Kept {
 
     fn address_holders(&self, address: [u8; 4]) -> Vec<DeviceId> {
         let addresses = self.addresses.lock().unwrap();
-        addresses
-            .keys()
-            .filter(|(held, _)| *held == address)
-            .map(|(_, device)| *device)
-            .collect()
+        addresses.keys().filter(|(held, _)| *held == address).map(|(_, device)| *device).collect()
     }
 
     fn name_holders(&self, name: &str) -> Vec<DeviceId> {
@@ -131,7 +127,10 @@ fn leaf(seed: u8, address: Option<u8>) -> DeviceLeaf {
 fn fixture(seeds: &[u8]) -> Vec<DeviceLeaf> {
     let mut leaves: Vec<DeviceLeaf> = seeds
         .iter()
-        .map(|seed| leaf(seed % 99 + 1, (seed % 3 == 0).then_some(seed % 99 + 1)))
+        .map(|seed| {
+            let seed = (seed % 99).saturating_add(1);
+            leaf(seed, (seed % 3 == 0).then_some(seed))
+        })
         .collect();
     leaves.sort_by_key(|leaf| leaf.record.id);
     leaves.dedup_by_key(|leaf| leaf.record.id);
@@ -184,7 +183,7 @@ proptest! {
         assert_same(&memory, &stored);
 
         for (act, seed) in changes {
-            let seed = seed % 99 + 1;
+            let seed = (seed % 99).saturating_add(1);
             let changed = leaf(seed, (act == 2).then_some(seed));
             let device = changed.record.id;
             match act {

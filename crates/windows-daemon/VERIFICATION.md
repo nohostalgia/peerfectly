@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 56 of 89. Every other result reads `not run`. That is the honest
+**Run so far**: 57 of 89. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2572,4 +2572,6 @@ peerfectly pending
 **Record** for 13.4, for `found` and for the approval (2 signatures each) and for the batch (1):
 how many Windows dialogs appeared — one for the whole act, or one per signature.
 
-**Result**: not run.
+**Result**: run, 2026-10-27/28, by the person, on the MSI of this branch (`peerfectly-0.4.1-windows-x64.msi`, built 2026-10-27, unsigned) and the phone running this branch's debug app (`android/VERIFICATION.md` S3, the same session). Every expectation held, as the person reported them: unelevated, `status` and `pending` answered and `invite` was refused before reaching the daemon; `prova` founded on the VPS's relay; the phone joined by invite, showed its key and no code, and the same key was in `pending`; `approve` signed and the phone was in `prova` within seconds; the batch of `lot-windows.json` (three boards, keys made with `openssl` for this run) was reviewed and signed on one consent; `withdraw` and `pending` as expected.
+
+For 13.4, the dialogs, as the person counted them: `found` showed one to set the key's password, when the key was made, and then **one** for its signatures; the approval (two signatures) and the batch showed one each. One dialog per act, whatever the number of signatures through the handle.

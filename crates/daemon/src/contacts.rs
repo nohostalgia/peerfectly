@@ -112,9 +112,9 @@ impl ContactRecord {
     /// Reads the record back.
     ///
     /// A missing file is an empty record, and so is an unreadable one — with the
-    /// failure returned beside it for the caller to report. Unlike confirmations,
-    /// neither direction of this loss misleads anybody: every device reads as "no
-    /// contact recorded", which is true of what this device now knows.
+    /// failure returned beside it for the caller to report. Neither direction of
+    /// this loss misleads anybody: every device reads as "no contact recorded",
+    /// which is true of what this device now knows.
     pub(crate) fn load(&self) -> (LastContacts, Option<Error>) {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -271,7 +271,6 @@ mod tests {
             ("batches.rs", include_str!("batches.rs")),
             ("channel.rs", include_str!("channel.rs")),
             ("clock.rs", include_str!("clock.rs")),
-            ("confirmations.rs", include_str!("confirmations.rs")),
             ("conflicts.rs", include_str!("conflicts.rs")),
             ("connectivity.rs", include_str!("connectivity.rs")),
             ("discovery.rs", include_str!("discovery.rs")),
@@ -354,11 +353,6 @@ mod tests {
         // Inside the node, the functions that pace, dial, route or authorise.
         let node = crate::code_of(include_str!("node.rs"));
         for function in [
-            "async fn lagging(",
-            "pub async fn owed(",
-            "pub async fn pressed(",
-            "pub async fn press(",
-            "async fn dial(",
             "pub async fn enforce_roster(",
             "async fn received_packet(",
             "pub async fn carry_one(",

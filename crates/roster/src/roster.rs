@@ -1799,7 +1799,10 @@ impl Roster {
     /// correct one, and it is taken whenever there is any doubt at all.
     fn follow(&mut self, in_one_step: bool) {
         let extended = in_one_step.then_some(self.at_heads.as_ref()).flatten().and_then(|state| {
-            self.dag.operations().last().and_then(|operation| crate::state::extend(state, operation))
+            self.dag
+                .operations()
+                .last()
+                .and_then(|operation| crate::state::extend(state, operation))
         });
         self.at_heads = match extended {
             Some(next) => Some(next),
@@ -2020,10 +2023,7 @@ fn attestation_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<
 /// some device in `state`.
 fn root_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<PublicKey> {
     let signs = |purpose| {
-        matches!(
-            purpose,
-            crate::types::KeyPurpose::Signing | crate::types::KeyPurpose::Attestation
-        )
+        matches!(purpose, crate::types::KeyPurpose::Signing | crate::types::KeyPurpose::Attestation)
     };
     let holder = state.devices.holding_for(author, signs)?;
     holder

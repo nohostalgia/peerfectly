@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use transport::error::{Error, Result as SessionResult};
 use transport::limits;
-use transport::session::{Path, Session, Transport};
+use transport::session::{CatchingUp, Path, RootsAfter, Session, Transport};
 
 use crate::error::{BuildError, Result};
 use crate::frame::{Frame, MAX_MESSAGE, Reason, SessionId, Stream, VERSION};
@@ -60,6 +60,18 @@ const AGAIN: [Duration; 3] =
 /// for the session protocol's own answer.
 const DIAL_PATIENCE: Duration = Duration::from_secs(20);
 
+/// How long a node holding no roster waits for the roots it asked for while a
+/// session opens, within the dialler's own patience.
+const CATCH_UP_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The most opens held while their roots are asked for. Beyond it an open
+/// that would be held is refused, as it was before anything was held.
+const MAX_HELD_OPENS: usize = 64;
+
+/// The most sessions remembered as answered with roots, before the record
+/// starts again.
+const MAX_ANSWERED: usize = 4096;
+
 /// What one peer's messages may hold before its sender waits: two of the
 /// largest, each at its cost.
 const MESSAGE_BUDGET: usize = 2 * (MAX_MESSAGE + ELEMENT_COST);
@@ -80,6 +92,18 @@ enum Answer {
     /// It was refused, or could not be made.
     Refused(Error),
 }
+
+/// An open from a peer, held while the roots its evidence rests on are asked
+/// for.
+struct HeldOpen {
+    peer: PeerId,
+    version: u8,
+    evidence: Vec<u8>,
+    since: tokio::time::Instant,
+}
+
+/// A dial of this node waiting for its roots: whom it asked, and where they go.
+type CatchUp = (PeerId, oneshot::Sender<Vec<u8>>);
 
 /// A dial waiting for its answer.
 struct Dial {
@@ -155,6 +179,17 @@ struct Shared {
     /// For a node holding no roster: how it judges the root a peer's evidence
     /// rests on. `None` for a node that judges peers by its state.
     judge: Option<Judge>,
+    /// For a node holding no roster: how it catches up on a root it cannot
+    /// place, while a session opens.
+    catching: std::sync::RwLock<Option<CatchingUp>>,
+    /// For a node holding a roster: the roots it answers that with.
+    roots: std::sync::RwLock<Option<RootsAfter>>,
+    /// Dials of this node waiting for the roots they asked for, by session.
+    catch_ups: std::sync::Mutex<HashMap<SessionId, CatchUp>>,
+    /// Opens held while their roots are asked for, by session.
+    held_opens: std::sync::Mutex<HashMap<SessionId, HeldOpen>>,
+    /// Sessions already answered with roots: once each.
+    answered: std::sync::Mutex<HashSet<SessionId>>,
     /// The access policy, and the groups it is decided over.
     policy: std::sync::RwLock<Policy>,
     /// This device.
@@ -370,6 +405,11 @@ impl ConvessoTransport {
             policy: std::sync::RwLock::new(Policy::of_state(&state, &identity.device_id())),
             own: identity.device_id(),
             judge,
+            catching: std::sync::RwLock::new(None),
+            roots: std::sync::RwLock::new(None),
+            catch_ups: std::sync::Mutex::new(HashMap::new()),
+            held_opens: std::sync::Mutex::new(HashMap::new()),
+            answered: std::sync::Mutex::new(HashSet::new()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             accepted_from: std::sync::Mutex::new(HashMap::new()),
             dials: std::sync::Mutex::new(HashMap::new()),
@@ -492,18 +532,20 @@ impl Transport for ConvessoTransport {
         }
 
         let outcome = match tokio::time::timeout(DIAL_PATIENCE, answered).await {
-            Ok(Ok(Answer::Accepted(evidence))) => match judged(shared, peer, &evidence) {
-                // A light node learns here who it reached.
-                Some(Ok(device)) => {
-                    if let Some(live) = &live {
-                        live.set_device(device);
-                        live.set_evidence(evidence);
+            Ok(Ok(Answer::Accepted(evidence))) => {
+                match judged_catching_up(shared, peer, address, id, &evidence).await {
+                    // A light node learns here who it reached.
+                    Some(Ok(device)) => {
+                        if let Some(live) = &live {
+                            live.set_device(device);
+                            live.set_evidence(evidence);
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Some(Err(error)) => Err(error),
+                    None => Ok(()),
                 }
-                Some(Err(error)) => Err(error),
-                None => Ok(()),
-            },
+            }
             Ok(Ok(Answer::Refused(error))) => Err(error),
             Ok(Err(_)) => Err(Error::PeerUnreachable {
                 cause: Some("the node stopped while dialling".to_owned()),
@@ -561,6 +603,18 @@ impl Transport for ConvessoTransport {
             runtime.spawn(async move {
                 let _ = node.set_hints(address.peer_id(), hints).await;
             });
+        }
+    }
+
+    fn serve_roots(&self, roots: RootsAfter) {
+        if let Ok(mut held) = self.shared.roots.write() {
+            *held = Some(roots);
+        }
+    }
+
+    fn catch_up_by(&self, catching: CatchingUp) {
+        if let Ok(mut held) = self.shared.catching.write() {
+            *held = Some(catching);
         }
     }
 
@@ -1070,6 +1124,135 @@ fn judged(
     }))
 }
 
+/// [`judged`], for the evidence a dialled peer answered with: where it rests on
+/// a root this node cannot place, the roots after its own are asked for on
+/// the session, taken, and the evidence judged again.
+async fn judged_catching_up(
+    shared: &Shared,
+    peer: &PublicKey,
+    address: Address,
+    id: SessionId,
+    evidence: &[u8],
+) -> Option<core::result::Result<DeviceId, Error>> {
+    let first = judged(shared, peer, evidence);
+    if !matches!(first, Some(Err(_))) {
+        return first;
+    }
+    let Some(catching) = shared.catching.read().ok().and_then(|held| held.clone()) else {
+        return first;
+    };
+    let Some(root) = (catching.behind)(evidence) else { return first };
+    let (tell, told) = oneshot::channel();
+    if let Ok(mut waiting) = shared.catch_ups.lock() {
+        waiting.insert(id, (address.peer_id(), tell));
+    }
+    let behind = Frame::Behind { id, root }.encode();
+    let asked = shared.context.send_message(address, behind).await.is_ok();
+    let roots = if asked { tokio::time::timeout(CATCH_UP_PATIENCE, told).await.ok() } else { None };
+    if let Ok(mut waiting) = shared.catch_ups.lock() {
+        waiting.remove(&id);
+    }
+    match roots {
+        Some(Ok(roots)) if (catching.take)(evidence, &roots) => judged(shared, peer, evidence),
+        _ => first,
+    }
+}
+
+/// Holds an open whose evidence rests on a root this node cannot place, and
+/// asks the dialler for the roots after its own. Whether it was held: where
+/// not, it is refused as any other.
+fn held_for_roots(
+    shared: &Shared,
+    peer: PeerId,
+    version: u8,
+    id: SessionId,
+    evidence: &[u8],
+) -> bool {
+    let Some(catching) = shared.catching.read().ok().and_then(|held| held.clone()) else {
+        return false;
+    };
+    let Some(root) = (catching.behind)(evidence) else { return false };
+    let Ok(mut held) = shared.held_opens.lock() else { return false };
+    // An open nobody answered for is let go once its dialler has given up.
+    held.retain(|_, open| open.since.elapsed() < DIAL_PATIENCE);
+    if held.len() >= MAX_HELD_OPENS || held.contains_key(&id) {
+        return false;
+    }
+    held.insert(
+        id,
+        HeldOpen { peer, version, evidence: evidence.to_vec(), since: tokio::time::Instant::now() },
+    );
+    drop(held);
+    let behind = Frame::Behind { id, root }.encode();
+    let _ = shared.outbound.send(Out::Reply(peer, behind));
+    true
+}
+
+/// Answers a peer that cannot place this node's root, with the roots after
+/// its own: once per session, and only for a session, or a dial, this node
+/// has with that peer.
+fn answer_behind(shared: &Shared, peer: PeerId, id: SessionId, root: [u8; 32]) {
+    let Some(source) = shared.roots.read().ok().and_then(|held| held.clone()) else { return };
+    let ours = session_of(shared, id, &peer).is_some()
+        || shared
+            .dials
+            .lock()
+            .is_ok_and(|dials| dials.get(&id).is_some_and(|dial| dial.peer == peer));
+    if !ours {
+        return;
+    }
+    let first = shared.answered.lock().is_ok_and(|mut answered| {
+        if answered.len() >= MAX_ANSWERED {
+            answered.clear();
+        }
+        answered.insert(id)
+    });
+    if !first {
+        return;
+    }
+    let outbound = shared.outbound.clone();
+    tokio::spawn(async move {
+        let roots = source(root).await;
+        // Whole roots fitting one frame are the source's to choose: cut here,
+        // the last would be half a root, and the rest unreadable with it.
+        if roots.len() <= crate::frame::MAX_ROOTS {
+            let _ = outbound.send(Out::Reply(peer, Frame::Roots { id, roots }.encode()));
+        }
+    });
+}
+
+/// Roots that arrived for a dial or an open waiting on them; anything else is
+/// dropped.
+fn roots_arrived(shared: &Shared, peer: PeerId, id: SessionId, roots: Vec<u8>) {
+    let waiting = shared.catch_ups.lock().ok().and_then(|mut waiting| {
+        if waiting.get(&id).is_some_and(|(from, _)| *from == peer) {
+            waiting.remove(&id)
+        } else {
+            None
+        }
+    });
+    if let Some((_, tell)) = waiting {
+        let _ = tell.send(roots);
+        return;
+    }
+    let held = shared.held_opens.lock().ok().and_then(|mut held| {
+        if held.get(&id).is_some_and(|open| open.peer == peer) { held.remove(&id) } else { None }
+    });
+    let Some(open) = held else { return };
+    let taken = shared
+        .catching
+        .read()
+        .ok()
+        .and_then(|held| held.clone())
+        .is_some_and(|catching| (catching.take)(&open.evidence, &roots));
+    if taken {
+        opened(shared, peer, open.version, id, &open.evidence, false);
+    } else {
+        let refuse = Frame::Refuse { id, reason: Reason::NotAMember }.encode();
+        let _ = shared.outbound.send(Out::Reply(peer, refuse));
+    }
+}
+
 /// The transport key behind an authenticated convesso peer, read from the
 /// evidence it shows: the one of its leaf's transport keys that is this peer.
 fn key_shown_by(peer: &PeerId, evidence: &[u8]) -> Option<(PublicKey, Address)> {
@@ -1090,7 +1273,18 @@ fn key_shown_by(peer: &PeerId, evidence: &[u8]) -> Option<(PublicKey, Address)> 
 }
 
 /// A peer opens a session with this node.
-fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId, evidence: &[u8]) {
+///
+/// Where this node holds no roster and cannot place the root the evidence
+/// rests on, the open is held while the roots are asked for, unless
+/// `may_catch_up` is false: once they are taken, it is judged again here.
+fn opened(
+    shared: &Shared,
+    peer: PeerId,
+    version: u8,
+    id: SessionId,
+    evidence: &[u8],
+    may_catch_up: bool,
+) {
     let refuse = |reason: Reason| {
         let _ = shared.outbound.send(Out::Reply(peer, Frame::Refuse { id, reason }.encode()));
     };
@@ -1113,7 +1307,9 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId, evidence: &
     let (device, address) = match entry {
         Some((Ok(device), Some(address))) => (device, address),
         Some((Err(error), _)) => {
-            refuse(reason_of(&error));
+            if !(may_catch_up && held_for_roots(shared, peer, version, id, evidence)) {
+                refuse(reason_of(&error));
+            }
             return;
         }
         _ => {
@@ -1163,8 +1359,10 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId, evidence: &
 async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
     match Frame::decode(data) {
         Some(Frame::Open { version, id, evidence }) => {
-            opened(shared, peer, version, id, &evidence);
+            opened(shared, peer, version, id, &evidence, true);
         }
+        Some(Frame::Behind { id, root }) => answer_behind(shared, peer, id, root),
+        Some(Frame::Roots { id, roots }) => roots_arrived(shared, peer, id, roots),
         Some(Frame::Accept { id, evidence }) => {
             answer_dial(shared, id, &peer, Answer::Accepted(evidence));
         }

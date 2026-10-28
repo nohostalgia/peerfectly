@@ -505,28 +505,6 @@ pub struct Branch {
     pub depth: Option<u64>,
 }
 
-/// An operation signed here that some member has not said it holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Waiting {
-    /// What it does.
-    pub does: Act,
-    /// When this device signed it, on this device's own clock.
-    pub signed_here: Signed,
-    /// Every member that has not said it holds it.
-    pub owed: Vec<Owed>,
-}
-
-/// A member an operation is owed to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Owed {
-    /// The member.
-    pub device: Named,
-    /// Whether a session with it is open now.
-    pub connected: bool,
-    /// When this device last had a session with it that spoke.
-    pub last_contact: Contact,
-}
-
 /// Where a network's signing key is kept, on **this** device.
 ///
 /// A fact about this device alone. It is never said about a peer: this device
@@ -642,19 +620,6 @@ pub struct Network {
     /// What this device knows, not an account of the network: a revocation signed
     /// elsewhere that has not arrived is not here.
     pub revoked: Vec<Revoked>,
-    /// Operations signed here that some member has not said it holds.
-    ///
-    /// Every revocation, then the others up to a bound, in the order they were
-    /// signed. A bound that could hide a revocation would tell a person the
-    /// stolen laptop is dealt with.
-    pub waiting: Vec<Waiting>,
-    /// How many further operations are waiting and not listed.
-    pub waiting_unlisted: usize,
-    /// How many members this device was never in contact with, owed what it
-    /// signed: counted here rather than listed under every operation. They
-    /// receive the current state at their first contact.
-    #[serde(default)]
-    pub waiting_never_met: usize,
     /// What is wrong in it now: the latest fault, if recent.
     ///
     /// One, and no history. The history is the service's log; a surface needs
@@ -725,14 +690,6 @@ impl Unconfirmed {
                 "check this device's clock, then let an administrator's device become reachable from here. Until then it carries no traffic to devices that are not administrators."
             }
         }
-    }
-}
-
-impl Network {
-    /// Whether anything signed here is waiting to reach another device in it.
-    #[must_use]
-    pub const fn has_unpropagated_work(&self) -> bool {
-        !self.waiting.is_empty() || self.waiting_unlisted > 0
     }
 }
 
@@ -2693,9 +2650,9 @@ mod tests {
         out
     }
 
-    fn report(standing: Standing, waiting: Vec<Waiting>) -> Report {
+    fn report(standing: Standing) -> Report {
         Report {
-            networks: vec![network(standing, waiting)],
+            networks: vec![network(standing)],
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
@@ -2706,7 +2663,7 @@ mod tests {
         }
     }
 
-    fn network(standing: Standing, waiting: Vec<Waiting>) -> Network {
+    fn network(standing: Standing) -> Network {
         Network {
             label: "test".to_owned(),
             tunnel: Tunnel::Down,
@@ -2736,9 +2693,6 @@ mod tests {
                 last_contact: Contact::NoneRecorded,
             }],
             revoked: Vec::new(),
-            waiting,
-            waiting_unlisted: 0,
-            waiting_never_met: 0,
             problem: None,
         }
     }
@@ -2763,7 +2717,7 @@ mod tests {
         assert!(said.contains("192.168.1.9") && said.contains("withheld"), "{said}");
         assert!(said.contains("192.168.1.0/24"), "and names the conflict: {said}");
 
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).peers.first_mut().unwrap().ipv4 = Some(withheld);
         let status = report.to_string();
         assert!(
@@ -2776,7 +2730,7 @@ mod tests {
 
     #[test]
     fn a_peers_path_is_said_beside_its_reachability() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         assert!(
             report.peers(None).to_string().contains("yes, via relay"),
             "{}",
@@ -2841,7 +2795,7 @@ mod tests {
     /// serious thing the roster can say.
     #[test]
     fn an_equivocation_is_reported_beside_a_problem() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).accused = vec![accused("laptop")];
         the_one(&mut report).problem = Some(crate::node::Fault {
             subsystem: "transport".to_owned(),
@@ -2858,7 +2812,7 @@ mod tests {
     /// revoking is a person's act — with the command they would use.
     #[test]
     fn a_detection_says_nothing_was_revoked_and_names_the_command() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).accused = vec![accused("laptop")];
 
         let shown = report.to_string();
@@ -2872,7 +2826,7 @@ mod tests {
     /// an attacker.
     #[test]
     fn a_detection_says_a_restored_backup_looks_the_same() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).accused = vec![accused("laptop")];
 
         let shown = report.to_string();
@@ -2882,7 +2836,7 @@ mod tests {
     /// Nothing is said when there is nothing to say.
     #[test]
     fn an_ordinary_report_says_nothing_about_equivocation() {
-        let shown = report(Standing::Current, Vec::new()).to_string();
+        let shown = report(Standing::Current).to_string();
         assert!(!shown.contains("EQUIVOCATION"), "{shown}");
     }
 
@@ -2890,7 +2844,7 @@ mod tests {
     /// the daemon loaded has to be visible rather than inferred from behaviour.
     #[test]
     fn the_relay_is_reported_as_trusted_by_its_key() {
-        let mut reported = report(Standing::Current, Vec::new());
+        let mut reported = report(Standing::Current);
         let key = convesso_core::identity::Identity::from_ed25519_seed(&[5; 32]).unwrap();
         the_one(&mut reported).relay = Some(transport_convesso::relay::written(
             key.address().as_bytes(),
@@ -2899,7 +2853,7 @@ mod tests {
         ));
         assert!(reported.to_string().contains("(trusted by its key)"), "{reported}");
 
-        let mut none = report(Standing::Current, Vec::new());
+        let mut none = report(Standing::Current);
         the_one(&mut none).relay = None;
         assert!(none.to_string().contains("no relay"), "{none}");
     }
@@ -2907,7 +2861,7 @@ mod tests {
     /// A failure a person can act on has to be a failure they can see.
     #[test]
     fn what_went_wrong_is_shown() {
-        let mut reported = report(Standing::Current, Vec::new());
+        let mut reported = report(Standing::Current);
         the_one(&mut reported).problem = Some(crate::node::Fault {
             subsystem: "transport".to_owned(),
             cause: "laptop: the peer could not be reached".to_owned(),
@@ -2925,7 +2879,7 @@ mod tests {
     /// Nothing wrong, nothing said.
     #[test]
     fn a_healthy_report_says_nothing_about_faults() {
-        let shown = report(Standing::Current, Vec::new()).to_string();
+        let shown = report(Standing::Current).to_string();
         assert!(!shown.contains("problem"), "{shown}");
         assert!(!shown.contains("recently"), "{shown}");
     }
@@ -2934,7 +2888,7 @@ mod tests {
     /// date in 1970.
     #[test]
     fn a_network_never_up_says_nothing_is_known() {
-        let never = report(Standing::LastKnown { at: SystemTime::UNIX_EPOCH }, Vec::new());
+        let never = report(Standing::LastKnown { at: SystemTime::UNIX_EPOCH });
         let shown = never.to_string();
         assert!(shown.contains("last known: nothing seen yet"), "{shown}");
         assert!(!shown.contains("1970") && !shown.contains("days ago"), "{shown}");
@@ -2945,7 +2899,7 @@ mod tests {
     fn a_remembered_answer_says_when_it_was_true() {
         let then =
             SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_000)).expect("representable");
-        let remembered = report(Standing::LastKnown { at: then }, Vec::new());
+        let remembered = report(Standing::LastKnown { at: then });
 
         assert!(!remembered.only().expect("one").standing.is_current());
         let shown = remembered.to_string();
@@ -2959,7 +2913,7 @@ mod tests {
 
     #[test]
     fn a_current_answer_says_so() {
-        let live = report(Standing::Current, Vec::new());
+        let live = report(Standing::Current);
         assert!(live.only().expect("one").standing.is_current());
         assert!(live.to_string().contains("(now)"));
     }
@@ -2985,81 +2939,6 @@ mod tests {
         assert_eq!(reason, "the machine was lost");
         assert!(!reason.contains("--"), "no option ever belongs in a signed reason");
         assert_eq!(network.as_deref(), Some("casa"), "and the network is its own field");
-    }
-
-    /// A revocation signed here, owed to the devices given.
-    fn revocation_owed_to(owed: &[(&str, bool)]) -> Waiting {
-        Waiting {
-            does: Act::Revokes(named("stolen", 3)),
-            signed_here: Signed::NotRecorded,
-            owed: owed
-                .iter()
-                .zip(20u8..)
-                .map(|((name, connected), tag)| Owed {
-                    device: named(name, tag),
-                    connected: *connected,
-                    last_contact: Contact::NoneRecorded,
-                })
-                .collect(),
-        }
-    }
-
-    /// A device that has not confirmed, as the person would need to name it.
-    fn lagging(name: &str, connected: bool) -> Waiting {
-        revocation_owed_to(&[(name, connected)])
-    }
-
-    /// An operation nobody else has seen is a decision the person believes they
-    /// have made. It has to be visible without being asked for — and naming the
-    /// device is the half of it that can be acted on.
-    #[test]
-    fn unpropagated_operations_name_the_devices_that_lack_them() {
-        let waiting = report(Standing::Current, vec![lagging("laptop", false)]);
-        assert!(waiting.only().expect("one").has_unpropagated_work());
-        let shown = waiting.to_string();
-        assert!(shown.contains("laptop"), "the device is named: {shown}");
-        assert!(shown.contains("revocation of stolen"), "with what it is missing: {shown}");
-        assert!(shown.contains("waiting"), "{shown}");
-    }
-
-    /// Waiting is the right advice for a device that has not appeared, and
-    /// precisely the wrong advice for one that is connected and still has not
-    /// taken the operation. The report has to tell them apart.
-    #[test]
-    fn a_device_out_of_contact_is_told_to_be_waited_for() {
-        let shown = report(Standing::Current, vec![lagging("laptop", false)]).to_string();
-        assert!(shown.contains("not in contact"), "{shown}");
-        assert!(shown.contains("Leave the tunnel up"), "{shown}");
-    }
-
-    #[test]
-    fn a_connected_device_that_has_not_confirmed_is_not_a_wait() {
-        let shown = report(Standing::Current, vec![lagging("desktop", true)]).to_string();
-        assert!(shown.contains("connected"), "{shown}");
-        assert!(
-            !shown.contains("Leave the tunnel up"),
-            "the device is already here; waiting is not the remedy: {shown}"
-        );
-        assert!(shown.contains("still admits"), "what it costs is said: {shown}");
-    }
-
-    /// Both situations at once, each with its own sentence.
-    #[test]
-    fn each_situation_gets_the_remedy_that_fits_it() {
-        let shown = report(
-            Standing::Current,
-            vec![revocation_owed_to(&[("laptop", false), ("nas", true)])],
-        )
-        .to_string();
-        assert!(shown.contains("Leave the tunnel up"), "{shown}");
-        assert!(shown.contains("still admits"), "{shown}");
-    }
-
-    /// A device that is its network's only member has nobody to be outstanding
-    /// toward. The report must not invent a warning out of that.
-    #[test]
-    fn nothing_waiting_is_not_mentioned() {
-        assert!(!report(Standing::Current, Vec::new()).to_string().contains("waiting"));
     }
 
     #[test]
@@ -3228,7 +3107,7 @@ mod tests {
 
     #[test]
     fn the_control_protocol_round_trips() {
-        let sent = Outcome::Reported(report(Standing::Current, vec![lagging("laptop", false)]));
+        let sent = Outcome::Reported(report(Standing::Current));
         let bytes = serde_json::to_vec(&sent).expect("encodes");
         let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
         assert_eq!(back, sent);
@@ -3628,7 +3507,7 @@ mod tests {
     #[test]
     fn nothing_in_a_rendered_report_obeys_what_another_device_wrote() {
         let hostile = "x\u{1b}[31m\u{202e}y";
-        let mut report = report(Standing::Current, vec![revocation_owed_to(&[(hostile, false)])]);
+        let mut report = report(Standing::Current);
         let network = the_one(&mut report);
         network.relay = Some(hostile.to_owned());
         if let Some(peer) = network.peers.first_mut() {
@@ -3667,22 +3546,25 @@ mod tests {
     #[test]
     fn what_was_signed_is_what_is_carried() {
         let hostile = "x\u{1b}[31m\u{202e}y";
-        let sent = Outcome::Reported(report(Standing::Current, vec![lagging(hostile, false)]));
+        let mut report = report(Standing::Current);
+        if let Some(peer) = the_one(&mut report).peers.first_mut() {
+            peer.name = hostile.to_owned();
+        }
+        let sent = Outcome::Reported(report);
         let back: Outcome = serde_json::from_slice(&serde_json::to_vec(&sent).unwrap()).unwrap();
         let Outcome::Reported(back) = back else { panic!("the shape must survive") };
         let name = back
             .networks
             .first()
-            .and_then(|network| network.waiting.first())
-            .and_then(|waiting| waiting.owed.first())
-            .and_then(|owed| owed.device.name.clone());
+            .and_then(|network| network.peers.first())
+            .map(|peer| peer.name.clone());
         assert_eq!(name.as_deref(), Some(hostile));
     }
 
     #[test]
     fn a_revoked_device_is_listed_as_held_here_with_the_signers_clock() {
         let then = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_757_000_000)).unwrap();
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).revoked = vec![
             Revoked {
                 device: named("laptop", 4),
@@ -3716,12 +3598,10 @@ mod tests {
 
     #[test]
     fn no_recorded_contact_is_not_never() {
-        let drawn = report(Standing::Current, vec![lagging("laptop", false)]).to_string();
-        assert!(said(&drawn).contains("no contact with this device recorded"), "{drawn}");
-        assert!(!drawn.to_lowercase().contains("never"), "{drawn}");
+        assert_eq!(Contact::NoneRecorded.to_string(), "no contact with this device recorded");
 
         let at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_757_000_040)).unwrap();
-        let mut recorded = report(Standing::Current, Vec::new());
+        let mut recorded = report(Standing::Current);
         if let Some(peer) = the_one(&mut recorded).peers.first_mut() {
             peer.last_contact = Contact::Recorded { at };
         }
@@ -3734,7 +3614,7 @@ mod tests {
 
     #[test]
     fn an_equivocation_shows_its_branches_and_no_time() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         let mut detail = accused("laptop");
         detail.pairs = 6;
         the_one(&mut report).accused = vec![detail];
@@ -3754,39 +3634,10 @@ mod tests {
         }
     }
 
-    /// A member that confirmed said it holds an operation. Whether it applies it
-    /// cannot be seen from here.
-    #[test]
-    fn a_confirmation_is_never_described_as_enforcement() {
-        let drawn = report(
-            Standing::Current,
-            vec![revocation_owed_to(&[("laptop", false), ("nas", true)])],
-        )
-        .to_string();
-        for claim in ["applies", "applying", "enforces", "enforcing", "in effect"] {
-            assert!(
-                !drawn.contains(claim),
-                "`{claim}` says more than a confirmation shows: {drawn}"
-            );
-        }
-    }
-
-    #[test]
-    fn operations_not_listed_are_counted_and_never_hide_a_revocation() {
-        let mut report = report(Standing::Current, vec![lagging("laptop", false)]);
-        the_one(&mut report).waiting_unlisted = 5;
-        let drawn = report.to_string();
-        assert!(drawn.contains("and 5 more operations waiting"), "{drawn}");
-        assert!(said(&drawn).contains("No revocation is among them"), "{drawn}");
-    }
-
     #[test]
     fn a_time_the_operation_does_not_carry_is_not_dated() {
         assert_eq!(Signed::from_ts(3), Signed::NotRecorded);
         assert!(matches!(Signed::from_ts(1_757_000_040_000), Signed::At { .. }));
-        let drawn = report(Standing::Current, vec![lagging("laptop", false)]).to_string();
-        assert!(drawn.contains("no time recorded"), "{drawn}");
-        assert!(!drawn.contains("1970"), "{drawn}");
     }
 
     /// A relay change is a transition, unless it is told otherwise, to a relay

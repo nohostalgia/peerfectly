@@ -59,7 +59,6 @@ pub(crate) mod batches;
 pub mod channel;
 pub mod checkpoint;
 pub(crate) mod clock;
-pub mod confirmations;
 pub mod conflicts;
 pub mod connectivity;
 pub(crate) mod contacts;
@@ -151,7 +150,6 @@ mod surface {
         "attesting",
         "channel",
         "checkpoint",
-        "confirmations",
         "conflicts",
         "connectivity",
         "control",
@@ -253,18 +251,11 @@ mod surface {
         let control = include_str!("control.rs");
 
         assert!(surface.contains("## What a renderer of the report owes"), "the section exists");
-        for field in [
-            "signer_clock",
-            "signed_here",
-            "NoneRecorded",
-            "NotRecorded",
-            "waiting_unlisted",
-            "reason",
-        ] {
+        for field in ["signer_clock", "NoneRecorded", "NotRecorded", "reason"] {
             assert!(surface.contains(field), "SURFACE.md says what to do with `{field}`");
             assert!(control.contains(field), "`{field}` is still a name in control.rs");
         }
-        for owed in ["seen, not obeyed", "never as \"never\"", "not of applying", "short id"] {
+        for owed in ["seen, not obeyed", "never as \"never\"", "short id"] {
             assert!(surface.contains(owed), "SURFACE.md states: {owed}");
         }
     }

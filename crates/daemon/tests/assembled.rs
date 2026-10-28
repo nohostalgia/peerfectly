@@ -507,6 +507,40 @@ async fn crossing_sessions_keep_the_one_the_lower_id_dialled_in_either_order() {
     }
 }
 
+/// **A session the peer lost is not kept against it.** Past the moment two
+/// dials can cross, a dial from the peer that keeps the lower id's session
+/// means it no longer holds that one: the new session is kept and the old
+/// closed. Kept instead, every dial it made was closed for a session only this
+/// side still had (found in the testbed, 18.1).
+#[tokio::test]
+async fn a_dial_after_the_crossing_window_replaces_a_session_the_peer_lost() {
+    let (fixture, founder, _joiner, dialled, _accepted) = pair().await;
+    let peer = dialled.peer();
+    let lower_dials_here = fixture.founder.device_id() < peer;
+    let (kept, other) = if lower_dials_here {
+        (Opening::Dialled, Opening::Accepted)
+    } else {
+        (Opening::Accepted, Opening::Dialled)
+    };
+    founder.node.closed(&peer).await;
+    let held = Watched::to(peer);
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&held))), kept).await;
+
+    // Within the window, a crossing dial is settled as before.
+    let crossing = Watched::to(peer);
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&crossing))), other).await;
+    assert!(crossing.closed() && !held.closed(), "two dials crossing keep the lower id's");
+
+    // Past it, the peer dialled because it lost the one held here.
+    tokio::time::pause();
+    tokio::time::advance(daemon::limits::CROSSING_DIALS + std::time::Duration::from_secs(1)).await;
+    let again = Watched::to(peer);
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&again))), other).await;
+    assert!(held.closed(), "the session the peer lost is closed");
+    assert!(!again.closed(), "and its new one kept");
+    assert_eq!(founder.node.session_count().await, 1);
+}
+
 /// **A dial that returns has registered its session**: whoever asks next
 /// finds it, rather than dialling a second session in the same direction
 /// (`convesso-reach` 5.4).

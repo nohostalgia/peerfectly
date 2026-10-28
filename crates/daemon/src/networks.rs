@@ -721,17 +721,8 @@ mod tests {
         // contact is metadata about the people in one network, and removing the
         // network's directory has to remove it too.
         let contacts = crate::contacts::ContactRecord::beside(&casa.roster()).path().to_path_buf();
-        let confirmations =
-            crate::confirmations::Confirmations::beside(&casa.roster()).path().to_path_buf();
 
-        for one in [
-            casa.roster(),
-            casa.identity(),
-            casa.endpoints(),
-            casa.choice(),
-            contacts,
-            confirmations,
-        ] {
+        for one in [casa.roster(), casa.identity(), casa.endpoints(), casa.choice(), contacts] {
             assert!(one.starts_with(casa.root()), "{} belongs to its own network", one.display());
             assert!(!one.starts_with(lavoro.root()));
         }

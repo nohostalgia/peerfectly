@@ -1707,10 +1707,25 @@ fn an_address_taken_after_the_snapshot_leaves_its_holder_without_it() {
     history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
     history.op("b", 1, &["a"], assign(2));
     history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
-    history.op("d", 1, &["c"], OperationBody::Rename { device: device_id(3), name: "x".to_owned() });
+    history.op(
+        "d",
+        1,
+        &["c"],
+        OperationBody::Rename { device: device_id(3), name: "x".to_owned() },
+    );
     history.op("e", 1, &["d"], assign(3));
-    history.op("f", 1, &["e"], OperationBody::Rename { device: device_id(3), name: "y".to_owned() });
-    history.op("h", 1, &["f"], OperationBody::Rename { device: device_id(3), name: "z".to_owned() });
+    history.op(
+        "f",
+        1,
+        &["e"],
+        OperationBody::Rename { device: device_id(3), name: "y".to_owned() },
+    );
+    history.op(
+        "h",
+        1,
+        &["f"],
+        OperationBody::Rename { device: device_id(3), name: "z".to_owned() },
+    );
 
     let mut whole = Roster::with_staleness_depth(1);
     load(&mut whole, &history);

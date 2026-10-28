@@ -79,7 +79,10 @@ fn of_two_writers_of_one_field_the_later_wins() {
     history.op("full", 1, &["light"], set(3, full));
     let state = loaded(&history).state().unwrap();
     assert_eq!(state.settings_of(&device_id(3)).mode, Mode::Full);
-    assert!(state.devices.changed_settings().next().is_none(), "back at the default, nothing is recorded");
+    assert!(
+        state.devices.changed_settings().next().is_none(),
+        "back at the default, nothing is recorded"
+    );
 }
 
 #[test]

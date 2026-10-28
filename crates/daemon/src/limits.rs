@@ -198,6 +198,12 @@ pub const HANDED_SEEN_WITHIN_MINUTES: u64 = 7 * 24 * 60;
 /// was a sealed file.
 pub const INVITE_DIAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long two sessions opened in opposite directions count as two dials
+/// crossing, which both sides settle by keeping the one the lower id dialled.
+/// Past it, a peer that dials again has lost the session held with it, and its
+/// new one is kept. Wide enough for a handshake through the relay.
+pub const CROSSING_DIALS: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// How long after its admission a new member this device has never been in
 /// contact with is dialled by the members around it, to be brought the
 /// network: three days. A device switched off for longer is still dialled by

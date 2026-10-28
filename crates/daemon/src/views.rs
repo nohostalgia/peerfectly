@@ -370,75 +370,6 @@ fn warnings(network: &Network, block: &mut Block) {
         block.plain("  to compare the code and admit it:  peerfectly resume");
     }
 
-    if network.has_unpropagated_work() {
-        block.blank();
-        block.note("waiting: signed operations have not reached every device");
-        for waiting in &network.waiting {
-            match waiting.signed_here {
-                Signed::At { time } => block.plain(format!(
-                    "  {} — signed here at {}",
-                    waiting.does,
-                    crate::drawing::when(time)
-                )),
-                _ => block.plain(format!("  {} — signed here, no time recorded", waiting.does)),
-            }
-            for owed in &waiting.owed {
-                if owed.connected {
-                    block.plain(format!(
-                        "    {} — connected, and has not said it holds it",
-                        owed.device
-                    ));
-                } else {
-                    block.plain(format!(
-                        "    {} — not in contact; {}",
-                        owed.device, owed.last_contact
-                    ));
-                }
-            }
-        }
-        if network.waiting_unlisted > 0 {
-            block.plain(format!(
-                "  and {} more operations waiting, not listed here. No revocation is among them.",
-                network.waiting_unlisted
-            ));
-        }
-
-        // The remedy, chosen from what is actually true. A number with no remedy
-        // trains a person to ignore the number; a remedy that does not apply to
-        // their situation trains them faster.
-        //
-        // Two conditions and not two branches of one: a network can hold both a
-        // device that has not appeared and one that is here and has not taken
-        // the operation, and each of those has an answer of its own.
-        let owed = || network.waiting.iter().flat_map(|waiting| waiting.owed.iter());
-        if owed().any(|device| !device.connected) {
-            block.plain(
-                "Leave the tunnel up. A device is sent these the moment it is in contact, by \
-                 this device or by any other member that already holds them.",
-            );
-        }
-        if owed().any(|device| device.connected) {
-            block.plain(
-                "A device that stays connected without saying it holds them has not taken \
-                 them. Until it does, it still admits anything these operations revoke.",
-            );
-        }
-    }
-
-    // Not a warning: a device that has never been in contact holds nothing yet
-    // to be missing anything from, and takes the current state when it first is.
-    match network.waiting_never_met {
-        0 => {}
-        1 => block.plain(
-            "1 device has never been in contact with this one; it takes everything signed here \
-             when it first is.",
-        ),
-        count => block.plain(format!(
-            "{count} devices have never been in contact with this one; each takes everything \
-             signed here when it first is."
-        )),
-    }
-
     if !network.revoked.is_empty() {
         block.blank();
         block.plain("revoked — the revocations this device holds:");
@@ -530,9 +461,6 @@ mod tests {
             accused: Vec::new(),
             peers,
             revoked: Vec::new(),
-            waiting: Vec::new(),
-            waiting_unlisted: 0,
-            waiting_never_met: 0,
             problem: None,
         }
     }
@@ -579,18 +507,6 @@ mod tests {
         let drawn = report.to_string();
         assert!(drawn.contains("the founding of `prova`"), "{drawn}");
         assert!(drawn.contains("peerfectly cancel"), "{drawn}");
-    }
-
-    /// **Devices never in contact are a count, not a list under each act.**
-    #[test]
-    fn status_counts_the_devices_never_met() {
-        let mut report = two_networks();
-        if let Some(casa) = report.networks.first_mut() {
-            casa.waiting_never_met = 1000;
-        }
-        let drawn = report.to_string();
-        assert!(drawn.contains("1000 devices have never been in contact"), "{drawn}");
-        assert!(!drawn.contains("waiting: signed operations"), "and no warning for them: {drawn}");
     }
 
     fn two_networks() -> Report {

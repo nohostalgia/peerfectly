@@ -897,6 +897,124 @@ async fn a_light_member_cuts_off_a_peer_its_view_no_longer_believes() {
     );
 }
 
+/// A light member that believes the full one only once it has taken the
+/// chain `chain`, asking after `held`: the judge, and how it catches up.
+fn catching_up_on(
+    network: &Network,
+    held: [u8; 32],
+    chain: &'static [u8],
+) -> (transport_convesso::node::Judge, transport::session::CatchingUp, Arc<AtomicUsize>) {
+    let caught_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
+    let judge: transport_convesso::node::Judge = {
+        let caught_up = Arc::clone(&caught_up);
+        Arc::new(move |shown: &roster::snapshot::RawSnapshot, _: &roster::leaf::DeviceLeaf| {
+            shown.body().root == root && caught_up.load(Ordering::SeqCst)
+        })
+    };
+    let behind = {
+        let caught_up = Arc::clone(&caught_up);
+        let asked = Arc::clone(&asked);
+        Arc::new(move |_: &[u8]| {
+            if caught_up.load(Ordering::SeqCst) {
+                return None;
+            }
+            asked.fetch_add(1, Ordering::SeqCst);
+            Some(held)
+        })
+    };
+    let take = Arc::new(move |_: &[u8], roots: &[u8]| {
+        let taken = roots == chain;
+        if taken {
+            caught_up.store(true, Ordering::SeqCst);
+        }
+        taken
+    });
+    (judge, transport::session::CatchingUp { behind, take }, asked)
+}
+
+/// Roots served for `held` alone: `chain`.
+fn serving(held: [u8; 32], chain: &'static [u8]) -> transport::session::RootsAfter {
+    Arc::new(move |since: [u8; 32]| {
+        Box::pin(async move { if since == held { chain.to_vec() } else { Vec::new() } })
+    })
+}
+
+/// A light member shown evidence on a root it cannot place asks the peer for
+/// the roots after its own, takes them, and believes the peer: dialling, and
+/// dialled. Before, it refused every member holding roots it had missed, and
+/// had nobody left to ask (testbed, 18.1).
+#[tokio::test]
+async fn a_light_member_catches_up_while_a_session_opens() {
+    const HELD: [u8; 32] = [7; 32];
+    const CHAIN: &[u8] = b"the roots after seven";
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    full.serve_roots(serving(HELD, CHAIN));
+
+    for light_dials in [true, false] {
+        let (judge, catching, asked) = catching_up_on(&network, HELD, CHAIN);
+        let joiner = ConvessoTransport::bind_light(
+            &network.joiner,
+            network.state.network,
+            network.state.params.clone(),
+            network.evidence.get(&network.joiner.device_id()).unwrap().clone(),
+            judge,
+        )
+        .await
+        .unwrap();
+        joiner.catch_up_by(catching);
+        tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+            .await
+            .unwrap();
+
+        let (dialled, accepted) =
+            if light_dials { session(&joiner, &full).await } else { session(&full, &joiner).await };
+        let (light_side, full_side) =
+            if light_dials { (dialled, accepted) } else { (accepted, dialled) };
+        assert_eq!(light_side.peer(), network.founder.device_id(), "dialling: {light_dials}");
+        assert_eq!(full_side.peer(), network.joiner.device_id());
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once");
+        light_side.send(b"through").await.unwrap();
+        assert_eq!(full_side.recv().await.unwrap(), b"through".to_vec());
+    }
+}
+
+/// A peer with nothing to answer is refused as before, within the dial's
+/// patience.
+#[tokio::test]
+async fn a_light_member_still_refuses_a_peer_with_no_roots_to_give() {
+    const HELD: [u8; 32] = [7; 32];
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    let (judge, catching, _) = catching_up_on(&network, HELD, b"never sent");
+    let joiner = ConvessoTransport::bind_light(
+        &network.joiner,
+        network.state.network,
+        network.state.params.clone(),
+        network.evidence.get(&network.joiner.device_id()).unwrap().clone(),
+        judge,
+    )
+    .await
+    .unwrap();
+    joiner.catch_up_by(catching);
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let dialled = tokio::time::timeout(PATIENCE, joiner.connect(&full.transport_key()))
+        .await
+        .expect("answered within patience");
+    assert!(
+        matches!(dialled, Err(ref error) if error.is_membership_refusal()),
+        "{:?}",
+        dialled.as_ref().err()
+    );
+}
+
 #[tokio::test]
 async fn a_rotated_transport_key_ends_the_session_it_authenticated() {
     let (_relay, network, founder, joiner) = pair().await;

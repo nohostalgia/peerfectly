@@ -991,17 +991,25 @@ impl Service {
 
     /// Starts the transport a node runs on: a light member's judges its peers
     /// by their evidence; a full member's by its state.
+    ///
+    /// Either way it is told how a light member catches up as a session opens:
+    /// a light one, how to ask; a full one, what to answer.
     async fn start_transport(
         &self,
-        node: &Node,
+        node: &Arc<Node>,
         state: roster::state::RosterState,
     ) -> crate::Result<Arc<dyn transport::Transport>> {
-        match node.light_binding() {
+        let transport = match node.light_binding() {
             Some((evidence, judge)) => {
-                self.connectivity.start_light(node.identity(), state, evidence, judge).await
+                self.connectivity.start_light(node.identity(), state, evidence, judge).await?
             }
-            None => self.connectivity.start(node.identity(), state).await,
+            None => self.connectivity.start(node.identity(), state).await?,
+        };
+        match node.catching_up() {
+            Some(catching) => transport.catch_up_by(catching),
+            None => transport.serve_roots(node.roots_source()),
         }
+        Ok(transport)
     }
 
     /// Builds a network's node again from what its directory keeps — after a
@@ -1298,22 +1306,6 @@ impl Service {
             loop {
                 tokio::time::sleep(core::time::Duration::from_secs(60)).await;
                 sweeping.close_idle(schedule.idle).await;
-            }
-        }));
-
-        // Urgency sets its own pace. A revocation nobody has received yet is not
-        // the same situation as an idle network, and until now both waited the
-        // same minute. This presses only the members that are owed something and
-        // have no session, and widens to six hours as attempts go unanswered — so
-        // a laptop switched off for a week is tried a few times a day, not every
-        // two seconds for a week.
-        let pressing_node = Arc::clone(&node);
-        driving.push(tokio::spawn(async move {
-            let mut pacing = crate::schedule::Pressing::new(schedule.press);
-            loop {
-                let waiting = pacing.next(pressing_node.owed().await, &schedule);
-                tokio::time::sleep(waiting).await;
-                pressing_node.press().await;
             }
         }));
 
@@ -1991,9 +1983,6 @@ impl Service {
                 accused: Vec::new(),
                 peers: Vec::new(),
                 revoked: Vec::new(),
-                waiting: Vec::new(),
-                waiting_unlisted: 0,
-                waiting_never_met: 0,
                 problem: node.problem(std::time::SystemTime::now()).await,
             };
         };
@@ -2080,9 +2069,6 @@ impl Service {
             accused: membership.accused,
             peers,
             revoked: membership.revoked,
-            waiting: membership.waiting,
-            waiting_unlisted: membership.waiting_unlisted,
-            waiting_never_met: membership.waiting_never_met,
             problem: node.problem(std::time::SystemTime::now()).await,
         }
     }
@@ -4262,7 +4248,7 @@ impl Service {
     /// [`crate::limits::NEWCOMER_PATIENCE`] after its admission was signed;
     /// never again once this device has had a session with it. Only from a
     /// network that is up: a member whose person turned it off speaks to
-    /// nobody.
+    /// nobody. Never a board of a batch: it reaches the network itself.
     async fn bring_to_newcomers(self: &Arc<Self>) {
         let now = std::time::Instant::now();
         let mut dials = tokio::task::JoinSet::new();
@@ -4294,7 +4280,7 @@ impl Service {
                     continue;
                 }
                 let recent = node
-                    .signed_at(&record.added_by)
+                    .admitted_alone_at(&record.added_by)
                     .await
                     .is_some_and(|signed| crate::clock::now_ms().saturating_sub(signed) < patience);
                 if !recent {
@@ -4313,6 +4299,9 @@ impl Service {
                 }
                 owed.push((device, record.keys.clone()));
             }
+            // What every one of them is given, read once for the round: it is
+            // the whole log, and a root worked out over it.
+            let mut delivery: Option<Arc<crate::admitting::Delivery>> = None;
             for (device, keys) in owed {
                 let key = (state.network, device);
                 {
@@ -4334,11 +4323,17 @@ impl Service {
                 ) else {
                     continue;
                 };
+                let delivery = match &delivery {
+                    Some(delivery) => Arc::clone(delivery),
+                    None => {
+                        let Ok(read) = self.delivery_of(&network).await else { break };
+                        Arc::clone(delivery.insert(Arc::new(read)))
+                    }
+                };
                 let this = Arc::clone(self);
                 let network = Arc::clone(&network);
                 let relay = relay.clone();
                 dials.spawn(async move {
-                    let Ok(delivery) = this.delivery_of(&network).await else { return };
                     let destination = crate::admitting::Destination {
                         dialled: transport.clone(),
                         relay: &relay,
@@ -6006,7 +6001,7 @@ mod tests {
     async fn revoking_a_name_nobody_holds_signs_nothing() {
         let fixture = fixture(None).await;
         let before =
-            fixture.service.node().await.expect("the fixture holds a network").outstanding().await;
+            fixture.service.node().await.expect("the fixture holds a network").heads().await;
 
         let outcome = fixture
             .service
@@ -6027,7 +6022,7 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(
-            fixture.service.node().await.expect("the fixture holds a network").outstanding().await,
+            fixture.service.node().await.expect("the fixture holds a network").heads().await,
             before,
             "nothing was signed"
         );
@@ -6095,10 +6090,6 @@ mod tests {
         assert!(
             daemon.contains("reconcile_with_neighbours"),
             "reconciliation must repeat on an open session, not only when one is established"
-        );
-        assert!(
-            daemon.contains(".press().await"),
-            "and what is outstanding must be pressed rather than waiting on the idle tick"
         );
     }
 
@@ -6333,7 +6324,16 @@ mod tests {
         assert_eq!(request.fingerprint, fingerprint, "the fingerprint both screens show");
         assert_eq!(request.taken, None);
         let network = service.all().await.first().map(Arc::clone).expect("the network");
-        let told = network.node().event().await.expect("an event");
+        // Said once the request is kept, so a moment after the list shows it.
+        let mut told = network.node().event().await;
+        for _ in 0..100 {
+            if told.as_ref().is_some_and(|event| event.cause.contains("request arrived")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            told = network.node().event().await;
+        }
+        let told = told.expect("an event");
         assert!(told.cause.contains("request arrived"), "{told:?}");
         let arrived_in = |outcome: Outcome| match outcome {
             Outcome::Reported(report) => report.networks.first().and_then(|n| n.arrived.clone()),
@@ -6383,6 +6383,29 @@ mod tests {
         assert!(held.evidence_for(&device).is_some(), "a proof of itself, in what it holds");
         let body = roster::snapshot::RawSnapshot::decode(&root).expect("decodes");
         assert_eq!(body.body().previous.len(), 1, "it follows the admitter's root");
+
+        // Invited as light, it is light once it is up: it keeps the light
+        // member, and no roster.
+        let up = joiner.handle(Command::Up { network: Some(arrived.label().to_string()) }).await;
+        assert!(!matches!(up, Outcome::Failed { .. }), "{up:?}");
+        let mut light = false;
+        for _ in 0..400 {
+            let held = joiner.all().await;
+            if held.first().is_some_and(|network| network.node().is_light()) {
+                light = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(light, "the device invited as light became light");
+        let became = joiner.all().await.first().map(Arc::clone).expect("its network");
+        let known = became.node().state().await.expect("a light state");
+        let admin = network.node().identity().device_id();
+        assert!(
+            known.devices.contains_key(&admin),
+            "it keeps the admin that admitted it, to reach: {:?}",
+            known.devices.iter().map(|(device, _)| device).collect::<Vec<_>>()
+        );
     }
 
     /// Restarts on both sides in the middle: the request stays pending on the
@@ -10195,12 +10218,6 @@ mod tests {
                     "and it is not listed among the members"
                 );
                 assert!(
-                    network.waiting.iter().all(|waiting| {
-                        !waiting.owed.iter().any(|owed| owed.device.id == revoked.device.id)
-                    }),
-                    "nor waited for"
-                );
-                assert!(
                     report.note.is_some_and(|note| note.contains("brought up")),
                     "the person is told the network was turned on to carry it"
                 );
@@ -10211,7 +10228,7 @@ mod tests {
     }
 
     /// A tunnel that will not start is not a reason to lose the revocation. It
-    /// is signed, it is in the log, and it is still owed to every member.
+    /// is signed, it is in the log, and it goes out once the tunnel does.
     #[tokio::test]
     async fn a_revocation_survives_a_tunnel_that_will_not_come_up() {
         let fixture = fixture(Some(Fail::Adapter)).await;
@@ -10255,14 +10272,6 @@ mod tests {
             log.read().expect("a readable log").len(),
             before.saturating_add(1),
             "and it is on disk rather than discarded because the tunnel refused"
-        );
-        // Nothing is outstanding, and that is correct rather than a loss: the
-        // device just revoked was this network's only other member, so there is
-        // nobody left for the revocation to be owed to. A report that invented a
-        // warning here would be describing a peer that does not exist.
-        assert!(
-            node.outstanding().await.is_empty(),
-            "a network of one has nobody to be waiting on"
         );
     }
 
@@ -11299,7 +11308,16 @@ mod tests {
 
         let admitted = fixture.service.handle(admit(Some(Vec::new()))).await;
         assert!(matches!(admitted, Outcome::Reported(_)), "{admitted:?}");
-        assert_eq!(node.state().await.expect("derives").devices.len(), before + 6, "all six in");
+        let state = node.state().await.expect("derives");
+        assert_eq!(state.devices.len(), before + 6, "all six in");
+
+        // Its boards reach the network themselves: no member dials them.
+        let boards: Vec<_> =
+            state.devices.iter().filter(|(_, record)| record.name.starts_with("board")).collect();
+        assert_eq!(boards.len(), 6);
+        for (_, record) in boards {
+            assert_eq!(node.admitted_alone_at(&record.added_by).await, None, "{}", record.name);
+        }
     }
 
     /// Revoking an admin whose batch this device holds only by its header asks

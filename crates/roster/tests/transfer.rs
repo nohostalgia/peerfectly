@@ -17,7 +17,13 @@ use support::params;
 
 /// A state of `count` devices, every fifth light and in a group.
 fn state_of(count: u32) -> RosterState {
-    let mut state = RosterState::from_parts(NetworkId::from_bytes([7; 32]), params(), BTreeMap::new(), BTreeSet::new(), BTreeMap::new());
+    let mut state = RosterState::from_parts(
+        NetworkId::from_bytes([7; 32]),
+        params(),
+        BTreeMap::new(),
+        BTreeSet::new(),
+        BTreeMap::new(),
+    );
     for index in 0..count {
         let mut seed = [0_u8; 32];
         seed[..4].copy_from_slice(&index.to_be_bytes());

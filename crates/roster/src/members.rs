@@ -504,7 +504,8 @@ impl Members {
                 }
             }
         }
-        for ((_, device), holds) in self.names.range(from..).take_while(|((held, _), _)| *held == lower)
+        for ((_, device), holds) in
+            self.names.range(from..).take_while(|((held, _), _)| *held == lower)
         {
             if *holds {
                 holders.insert(*device, false);
@@ -568,12 +569,10 @@ impl Members {
         Some(
             touched
                 .into_iter()
-                .filter(|device| {
-                    match (self.get(device), other.get(device)) {
-                        (None, None) => false,
-                        (Some(one), Some(two)) => !Arc::ptr_eq(&one, &two) && one != two,
-                        _ => true,
-                    }
+                .filter(|device| match (self.get(device), other.get(device)) {
+                    (None, None) => false,
+                    (Some(one), Some(two)) => !Arc::ptr_eq(&one, &two) && one != two,
+                    _ => true,
                 })
                 .collect(),
         )

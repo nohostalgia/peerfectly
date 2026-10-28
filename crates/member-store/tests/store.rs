@@ -38,7 +38,7 @@ fn leaf(n: u32) -> DeviceLeaf {
         added_by: OperationId::from_bytes([1; 32]),
         capabilities: Vec::new(),
     };
-    let address = (n % 3 == 0).then(|| {
+    let address = n.is_multiple_of(3).then(|| {
         let [_, _, high, low] = n.to_be_bytes();
         [100, 70, high, low]
     });

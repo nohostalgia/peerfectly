@@ -85,6 +85,10 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Only for this version's notes, written beside the code they describe.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: deploy/release-notes
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
@@ -107,7 +111,12 @@ jobs:
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          cat > notes.md <<EOF
+          # What changed in this version, where it was written down, first.
+          if [ -f "deploy/release-notes/$VERSION.md" ]; then
+            cat "deploy/release-notes/$VERSION.md" > notes.md
+            echo >> notes.md
+          fi
+          cat >> notes.md <<EOF
           ## Install
 
           - **Windows:** \`peerfectly-$VERSION-windows-x64.msi\`

@@ -251,6 +251,18 @@ impl BatchEntry {
         self.spec()?.device_id()
     }
 
+    /// The device this entry admits, for an entry already found to keep the
+    /// rules: what [`Self::spec`] gives, without checking them again.
+    pub(crate) fn admitted_spec(&self) -> crate::types::DeviceSpec {
+        crate::types::DeviceSpec {
+            keys: self.keys.clone(),
+            name: self.name.clone(),
+            role: crate::types::Role::Member,
+            founder: false,
+            capabilities: Vec::new(),
+        }
+    }
+
     /// Where the entry sits in its batch's tree.
     #[must_use]
     pub fn position(device: &crate::id::DeviceId) -> Hash {
@@ -617,13 +629,25 @@ pub fn skipped(
     header: &BatchHeader,
     entries: &[BatchEntry],
 ) -> alloc::collections::BTreeMap<crate::id::DeviceId, Skip> {
+    skipped_among(
+        held,
+        header,
+        entries.iter().filter_map(|entry| entry.device_id().ok().map(|device| (device, entry))),
+    )
+}
+
+/// [`skipped`], over entries whose devices are already worked out: what
+/// derivation holds, which asks this every time it resolves a state.
+#[must_use]
+pub fn skipped_among<'entry>(
+    held: &crate::state::RosterState,
+    header: &BatchHeader,
+    entries: impl Iterator<Item = (crate::id::DeviceId, &'entry BatchEntry)>,
+) -> alloc::collections::BTreeMap<crate::id::DeviceId, Skip> {
     // The addresses entries before this one took; those members hold are asked
     // of the state's index, rather than gathered from every member.
     let mut taken: alloc::collections::BTreeSet<[u8; 4]> = alloc::collections::BTreeSet::new();
-    let mut ordered: Vec<(crate::id::DeviceId, &BatchEntry)> = entries
-        .iter()
-        .filter_map(|entry| entry.device_id().ok().map(|device| (device, entry)))
-        .collect();
+    let mut ordered: Vec<(crate::id::DeviceId, &BatchEntry)> = entries.collect();
     ordered.sort_by_key(|(device, _)| *device);
     let mut out = alloc::collections::BTreeMap::new();
     for (device, entry) in ordered {

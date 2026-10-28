@@ -130,7 +130,7 @@ impl<K: Ord + Clone, V: Clone> Layered<K, V> {
     /// Folds the changes into a new base once they are a good part of it, so
     /// that copying stays cheap and reading stays one lookup or two.
     fn settle(&mut self) {
-        if self.over.len() <= self.base.len() / 8 + 64 {
+        if self.over.len() <= (self.base.len() / 8).saturating_add(64) {
             return;
         }
         let merged: BTreeMap<K, V> =
