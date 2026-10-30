@@ -95,6 +95,8 @@ pub mod schedule;
 pub mod seeking;
 pub(crate) mod service;
 pub mod signing;
+#[cfg(test)]
+mod simulator;
 pub mod snapshots;
 pub mod state;
 pub mod views;

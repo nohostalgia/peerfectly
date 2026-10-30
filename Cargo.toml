@@ -81,3 +81,15 @@ opt-level = 3
 # seventy-five million hashes: minutes unoptimised, seconds optimised.
 [profile.dev.package.blake3]
 opt-level = 3
+
+# Every signature a simulated network checks — tens of thousands of roots and
+# proofs for ten thousand light members — goes through these: twenty minutes
+# unoptimised (`daemon::simulator`).
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

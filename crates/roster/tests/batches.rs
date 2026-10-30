@@ -354,15 +354,42 @@ fn an_urgent_act_is_anchored_off_a_recent_batch() {
     for piece in pieces_of(&history.id("batch"), &entries).unwrap() {
         let _ = roster.offer_piece(&piece);
     }
-    let member = entries.first().unwrap().device_id().unwrap();
+    let other = support::device_id(2);
     let at = signed_at(&history, "batch");
 
-    let soon = roster.urgent_anchor(&member, at.saturating_add(1_000));
+    let soon = roster.urgent_anchor(&other, at.saturating_add(1_000));
     assert_eq!(soon.heads, vec![history.id("admin2")], "the batch is left out");
-    assert!(soon.voided.is_empty(), "a member's revocation voids nothing of its own");
+    assert!(soon.voided.is_empty(), "nothing of the target's own is voided");
 
-    let later = roster.urgent_anchor(&member, at.saturating_add(URGENT_BATCH_AGE_MS + 1));
+    let later = roster.urgent_anchor(&other, at.saturating_add(URGENT_BATCH_AGE_MS + 1));
     assert_eq!(later.heads, vec![history.id("batch")], "an old batch is an ancestor like any");
+}
+
+/// A board revoked minutes after its batch: the batch that admitted it stays
+/// an ancestor, or the revocation would name a device its ancestors do not
+/// hold and be refused. Found in the testbed (18.1), where such a board could
+/// not be revoked at all.
+#[test]
+fn a_board_of_a_recent_batch_is_revoked_over_its_batch() {
+    let (mut history, entries) = with_header();
+    let mut roster = loaded(&history);
+    for piece in pieces_of(&history.id("batch"), &entries).unwrap() {
+        let _ = roster.offer_piece(&piece);
+    }
+    let board = entries.first().unwrap().device_id().unwrap();
+    let at = signed_at(&history, "batch");
+
+    let anchor = roster.urgent_anchor(&board, at.saturating_add(1_000));
+    assert_eq!(anchor.heads, vec![history.id("batch")], "its own batch is kept");
+
+    history.op(
+        "revoke",
+        1,
+        &["batch"],
+        OperationBody::RevokeDevice { device: board, reason: "lost".to_owned() },
+    );
+    assert!(roster.offer_bytes(&history.bytes("revoke")).is_accepted(), "and the act is taken");
+    assert!(!roster.state().unwrap().devices.contains_key(&board), "the board is out");
 }
 
 #[test]

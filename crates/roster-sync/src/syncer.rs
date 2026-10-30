@@ -221,10 +221,20 @@ impl Syncer {
     /// `message` as `peer` is to receive it, if at all.
     ///
     /// A full member receives everything. A light member receives roots and
-    /// attestations, and never an operation, a piece or an offer of them; in
-    /// place of a digest, which would invite an offer, it is sent the root this
-    /// node holds. Every message a node sends on a roster channel passes here,
-    /// so the rule is in one place rather than at each send.
+    /// attestations, and never an operation, a piece or an offer of them, and
+    /// no digest, which would invite an offer.
+    ///
+    /// Nor the root this node holds, in place of the digest, as it once was:
+    /// the light member already has it from the evidence this node showed as
+    /// the session opened, taken there or caught up to (`transport`'s
+    /// `CatchingUp`). Sent with every greeting, the same root went to every
+    /// light member at every session, about an hour apart, whether anything
+    /// had changed or not: at a hundred thousand light members, some 70 MB an
+    /// hour from each full member serving half of them. A root a node takes
+    /// later still reaches open sessions, as what it forwards.
+    ///
+    /// Every message a node sends on a roster channel passes here, so the
+    /// rule is in one place rather than at each send.
     #[must_use]
     pub fn for_peer(&self, peer: &DeviceId, message: Message) -> Option<Message> {
         if !self.is_light(peer) {
@@ -232,8 +242,8 @@ impl Syncer {
         }
         match message {
             Message::Snapshot(_) | Message::Attestation(_) => Some(message),
-            Message::Digest(_) => self.root_message(),
-            Message::Offer(_)
+            Message::Digest(_)
+            | Message::Offer(_)
             | Message::Transfer(_)
             | Message::Pieces(_)
             | Message::StateRequest(_)

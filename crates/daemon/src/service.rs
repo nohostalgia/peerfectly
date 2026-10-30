@@ -2138,7 +2138,12 @@ impl Service {
     /// When the roster refuses the operation, or the network will not come up.
     pub async fn admit_to(&self, network: &Arc<Network>, operation: &[u8]) -> Result<bool> {
         network.node().admit_without_activating(operation).await?;
+        self.carried_by(network).await
+    }
 
+    /// What follows an act the roster took: attested, and the network brought
+    /// up to carry it. Whether it had to be brought up.
+    async fn carried_by(&self, network: &Arc<Network>) -> Result<bool> {
         // The roster just changed, and the person who changed it is here. On a
         // phone this is the one moment a signature may ask for the lock without
         // arriving out of nowhere: they have this second signed an admission or a
@@ -3608,7 +3613,15 @@ impl Service {
     /// Reached by both paths, because by the time the bytes exist it no longer
     /// matters which of them produced the signature.
     async fn carry_revocation(&self, network: &Arc<Network>, signed: Vec<u8>) -> Outcome {
-        match self.admit_to(network, &signed).await {
+        // Refused by the roster, it is held nowhere, and saying the network
+        // would not come up would send a person after the wrong thing.
+        if let Err(cause) = network.node().admit_without_activating(&signed).await {
+            return Outcome::Failed {
+                message: format!("nothing was revoked: {cause}"),
+                left_behind: Vec::new(),
+            };
+        }
+        match self.carried_by(network).await {
             Ok(false) => Outcome::Reported(self.report().await),
             Ok(true) => Outcome::Reported(
                 self.report().await.with_note("the network was brought up to carry it"),
@@ -3718,7 +3731,13 @@ impl Service {
     /// Puts a signed rename into the roster, bringing the network up to carry
     /// it, as every administrative act does.
     async fn carry_rename(&self, network: &Arc<Network>, signed: Vec<u8>) -> Outcome {
-        match self.admit_to(network, &signed).await {
+        if let Err(cause) = network.node().admit_without_activating(&signed).await {
+            return Outcome::Failed {
+                message: format!("nothing was renamed: {cause}"),
+                left_behind: Vec::new(),
+            };
+        }
+        match self.carried_by(network).await {
             Ok(false) => Outcome::Reported(self.report().await),
             Ok(true) => Outcome::Reported(
                 self.report().await.with_note("the network was brought up to carry it"),
@@ -4831,8 +4850,13 @@ impl Service {
             }
         };
         let fingerprint = crate::joining::fingerprint(&identity.signing_key().public_key());
-        let (underway, reporting) =
-            crate::joining::Underway::new(crate::joining::Progress::Registering);
+        // Where the admin's daemon already said it was received, that is where it
+        // stands from the first moment, not once the resumed task has got that
+        // far: a list asked for in between said it was registering again.
+        let first = join.requested_at.map_or(crate::joining::Progress::Registering, |at| {
+            crate::joining::Progress::Requested { at }
+        });
+        let (underway, reporting) = crate::joining::Underway::new(first);
         let machine = self.machine.clone();
         let joined = Arc::clone(&self.joined);
         let since = join.started_at;
@@ -5703,7 +5727,12 @@ impl Service {
                 )));
             }
         };
-        if let Err(cause) = self.admit_to(network, &signed).await {
+        if let Err(cause) = node.admit_without_activating(&signed).await {
+            return Err(Outcome::refused(format!(
+                "the device holding that name could not be revoked, so nothing was admitted: {cause}"
+            )));
+        }
+        if let Err(cause) = self.carried_by(network).await {
             return Err(Outcome::Failed {
                 message: format!(
                     "the device holding that name was revoked, and the network would not come up to carry it: {cause}"

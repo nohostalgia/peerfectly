@@ -303,6 +303,7 @@ mod tests {
             ("rule.rs", include_str!("rule.rs")),
             ("schedule.rs", include_str!("schedule.rs")),
             ("signing.rs", include_str!("signing.rs")),
+            ("simulator.rs", include_str!("simulator.rs")),
             ("snapshots.rs", include_str!("snapshots.rs")),
             ("state.rs", include_str!("state.rs")),
             ("wire.rs", include_str!("wire.rs")),

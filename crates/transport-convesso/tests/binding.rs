@@ -393,14 +393,26 @@ async fn a_revoked_device_is_closed_and_then_refused_in_the_handshake() {
     }
 
     // The revoked device still holds the old state, so it dials as a member
-    // would: the founder's handshake is what refuses it.
-    let dial = tokio::time::timeout(PATIENCE, joiner.connect(&founder.transport_key()))
-        .await
-        .expect("the dial finishes");
-    match dial {
-        Err(error) => assert!(error.is_membership_refusal(), "{error:?}"),
-        Ok(_) => panic!("a revoked device must not establish"),
-    }
+    // would: the founder's handshake is what refuses it. A dial made at once
+    // may meet the old channel being reset instead, and fail as unreachable:
+    // with signatures fast, as in a release build, it does. It never
+    // establishes, and once the old channel is gone it is refused as what it
+    // is.
+    let refused = tokio::time::timeout(PATIENCE, async {
+        loop {
+            match joiner.connect(&founder.transport_key()).await {
+                Ok(_) => panic!("a revoked device must not establish"),
+                Err(error) if error.is_membership_refusal() => return error,
+                Err(Error::PeerUnreachable { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(other) => panic!("neither a refusal nor the old channel: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("refused within patience");
+    assert!(refused.is_membership_refusal(), "{refused:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -744,9 +756,7 @@ async fn a_session_nobody_reads_holds_back_its_peer_alone() {
 /// A judge believing only the network's root.
 fn believing(network: &Network) -> transport_convesso::node::Judge {
     let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
-    Arc::new(move |shown: &roster::snapshot::RawSnapshot, _: &roster::leaf::DeviceLeaf| {
-        shown.body().root == root
-    })
+    Arc::new(move |shown: &roster::membership::Shown| shown.against == root)
 }
 
 /// The joiner as a light member, on `relay`, showing `evidence`.
@@ -867,9 +877,9 @@ async fn a_light_member_cuts_off_a_peer_its_view_no_longer_believes() {
     let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
     let judge: transport_convesso::node::Judge = {
         let invalidated = Arc::clone(&invalidated);
-        Arc::new(move |shown: &roster::snapshot::RawSnapshot, leaf: &roster::leaf::DeviceLeaf| {
-            shown.body().root == root
-                && !(invalidated.load(Ordering::SeqCst) && leaf.record.name == "founder")
+        Arc::new(move |shown: &roster::membership::Shown| {
+            shown.against == root
+                && !(invalidated.load(Ordering::SeqCst) && shown.leaf.record.name == "founder")
         })
     };
     let joiner = ConvessoTransport::bind_light(
@@ -909,8 +919,8 @@ fn catching_up_on(
     let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
     let judge: transport_convesso::node::Judge = {
         let caught_up = Arc::clone(&caught_up);
-        Arc::new(move |shown: &roster::snapshot::RawSnapshot, _: &roster::leaf::DeviceLeaf| {
-            shown.body().root == root && caught_up.load(Ordering::SeqCst)
+        Arc::new(move |shown: &roster::membership::Shown| {
+            shown.against == root && caught_up.load(Ordering::SeqCst)
         })
     };
     let behind = {

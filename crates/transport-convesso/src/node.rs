@@ -80,10 +80,10 @@ const MESSAGE_BUDGET: usize = 2 * (MAX_MESSAGE + ELEMENT_COST);
 /// packet queue, in datagrams of the largest size.
 const DATAGRAM_BUDGET: usize = limits::PACKET_QUEUE * (DATAGRAM_ROOM + ELEMENT_COST);
 
-/// Whether a light node believes a peer's evidence: the root it rests on, and
-/// the leaf under it, still the device's word as far as the node knows.
-pub type Judge =
-    Arc<dyn Fn(&roster::snapshot::RawSnapshot, &roster::leaf::DeviceLeaf) -> bool + Send + Sync>;
+/// Whether a light node believes a peer's compact evidence: its proof holds
+/// against a root the node remembers, and the leaf is still the device's word
+/// as far as the node knows.
+pub type Judge = Arc<dyn Fn(&roster::membership::Shown) -> bool + Send + Sync>;
 
 /// What a dial is told.
 enum Answer {
@@ -160,8 +160,8 @@ impl Policy {
         }
         let groups = match self.groups.get(initiator) {
             Some(groups) => groups.clone(),
-            None => roster::membership::Evidence::from_bytes(shown)
-                .map(|evidence| evidence.leaf.settings.groups)
+            None => roster::membership::Shown::from_bytes(shown)
+                .map(|shown| shown.leaf.settings.groups)
                 .unwrap_or_default(),
         };
         roster::parameters::allows(&self.rules, &groups, &self.own)
@@ -304,10 +304,10 @@ impl ConvessoTransport {
 
     /// Starts a node for a device holding no roster: a light member.
     ///
-    /// It knows its network and the parameters it uses, shows `evidence`, and
-    /// judges every peer by the evidence that peer shows — its leaf must name
-    /// the key the handshake authenticated, its proof must lead to its root,
-    /// and `judge` must believe the root.
+    /// It knows its network and the parameters it uses, shows `evidence` — its
+    /// compact evidence — and judges every peer by what that peer shows: its
+    /// leaf must name the key the handshake authenticated, and `judge` must
+    /// believe its proof against a root the node remembers.
     ///
     /// # Errors
     ///
@@ -621,7 +621,7 @@ impl Transport for ConvessoTransport {
     fn update_evidence(&self, evidence: Vec<u8>) {
         // A node holding no roster knows its own groups from its own leaf.
         if self.shared.judge.is_some()
-            && let Ok(shown) = roster::membership::Evidence::from_bytes(&evidence)
+            && let Ok(shown) = roster::membership::Shown::from_bytes(&evidence)
             && let Ok(mut policy) = self.shared.policy.write()
         {
             policy.own = shown.leaf.settings.groups;
@@ -641,10 +641,9 @@ impl Transport for ConvessoTransport {
                 continue;
             };
             let shown = live.evidence();
-            let holds =
-                transport::auth::authenticate_by_evidence(&shown, &key.key_id(), &|root, leaf| {
-                    judge(root, leaf)
-                });
+            let holds = transport::auth::authenticate_by_shown(&shown, &key.key_id(), &|shown| {
+                judge(shown)
+            });
             if holds.ok() != Some(live.device()) {
                 live.shut(Error::ClosedOnMembershipLoss);
                 let close = Frame::Close { id: live.id, reason: Reason::MembershipLost };
@@ -1119,9 +1118,7 @@ fn judged(
     evidence: &[u8],
 ) -> Option<core::result::Result<DeviceId, Error>> {
     let judge = shared.judge.as_ref()?;
-    Some(transport::auth::authenticate_by_evidence(evidence, &peer.key_id(), &|root, leaf| {
-        judge(root, leaf)
-    }))
+    Some(transport::auth::authenticate_by_shown(evidence, &peer.key_id(), &|shown| judge(shown)))
 }
 
 /// [`judged`], for the evidence a dialled peer answered with: where it rests on
@@ -1256,8 +1253,8 @@ fn roots_arrived(shared: &Shared, peer: PeerId, id: SessionId, roots: Vec<u8>) {
 /// The transport key behind an authenticated convesso peer, read from the
 /// evidence it shows: the one of its leaf's transport keys that is this peer.
 fn key_shown_by(peer: &PeerId, evidence: &[u8]) -> Option<(PublicKey, Address)> {
-    let evidence = roster::membership::Evidence::from_bytes(evidence).ok()?;
-    evidence.leaf.record.keys.iter().find_map(|entry| {
+    let shown = roster::membership::Shown::from_bytes(evidence).ok()?;
+    shown.leaf.record.keys.iter().find_map(|entry| {
         if entry.purpose != roster::types::KeyPurpose::Transport || entry.alg != Algorithm::Ed25519
         {
             return None;

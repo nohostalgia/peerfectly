@@ -1394,6 +1394,74 @@ it, and the checkpoint names that (`checkpoint::a_light_member_is_vouched_for_as
 not read while the daemon runs, and at the next start the network is refused as changed outside, as
 for a roster. Daemon tests only; not run in the testbed, which has no light member.
 
+## S6. Batches, sibling roots, a light member behind, and an island
+
+`scalable-membership` 18.1. In the testbed of S5, recreated, so every node starts with nothing:
+`casa` founded on `a`; `anchor` invited full and set as the anchor; `b` invited light; `c` invited
+with `--admin`, its keys a file sealed with a passphrase. The acts driven through a pseudo-terminal,
+the passphrases fed on its input.
+
+1. A batch: on `a`, a file of 2000 boards with fresh Ed25519 keys, `peerfectly admit --batch
+   /tmp/lot2000.json --network casa --light`. Devices on `c` and `anchor`, and the CPU of every
+   container, every ten seconds. Then `docker compose restart c`, timed until `status` answers.
+2. Sibling roots: `docker network disconnect` of `a`; on `a`, `revoke scheda-1` and `rename scheda-5
+   sensore-a5`; on `c`, `revoke scheda-2` and `rename scheda-6 sensore-c6`; `a` connected again.
+   Devices on the three full members; `peers` on `b`, which followed `c`'s branch meanwhile.
+3. A light member behind: `stop b`; on `a`, two renames, so two roots; `start b`; `peers` on `b`, and
+   pings from `b` to `a` and `c` over the tunnel.
+4. An island: `stop relay` for a minute and a half; pings `a`→`c` and `b`→`a`; `restart c` with
+   the relay still down, and `a`→`c` again; `status` on every node. Then `start relay`, a minute,
+   and the CPU and memory of every container.
+
+A revocation passing an incomplete batch is not staged: the testbed's kernel has no `act_police` to
+slow one node's traffic, and the revocation would queue behind the pieces anyway. The roster and
+daemon tests cover it.
+
+**Expect**: the batch reaches every full member in seconds, with the CPU at rest after; a member
+restarts in seconds with the batch in its log; both admins' revocations and renames stand on every
+full member after they meet; the light member on the other branch believes every full member after
+the merge; a light member two roots behind believes them as soon as it is back; the island keeps
+working with no fuse, and finds itself again on the LAN.
+
+**Result**: run, 2026-10-28, in the testbed, passed after the fixes the first run found (below).
+- Step 1: one consent, 2000 devices, skipped none; `c` and `anchor` held 2004 devices at the first
+  look, seven seconds after the signature, and every container stayed under 1% of CPU. `c`
+  restarted and answered with 2004 devices after 3 s.
+- Step 2: the revocations failed at first (*the roster refused it: unknown_target*): fixed, below.
+  After the fix: apart, each side 2003 devices; 45 s after `a` came back, `a`, `c` and `anchor` 2002,
+  with all four renames. `b` reached `a`, `c` and `anchor` directly.
+- Step 3: `b` reached the three full members 1 s after its start, nothing refused in its log; 3 of
+  3 pings to `a` and to `c`.
+- Step 4: 3 of 3 pings `a`→`c`, 2 of 3 `b`→`a` with the relay down; `c` restarted without it and
+  answered 3 of 3; no node said it could not confirm its roster. At rest after: 0.14% to 0.45% of
+  CPU; 104 to 132 MiB on the full members holding the batch, 13 MiB on `b`. No `confirmations`
+  file anywhere.
+
+**Found by the first run, which stopped half way, and fixed with tests:**
+- A device invited light stayed full and fell behind for good: the root naming it light came with
+  its admission, and nothing looked again (`Node::started`).
+- A session one side had lost was kept by the other's tie-break, which then closed every new one
+  from that peer (`CROSSING_DIALS`; `assembled::a_dial_after_the_crossing_window_replaces_a_session_the_peer_lost`).
+- With the 2000-board batch in its log a daemon spent minutes of start-up at 100% of a core: every
+  derivation rebuilt every board's device id, for every board. The ids are now worked out once,
+  when the batch enters the graph.
+- Full members dialled every board as a new member, building the whole delivery for each dial.
+  Boards reach the network themselves (`bulk-admission`), and the delivery is built once a round.
+- Every author dialled every board after every act it signed (pressing). Pressing, per-member
+  confirmations and the waiting report are removed.
+- `b`, on `c`'s branch, refused every full member after the merge, for good: it could not place
+  their root, and had nobody left to ask. A light member now asks the peer for the roots after its
+  own as the session opens (`BEHIND` and `ROOTS` in `transport-convesso`), and switches to a heavier
+  branch it had set aside.
+- A board revoked minutes after its batch could not be revoked: the revocation was anchored off the
+  recent batch that admitted it (`batches::a_board_of_a_recent_batch_is_revoked_over_its_batch`).
+  The person was told *the network would not come up*; a refusal by the roster now says *nothing
+  was revoked* (or *renamed*).
+
+Left to convesso: each frame walks every session the endpoint ever had, so a member that dialled
+thousands of absent boards spent a core in `Session::expire` while it did (`design.md`, *Requests
+to convesso*, 4).
+
 ## S2. On a machine with a hardware TPM
 
 On a Linux machine with `/dev/tpmrm0`, the archive of this branch installed:

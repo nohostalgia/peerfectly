@@ -101,8 +101,8 @@ pub trait Transport: Send + Sync {
     async fn update_state(&self, _state: RosterState) {}
 
     /// Hands the transport what this device shows a peer as a session opens:
-    /// its leaf, the proof of it and the root they rest on, as the bytes of a
-    /// `roster::membership::Evidence`. Empty when it holds no root.
+    /// its leaf, the proof of it and the hash of the root they rest on, as the
+    /// bytes of a `roster::membership::Shown`. Empty when it holds no root.
     ///
     /// A peer holding no roster judges this device by it alone; a peer holding
     /// one judges by its state and may ignore it. Replaces what was said

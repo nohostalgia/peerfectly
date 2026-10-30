@@ -26,15 +26,17 @@
 //! ([`Stream`]).
 //!
 //! `evidence` is what the sender shows of its membership — its leaf, the
-//! proof of it and the root they rest on, as `roster::membership::Evidence`
-//! bytes — or nothing, where it holds no root. A peer holding no roster judges
-//! the sender by it; one holding a roster judges by that.
+//! proof of it and the hash of the root they rest on, as
+//! `roster::membership::Shown` bytes — or nothing, where it holds no root. A
+//! peer holding no roster judges the sender by it; one holding a roster judges
+//! by that. Version 3: version 2 carried the root itself, which was most of
+//! what opening a session cost, and a peer nearly always holds it already.
 //!
 //! `BEHIND` and `ROOTS` are how a peer holding no roster catches up while a
-//! session opens. Shown evidence resting on a root it cannot place, it says
+//! session opens. Shown evidence resting on a root it does not know, it says
 //! the root it holds instead of refusing; the other side answers with the
-//! roots taken after it, and the evidence is judged again once they are
-//! taken. `roots` is opaque here: what the serving side's source gives, and
+//! roots taken after it, each verified against the one before as it is taken,
+//! and the evidence is judged again once they are. `roots` is opaque here: what the serving side's source gives, and
 //! what the taking side reads.
 //!
 //! Decoding never panics: a frame that is truncated or of an unknown kind is
@@ -44,7 +46,7 @@ use convesso_stream::config::StreamConfig;
 
 /// The version of this protocol. Carried in `OPEN`, so two ends that disagree
 /// say so rather than misreading each other.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// The bytes in front of a payload: kind, id.
 pub const PAYLOAD_HEADER: usize = 9;

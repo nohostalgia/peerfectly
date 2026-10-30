@@ -166,6 +166,25 @@ pub struct Shown {
 }
 
 impl Shown {
+    /// The device this compact evidence is, where its leaf names
+    /// `transport_key` for the transport purpose: a proof of another device's
+    /// leaf shows nothing about the peer presenting it. Whether the proof
+    /// holds, and against a root to believe, is the caller's, against what it
+    /// holds: only it knows the network and its roots.
+    ///
+    /// # Errors
+    ///
+    /// When the leaf is not the holder's of `transport_key`.
+    pub fn shows(&self, transport_key: &crate::id::KeyId) -> Result<DeviceId> {
+        let holds = self.leaf.record.keys.iter().any(|entry| {
+            entry.purpose == crate::types::KeyPurpose::Transport && entry.key_id() == *transport_key
+        });
+        if !holds {
+            return Err(Error::InvalidValue("evidence of another device"));
+        }
+        Ok(self.leaf.record.id)
+    }
+
     /// Its canonical bytes.
     #[must_use]
     pub fn to_bytes(&self) -> alloc::vec::Vec<u8> {

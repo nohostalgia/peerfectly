@@ -140,7 +140,8 @@ pub struct Network {
     pub state: RosterState,
     /// A root over that state, signed by the founder.
     pub root: Vec<u8>,
-    /// What each device shows a peer, against that root.
+    /// What each device shows a peer as a session opens: its compact
+    /// evidence, against that root.
     pub evidence: std::collections::HashMap<roster::id::DeviceId, Vec<u8>>,
 }
 
@@ -222,8 +223,8 @@ impl Network {
         let evidence = [&founder, &joiner, &third]
             .iter()
             .map(|device| {
-                let shown = node.evidence_for(&device.device_id()).expect("a member");
-                (device.device_id(), shown.to_bytes())
+                let evidence = node.evidence_for(&device.device_id()).expect("a member");
+                (device.device_id(), evidence.shown().expect("its root reads").to_bytes())
             })
             .collect();
         Self { founder, joiner, third, state, root, evidence }

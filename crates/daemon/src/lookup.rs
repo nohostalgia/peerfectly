@@ -49,8 +49,10 @@ pub enum Query {
     /// The roots taken after this one, for a member that missed them.
     RootsAfter([u8; 32]),
     /// What the light member with this id stands on: the parameters, and the
-    /// full members it may turn to.
-    Footing(DeviceId),
+    /// full members it may turn to. With the [`Footing::digest`] of the
+    /// footing it last took, where it holds one: a footing that has not
+    /// changed is answered with that digest alone.
+    Footing(DeviceId, Option<[u8; 32]>),
 }
 
 /// A lookup message.
@@ -106,9 +108,12 @@ impl Message {
                         out.push(ROOTS_AFTER);
                         out.extend_from_slice(root);
                     }
-                    Query::Footing(device) => {
+                    Query::Footing(device, held) => {
                         out.push(FOOTING);
                         out.extend_from_slice(device.as_bytes());
+                        if let Some(held) = held {
+                            out.extend_from_slice(held);
+                        }
                     }
                 }
             }
@@ -142,7 +147,13 @@ impl Message {
                     BY_IPV4 => Query::Ipv4(Ipv4Addr::from(<[u8; 4]>::try_from(value).ok()?)),
                     ROOTS_AFTER => Query::RootsAfter(<[u8; 32]>::try_from(value).ok()?),
                     FOOTING => {
-                        Query::Footing(DeviceId::from_bytes(<[u8; 32]>::try_from(value).ok()?))
+                        let (device, held) = value.split_at_checked(32)?;
+                        let device = DeviceId::from_bytes(<[u8; 32]>::try_from(device).ok()?);
+                        let held = match held.len() {
+                            0 => None,
+                            _ => Some(<[u8; 32]>::try_from(held).ok()?),
+                        };
+                        Query::Footing(device, held)
                     }
                     _ => return None,
                 };
@@ -168,7 +179,7 @@ pub fn resolve(state: &RosterState, query: &Query) -> Option<DeviceId> {
             state.devices.keys().find(|device| tunnel::address_of(device, &prefix) == *address)
         }
         Query::Ipv4(address) => tunnel::Ipv4Holdings::of_state(state).holder(*address),
-        Query::RootsAfter(_) | Query::Footing(_) => None,
+        Query::RootsAfter(_) | Query::Footing(..) => None,
     }
 }
 
@@ -234,7 +245,7 @@ pub fn answers(
             Some(assigned) => Ipv4Addr::from(assigned) == *address,
             None => tunnel::ipv4_candidate(network, &device, &params.ipv4_range()) == *address,
         },
-        Query::RootsAfter(_) | Query::Footing(_) => false,
+        Query::RootsAfter(_) | Query::Footing(..) => false,
     }
 }
 
@@ -249,7 +260,28 @@ pub struct Footing {
     pub fulls: Vec<Vec<u8>>,
 }
 
+/// The context a footing's digest is derived under.
+const FOOTING_DIGEST_CONTEXT: &str = "peerfectly footing digest v1";
+
 impl Footing {
+    /// What a light member keeps of it, as one hash: the parameters, and the
+    /// leaf of each full member handed over. Not the devices' root nor the
+    /// proofs, which change with every root: a footing whose digest is the one
+    /// a light member last took holds nothing it lacks.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(FOOTING_DIGEST_CONTEXT);
+        hasher.update(&u64::try_from(self.params.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(&self.params);
+        for full in &self.fulls {
+            match roster::membership::Evidence::from_bytes(full) {
+                Ok(shown) => hasher.update(&shown.leaf.value_hash()),
+                Err(_) => hasher.update(&blake3::hash(full).as_bytes()[..]),
+            };
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     /// Its bytes, as an answer carries them.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -289,10 +321,16 @@ pub fn handed_evidence(
     asker: &DeviceId,
     recent: &dyn Fn(&DeviceId) -> bool,
 ) -> Vec<Vec<u8>> {
-    let Some((_, state)) =
-        roster.snapshot().and_then(|held| roster.state_for_root(&held.body().root))
-    else {
-        return Vec::new();
+    let copied;
+    let state = match roster.held_state() {
+        Some(state) => state,
+        None => match roster.snapshot().and_then(|held| roster.state_for_root(&held.body().root)) {
+            Some((_, state)) => {
+                copied = state;
+                &copied
+            }
+            None => return Vec::new(),
+        },
     };
     let full = |device: &DeviceId| {
         state.devices.get(device).is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Full)
@@ -320,24 +358,40 @@ pub fn handed_evidence(
 
 /// What a full member holding `roster` answers the light member `asker` that
 /// asks what it stands on: the parameters and the devices' root under the
-/// root held, and [`handed_evidence`]. Empty where it holds no root.
+/// root held, and [`handed_evidence`]; or the digest alone, where it is
+/// `held`, the digest of the footing the light member last took. Empty where
+/// it holds no root.
+///
+/// Asked by every light member that takes a root, after every act: answered
+/// whole, it was some 9 KB a light member per act at a hundred thousand of
+/// them, for parameters and full members that had not changed
+/// (`daemon::simulator`).
 #[must_use]
 pub fn footing_of(
     roster: &roster::roster::Roster,
     asker: &DeviceId,
+    held: Option<&[u8; 32]>,
     recent: &dyn Fn(&DeviceId) -> bool,
 ) -> Vec<u8> {
-    let Some((_, state)) =
-        roster.snapshot().and_then(|held| roster.state_for_root(&held.body().root))
-    else {
-        return Vec::new();
+    let answer = |footing: Footing| {
+        let digest = footing.digest();
+        if held == Some(&digest) { digest.to_vec() } else { footing.encode() }
     };
-    Footing {
+    let footing = |state: &RosterState| Footing {
         devices_root: state.devices.root(),
         params: state.params.to_bytes(),
         fulls: handed_evidence(roster, asker, recent),
+    };
+    // Read where it is kept: asked of a full member by every light member
+    // that takes a root, so a copy of the state each time was a copy per light
+    // member per act (`roster::roster::Roster::held_state`).
+    if let Some(state) = roster.held_state() {
+        return answer(footing(state));
     }
-    .encode()
+    roster
+        .snapshot()
+        .and_then(|held| roster.state_for_root(&held.body().root))
+        .map_or_else(Vec::new, |(_, state)| answer(footing(&state)))
 }
 
 /// Takes what a full member handed over as `footing`: the parameters, where
@@ -534,8 +588,13 @@ mod tests {
         let cut = footing.encode().get(..20).map(<[u8]>::to_vec).unwrap();
         assert_eq!(Footing::decode(&cut), None, "cut short");
         let asked =
-            Message::Request { id: 3, query: Query::Footing(DeviceId::from_bytes([2; 32])) };
+            Message::Request { id: 3, query: Query::Footing(DeviceId::from_bytes([2; 32]), None) };
         assert_eq!(Message::decode(&asked.encode()), Some(asked));
+        let holding = Message::Request {
+            id: 3,
+            query: Query::Footing(DeviceId::from_bytes([2; 32]), Some([8; 32])),
+        };
+        assert_eq!(Message::decode(&holding.encode()), Some(holding));
         let after = Message::Request { id: 4, query: Query::RootsAfter([9; 32]) };
         assert_eq!(Message::decode(&after.encode()), Some(after.clone()));
         let cut = after.encode().get(..20).map(<[u8]>::to_vec).unwrap();
@@ -568,7 +627,7 @@ mod tests {
         let mut light = light_for(&roster, &sensor);
 
         // A home network: full members to turn to besides its contact.
-        let answer = footing_of(&roster, &sensor, &|_| false);
+        let answer = footing_of(&roster, &sensor, None, &|_| false);
         let footing = Footing::decode(&answer).unwrap();
         assert!(take_footing(&mut light, &footing), "it keeps what it was handed");
         let kept = light.known_fulls();
@@ -580,10 +639,28 @@ mod tests {
         let params = roster.state().unwrap().params.with_anchors(vec![laptop]).unwrap();
         let root = signed_on(&mut roster, &founder, OperationBody::SetNetwork(params));
         light.offer_root(&root).unwrap();
-        let footing = Footing::decode(&footing_of(&roster, &sensor, &|_| false)).unwrap();
+        let footing = Footing::decode(&footing_of(&roster, &sensor, None, &|_| false)).unwrap();
         assert!(take_footing(&mut light, &footing));
         assert_eq!(light.params().anchors, vec![laptop], "the anchor list reached it");
         assert!(light.known_fulls().contains(&laptop), "with the anchor's leaf");
+
+        // Asked again with the digest of what it took: nothing it keeps changed
+        // — a device that is not its anchor was renamed — so the digest alone
+        // comes back, though a root has been published since.
+        let held = footing.digest();
+        let other = members.get(1).unwrap().device_id();
+        let renamed = OperationBody::Rename { device: other, name: "studio".to_owned() };
+        let root = signed_on(&mut roster, &founder, renamed);
+        light.offer_root(&root).unwrap();
+        assert_eq!(footing_of(&roster, &sensor, Some(&held), &|_| false), held.to_vec());
+
+        // The parameters changed: the footing comes back whole.
+        let params = roster.state().unwrap().params.with_anchors(Vec::new()).unwrap();
+        let root = signed_on(&mut roster, &founder, OperationBody::SetNetwork(params));
+        light.offer_root(&root).unwrap();
+        let answer = footing_of(&roster, &sensor, Some(&held), &|_| false);
+        let whole = Footing::decode(&answer).expect("the footing, whole");
+        assert_ne!(whole.digest(), held);
     }
 
     #[test]
@@ -592,7 +669,7 @@ mod tests {
         let sensor = members.get(2).unwrap().device_id();
         let mut light = light_for(&roster, &sensor);
         let before = light.params().clone();
-        let mut footing = Footing::decode(&footing_of(&roster, &sensor, &|_| false)).unwrap();
+        let mut footing = Footing::decode(&footing_of(&roster, &sensor, None, &|_| false)).unwrap();
 
         // Parameters that do not make the root held, and a leaf altered.
         let mut changed = before.clone();

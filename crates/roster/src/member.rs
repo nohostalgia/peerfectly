@@ -147,16 +147,24 @@ impl LightMember {
         self.view.current()
     }
 
-    /// Where a peer's evidence rests on `root`, a root of this network this
-    /// member knows nothing of: the root to ask the peer the chain after —
-    /// its own current one. `None` for a root it knows, or of another network.
+    /// Where a peer's compact evidence rests on `against`, a root this member
+    /// knows nothing of: the root to ask the peer the chain after — its own
+    /// current one. `None` for a root it knows.
     #[must_use]
-    pub fn behind(&self, root: &RawSnapshot) -> Option<Hash> {
-        let body = root.body();
-        if body.network != self.network || self.view.knows(&body.root) {
+    pub fn behind(&self, against: &Hash) -> Option<Hash> {
+        if self.view.knows(against) {
             return None;
         }
         self.view.current()
+    }
+
+    /// Whether this member believes a peer's compact evidence: the proof
+    /// holds against a root it remembers, in this network, and nothing since
+    /// names the device. A root it does not remember is not believed on the
+    /// peer's word: it is caught up to first, from the roots themselves.
+    #[must_use]
+    pub fn believes_shown(&self, shown: &crate::membership::Shown) -> bool {
+        self.view.judge(&shown.leaf, &shown.proof, &shown.against) == ProofVerdict::Accepted
     }
 
     /// Takes a chain of roots a peer sent, in the order sent, and again while

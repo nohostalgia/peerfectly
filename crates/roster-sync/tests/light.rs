@@ -32,8 +32,13 @@ fn a_light_member_is_sent_roots_and_never_operations() {
     assert_eq!(node.for_peer(&phone, transfer.clone()), None, "no operation");
     assert_eq!(node.for_peer(&phone, Message::Pieces(vec![vec![1]])), None, "no piece");
     assert_eq!(node.for_peer(&phone, Message::Offer(node.offer())), None, "no offer");
-    let root = node.for_peer(&phone, node.greeting());
-    assert!(matches!(root, Some(Message::Snapshot(_))), "the root in place of a digest: {root:?}");
+    assert_eq!(
+        node.for_peer(&phone, node.greeting()),
+        None,
+        "no greeting: the root is in the evidence shown as the session opened"
+    );
+    let root = Message::Snapshot(vec![9]);
+    assert_eq!(node.for_peer(&phone, root.clone()), Some(root), "a root taken later still goes");
     let attestation = Message::Attestation(vec![7]);
     assert_eq!(node.for_peer(&phone, attestation.clone()), Some(attestation));
 

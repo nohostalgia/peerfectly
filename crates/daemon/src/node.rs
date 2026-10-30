@@ -227,6 +227,10 @@ pub struct Node {
     /// Whether a light member still owes itself the question of what it
     /// stands on, since it started: asked of the first full member it meets.
     footing_due: std::sync::atomic::AtomicBool,
+    /// The digest of the footing this light member last took, since it
+    /// started: what it asks with, so that one unchanged comes back as that
+    /// digest alone.
+    footing_held: std::sync::Mutex<Option<[u8; 32]>>,
     /// Wakes the light member's upkeep.
     upkeep: Arc<tokio::sync::Notify>,
     /// Held while the log is written: appended to, or rewritten after a
@@ -405,6 +409,7 @@ impl Node {
             owed: std::sync::Mutex::new(Owed::default()),
             adopted_from: Arc::default(),
             footing_due: std::sync::atomic::AtomicBool::new(true),
+            footing_held: std::sync::Mutex::new(None),
             upkeep: Arc::new(tokio::sync::Notify::new()),
             log_guard: Mutex::new(()),
             keeper: std::sync::OnceLock::new(),
@@ -961,38 +966,24 @@ impl Node {
         self.light().is_some()
     }
 
-    /// What a light member's transport starts with: the evidence it shows, and
-    /// how it judges the evidence its peers show. `None` for a full member.
+    /// What a light member's transport starts with: the compact evidence it
+    /// shows, and how it judges the compact evidence its peers show. `None`
+    /// for a full member.
+    ///
+    /// A peer is believed against a root this member remembers, and nothing
+    /// else: a root it does not is caught up to first, as the session opens
+    /// ([`Self::catching_up`]). It used to be shown with the evidence, and a
+    /// root one step ahead adopted here; it was most of what opening a session
+    /// cost, for a root the member nearly always held already
+    /// (`daemon::simulator`).
     #[must_use]
     pub fn light_binding(&self) -> Option<(Vec<u8>, transport_convesso::node::Judge)> {
         let member = self.light()?;
-        let evidence = member.lock().ok()?.evidence();
+        let shown = member.lock().ok()?.shown();
         let judging = Arc::clone(&member);
-        let adopted_from = Arc::clone(&self.adopted_from);
-        let upkeep = Arc::clone(&self.upkeep);
-        let judge: transport_convesso::node::Judge = Arc::new(move |root, leaf| {
-            let Ok(mut member) = judging.lock() else { return false };
-            if member.believes(root, leaf) {
-                return true;
-            }
-            // A root this member does not hold yet, shown with the evidence:
-            // verified as any root is, adopted where it follows the current
-            // one, and the proof judged against it. A root further ahead is
-            // not adopted here, and the peer is not believed.
-            let adopted = matches!(
-                member.offer_shown_root(root),
-                Ok(roster::light::RootOutcome::Adopted | roster::light::RootOutcome::Switched)
-            );
-            if !adopted || !member.believes(root, leaf) {
-                return false;
-            }
-            if let Ok(mut from) = adopted_from.lock() {
-                *from = Some(leaf.record.id);
-            }
-            upkeep.notify_one();
-            true
-        });
-        Some((evidence, judge))
+        let judge: transport_convesso::node::Judge =
+            Arc::new(move |shown| judging.lock().is_ok_and(|member| member.believes_shown(shown)));
+        Some((shown, judge))
     }
 
     /// How a light member catches up while a session opens, on a root its
@@ -1006,20 +997,18 @@ impl Node {
     pub fn catching_up(&self) -> Option<transport::session::CatchingUp> {
         let member = self.light()?;
         let asking = Arc::clone(&member);
-        let behind: transport::session::Behind = Arc::new(move |evidence: &[u8]| {
-            let shown = roster::membership::Evidence::from_bytes(evidence).ok()?;
-            let root = roster::snapshot::RawSnapshot::decode(&shown.root).ok()?;
-            asking.lock().ok()?.behind(&root)
+        let behind: transport::session::Behind = Arc::new(move |shown: &[u8]| {
+            let shown = roster::membership::Shown::from_bytes(shown).ok()?;
+            asking.lock().ok()?.behind(&shown.against)
         });
         let adopted_from = Arc::clone(&self.adopted_from);
         let upkeep = Arc::clone(&self.upkeep);
-        let take: transport::session::TakeRoots = Arc::new(move |evidence: &[u8], roots: &[u8]| {
+        let take: transport::session::TakeRoots = Arc::new(move |shown: &[u8], roots: &[u8]| {
             let Some(chain) = crate::lookup::decode_roots(roots) else { return false };
             let taken = member.lock().is_ok_and(|mut member| member.take_chain(&chain));
             if taken {
-                // Kept, and what it stands on asked, by the upkeep: as for a
-                // root adopted while judging.
-                if let Ok(shown) = roster::membership::Evidence::from_bytes(evidence)
+                // Kept, and what it stands on asked, by the upkeep.
+                if let Ok(shown) = roster::membership::Shown::from_bytes(shown)
                     && let Ok(mut from) = adopted_from.lock()
                 {
                     *from = Some(shown.leaf.record.id);
@@ -1106,10 +1095,12 @@ impl Node {
         if self.is_light() {
             return Vec::new();
         }
-        if let crate::lookup::Query::Footing(asker) = query {
+        if let crate::lookup::Query::Footing(asker, held) = query {
             let recent = self.seen_lately().await;
             let syncer = self.syncer.lock().await;
-            return crate::lookup::footing_of(syncer.roster(), asker, &|device| recent(device));
+            return crate::lookup::footing_of(syncer.roster(), asker, held.as_ref(), &|device| {
+                recent(device)
+            });
         }
         let syncer = self.syncer.lock().await;
         if let crate::lookup::Query::RootsAfter(since) = query {
@@ -1213,15 +1204,23 @@ impl Node {
     async fn take_footing_from(&self, peer: DeviceId) -> bool {
         let Some(member) = self.light() else { return false };
         let Some(me) = member.lock().ok().map(|member| member.device()) else { return false };
-        let Some(answer) = self.ask(peer, crate::lookup::Query::Footing(me)).await else {
+        let held = self.footing_held.lock().ok().and_then(|held| *held);
+        let Some(answer) = self.ask(peer, crate::lookup::Query::Footing(me, held)).await else {
             return false;
         };
+        // Its own digest back: nothing it keeps has changed.
+        if held.is_some_and(|held| answer == held) {
+            return true;
+        }
         let Some(footing) = crate::lookup::Footing::decode(&answer) else { return false };
         let kept = member.lock().ok().and_then(|mut member| {
             crate::lookup::take_footing(&mut member, &footing).then(|| member.clone())
         });
         if let Some(kept) = kept {
             self.keep_light(&kept).await;
+        }
+        if let Ok(mut held) = self.footing_held.lock() {
+            *held = Some(footing.digest());
         }
         true
     }
@@ -1675,12 +1674,13 @@ impl Node {
     }
 
     /// Tells the transport what this device shows a peer as a session opens:
-    /// its leaf and proof against the root it holds. A light peer, holding no
-    /// roster, judges this device by that alone.
+    /// its leaf, and its proof against the root it holds with that root's
+    /// hash. A light peer, holding no roster, judges this device by that
+    /// alone, and catches up to a root it does not know.
     async fn refresh_evidence(&self) {
         let evidence = match &self.light() {
-            Some(member) => member.lock().map_or_else(|_| Vec::new(), |member| member.evidence()),
-            None => crate::snapshots::evidence_of(
+            Some(member) => member.lock().map_or_else(|_| Vec::new(), |member| member.shown()),
+            None => crate::snapshots::shown_of(
                 self.syncer.lock().await.roster(),
                 &self.identity.device_id(),
             ),
@@ -4319,12 +4319,12 @@ mod light {
         (roster, network)
     }
 
-    /// A full member that took a root the light member has not seen yet is
-    /// believed all the same: the root it shows is verified and adopted where
-    /// it follows the light member's own, and its proof judged against it. One
-    /// further ahead is not adopted, and the peer not believed.
+    /// A full member on the root the light member holds is believed by its
+    /// compact evidence. One that took the next root is not believed on its
+    /// word, since only the root's hash is shown: the light member catches up
+    /// from the chain, and then believes it.
     #[tokio::test]
-    async fn a_peer_on_the_next_root_is_believed_by_adopting_it() {
+    async fn a_peer_on_a_root_not_held_is_believed_once_caught_up() {
         let founder = NodeIdentity::generate().unwrap();
         let sensor = Arc::new(NodeIdentity::generate().unwrap());
         let (mut roster, network) = founded(&founder, &sensor);
@@ -4339,6 +4339,8 @@ mod light {
         crate::state::write_light(&paths, &member).unwrap();
         let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().expect("a light member");
         let (_, judge) = node.light_binding().unwrap();
+        let catching = node.catching_up().expect("a light member catches up");
+        let held = member.current().unwrap();
 
         let admit = |roster: &mut Roster, name: &str, ts: u64| {
             let device = NodeIdentity::generate().unwrap();
@@ -4359,27 +4361,22 @@ mod light {
             let root = crate::snapshots::sign_over_heads(roster, &founder).unwrap();
             assert!(roster.offer_snapshot(&root).is_accepted());
         };
-        let shown = |roster: &Roster| {
-            let evidence = roster.evidence_for(&founder.device_id()).unwrap();
-            (roster::snapshot::RawSnapshot::decode(&evidence.root).unwrap(), evidence.leaf)
-        };
+        let shown =
+            |roster: &Roster| roster.evidence_for(&founder.device_id()).unwrap().shown().unwrap();
+
+        assert!(judge(&shown(&roster)), "on the root it holds, believed");
 
         admit(&mut roster, "tv", 2);
-        let (next, next_leaf) = shown(&roster);
-        admit(&mut roster, "radio", 3);
-        let (far, far_leaf) = shown(&roster);
-
-        // Two roots ahead: not adopted here, and not believed.
-        assert!(!judge(&far, &far_leaf), "a root it cannot place is not taken on a peer's word");
-
-        // The next one: adopted, and the peer believed.
-        assert!(judge(&next, &next_leaf), "believed against the root it showed");
-        let member = node.light().unwrap();
-        assert_eq!(
-            member.lock().unwrap().current(),
-            Some(next.body().root),
-            "which is now its own"
+        let next = shown(&roster);
+        assert!(!judge(&next), "on the next root, not taken on a peer's word");
+        assert_eq!((catching.behind)(&next.to_bytes()), Some(held), "it asks after its own");
+        let answer = crate::lookup::encode_roots_within(
+            &roster.roots_after(&held),
+            transport_convesso::frame::MAX_ROOTS,
         );
+        assert!((catching.take)(&next.to_bytes(), &answer), "the chain is taken");
+        assert!(judge(&next), "and the peer believed");
+        assert_eq!(node.light().unwrap().lock().unwrap().current(), Some(next.against));
     }
 
     /// Two roots behind, a light member asks the peer for the roots after its
@@ -4424,11 +4421,10 @@ mod light {
             let root = crate::snapshots::sign_over_heads(&roster, &founder).unwrap();
             assert!(roster.offer_snapshot(&root).is_accepted());
         }
-        let evidence = roster.evidence_for(&founder.device_id()).unwrap();
-        let far = roster::snapshot::RawSnapshot::decode(&evidence.root).unwrap();
-        let shown = evidence.to_bytes();
+        let far = roster.evidence_for(&founder.device_id()).unwrap().shown().unwrap();
+        let shown = far.to_bytes();
 
-        assert!(!judge(&far, &evidence.leaf), "not placed, not believed");
+        assert!(!judge(&far), "not placed, not believed");
         assert_eq!((catching.behind)(&shown), Some(held), "it asks after the root it holds");
 
         // What a full member answers, as `Node::roots_source` builds it.
@@ -4437,9 +4433,9 @@ mod light {
             transport_convesso::frame::MAX_ROOTS,
         );
         assert!((catching.take)(&shown, &answer), "the chain is taken");
-        assert!(judge(&far, &evidence.leaf), "and the peer believed");
+        assert!(judge(&far), "and the peer believed");
         assert_eq!((catching.behind)(&shown), None, "nothing more to ask");
-        assert_eq!(node.light().unwrap().lock().unwrap().current(), Some(far.body().root));
+        assert_eq!(node.light().unwrap().lock().unwrap().current(), Some(far.against));
         assert!(
             !(catching.take)(&shown, b"not roots"),
             "nothing is taken from bytes that are not roots"

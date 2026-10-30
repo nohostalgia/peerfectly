@@ -796,6 +796,17 @@ impl Roster {
 
     /// Derives the state a snapshot claims, from operations this node holds.
     fn derive_covered_state(&self, snapshot: &SignedSnapshot) -> Option<RosterState> {
+        // A root over exactly the heads, which is what an admin publishes after
+        // its act: the state kept at the heads is the state it covers, so it is
+        // not derived again. Derived, it cost a full member 366 ms for every
+        // copy of a root at ten thousand devices (`daemon::simulator`).
+        if let Some(state) = &self.at_heads {
+            let heads = self.dag.heads();
+            let covered = &snapshot.body().heads;
+            if heads.len() == covered.len() && covered.iter().all(|head| heads.contains(head)) {
+                return Some(state.clone());
+            }
+        }
         let region = self.dag.covered_region(snapshot)?;
         crate::state::derive_region(&self.dag, &region).ok()
     }
@@ -808,9 +819,13 @@ impl Roster {
     /// trusts the admin's signature and has no way to check the claim.
     fn resolve_snapshot_signer(&self, raw: &RawSnapshot) -> Option<PublicKey> {
         let author = raw.body().author;
-        if let Ok(state) = self.state()
-            && let Some(key) = root_key_of(&state, &author)
-        {
+        // Read where it is kept: copying the state to look up one key cost as
+        // much as the lookup a hundred times over, at ten thousand devices.
+        let found = match &self.at_heads {
+            Some(state) => root_key_of(state, &author),
+            None => derive(&self.dag).ok().and_then(|state| root_key_of(&state, &author)),
+        };
+        if let Some(key) = found {
             return Some(key);
         }
         raw.body()
@@ -951,12 +966,34 @@ impl Roster {
     #[must_use]
     pub fn evidence_for(&self, device: &DeviceId) -> Option<crate::membership::Evidence> {
         let held = self.snapshot.as_ref()?;
+        let evidence = |state: &RosterState, root: &SignedSnapshot| {
+            Some(crate::membership::Evidence {
+                leaf: state.leaf(device)?,
+                proof: crate::membership::MembershipProof::of(state, device)?,
+                root: root.to_bytes(),
+            })
+        };
+        if let Some(state) = self.held_state() {
+            return evidence(state, held);
+        }
         let (root, state) = self.state_for_root(&held.body().root)?;
-        Some(crate::membership::Evidence {
-            leaf: state.leaf(device)?,
-            proof: crate::membership::MembershipProof::of(&state, device)?,
-            root: root.to_bytes(),
-        })
+        evidence(&state, &root)
+    }
+
+    /// The state the root this roster holds commits to, read where it is kept
+    /// rather than copied out. `None` where it is not kept, which
+    /// [`Self::state_for_root`] still answers, with a copy.
+    ///
+    /// A state of ten thousand devices took 14 ms to copy, for one leaf and
+    /// its proof; a full member answers that for every lookup, renewal and
+    /// footing a light member asks (`daemon::simulator`).
+    #[must_use]
+    pub fn held_state(&self) -> Option<&RosterState> {
+        let root = self.snapshot.as_ref()?.body().root;
+        self.snapshot_state
+            .as_ref()
+            .filter(|state| state.root() == root)
+            .or_else(|| self.at_heads.as_ref().filter(|state| state.root() == root))
     }
 
     /// The roots this roster took after `since`, oldest first, as bytes: the
@@ -1521,6 +1558,11 @@ impl Roster {
     /// out, they would be concurrent with its removal, and void; held whole
     /// here, they are its acts from before the removal, and stand. What is
     /// voided anyway is reported, for the person to see before signing.
+    ///
+    /// The batch that admitted the target stays too: left out, the act would
+    /// name a device its own ancestors do not hold, and be refused as aimed at
+    /// nobody. Found in the testbed (18.1): a board revoked minutes after its
+    /// batch could not be revoked at all.
     #[must_use]
     pub fn urgent_anchor(&self, target: &DeviceId, now_ms: u64) -> UrgentAnchor {
         let heads = self.dag.heads();
@@ -1538,6 +1580,7 @@ impl Roster {
                 matches!(operation.body(), OperationBody::AdmitBatch(_))
                     && operation.core().ts.saturating_add(URGENT_BATCH_AGE_MS) > now_ms
                     && !(target_is_admin && by_target(&operation.core().author))
+                    && self.dag.batch_entry(&operation.id(), target).is_none()
             })
             .map(|(index, _)| index)
             .collect();
@@ -1755,11 +1798,17 @@ impl Roster {
         // state at the heads *is* the state its ancestors imply — already kept,
         // and the case an honest client produces. Anything else is resolved from
         // its own ancestors, which costs a derivation over them.
+        let resolved;
         let ancestor_state = match (extends_every_head, self.at_heads.as_ref()) {
-            (true, Some(state)) => state.clone(),
-            _ => crate::state::state_for_parents(&self.dag, &raw.core().parents).ok()?,
+            // Borrowed: a copy of the state per operation offered was most of
+            // what admitting one cost, at ten thousand devices.
+            (true, Some(state)) => state,
+            _ => {
+                resolved = crate::state::state_for_parents(&self.dag, &raw.core().parents).ok()?;
+                &resolved
+            }
         };
-        if crate::state::unauthorized_author(&ancestor_state, &raw.core().author).is_some() {
+        if crate::state::unauthorized_author(ancestor_state, &raw.core().author).is_some() {
             return Some(Error::UnauthorizedAuthor);
         }
 
