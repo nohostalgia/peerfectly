@@ -1297,8 +1297,8 @@ impl Service {
         driving.push(tokio::spawn(Arc::clone(&node).spread_forever()));
         driving.push(tokio::spawn(Arc::clone(&node).keep_up_forever()));
 
-        // A session nothing uses is closed, so it stops costing a keep-alive
-        // every three seconds; the next packet that needs it opens it again.
+        // A session nothing uses is closed, but one with a light member
+        // (`node::held_open`); the next packet that needs it opens it again.
         // Checked every minute: the idle period is ten, so a session lives at
         // most a minute past it.
         let sweeping = Arc::clone(&node);

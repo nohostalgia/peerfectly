@@ -210,7 +210,13 @@ async fn read_context(
             ContextEvent::Closed { peer, .. } | ContextEvent::ChannelReset { peer, .. } => {
                 end(&routes, &peer);
             }
-            ContextEvent::Datagram { .. } | ContextEvent::PathChanged { .. } => {}
+            // An exchange is over within seconds, well inside a session's keys;
+            // a session that goes idle meanwhile reopens with the next message.
+            // No context here takes data in a first contact.
+            ContextEvent::Datagram { .. }
+            | ContextEvent::PathChanged { .. }
+            | ContextEvent::Idle { .. }
+            | ContextEvent::EarlyDatagram { .. } => {}
         }
     }
 }

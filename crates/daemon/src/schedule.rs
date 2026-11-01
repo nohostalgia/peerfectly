@@ -56,10 +56,14 @@ pub struct Schedule {
     ///
     /// A session is opened by the first packet that needs it, so a closed one
     /// costs the next packet a reopening: a handshake of a few kilobytes and a
-    /// pause of tens to hundreds of milliseconds. An open one costs the
-    /// keep-alives that hold its path open, for as long as it stays open. Ten minutes keeps a session through the ordinary pauses of
-    /// someone working — reading a page, thinking between commands — and closes it
-    /// once they have stopped.
+    /// pause of tens to hundreds of milliseconds. An open one costs nothing on
+    /// the wire — convesso sends no keep-alive for a session, and forgets one
+    /// whose keys expired — only what the daemon holds for it. Ten minutes keeps
+    /// a session through the ordinary pauses of someone working — reading a
+    /// page, thinking between commands — and closes it once they have stopped.
+    ///
+    /// Not a session with a light member: that one stays open, the way a new
+    /// root reaches the light member (`node::held_open`).
     pub idle: Duration,
 }
 

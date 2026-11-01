@@ -594,9 +594,12 @@ mod tests {
         assert_eq!(reasons, vec!["stolen"]);
     }
 
-    /// The admission is gone; the revocation is permanent. Listed by id.
+    /// A checkpoint absorbed the revocation: the device is absent from the
+    /// network, and listed neither among the revoked nor among the members
+    /// (`windows-daemon`, "An absorbed revocation leaves the list"). It was
+    /// listed only while the kept state went unrederived after compacting.
     #[test]
-    fn a_revoked_device_whose_admission_was_compacted_away_is_listed_by_id() {
+    fn an_absorbed_revocation_leaves_the_list() {
         let mut history = History::founded_by(1, "nas");
         history.op(
             "laptop",
@@ -639,8 +642,8 @@ mod tests {
         let listed = revoked(&directory, &state, &held, &LastContacts::default());
         let laptop =
             listed.iter().find(|entry| entry.device.id == crate::control::short_id(&id(2)));
-        let laptop = laptop.expect("a revoked device is never left out");
-        assert_eq!(laptop.device.name, None, "and nothing held names it");
+        assert!(laptop.is_none(), "not among the revoked");
+        assert!(!state.devices.contains_key(&id(2)), "nor among the members");
     }
 
     // ---- 5.x equivocation -----------------------------------------------------

@@ -19,6 +19,17 @@
 //! The answers are the ones the map gave, in the same order: every iteration is
 //! by device id, and a key two devices hold is answered with the lower id.
 //!
+//! # A batch is a layer
+//!
+//! A batch admits thousands of devices at once, and a board nothing else names
+//! is exactly what its entry and its batch's header say. So a whole batch is
+//! one [`Layer`]: its entries, the devices they admit, and its indexes, built
+//! once and shared by every state that admits them. A state holds its base,
+//! its layers with the devices each leaves out, and its changes on top. Copying
+//! it costs the changes, and a device a layer admits costs nothing per state
+//! but the paths its leaf takes in the tree, which the layer builds once for
+//! the tree it is laid over and remembers (`scalable-membership` 16.4).
+//!
 //! # A base kept elsewhere
 //!
 //! The base is in memory, or in a [`MemberStore`] — on a disk, for a member
@@ -31,11 +42,13 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use std::sync::Mutex;
 
-use crate::id::{DeviceId, KeyId};
-use crate::leaf::{DeviceLeaf, DeviceSettings};
+use crate::batch::BatchEntry;
+use crate::id::{DeviceId, KeyId, OperationId};
+use crate::leaf::{DeviceLeaf, DeviceSettings, Group, Mode};
 use crate::merkle;
-use crate::types::{DeviceRecord, KeyPurpose};
+use crate::types::{DeviceRecord, KeyPurpose, Role};
 
 /// Where a state's base devices are kept when they are not in memory.
 ///
@@ -66,6 +79,303 @@ pub trait MemberStore: merkle::NodeSource {
 
 /// How many leaves a walk over a store reads at once.
 const PAGE: usize = 512;
+
+/// How many trees a layer remembers having been laid over: the one the kept
+/// state rests on, the one at the root, and those the states a derivation
+/// judges against rest on, which are the same few each time.
+const TREES_REMEMBERED: usize = 8;
+
+/// A whole batch's devices, held once and shared by every state admitting
+/// them: its entries, the device each admits, and indexes by key, address and
+/// name. A device's leaf is built as it is asked for, from its entry and the
+/// batch's header, and is the leaf derivation gives a board nothing else names.
+pub struct Layer {
+    batch: OperationId,
+    mode: Mode,
+    groups: Vec<Group>,
+    entries: Vec<BatchEntry>,
+    /// Each device an entry admits, with the entry's place, in device order.
+    /// The first entry naming a device is the one kept.
+    devices: Vec<(DeviceId, usize)>,
+    /// Every key an admitted device holds, with the device's slot in
+    /// `devices`, in (key, device) order.
+    keys: Vec<(KeyId, u32)>,
+    /// Every address an entry assigns, with the device's slot, in (address,
+    /// device) order.
+    addresses: Vec<([u8; 4], u32)>,
+    /// The device slots in (name in ASCII lower case, device) order.
+    names: Vec<u32>,
+    /// The trees this layer was laid over, with what it left out, and the tree
+    /// that made.
+    trees: Mutex<Vec<LaidOver>>,
+    /// The devices left out for being skipped against the state the batch's
+    /// ancestors imply, by that state's root.
+    skipped: Mutex<Vec<Skipped>>,
+}
+
+/// The devices a batch skips, against the devices root of the state its
+/// ancestors imply.
+type Skipped = ([u8; 32], Arc<BTreeSet<DeviceId>>);
+
+/// One of the sources [`Members::lower_iter`] merges.
+type Source<'members> = core::iter::Peekable<
+    alloc::boxed::Box<dyn Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + Send + 'members>,
+>;
+
+/// A tree a layer was laid over: its root and the root of the store it rests
+/// on, a digest of the devices left out, and the tree that made.
+struct LaidOver {
+    root: merkle::Hash,
+    stored: Option<merkle::Hash>,
+    left_out: [u8; 32],
+    tree: merkle::Tree,
+}
+
+impl core::fmt::Debug for Layer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Layer")
+            .field("batch", &self.batch)
+            .field("devices", &self.devices.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Layer {
+    /// The layer of batch `batch`, admitting in `mode` and `groups` the
+    /// devices `entries` name.
+    #[must_use]
+    pub fn new(
+        batch: OperationId,
+        mode: Mode,
+        groups: Vec<Group>,
+        entries: Vec<BatchEntry>,
+    ) -> Self {
+        let mut devices: Vec<(DeviceId, usize)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(place, entry)| entry.device_id().ok().map(|device| (device, place)))
+            .collect();
+        devices.sort_unstable();
+        devices.dedup_by_key(|(device, _)| *device);
+        let slot = |index: usize| u32::try_from(index).unwrap_or(u32::MAX);
+        let mut keys: Vec<(KeyId, u32)> = Vec::new();
+        let mut addresses: Vec<([u8; 4], u32)> = Vec::new();
+        for (index, (_, place)) in devices.iter().enumerate() {
+            let Some(entry) = entries.get(*place) else { continue };
+            keys.extend(entry.keys.iter().map(|key| (key.key_id(), slot(index))));
+            addresses.extend(entry.ipv4.map(|address| (address, slot(index))));
+        }
+        // Slots follow device order, so (thing, slot) order is (thing, device).
+        keys.sort_unstable();
+        addresses.sort_unstable();
+        let mut names: Vec<u32> = (0..devices.len()).map(slot).collect();
+        names.sort_by(|one, two| {
+            let name = |at: &u32| {
+                devices
+                    .get(*at as usize)
+                    .and_then(|(_, place)| entries.get(*place))
+                    .map_or("", |entry| entry.name.as_str())
+            };
+            lower_order(name(one), name(two)).then(one.cmp(two))
+        });
+        Self {
+            batch,
+            mode,
+            groups,
+            entries,
+            devices,
+            keys,
+            addresses,
+            names,
+            trees: Mutex::new(Vec::new()),
+            skipped: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The batch this is the layer of.
+    #[must_use]
+    pub const fn batch(&self) -> OperationId {
+        self.batch
+    }
+
+    /// The batch's entries, as they arrived.
+    #[must_use]
+    pub fn entries(&self) -> &[BatchEntry] {
+        &self.entries
+    }
+
+    /// How many devices it admits.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Whether it admits none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    /// The devices it admits, each with its entry, in device order.
+    pub fn devices(&self) -> impl Iterator<Item = (DeviceId, &BatchEntry)> {
+        self.devices
+            .iter()
+            .filter_map(|(device, place)| self.entries.get(*place).map(|entry| (*device, entry)))
+    }
+
+    /// The entry admitting `device`.
+    #[must_use]
+    pub fn entry(&self, device: &DeviceId) -> Option<&BatchEntry> {
+        let (_, place) = self.devices.get(self.slot_of(device)?)?;
+        self.entries.get(*place)
+    }
+
+    /// The devices whose entry assigns `address`, in device order.
+    pub fn assigning(&self, address: [u8; 4]) -> impl Iterator<Item = DeviceId> + '_ {
+        let from = self.addresses.partition_point(|(held, _)| *held < address);
+        self.addresses
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(move |(held, _)| *held == address)
+            .filter_map(|(_, slot)| self.devices.get(*slot as usize).map(|(device, _)| *device))
+    }
+
+    /// The addresses its entries assign, each once, in order.
+    pub fn addresses(&self) -> impl Iterator<Item = [u8; 4]> + '_ {
+        let mut last = None;
+        self.addresses.iter().filter_map(move |(address, _)| {
+            if last == Some(*address) {
+                return None;
+            }
+            last = Some(*address);
+            Some(*address)
+        })
+    }
+
+    fn slot_of(&self, device: &DeviceId) -> Option<usize> {
+        self.devices.binary_search_by_key(device, |(held, _)| *held).ok()
+    }
+
+    /// The leaf of the device at `slot`, as derivation gives it a board nothing
+    /// else names: its entry's keys and name, a member and not a founder,
+    /// admitted by the batch, with the batch's mode and groups and its entry's
+    /// address.
+    fn leaf_at(&self, slot: usize) -> Option<Arc<DeviceLeaf>> {
+        let (device, place) = self.devices.get(slot)?;
+        let entry = self.entries.get(*place)?;
+        Some(Arc::new(DeviceLeaf {
+            record: DeviceRecord {
+                id: *device,
+                keys: entry.keys.clone(),
+                name: entry.name.clone(),
+                role: Role::Member,
+                founder: false,
+                added_by: self.batch,
+                capabilities: Vec::new(),
+            },
+            settings: DeviceSettings::new(self.mode, self.groups.clone(), entry.ipv4, None)
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// The devices left out for being skipped against a state of root `root`,
+    /// worked out by `skip` the first time.
+    pub fn skipped_against(
+        &self,
+        root: [u8; 32],
+        skip: impl FnOnce() -> BTreeSet<DeviceId>,
+    ) -> Arc<BTreeSet<DeviceId>> {
+        if let Ok(held) = self.skipped.lock()
+            && let Some((_, skipped)) = held.iter().find(|(against, _)| *against == root)
+        {
+            return Arc::clone(skipped);
+        }
+        let skipped = Arc::new(skip());
+        if let Ok(mut held) = self.skipped.lock() {
+            if held.len() >= TREES_REMEMBERED {
+                held.remove(0);
+            }
+            held.push((root, Arc::clone(&skipped)));
+        }
+        skipped
+    }
+
+    /// `tree` with the leaf of every device this layer admits, but those in
+    /// `left_out`: built the first time, remembered after.
+    fn laid_over(&self, tree: &merkle::Tree, left_out: &BTreeSet<DeviceId>) -> merkle::Tree {
+        let digest = {
+            let mut hasher = blake3::Hasher::new_derive_key("peerfectly layer left out v1");
+            for device in left_out {
+                hasher.update(device.as_bytes());
+            }
+            *hasher.finalize().as_bytes()
+        };
+        let (root, stored) = (tree.root(), tree.stored_root());
+        if let Ok(held) = self.trees.lock()
+            && let Some(laid) = held
+                .iter()
+                .find(|laid| laid.root == root && laid.stored == stored && laid.left_out == digest)
+        {
+            return laid.tree.clone();
+        }
+        let mut laid = tree.clone();
+        for slot in 0..self.devices.len() {
+            let Some(leaf) = self.leaf_at(slot) else { continue };
+            if left_out.contains(&leaf.record.id) {
+                continue;
+            }
+            laid.insert(DeviceLeaf::position(&leaf.record.id), leaf.value_hash());
+        }
+        if let Ok(mut held) = self.trees.lock() {
+            if held.len() >= TREES_REMEMBERED {
+                held.remove(0);
+            }
+            held.push(LaidOver { root, stored, left_out: digest, tree: laid.clone() });
+        }
+        laid
+    }
+}
+
+/// Two names in ASCII lower case order, without lowering either.
+fn lower_order(one: &str, two: &str) -> core::cmp::Ordering {
+    one.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(two.bytes().map(|byte| byte.to_ascii_lowercase()))
+}
+
+/// A layer as a state holds it: the layer, and the devices it leaves out of
+/// it — those skipped against the batch's ancestors, and those named by
+/// something else, which the state's changes answer for.
+#[derive(Clone)]
+struct Laid {
+    layer: Arc<Layer>,
+    left_out: Arc<BTreeSet<DeviceId>>,
+}
+
+impl Laid {
+    fn holds(&self, slot: usize) -> Option<DeviceId> {
+        self.layer
+            .devices
+            .get(slot)
+            .map(|(device, _)| *device)
+            .filter(|device| !self.left_out.contains(device))
+    }
+
+    fn get(&self, device: &DeviceId) -> Option<Arc<DeviceLeaf>> {
+        if self.left_out.contains(device) {
+            return None;
+        }
+        self.layer.leaf_at(self.layer.slot_of(device)?)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
+        (0..self.layer.devices.len()).filter_map(move |slot| {
+            let device = self.holds(slot)?;
+            self.layer.leaf_at(slot).map(|leaf| (device, leaf))
+        })
+    }
+}
 
 /// The devices a state starts from.
 #[derive(Clone)]
@@ -99,6 +409,10 @@ struct Shared {
 #[derive(Clone, Default)]
 pub struct Members {
     base: Base,
+    /// Whole batches, in the order their batches were admitted, between the
+    /// base and the changes. A device is in at most one of them, and in
+    /// neither the base nor the changes where it is.
+    layers: Vec<Laid>,
     leaves: BTreeMap<DeviceId, Option<Arc<DeviceLeaf>>>,
     keys: BTreeMap<(KeyId, DeviceId), Option<KeyPurpose>>,
     addresses: BTreeMap<([u8; 4], DeviceId), bool>,
@@ -149,6 +463,7 @@ impl Members {
             len: store.count(),
             tree: merkle::Tree::stored(root, source),
             base: Base::Kept(store),
+            layers: Vec::new(),
             leaves: BTreeMap::new(),
             keys: BTreeMap::new(),
             addresses: BTreeMap::new(),
@@ -170,8 +485,45 @@ impl Members {
     pub fn get(&self, device: &DeviceId) -> Option<Arc<DeviceLeaf>> {
         match self.leaves.get(device) {
             Some(changed) => changed.clone(),
-            None => self.base_leaf(device),
+            None => self
+                .layers
+                .iter()
+                .rev()
+                .find_map(|laid| laid.get(device))
+                .or_else(|| self.base_leaf(device)),
         }
+    }
+
+    /// Lays `layer` over these members, leaving out the devices in
+    /// `left_out`: every other device it admits becomes a member, read from
+    /// the layer.
+    ///
+    /// None of those may be in the base or among the changes: derivation lays
+    /// a batch's layer before it changes anything, and leaves out what its
+    /// batch skipped against its ancestors and what anything else names.
+    pub fn lay(&mut self, layer: Arc<Layer>, left_out: Arc<BTreeSet<DeviceId>>) {
+        let leaving = left_out.iter().filter(|device| layer.slot_of(device).is_some()).count();
+        self.len = self.len.saturating_add(layer.len().saturating_sub(leaving));
+        self.tree = layer.laid_over(&self.tree, &left_out);
+        self.layers.push(Laid { layer, left_out });
+    }
+
+    /// Whether the changes on top of the base and the layers say anything of
+    /// `device`: a new leaf, or its removal.
+    #[must_use]
+    pub fn has_change(&self, device: &DeviceId) -> bool {
+        self.leaves.contains_key(device)
+    }
+
+    /// The devices the changes on top of the base and the layers speak of, in
+    /// order.
+    pub fn changed(&self) -> impl Iterator<Item = DeviceId> + '_ {
+        self.leaves.keys().copied()
+    }
+
+    /// The layers laid, in order, each with the devices it leaves out.
+    pub fn layers(&self) -> impl Iterator<Item = (&Arc<Layer>, &BTreeSet<DeviceId>)> {
+        self.layers.iter().map(|laid| (&laid.layer, laid.left_out.as_ref()))
     }
 
     /// A device's leaf in the base, checked against the tree where the base is
@@ -229,7 +581,7 @@ impl Members {
 
     /// The members with their ids, by id: the base and the changes merged.
     pub fn iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
-        let mut base = self.base_iter().peekable();
+        let mut base = self.lower_iter().peekable();
         let mut over = self.leaves.iter().peekable();
         core::iter::from_fn(move || {
             loop {
@@ -252,6 +604,38 @@ impl Members {
                     return base.next();
                 }
             }
+        })
+    }
+
+    /// The base's leaves and the layers', merged by id: what the changes are
+    /// laid over. Where two answer for one id, which derivation never makes,
+    /// the later layer does.
+    fn lower_iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
+        let mut sources: Vec<Source<'_>> = Vec::with_capacity(self.layers.len().saturating_add(1));
+        sources.push(
+            (alloc::boxed::Box::new(self.base_iter())
+                as alloc::boxed::Box<dyn Iterator<Item = _> + Send>)
+                .peekable(),
+        );
+        for laid in &self.layers {
+            sources.push(
+                (alloc::boxed::Box::new(laid.iter())
+                    as alloc::boxed::Box<dyn Iterator<Item = _> + Send>)
+                    .peekable(),
+            );
+        }
+        core::iter::from_fn(move || {
+            let lowest = sources
+                .iter_mut()
+                .filter_map(|source| source.peek().map(|(device, _)| *device))
+                .min()?;
+            let mut found = None;
+            for source in &mut sources {
+                if source.peek().is_some_and(|(device, _)| *device == lowest) {
+                    found = source.next();
+                }
+            }
+            found
         })
     }
 
@@ -408,6 +792,25 @@ impl Members {
                 }
             }
         }
+        for laid in &self.layers {
+            let keys = &laid.layer.keys;
+            let from = keys.partition_point(|(held, _)| held < key);
+            for (_, slot) in
+                keys.get(from..).unwrap_or_default().iter().take_while(|(held, _)| held == key)
+            {
+                let Some(device) = laid.holds(*slot as usize) else { continue };
+                let purpose = laid.layer.entry(&device).and_then(|entry| {
+                    entry
+                        .keys
+                        .iter()
+                        .find(|entry| entry.key_id() == *key)
+                        .map(|entry| entry.purpose)
+                });
+                if let Some(purpose) = purpose {
+                    holders.insert(device, (purpose, false));
+                }
+            }
+        }
         for ((_, device), purpose) in
             self.keys.range(from..).take_while(|((held, _), _)| held == key)
         {
@@ -456,6 +859,13 @@ impl Members {
                 }
             }
         }
+        for laid in &self.layers {
+            for device in laid.layer.assigning(address) {
+                if !laid.left_out.contains(&device) {
+                    holders.insert(device, false);
+                }
+            }
+        }
         for ((_, device), holds) in
             self.addresses.range(from..).take_while(|((held, _), _)| *held == address)
         {
@@ -501,6 +911,29 @@ impl Members {
             Base::Kept(store) => {
                 for device in store.name_holders(&lower) {
                     holders.insert(device, true);
+                }
+            }
+        }
+        for laid in &self.layers {
+            let layer = &laid.layer;
+            let name_of = |slot: &u32| {
+                layer
+                    .devices
+                    .get(*slot as usize)
+                    .and_then(|(_, place)| layer.entries.get(*place))
+                    .map_or("", |entry| entry.name.as_str())
+            };
+            let from =
+                layer.names.partition_point(|slot| lower_order(name_of(slot), &lower).is_lt());
+            for slot in layer
+                .names
+                .get(from..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|slot| lower_order(name_of(slot), &lower).is_eq())
+            {
+                if let Some(device) = laid.holds(*slot as usize) {
+                    holders.insert(device, false);
                 }
             }
         }
@@ -564,8 +997,28 @@ impl Members {
         if !same_base {
             return None;
         }
-        let touched: BTreeSet<DeviceId> =
-            self.leaves.keys().chain(other.leaves.keys()).copied().collect();
+        let same_layer = |one: &Laid, two: &Laid| {
+            Arc::ptr_eq(&one.layer, &two.layer) && one.left_out == two.left_out
+        };
+        let shared = self.layers.len().min(other.layers.len());
+        if !self.layers.iter().zip(&other.layers).all(|(one, two)| same_layer(one, two)) {
+            return None;
+        }
+        // The layers one has and the other not differ in every device they
+        // admit; a batch's arrival is the one time that walks its devices.
+        let extra = self
+            .layers
+            .get(shared..)
+            .unwrap_or_default()
+            .iter()
+            .chain(other.layers.get(shared..).unwrap_or_default());
+        let touched: BTreeSet<DeviceId> = self
+            .leaves
+            .keys()
+            .chain(other.leaves.keys())
+            .copied()
+            .chain(extra.flat_map(|laid| laid.iter().map(|(device, _)| device)))
+            .collect();
         Some(
             touched
                 .into_iter()
@@ -582,7 +1035,13 @@ impl Members {
     /// `None` where it was removed. With [`merkle::Tree::dropped`] and
     /// [`merkle::Tree::fresh`], what a store writes to become these members.
     pub fn changes(&self) -> impl Iterator<Item = (DeviceId, Option<Arc<DeviceLeaf>>)> + '_ {
-        self.leaves.iter().map(|(device, changed)| (*device, changed.clone()))
+        let laid = self
+            .layers
+            .iter()
+            .flat_map(Laid::iter)
+            .filter(|(device, _)| !self.leaves.contains_key(device))
+            .map(|(device, leaf)| (device, Some(leaf)));
+        self.leaves.iter().map(|(device, changed)| (*device, changed.clone())).chain(laid)
     }
 
     /// Folds the changes into a new shared base, so that copies made from here
@@ -590,7 +1049,7 @@ impl Members {
     /// derived from. A base in a store is folded by writing the store.
     pub fn flatten(&mut self) {
         let Base::Memory(shared) = &self.base else { return };
-        if self.leaves.is_empty() {
+        if self.leaves.is_empty() && self.layers.is_empty() {
             return;
         }
         let mut merged = Shared {
@@ -599,6 +1058,16 @@ impl Members {
             addresses: shared.addresses.clone(),
             names: shared.names.clone(),
         };
+        for (device, leaf) in self.layers.iter().flat_map(Laid::iter) {
+            for entry in &leaf.record.keys {
+                merged.keys.insert((entry.key_id(), device), entry.purpose);
+            }
+            if let Some(address) = leaf.settings.ipv4 {
+                merged.addresses.insert((address, device));
+            }
+            merged.names.insert((leaf.record.name.to_ascii_lowercase(), device));
+            merged.leaves.insert(device, leaf);
+        }
         for (device, changed) in &self.leaves {
             match changed {
                 Some(leaf) => merged.leaves.insert(*device, Arc::clone(leaf)),
@@ -626,6 +1095,7 @@ impl Members {
             }
         }
         self.base = Base::Memory(Arc::new(merged));
+        self.layers.clear();
         self.leaves.clear();
         self.keys.clear();
         self.addresses.clear();

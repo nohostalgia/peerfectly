@@ -36,10 +36,10 @@ rust-version = "1.95"
 [workspace.dependencies]
 # The transport, from its repository, fixed to one commit: a new one is taken on
 # purpose, never by an update.
-convesso-core = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
-convesso-stream = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
-convesso-tokio = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
-convesso-relay = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
+convesso-core = { git = "https://github.com/nohostalgia/convesso", rev = "257a2ede1b8d2e3bba94d564b67aed2b02875947" }
+convesso-stream = { git = "https://github.com/nohostalgia/convesso", rev = "257a2ede1b8d2e3bba94d564b67aed2b02875947" }
+convesso-tokio = { git = "https://github.com/nohostalgia/convesso", rev = "257a2ede1b8d2e3bba94d564b67aed2b02875947" }
+convesso-relay = { git = "https://github.com/nohostalgia/convesso", rev = "257a2ede1b8d2e3bba94d564b67aed2b02875947" }
 # Canonical CBOR. Chosen over serde-based codecs so encoding stays byte-exact and
 # under our control.
 minicbor = { version = "2.3.0", features = ["alloc"] }

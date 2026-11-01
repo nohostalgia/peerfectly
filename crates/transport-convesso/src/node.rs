@@ -190,6 +190,8 @@ struct Shared {
     held_opens: std::sync::Mutex<HashMap<SessionId, HeldOpen>>,
     /// Sessions already answered with roots: once each.
     answered: std::sync::Mutex<HashSet<SessionId>>,
+    /// Sessions this node does not hold whose sender was told so: once each.
+    unknown: std::sync::Mutex<HashSet<SessionId>>,
     /// The access policy, and the groups it is decided over.
     policy: std::sync::RwLock<Policy>,
     /// This device.
@@ -410,6 +412,7 @@ impl ConvessoTransport {
             catch_ups: std::sync::Mutex::new(HashMap::new()),
             held_opens: std::sync::Mutex::new(HashMap::new()),
             answered: std::sync::Mutex::new(HashSet::new()),
+            unknown: std::sync::Mutex::new(HashSet::new()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             accepted_from: std::sync::Mutex::new(HashMap::new()),
             dials: std::sync::Mutex::new(HashMap::new()),
@@ -825,13 +828,27 @@ fn schedule_move_end(shared: &Arc<Shared>, params: &NetworkParams) {
     }
 }
 
-/// Starts a reader for every member that has none, and stops those of
-/// devices that are no longer members.
+/// Stops the readers of devices that are no longer members, and of those
+/// that ended.
+///
+/// A reader is started when a session with a peer has keys
+/// ([`ContextEvent::Connected`]) or this node dials it, and ended when the
+/// session has none left ([`ContextEvent::Idle`]): not one for every member.
+/// An open reader keeps convesso from forgetting its peer's channel, and one
+/// for every member was a task and a channel per member, for good, on every
+/// full member of a network of a hundred thousand.
 fn ensure_readers(shared: &Arc<Shared>) {
+    // A node holding no roster judges by evidence, and knows no members to
+    // keep readers to: it keeps those its sessions started.
+    if shared.judge.is_some() {
+        return;
+    }
     let own = shared.node.address().peer_id();
-    let members: Vec<Address> =
-        shared.members.read().map(|members| members.others(&own)).unwrap_or_default();
-    let keep: HashSet<PeerId> = members.iter().map(Address::peer_id).collect();
+    let keep: HashSet<PeerId> = shared
+        .members
+        .read()
+        .map(|members| members.others(&own).iter().map(Address::peer_id).collect())
+        .unwrap_or_default();
     if let Ok(mut readers) = shared.readers.lock() {
         readers.retain(|peer, reader| {
             let kept = keep.contains(peer) && !reader.is_finished();
@@ -841,8 +858,23 @@ fn ensure_readers(shared: &Arc<Shared>) {
             kept
         });
     }
-    for address in members {
-        ensure_reader(shared, address);
+}
+
+/// Ends `peer`'s reader once its session has no keys, so that convesso may
+/// forget its channel: a message either side sends next opens a new session,
+/// and its [`ContextEvent::Connected`] a new reader.
+///
+/// Asked first whether the session is still without keys: a reader dropped
+/// while the peer has opened a new one would reset the channel that new
+/// session carries. Dropped while there is none, it tells the peer nothing.
+async fn end_reader_if_idle(shared: Arc<Shared>, peer: PeerId) {
+    if !matches!(shared.context.is_live(peer).await, Ok(false)) {
+        return;
+    }
+    if let Ok(mut readers) = shared.readers.lock()
+        && let Some(reader) = readers.remove(&peer)
+    {
+        reader.abort();
     }
 }
 
@@ -1029,15 +1061,22 @@ async fn read_context_events(shared: Arc<Shared>, mut events: ContextEvents) {
             ContextEvent::ChannelReset { peer, reason } => {
                 lose_peer(&shared, &peer, &reset(&reason));
             }
-            // A node holding no roster has a reader for nobody it has not met:
-            // a member admitted a moment ago would have its open held back
-            // unread — convesso grants a peer's channel only the room of its
-            // receiver — and its dial would time out. Whoever connects is read,
-            // and the judge decides what what it opens with is worth.
-            ContextEvent::Connected { peer } if shared.judge.is_some() => {
-                ensure_reader_of(&shared, peer);
+            // Whoever connects is read: convesso grants a peer's channel only
+            // the room of its receiver, so a peer with none would have its open
+            // held back unread and its dial time out. Whether it is let into a
+            // session is decided by what it opens with.
+            ContextEvent::Connected { peer } => ensure_reader_of(&shared, peer),
+            // A convesso session with no keys left ends no session of this
+            // binding: the next frame either side sends opens a new convesso
+            // session, and the session carries on (`Live` outlives it). Its
+            // reader ends, asked aside: the question goes to the node that
+            // sends these events.
+            ContextEvent::Idle { peer } => {
+                tokio::spawn(end_reader_if_idle(Arc::clone(&shared), peer));
             }
-            ContextEvent::Connected { .. } | ContextEvent::PathChanged { .. } => {}
+            // No context of this binding takes data in a first contact: it
+            // would be unconfirmed, and could be replayed.
+            ContextEvent::PathChanged { .. } | ContextEvent::EarlyDatagram { .. } => {}
         }
     }
 }
@@ -1371,11 +1410,10 @@ async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
                 live.shut(Error::ClosedByPeer);
             }
         }
-        Some(Frame::Payload { id, bytes }) => {
-            if let Some(live) = session_of(shared, id, &peer) {
-                live.deliver_payload(bytes).await;
-            }
-        }
+        Some(Frame::Payload { id, bytes }) => match session_of(shared, id, &peer) {
+            Some(live) => live.deliver_payload(bytes).await,
+            None => unknown_session(shared, peer, id),
+        },
         // A packet sent as a message is not one: ignored.
         Some(Frame::Packet { .. }) | None => {}
     }
@@ -1383,10 +1421,32 @@ async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
 
 /// A datagram from `peer`.
 fn on_datagram(shared: &Shared, peer: PeerId, data: &[u8]) {
-    if let Some(Frame::Packet { id, fragment }) = Frame::decode(data)
-        && let Some(live) = session_of(shared, id, &peer)
-    {
-        live.deliver_fragment(&fragment);
+    if let Some(Frame::Packet { id, fragment }) = Frame::decode(data) {
+        match session_of(shared, id, &peer) {
+            Some(live) => live.deliver_fragment(&fragment),
+            None => unknown_session(shared, peer, id),
+        }
+    }
+}
+
+/// A frame for a session this node does not hold: one it closed, or one it
+/// lost by restarting. The sender is told, once per session, so that it ends
+/// the session rather than carry on into nothing.
+///
+/// convesso tells a restart only when a message was cut half way: a peer that
+/// restarted between messages takes the next one as a new start, silently. A
+/// node that kept a session with it would otherwise send into it until that
+/// session closed on its own, which, held open, is never.
+fn unknown_session(shared: &Shared, peer: PeerId, id: SessionId) {
+    let first = shared.unknown.lock().is_ok_and(|mut told| {
+        if told.len() >= MAX_ANSWERED {
+            told.clear();
+        }
+        told.insert(id)
+    });
+    if first {
+        let close = Frame::Close { id, reason: Reason::Ordinary }.encode();
+        let _ = shared.outbound.send(Out::Reply(peer, close));
     }
 }
 

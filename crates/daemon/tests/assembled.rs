@@ -273,6 +273,15 @@ fn packet(source: Ipv6Addr, destination: Ipv6Addr) -> Vec<u8> {
 /// Two assembled nodes with a session between them, ready to be pumped.
 async fn pair() -> (Fixture, Assembled, Assembled, Arc<dyn Session>, Arc<dyn Session>) {
     let fixture = Fixture::found();
+    let roster = fixture.roster();
+    pair_holding(fixture, roster).await
+}
+
+/// As [`pair`], the founder holding a roster of the caller's choosing.
+async fn pair_holding(
+    fixture: Fixture,
+    founder_roster: Roster,
+) -> (Fixture, Assembled, Assembled, Arc<dyn Session>, Arc<dyn Session>) {
     let fabric = MemoryFabric::new();
 
     let founder_transport = Arc::new(
@@ -288,8 +297,13 @@ async fn pair() -> (Fixture, Assembled, Assembled, Arc<dyn Session>, Arc<dyn Ses
     let dialled: Arc<dyn Session> = Arc::from(dialled.expect("establishes"));
     let accepted: Arc<dyn Session> = Arc::from(accepted.expect("establishes"));
 
-    let founder =
-        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+    let founder = assemble_holding(
+        &fixture,
+        founder_roster,
+        &fixture.founder,
+        founder_transport as Arc<dyn Transport>,
+    )
+    .await;
     let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
 
     (fixture, founder, joiner, dialled, accepted)
@@ -1184,6 +1198,38 @@ async fn an_unused_session_is_closed_without_a_fault() {
 
     assert!(!founder.node.has_session(&fixture.joiner.device_id()).await, "closed");
     assert_eq!(None, founder.node.fault().await, "and nothing went wrong");
+}
+
+/// A session with a light member is not closed however long it carries
+/// nothing: it is how the light member hears of a new root.
+#[tokio::test(start_paused = true)]
+async fn an_unused_session_with_a_light_member_is_kept() {
+    let fixture = Fixture::found();
+    let mut roster = fixture.roster();
+    let core = OperationCore::new(
+        3,
+        fixture.founder.signing_key().algorithm(),
+        OperationBody::SetDevice {
+            device: fixture.joiner.device_id(),
+            change: roster::leaf::SettingsChange {
+                mode: Some(roster::leaf::Mode::Light),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+        roster.heads(),
+        fixture.founder.signing_key().key_id(),
+        fixture.network,
+    )
+    .expect("well-formed");
+    let light = sign_operation(&core, fixture.founder.signer()).expect("signs");
+    assert!(roster.offer_bytes(&light).is_accepted());
+
+    let (fixture, founder, _joiner, dialled, _accepted) = pair_holding(fixture, roster).await;
+    register(&founder, &dialled).await;
+
+    tokio::time::advance(IDLE * 6).await;
+    founder.node.close_idle(IDLE).await;
+    assert!(founder.node.has_session(&fixture.joiner.device_id()).await, "still open");
 }
 
 #[tokio::test(start_paused = true)]

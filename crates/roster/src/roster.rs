@@ -24,6 +24,7 @@
 //! Discarding an operation because its parents have not arrived is not an
 //! option. The operation that cannot yet be placed may be a revocation.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 
 use crate::attestation::{RawAttestation, SignedAttestation};
@@ -643,7 +644,7 @@ impl Roster {
         // A revocation settles the question. The revoked set carries the outcome
         // from then on, so the accusation has nothing left to add and reporting
         // it would keep a person looking at something already dealt with.
-        if let Ok(state) = self.state() {
+        if let Some(state) = self.current() {
             found.retain(|held| {
                 state
                     .device_for_key(&held.author)
@@ -842,7 +843,7 @@ impl Roster {
         let signer = snapshot.signer();
         // A root is signed with the admin's attestation key, which asks nobody;
         // a key of either purpose names its device.
-        if let Ok(state) = self.state()
+        if let Some(state) = self.current()
             && let Some(device) = state.device_holding(&signer)
         {
             return state.is_admin(&device) && !state.revoked.contains(&device);
@@ -1038,6 +1039,11 @@ impl Roster {
                 Ok(state) => {
                     let discarded = self.dag.compact(candidate, state)?;
                     self.checkpoints.drain(..=position);
+                    // What derivation now says: the revocations the base
+                    // absorbed leave the revoked set, the device merely absent.
+                    // Kept as it was, the state still named them until the next
+                    // derivation, found by `tests/layers.rs`.
+                    self.follow(false);
                     return Ok(discarded);
                 }
                 Err(refusal) => {
@@ -1200,7 +1206,7 @@ impl Roster {
         // Resolved against this node's own roster and nothing else. An
         // attestation carries no state, so there is nothing in it that could
         // claim who its author is — the case a snapshot has, and this does not.
-        let Ok(state) = self.state() else {
+        let Some(state) = self.current() else {
             return AttestationAdmission::Refused { reason: Error::UnauthorizedAuthor };
         };
         let Some(key) = attestation_key_of(&state, &raw.body().author) else {
@@ -1272,7 +1278,7 @@ impl Roster {
     pub fn freshness(&mut self) -> Freshness {
         // A network that sets no window is never stale: there is nothing for
         // an island to wait out, and nothing to be cautious about.
-        if self.state().is_ok_and(|state| state.params.snapshot_window == 0) {
+        if self.current().is_some_and(|state| state.params.snapshot_window == 0) {
             return Freshness::Fresh;
         }
         let Some(received_at) = self.freshness_since else {
@@ -1290,9 +1296,9 @@ impl Roster {
         if now < received_at {
             return Freshness::ClockWentBackwards;
         }
-        let window = match self.state() {
-            Ok(state) => state.params.snapshot_window,
-            Err(_) => return Freshness::Unknown,
+        let window = match self.current() {
+            Some(state) => state.params.snapshot_window,
+            None => return Freshness::Unknown,
         };
         if now.saturating_sub(received_at) > window { Freshness::Stale } else { Freshness::Fresh }
     }
@@ -1308,6 +1314,19 @@ impl Roster {
     #[must_use]
     pub const fn dag(&self) -> &Dag {
         &self.dag
+    }
+
+    /// The roster this node's operations imply, lent where it is kept and
+    /// derived only where it is not.
+    ///
+    /// For the reads that need a field or two: a copy of the state costs as
+    /// much as the roster is large, and these run for every operation, root
+    /// and attestation a node receives (`daemon::simulator`).
+    fn current(&self) -> Option<Cow<'_, RosterState>> {
+        match &self.at_heads {
+            Some(state) => Some(Cow::Borrowed(state)),
+            None => derive(&self.dag).ok().map(Cow::Owned),
+        }
     }
 
     /// The roster this node's operations imply.
@@ -1432,7 +1451,7 @@ impl Roster {
     /// the admin role — the case that deserves an alert rather than a log line.
     #[must_use]
     pub fn refusal_is_from_current_admin(&self, operation: &VerifiedOperation) -> bool {
-        let Ok(state) = self.state() else { return false };
+        let Some(state) = self.current() else { return false };
         state
             .device_for_key(&operation.core().author)
             .is_some_and(|record| record.role == crate::types::Role::Admin)
@@ -1566,7 +1585,7 @@ impl Roster {
     #[must_use]
     pub fn urgent_anchor(&self, target: &DeviceId, now_ms: u64) -> UrgentAnchor {
         let heads = self.dag.heads();
-        let Ok(state) = self.state() else {
+        let Some(state) = self.current() else {
             return UrgentAnchor { heads, voided: Vec::new() };
         };
         let target_is_admin = state.is_admin(target);
@@ -1847,11 +1866,12 @@ impl Roster {
     /// anchored behind the frontier. Deriving is the expensive path and the
     /// correct one, and it is taken whenever there is any doubt at all.
     fn follow(&mut self, in_one_step: bool) {
-        let extended = in_one_step.then_some(self.at_heads.as_ref()).flatten().and_then(|state| {
+        let kept = self.at_heads.take();
+        let extended = in_one_step.then_some(kept).flatten().and_then(|state| {
             self.dag
                 .operations()
                 .last()
-                .and_then(|operation| crate::state::extend(state, operation))
+                .and_then(|operation| crate::state::extend(state, operation, &self.dag))
         });
         self.at_heads = match extended {
             Some(next) => Some(next),
@@ -1926,7 +1946,7 @@ impl Roster {
                 })
                 .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok());
         }
-        let state = self.state().ok()?;
+        let state = self.current()?;
         let record = state.device_for_key(&raw.core().author)?;
         record
             .keys
@@ -1940,8 +1960,12 @@ impl Roster {
 
     /// Whether an operation is anchored too far behind the local frontier.
     ///
-    /// Local policy. The comparison uses the deepest parent this node holds,
-    /// which is the best evidence available of where the author was standing.
+    /// Local policy. The comparison uses the shallowest parent: an operation
+    /// naming one parent beyond the horizon is anchored there, whatever recent
+    /// parent it names beside it. Judged on the deepest, it was taken here and
+    /// held pending for ever by a node that had compacted that parent away,
+    /// the two then deriving different states (`tests/layers.rs`). An honest
+    /// author names its heads, and is never anchored behind them.
     fn staleness_refusal(&self, operation: &RawOperation<'_>) -> Option<Error> {
         if self.dag.is_empty() {
             return None;
@@ -1952,7 +1976,7 @@ impl Roster {
             .iter()
             .filter_map(|parent| self.dag.position(parent))
             .map(|index| self.dag.depth(index))
-            .max()?;
+            .min()?;
         let frontier = self.dag.frontier_depth();
         let behind = frontier.saturating_sub(anchor_depth);
         (behind > self.staleness_depth).then_some(Error::StaleOperation)

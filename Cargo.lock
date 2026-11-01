@@ -462,7 +462,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 [[package]]
 name = "convesso-core"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=257a2ede1b8d2e3bba94d564b67aed2b02875947#257a2ede1b8d2e3bba94d564b67aed2b02875947"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -476,7 +476,7 @@ dependencies = [
 [[package]]
 name = "convesso-relay"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=257a2ede1b8d2e3bba94d564b67aed2b02875947#257a2ede1b8d2e3bba94d564b67aed2b02875947"
 dependencies = [
  "convesso-core",
 ]
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "convesso-stream"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=257a2ede1b8d2e3bba94d564b67aed2b02875947#257a2ede1b8d2e3bba94d564b67aed2b02875947"
 dependencies = [
  "convesso-core",
 ]
@@ -492,7 +492,7 @@ dependencies = [
 [[package]]
 name = "convesso-tokio"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=257a2ede1b8d2e3bba94d564b67aed2b02875947#257a2ede1b8d2e3bba94d564b67aed2b02875947"
 dependencies = [
  "convesso-core",
  "convesso-relay",
@@ -882,7 +882,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2600,7 +2600,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2950,7 +2950,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3482,7 +3482,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

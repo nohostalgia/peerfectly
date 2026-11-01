@@ -6,12 +6,15 @@
 //! `Syncer::for_peer`. Light members hold what a light member holds, and meet
 //! full members as the daemon has them meet: each keeps in touch with two, its
 //! anchors first (`Node::chosen_neighbours`), opens its sessions with them
-//! once an hour (the reconciliation tick), and is left alone once they have
-//! carried nothing for a while (`close_idle`). As a session opens each side
-//! shows its evidence; the light member takes the root it is shown, or asks
-//! the chain to it (`BEHIND`, `ROOTS`), then asks what it stands on, and renews
-//! its proof when a delta names it. Nothing else of a daemon is here: no
-//! tunnel, no transport, no tasks.
+//! when it comes online (the reconciliation tick reaches a peer without one),
+//! and keeps them open however long they carry nothing (`node::held_open`).
+//! As a session opens each side shows its evidence; the light member takes
+//! the root it is shown, or asks the chain to it (`BEHIND`, `ROOTS`). A root
+//! taken later is pushed to it on the session already open, as anything new
+//! is; on taking one it asks what it stands on, and renews its proof when a
+//! delta names it. Nothing else of a daemon is here: no tunnel, no transport,
+//! no tasks, and no convesso: a session's handshakes, and the new ones after
+//! convesso forgets a session nothing used, are not counted.
 //!
 //! Messages travel over an in-memory queue, one hop a tick, so a tick is the
 //! latency of one message and propagation is counted in hops. Every byte sent
@@ -114,7 +117,8 @@ struct Light {
     online: bool,
     /// The full members it keeps in touch with.
     kept: Vec<usize>,
-    /// Whether its sessions with them are open now.
+    /// Whether its sessions with them are open: from when it comes online
+    /// until it goes off.
     in_session: bool,
     /// The digest of the footing it last took.
     footing: Option<[u8; 32]>,
@@ -291,9 +295,14 @@ impl Simulation {
 
     /// Admits `count` light members in batches signed by the founder, and
     /// runs until every full member holds it. Then the founder publishes the
-    /// root over it, and each board is provisioned from that root, as a board
-    /// is at the station: what the phase returns is the batch's spreading.
-    pub(crate) fn admit_light_batch(&mut self, count: usize) -> Phase {
+    /// root over it, and `running` of the boards are provisioned from that
+    /// root, as a board is at the station, and run: what the phase returns is
+    /// the batch's spreading.
+    ///
+    /// The rest are members the full members hold and serve nobody for: a
+    /// sample stands for them where running them all would not fit, a full
+    /// member's traffic with light members growing with how many it serves.
+    pub(crate) fn admit_light_batch(&mut self, count: usize, running: usize) -> Phase {
         let entries: Vec<BatchEntry> = (0..count)
             .map(|index| {
                 let board = NodeIdentity::generate().expect("generates");
@@ -337,13 +346,13 @@ impl Simulation {
 
         self.publish_root();
         let _settled = self.run_until(|_| false);
-        self.provision_lights();
+        self.provision_lights(running);
         phase
     }
 
-    /// Every board of the batch, provisioned from the founder's current root
-    /// and handed its anchors.
-    fn provision_lights(&mut self) {
+    /// `running` boards of the batch, provisioned from the founder's current
+    /// root and handed their anchors.
+    fn provision_lights(&mut self, running: usize) {
         let roster = self.founder_roster();
         let state = roster.state().expect("derives");
         let index: BTreeMap<DeviceId, usize> =
@@ -353,6 +362,7 @@ impl Simulation {
             .iter()
             .filter(|(id, _)| !index.contains_key(id) && !self.light_index.contains_key(id))
             .map(|(id, _)| id)
+            .take(running)
             .collect();
         let mut lights = Vec::new();
         for board in boards {
@@ -418,14 +428,18 @@ impl Simulation {
 
     /// An admin's act and the root after it: the founder revokes `revoked` and
     /// renames `renamed`, two of the light members, then publishes. Runs until
-    /// every full member holds both; light members, with no session open, take
-    /// the root at their next [`Self::hour`]. The revoked one is out.
+    /// every full member holds both, and every light member online the root,
+    /// pushed on its sessions. The revoked one is out, its sessions closed.
     pub(crate) fn revoke_and_rename(&mut self, revoked: usize, renamed: usize) -> Phase {
         let device = |at: usize, lights: &[Light]| {
             lights.get(at).map(|light| light.member.device()).expect("a light member")
         };
         let gone = device(revoked, &self.lights);
         let changed = device(renamed, &self.lights);
+        if let Some(light) = self.lights.get_mut(revoked) {
+            light.online = false;
+            light.in_session = false;
+        }
         let before = self.counters();
         let mut signed = Vec::new();
         for body in [
@@ -445,15 +459,14 @@ impl Simulation {
                 .fulls
                 .iter()
                 .all(|full| signed.iter().all(|id| full.syncer.roster().dag().contains(id)))
+                && simulation.lights_hold_the_root()
         });
-        if let Some(light) = self.lights.get_mut(revoked) {
-            light.online = false;
-        }
         self.phase_since(&before, ticks)
     }
 
     /// An admin's rename of light member `renamed`, and the root after it:
-    /// runs until every full member holds it.
+    /// runs until every full member holds it, and every light member online
+    /// the root.
     pub(crate) fn rename(&mut self, renamed: usize) -> Phase {
         let device =
             self.lights.get(renamed).map(|light| light.member.device()).expect("a light member");
@@ -470,16 +483,18 @@ impl Simulation {
         let _root = self.publish_root();
         let ticks = self.run_until(|simulation| {
             simulation.fulls.iter().all(|full| full.syncer.roster().dag().contains(&id))
+                && simulation.lights_hold_the_root()
         });
         self.phase_since(&before, ticks)
     }
 
-    /// Takes light members offline, so roots published meanwhile do not reach
-    /// them.
+    /// Takes light members offline, their sessions gone, so roots published
+    /// meanwhile do not reach them.
     pub(crate) fn switch_off(&mut self, lights: &[usize]) {
         for at in lights {
             if let Some(light) = self.lights.get_mut(*at) {
                 light.online = false;
+                light.in_session = false;
             }
         }
     }
@@ -494,11 +509,11 @@ impl Simulation {
         }
     }
 
-    /// One hour of the reconciliation tick: every light member online opens
-    /// its sessions with the full members it keeps, each side showing its
-    /// evidence, and catches up from what it is shown. The sessions close
-    /// after, as idle ones do. Runs until every light member online holds
-    /// the founder's root.
+    /// One hour of the reconciliation tick: every light member online without
+    /// its sessions opens them with the full members it keeps, each side
+    /// showing its evidence, and catches up from what it is shown. The
+    /// sessions stay open. Runs until every light member online holds the
+    /// founder's root.
     pub(crate) fn hour(&mut self) -> Phase {
         let before = self.counters();
         let shown: Vec<Vec<u8>> = self
@@ -508,7 +523,7 @@ impl Simulation {
             .collect();
         for at in 0..self.lights.len() {
             let Some(light) = self.lights.get_mut(at) else { continue };
-            if !light.online {
+            if !light.online || light.in_session {
                 continue;
             }
             light.in_session = true;
@@ -538,14 +553,14 @@ impl Simulation {
                 });
             }
         }
-        let root = self.founder_roster().snapshot().map(|held| held.body().root);
-        let ticks = self.run_until(|simulation| {
-            simulation.lights.iter().all(|light| !light.online || light.member.current() == root)
-        });
-        for light in &mut self.lights {
-            light.in_session = false;
-        }
+        let ticks = self.run_until(Self::lights_hold_the_root);
         self.phase_since(&before, ticks)
+    }
+
+    /// Whether every light member online holds the founder's root.
+    fn lights_hold_the_root(&self) -> bool {
+        let root = self.founder_roster().snapshot().map(|held| held.body().root);
+        self.lights.iter().all(|light| !light.online || light.member.current() == root)
     }
 
     /// What a light member keeps, as it writes it: its memory, near enough.
@@ -618,7 +633,7 @@ impl Simulation {
     /// ticks it took for `done` to hold, and whether it ever did.
     fn run_until(&mut self, done: impl Fn(&Self) -> bool) -> (u64, bool) {
         let mut ticks = 0_u64;
-        let mut reached = None;
+        let mut reached = done(self).then_some(0);
         while !self.queue.is_empty() {
             ticks = ticks.saturating_add(1);
             let now: Vec<Envelope> = std::mem::take(&mut self.queue);
@@ -730,13 +745,20 @@ impl Simulation {
                             asks.push(Carried::RootsAfter(current));
                         }
                     }
-                    // Asked once, on taking the root that named it: the same root
-                    // from its other anchors asks nothing again.
+                    // As `Node::received_light`: on taking a root, what it stands
+                    // on is asked of the one who pushed it, and the proof renewed
+                    // when the root named it. Asked once: the same root from its
+                    // other anchors is taken already.
                     Ok(
                         roster::light::RootOutcome::Adopted
                         | roster::light::RootOutcome::Switched
                         | roster::light::RootOutcome::KeptAside,
-                    ) if light.member.needs_renewal() => asks.push(Carried::Renew),
+                    ) => {
+                        asks.push(Carried::Footing(light.footing));
+                        if light.member.needs_renewal() {
+                            asks.push(Carried::Renew);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -860,7 +882,9 @@ mod tests {
     /// A network at scale, run by hand when a measurement is wanted and never
     /// in CI: at a size given in `PEERFECTLY_SIM_LIGHTS` (and
     /// `PEERFECTLY_SIM_FULLS`, `PEERFECTLY_SIM_ANCHORS`), ten thousand light
-    /// members behind a dozen full ones by default. A batch reaches every
+    /// members behind a dozen full ones by default. `PEERFECTLY_SIM_RUNNING`
+    /// runs only that many of the light members, every one by default: the
+    /// full members hold them all, and serve the sample. A batch reaches every
     /// full member, the root after an act every light member, and a light
     /// member that was off catches up as its anchors greet it; what each
     /// phase cost is printed for the record.
@@ -870,37 +894,42 @@ mod tests {
         let read = |name: &str, default: usize| {
             std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
         };
+        let lights = read("PEERFECTLY_SIM_LIGHTS", 10_000);
         run(
-            read("PEERFECTLY_SIM_LIGHTS", 10_000),
+            lights,
+            read("PEERFECTLY_SIM_RUNNING", lights).min(lights),
             read("PEERFECTLY_SIM_FULLS", 12),
             read("PEERFECTLY_SIM_ANCHORS", 4),
         );
     }
 
-    fn run(lights: usize, fulls: usize, anchors: usize) {
+    fn run(admitted: usize, lights: usize, fulls: usize, anchors: usize) {
         let started = std::time::Instant::now();
         let mut simulation = Simulation::founded(fulls, anchors);
-        let batch = simulation.admit_light_batch(lights);
+        let batch = simulation.admit_light_batch(admitted, lights);
         assert!(batch.reached, "the batch reaches every full member: {batch:?}");
         assert_eq!(simulation.size(), (fulls, lights));
-        println!("batch of {lights}: {batch}  ({:?} so far)", started.elapsed());
+        println!(
+            "batch of {admitted}, {lights} of them run: {batch}  ({:?} so far)",
+            started.elapsed()
+        );
 
-        // The first hour after a start asks each light member's footing whole,
+        // Sessions opened after a start ask each light member's footing whole,
         // as the daemon does of the first full member it meets.
         let first = simulation.hour();
-        println!("the first hour, after a start: {first}");
+        println!("sessions opened, after a start: {first}");
         assert!(first.reached, "every light member holds the root: {first:?}");
         let quiet = simulation.hour();
         println!("an hour with nothing new: {quiet}");
         assert!(quiet.reached, "and still does: {quiet:?}");
 
         let act = simulation.revoke_and_rename(0, 1);
-        println!("revoke and rename, to the full members: {act}");
-        assert!(act.reached, "every full member has the act: {act:?}");
+        println!("revoke and rename, to everyone: {act}  ({:?} so far)", started.elapsed());
+        assert!(act.reached, "every member has it, the light ones pushed the root: {act:?}");
+        assert_eq!(act.renewals, 1, "the renamed member renews its proof, once");
         let next = simulation.hour();
-        println!("the hour after it: {next}  ({:?} so far)", started.elapsed());
-        assert!(next.reached, "every light member takes the root as it meets a full one: {next:?}");
-        assert_eq!(next.renewals, 1, "the renamed member renews its proof, once");
+        println!("the hour after it: {next}");
+        assert!(next.reached, "and keeps it: {next:?}");
 
         // A tenth of the light members off across two acts, then back.
         let off: Vec<usize> = (2..lights).step_by(10).collect();
@@ -910,7 +939,7 @@ mod tests {
         assert!(simulation.rename(4).reached);
         simulation.switch_on(&off);
         let back = simulation.hour();
-        println!("{} back after two roots, and an act: {back}", off.len());
+        println!("{} back after two roots: {back}", off.len());
         assert!(back.reached, "each catches up from the full members it keeps: {back:?}");
         println!("roots held: {:?}", simulation.light_roots().values().collect::<Vec<_>>());
 

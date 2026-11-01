@@ -50,6 +50,7 @@ use crate::dag::{Dag, Foundation};
 use crate::error::{Error, Result};
 use crate::id::{DeviceId, KeyId, OperationId};
 use crate::leaf::{DeviceLeaf, DeviceSettings, Mode, SettingsChange};
+use crate::members::Layer;
 use crate::merkle;
 use crate::parameters::{PARAMETER_NAMES, Parameter};
 use crate::types::{DeviceRecord, DeviceSpec, NetworkParams, OperationBody, Role};
@@ -408,6 +409,23 @@ pub fn derive(dag: &Dag) -> Result<RosterState> {
     Ok(derive_with_verdicts(dag)?.0)
 }
 
+/// The roster as derivation before 2026-10-31 resolved it, a batch's every
+/// device one by one: what [`derive`] is held to in tests, and nothing else.
+///
+/// # Errors
+///
+/// As [`derive`].
+#[doc(hidden)]
+pub fn derive_reference(dag: &Dag) -> Result<RosterState> {
+    let foundation = dag.foundation().ok_or(Error::MissingGenesis)?;
+    let base = Base::build(dag, &foundation)?;
+    let verdicts = judge_within(dag, &base, None, reference::resolve_in)?;
+    let mask: Vec<bool> =
+        (0..dag.len()).map(|index| verdicts.is_valid(index) && !dag.is_covered(index)).collect();
+    reference::resolve_in(dag, &base, &mask, &mut Memo::new(reference::resolve_in))
+        .ok_or(Error::MissingGenesis)
+}
+
 /// Derives the roster, and says why any operation was disregarded.
 pub fn derive_with_verdicts(dag: &Dag) -> Result<(RosterState, Verdicts)> {
     let foundation = dag.foundation().ok_or(Error::MissingGenesis)?;
@@ -444,7 +462,7 @@ pub fn derive_region(dag: &Dag, region: &[usize]) -> Result<RosterState> {
             *slot = true;
         }
     }
-    let verdicts = judge_within(dag, &base, Some(&scope))?;
+    let verdicts = judge_within(dag, &base, Some(&scope), resolve_in)?;
     let mask: Vec<bool> = (0..dag.len())
         .map(|index| {
             scope.get(index).copied().unwrap_or(false)
@@ -509,7 +527,7 @@ impl Base {
 
 /// Runs the validity rounds described in the module documentation.
 fn judge(dag: &Dag, base: &Base) -> Result<Verdicts> {
-    judge_within(dag, base, None)
+    judge_within(dag, base, None, resolve_in)
 }
 
 /// Judges every operation, optionally within a subset of the graph.
@@ -519,7 +537,12 @@ fn judge(dag: &Dag, base: &Base) -> Result<Verdicts> {
 /// nothing outside that set may be consulted: the answer has to be the same on
 /// every node holding those ancestors, and what else a node holds is not
 /// something the operation's author could know or the network could agree on.
-fn judge_within(dag: &Dag, base: &Base, scope: Option<&[bool]>) -> Result<Verdicts> {
+fn judge_within(
+    dag: &Dag,
+    base: &Base,
+    scope: Option<&[bool]>,
+    resolver: Resolver,
+) -> Result<Verdicts> {
     let count = dag.len();
     let mut reasons: Vec<Option<Invalidity>> = vec![None; count];
 
@@ -549,7 +572,7 @@ fn judge_within(dag: &Dag, base: &Base, scope: Option<&[bool]>) -> Result<Verdic
             .enumerate()
             .map(|(index, valid)| *valid && !dag.is_covered(index))
             .collect();
-        let mut memo = Memo::new();
+        let mut memo = Memo::new(resolver);
 
         // Every rule but the causal authorship one, which needs this answer
         // before it can be asked. An operation is *authorised* when its author
@@ -661,7 +684,7 @@ pub fn state_for_parents(dag: &Dag, parents: &[OperationId]) -> Result<RosterSta
     // fixed the moment its author signs it, so a verdict that reads only them is
     // the same verdict on every node — which is what lets admission refuse
     // without two nodes disagreeing about what the network holds.
-    let verdicts = judge_within(dag, &base, Some(&scope))?;
+    let verdicts = judge_within(dag, &base, Some(&scope), resolve_in)?;
     let mask: Vec<bool> = (0..dag.len())
         .map(|index| {
             scope.get(index).copied().unwrap_or(false)
@@ -696,20 +719,45 @@ pub fn state_for_parents(dag: &Dag, parents: &[OperationId]) -> Result<RosterSta
 /// says what. For those this answers `None`, and the roster derives — which
 /// costs the window, not the network. Founder protection is among what
 /// derivation then judges.
+///
+/// A revocation is followed here where it can give nothing back: a member's,
+/// neither admin nor founder, holding no address another operation in `dag`
+/// assigned elsewhere. It removes its device and nothing else. Derived instead,
+/// it cost every full member the window, a fleet's batch included, at every
+/// revocation: most of a second at ten thousand devices (`daemon::simulator`).
+///
+/// The state is taken, and changed where it is: a copy of it cost a full
+/// member more than the operation, at ten thousand devices whose batch is
+/// still in the window (`daemon::simulator`). Where this answers `None` the
+/// state taken is dropped, unchanged, for the derivation that replaces it.
 #[must_use]
 pub fn extend(
-    state: &RosterState,
+    mut next: RosterState,
     operation: &crate::sign::VerifiedOperation,
+    dag: &Dag,
 ) -> Option<RosterState> {
-    let mut next = state.clone();
     match &operation.core().body {
         // The founding operation names no parents, so it never extends a head.
         // A batch takes effect only once every entry is held, which is the
         // batch handling's to decide, not one operation's.
         OperationBody::CreateNetwork { .. } | OperationBody::AdmitBatch(_) => {}
-        OperationBody::RevokeDevice { .. }
-        | OperationBody::Promote { .. }
-        | OperationBody::Demote { .. } => return None,
+        OperationBody::RevokeDevice { device, .. } => {
+            if let Some(held) = next.devices.get(device) {
+                if held.record.role == Role::Admin || held.record.founder {
+                    return None;
+                }
+                if let Some(address) = held.settings.ipv4
+                    && assigned_elsewhere(dag, device, address)
+                {
+                    return None;
+                }
+                next.devices.remove(device);
+            }
+            // As derivation keeps it: a device a held revocation removed, or
+            // never held, and nothing admitted since.
+            next.revoked.insert(*device);
+        }
+        OperationBody::Promote { .. } | OperationBody::Demote { .. } => return None,
         OperationBody::AddDevice(spec) => {
             let Ok(id) = spec.device_id() else { return Some(next) };
             // The first add wins: a second add changes a device that is already
@@ -746,6 +794,22 @@ pub fn extend(
     }
     keep_member_anchors(&mut next);
     Some(next)
+}
+
+/// Whether an operation `dag` holds assigns `address` to a device other than
+/// `device`: one that, having lost it to `device`, would take it back once
+/// `device` is gone. Any such operation, whether it won or lost: answering
+/// `true` too often only derives.
+fn assigned_elsewhere(dag: &Dag, device: &DeviceId, address: [u8; 4]) -> bool {
+    dag.operations().iter().any(|operation| match &operation.core().body {
+        OperationBody::SetDevice { device: other, change } => {
+            other != device && change.ipv4 == Some(Some(address))
+        }
+        OperationBody::AdmitBatch(_) => dag
+            .batch_devices(&operation.id())
+            .any(|(other, entry)| other != *device && entry.ipv4 == Some(address)),
+        _ => false,
+    })
 }
 
 /// Drops from the anchor list every entry that names no member.
@@ -907,18 +971,31 @@ fn author_of(
 /// once over the whole valid set to obtain the roster. Sharing the code is what
 /// keeps the two consistent.
 fn resolve(dag: &Dag, base: &Base, mask: &[bool]) -> Option<RosterState> {
-    resolve_in(dag, base, mask, &mut Memo::new())
+    resolve_in(dag, base, mask, &mut Memo::new(resolve_in))
 }
 
+/// What resolves the state a mask selects: [`resolve_in`], or, in tests, the
+/// reference it is held to.
+type Resolver = fn(&Dag, &Base, &[bool], &mut Memo) -> Option<RosterState>;
+
 /// The state each operation's ancestors imply, by the operation's index, for
-/// one top-level derivation.
+/// one top-level derivation, and the resolver that derivation uses throughout.
 ///
 /// Valid across nested derivations: an operation's ancestors within an
 /// ancestor's region are its ancestors within the whole region, since every
 /// ancestor of an ancestor is one too. Without it, each `set_network` and
 /// each batch would derive its ancestors afresh, and the ones among them
 /// would do the same, doubling the cost with every one in the window.
-type Memo = BTreeMap<usize, Option<RosterState>>;
+struct Memo {
+    states: BTreeMap<usize, Option<RosterState>>,
+    resolver: Resolver,
+}
+
+impl Memo {
+    fn new(resolver: Resolver) -> Self {
+        Self { states: BTreeMap::new(), resolver }
+    }
+}
 
 /// [`resolve`], sharing what nested derivations already computed.
 fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<RosterState> {
@@ -952,15 +1029,21 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     // it — so the base's holder of every address the window assigns is
     // touched too. Everything else is carried over from the base as it is,
     // which is what lets a window over a million devices cost the window.
+    //
+    // A batch's devices are not touched for being in it. A board nothing else
+    // names is exactly what its entry and its batch's header say, so it is
+    // read from the batch's layer and resolves nothing here; only the boards
+    // something else decides are touched (`scalable-membership` 16.4).
     let mut touched: BTreeSet<DeviceId> = BTreeSet::new();
     let mut assigning: BTreeSet<[u8; 4]> = BTreeSet::new();
-    for (_, operation) in selected(dag, mask) {
+    let mut batches: Vec<(usize, &crate::batch::BatchHeader, &alloc::sync::Arc<Layer>)> =
+        Vec::new();
+    for (index, operation) in selected(dag, mask) {
         match &operation.core().body {
             OperationBody::AddDevice(spec) => touched.extend(spec.device_id().ok()),
-            OperationBody::AdmitBatch(_) => {
-                touched.extend(dag.batch_devices(&operation.id()).map(|(device, _)| device));
-                for entry in dag.entries_of(&operation.id()).unwrap_or_default() {
-                    assigning.extend(entry.ipv4);
+            OperationBody::AdmitBatch(header) => {
+                if let Some(layer) = dag.batch_layer(&operation.id()) {
+                    batches.push((index, header, layer));
                 }
             }
             body => {
@@ -969,6 +1052,48 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
                 }
                 touched.extend(Dag::target_of(body));
             }
+        }
+    }
+    // A board two concurrent batches admit, or an address both assign: which
+    // one stands is the rank's to decide.
+    for (at, (one, _, first)) in batches.iter().enumerate() {
+        for (other, _, second) in batches.iter().skip(at.saturating_add(1)) {
+            if !dag.concurrent(*one, *other) {
+                continue;
+            }
+            let (smaller, larger) =
+                if first.len() <= second.len() { (first, second) } else { (second, first) };
+            for (device, _) in smaller.devices() {
+                if larger.entry(&device).is_some() {
+                    touched.insert(device);
+                }
+            }
+            for address in smaller.addresses() {
+                if larger.assigning(address).next().is_some() {
+                    touched.extend(smaller.assigning(address));
+                    touched.extend(larger.assigning(address));
+                }
+            }
+        }
+    }
+    for (_, _, layer) in &batches {
+        // A board whose address an admin assigns elsewhere: contested.
+        for address in &assigning {
+            touched.extend(layer.assigning(*address));
+        }
+        // A board the base's own changes speak of: they would answer for it
+        // over the layer, so it is resolved here instead.
+        for device in base.state.devices.changed() {
+            if layer.entry(&device).is_some() {
+                touched.insert(device);
+            }
+        }
+    }
+    for (_, _, layer) in &batches {
+        let named: Vec<DeviceId> =
+            touched.iter().filter(|device| layer.entry(device).is_some()).copied().collect();
+        for device in named {
+            assigning.extend(layer.entry(&device).and_then(|entry| entry.ipv4));
         }
     }
     for address in assigning {
@@ -989,6 +1114,7 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     // operations name the same device id — the same signing key, but perhaps a
     // different transport key — the deeper one wins, ties broken by id, so the
     // whole record comes from one operation rather than being spliced.
+    let mut claimed = address_claims(dag, mask);
     let mut added: BTreeMap<DeviceId, (Rank, DeviceSpec, OperationId)> = BTreeMap::new();
     for id in &touched {
         let Some(record) = base.state.devices.get(id) else { continue };
@@ -1015,14 +1141,21 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
         // the header's rank, except those that collide with what its own
         // ancestors hold: those are skipped, and the rest stand.
         if let OperationBody::AdmitBatch(header) = &operation.core().body {
+            let Some(layer) = dag.batch_layer(&operation.id()) else { continue };
             let rank = Rank::new(dag.depth(index), operation.id());
-            let skips = crate::batch::skipped_among(
-                ancestor_state(dag, base, mask, index, memo)?,
-                header,
-                dag.batch_devices(&operation.id()),
-            );
-            for (id, entry) in dag.batch_devices(&operation.id()) {
-                if skips.contains_key(&id) || !survives(&id, Some(index)) {
+            let skips = skipped_by(layer, header, ancestor_state(dag, base, mask, index, memo)?);
+            let named: Vec<(DeviceId, &crate::batch::BatchEntry)> = touched
+                .iter()
+                .filter_map(|device| layer.entry(device).map(|entry| (*device, entry)))
+                .collect();
+            for (id, entry) in named {
+                if skips.contains(&id) {
+                    continue;
+                }
+                if let Some(address) = entry.ipv4 {
+                    claimed.entry(address).or_default().push((rank, id));
+                }
+                if !survives(&id, Some(index)) {
                     continue;
                 }
                 let replace = added.get(&id).is_none_or(|(existing, _, _)| rank < *existing);
@@ -1058,18 +1191,9 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
         }
     }
 
-    // Roles. Rule 2: a demote concurrent with a promote wins; causally ordered,
-    // the deeper one wins, so a promote descending from a demote re-promotes.
+    // Roles and modes are settled together, below, once the settings are
+    // known: a device's decisions in rank order (`settle_role_and_mode`).
     let mut roles: BTreeMap<DeviceId, Role> = BTreeMap::new();
-    for (device, (_, spec, _)) in &added {
-        roles.insert(*device, spec.role);
-    }
-    for (device, (_, _, added_by)) in &added {
-        let added_at = dag.position(added_by);
-        if let Some(role) = resolve_role(dag, mask, *device, added_at, roles.get(device).copied()) {
-            roles.insert(*device, role);
-        }
-    }
 
     // Founder status is granted and never withdrawn: a founder leaves by
     // revoking itself, not by ceasing to be one.
@@ -1181,58 +1305,26 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
         }
     }
 
-    // One address, one device. Where two devices are assigned the same address,
-    // by concurrent `set_device`s or batches, the later assignment keeps it
-    // (rule 3) and the other falls back to its derived candidate. An address
-    // set by no held operation dates from the device's admission.
-    let mut assigned: BTreeMap<[u8; 4], Vec<(Rank, DeviceId)>> = BTreeMap::new();
-    for (device, current) in &settings {
-        let Some(address) = current.ipv4 else { continue };
-        let rank = fields
-            .get(&(*device, IPV4_FIELD))
-            .map(|(rank, _)| *rank)
-            .or_else(|| added.get(device).map(|(rank, _, _)| *rank))
-            .unwrap_or(base.rank);
-        assigned.entry(address).or_default().push((rank, *device));
-    }
-    for mut claims in assigned.into_values().filter(|claims| claims.len() > 1) {
-        claims.sort();
-        claims.pop();
-        for (_, device) in claims {
-            if let Some(current) = settings.get_mut(&device) {
-                current.ipv4 = None;
-            }
-            if settings.get(&device).is_some_and(|current| *current == DeviceSettings::default()) {
-                settings.remove(&device);
-            }
-        }
-    }
+    // One address, one device: the latest claim on it keeps it (rule 3), and
+    // every device a later claim overruled has lost it for good.
+    settle_addresses(&mut settings, &fields, &added, base.rank, &mut claimed);
 
     // Admins are full: an admin signs roots, and must hold the state it vouches
-    // for. Where a device would be both an admin and light, the later of the
-    // two decisions stands — a promotion after the device went light has no
-    // effect, and neither has a switch to light after it became an admin.
-    let both: Vec<DeviceId> = settings
-        .iter()
-        .filter(|(device, current)| {
-            current.mode == Mode::Light && roles.get(*device) == Some(&Role::Admin)
-        })
-        .map(|(device, _)| *device)
-        .collect();
-    for device in both {
-        let light_at = fields.get(&(device, 0)).map_or(base.rank, |(rank, _)| *rank);
-        let admitted_at = added.get(&device).map_or(base.rank, |(rank, _, _)| *rank);
-        let added_at = added.get(&device).and_then(|(_, _, added_by)| dag.position(added_by));
-        let admin_at = latest_promote(dag, mask, device, added_at).unwrap_or(admitted_at);
-        if light_at > admin_at {
-            if let Some(current) = settings.get_mut(&device) {
-                current.mode = Mode::Full;
-            }
-            if settings.get(&device).is_some_and(|current| *current == DeviceSettings::default()) {
-                settings.remove(&device);
-            }
-        } else {
-            roles.insert(device, Role::Member);
+    // for. A device's promotions, demotions and switches between full and
+    // light are taken in rank order, and the one that would make it a light
+    // admin has no effect, for good (`settle_role_and_mode`).
+    for (device, (_, spec, added_by)) in &added {
+        let starting = match base.state.devices.get(device) {
+            Some(record) if record.added_by == *added_by => base.state.settings_of(device).mode,
+            _ => batch_settings(dag, added_by, device).unwrap_or_default().mode,
+        };
+        let (role, mode) =
+            settle_role_and_mode(dag, mask, *device, dag.position(added_by), spec.role, starting);
+        roles.insert(*device, role);
+        let current = settings.entry(*device).or_default();
+        current.mode = mode;
+        if *current == DeviceSettings::default() {
+            settings.remove(device);
         }
     }
 
@@ -1259,8 +1351,32 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     let revoked: BTreeSet<DeviceId> =
         revocations.keys().filter(|device| !devices.contains_key(*device)).copied().collect();
 
-    // The base's devices, with what the window made of the ones it touched.
+    // The base's devices, each batch's layer laid over them in order, and
+    // what the window made of the devices it touched over those.
     let mut members = base.state.devices.clone();
+    for (index, header, layer) in &batches {
+        let skips = skipped_by(layer, header, ancestor_state(dag, base, mask, *index, memo)?);
+        // A layer answers for every board it admits but those its batch
+        // skipped, and those the base or a second batch also speaks of, which
+        // the touched devices below answer for. What it leaves out is the
+        // same from one derivation to the next, so the tree it makes is built
+        // once.
+        let mut left_out: BTreeSet<DeviceId> = skips.as_ref().clone();
+        for device in &touched {
+            if layer.entry(device).is_none() || left_out.contains(device) {
+                continue;
+            }
+            let elsewhere = base.state.devices.get(device).is_some()
+                || base.state.devices.has_change(device)
+                || batches
+                    .iter()
+                    .any(|(other, _, second)| other != index && second.entry(device).is_some());
+            if elsewhere {
+                left_out.insert(*device);
+            }
+        }
+        members.lay(alloc::sync::Arc::clone(layer), alloc::sync::Arc::new(left_out));
+    }
     for device in &touched {
         match devices.remove(device) {
             Some(record) => members.insert_leaf(DeviceLeaf {
@@ -1280,6 +1396,87 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
 /// The number `SettingsChange::fields` gives the address field.
 const IPV4_FIELD: u8 = 2;
 
+/// Every claim on an address the `set_device`s the mask selects make: the
+/// operation's rank and the device it names. A batch's claims, an entry's for
+/// each device it does not skip, are added as the batch is resolved.
+fn address_claims(dag: &Dag, mask: &[bool]) -> BTreeMap<[u8; 4], Vec<(Rank, DeviceId)>> {
+    let mut claimed: BTreeMap<[u8; 4], Vec<(Rank, DeviceId)>> = BTreeMap::new();
+    for (index, operation) in selected(dag, mask) {
+        if let OperationBody::SetDevice { device, change } = &operation.core().body
+            && let Some(Some(address)) = change.ipv4
+        {
+            claimed
+                .entry(address)
+                .or_default()
+                .push((Rank::new(dag.depth(index), operation.id()), *device));
+        }
+    }
+    claimed
+}
+
+/// One address, one device. A device keeps the address its settings carry
+/// only where no claim on it by another device ranks above the one that gave
+/// it: the latest assignment keeps it (rule 3), and every device a later claim
+/// overruled has lost it for good, the overruling device's own address having
+/// changed since or not.
+///
+/// For good, because a base keeps only who won: a device that lost, given the
+/// address back once the winner let it go, got it back only where the
+/// operations of the contest were still held, and a node that compacted them
+/// derived another state (`tests/layers.rs`, 2026-11-01). Every claim counts —
+/// a revoked device's, one superseded by its own device's later setting —
+/// because whether it was overruled is settled once, the same everywhere.
+/// The base's holders claim at the base's rank, below everything held.
+fn settle_addresses(
+    settings: &mut BTreeMap<DeviceId, DeviceSettings>,
+    fields: &BTreeMap<(DeviceId, u8), (Rank, SettingsChange)>,
+    added: &BTreeMap<DeviceId, (Rank, DeviceSpec, OperationId)>,
+    base_rank: Rank,
+    claimed: &mut BTreeMap<[u8; 4], Vec<(Rank, DeviceId)>>,
+) {
+    let mut holding: Vec<(DeviceId, [u8; 4], Rank)> = Vec::new();
+    for (device, current) in settings.iter() {
+        let Some(address) = current.ipv4 else { continue };
+        let rank = fields
+            .get(&(*device, IPV4_FIELD))
+            .map(|(rank, _)| *rank)
+            .or_else(|| added.get(device).map(|(rank, _, _)| *rank))
+            .unwrap_or(base_rank);
+        holding.push((*device, address, rank));
+    }
+    // The current claims are claims too: two devices the base and a batch
+    // both left holding one address settle it the same way.
+    for (device, address, rank) in &holding {
+        claimed.entry(*address).or_default().push((*rank, *device));
+    }
+    for (device, address, rank) in holding {
+        let overruled = claimed.get(&address).is_some_and(|claims| {
+            claims.iter().any(|(other_rank, other)| *other != device && *other_rank > rank)
+        });
+        if !overruled {
+            continue;
+        }
+        if let Some(current) = settings.get_mut(&device) {
+            current.ipv4 = None;
+        }
+        if settings.get(&device).is_some_and(|current| *current == DeviceSettings::default()) {
+            settings.remove(&device);
+        }
+    }
+}
+
+/// The boards a batch skips against the state its ancestors imply, worked out
+/// once per such state and remembered by the batch's layer.
+fn skipped_by(
+    layer: &Layer,
+    header: &crate::batch::BatchHeader,
+    ancestors: &RosterState,
+) -> alloc::sync::Arc<BTreeSet<DeviceId>> {
+    layer.skipped_against(ancestors.devices.root(), || {
+        crate::batch::skipped_among(ancestors, header, layer.devices()).into_keys().collect()
+    })
+}
+
 /// The settings a device admitted by a batch starts with: the header's mode
 /// and groups, and the address its entry was assigned.
 fn batch_settings(dag: &Dag, added_by: &OperationId, device: &DeviceId) -> Option<DeviceSettings> {
@@ -1297,7 +1494,7 @@ fn ancestor_state<'memo>(
     index: usize,
     memo: &'memo mut Memo,
 ) -> Option<&'memo RosterState> {
-    if !memo.contains_key(&index) {
+    if !memo.states.contains_key(&index) {
         let mut ancestor_mask = vec![false; dag.len()];
         for ancestor in dag.ancestors_of(index) {
             if mask.get(ancestor).copied().unwrap_or(false)
@@ -1306,10 +1503,10 @@ fn ancestor_state<'memo>(
                 *slot = true;
             }
         }
-        let state = resolve_in(dag, base, &ancestor_mask, memo);
-        memo.insert(index, state);
+        let state = (memo.resolver)(dag, base, &ancestor_mask, memo);
+        memo.states.insert(index, state);
     }
-    memo.get(&index)?.as_ref()
+    memo.states.get(&index)?.as_ref()
 }
 
 /// Parameters as their leaves, by name.
@@ -1357,16 +1554,39 @@ fn applies_to(dag: &Dag, added_at: Option<usize>, operation: usize) -> bool {
     !dag.is_ancestor(operation, add_index)
 }
 
-/// Resolves one device's role from the selected promote and demote operations.
-fn resolve_role(
+/// A device's role and mode, from those it was admitted with and the
+/// promotions, demotions and switches between full and light the mask selects
+/// that take effect on it, taken in rank order.
+///
+/// Rule 2: a promotion concurrent with a demotion of the same device has no
+/// effect, so a race between raising and lowering resolves downwards, on every
+/// node, in either merge order; a promotion that descends from a demotion
+/// raises again. Admins are full: a promotion while the device is light, or a
+/// switch to light while it is an admin, has no effect.
+///
+/// Each has no effect for good. Where the deciding came last, at the end, a
+/// promotion voided for being light came back once the device went full, and a
+/// switch to light once the admin was demoted, but only where the operations
+/// were still held: a base keeps the role and mode that came out, and a node
+/// that compacted derived another (`tests/layers.rs`, 2026-11-01). In rank
+/// order the same decisions come out the same, compacted or not, since every
+/// held operation ranks above everything its base covers.
+fn settle_role_and_mode(
     dag: &Dag,
     mask: &[bool],
     device: DeviceId,
     added_at: Option<usize>,
-    initial: Option<Role>,
-) -> Option<Role> {
+    role: Role,
+    mode: Mode,
+) -> (Role, Mode) {
+    enum Decision {
+        Promote,
+        Demote,
+        Switch(Mode),
+    }
     let mut promotes: Vec<usize> = Vec::new();
     let mut demotes: Vec<usize> = Vec::new();
+    let mut switches: Vec<(usize, Mode)> = Vec::new();
     for (index, operation) in selected(dag, mask) {
         if !applies_to(dag, added_at, index) {
             continue;
@@ -1375,56 +1595,33 @@ fn resolve_role(
             OperationBody::Promote { device: target, .. } if *target == device => {
                 promotes.push(index);
             }
-            OperationBody::Demote { device: target } if *target == device => {
-                demotes.push(index);
+            OperationBody::Demote { device: target } if *target == device => demotes.push(index),
+            OperationBody::SetDevice { device: target, change } if *target == device => {
+                switches.extend(change.mode.map(|mode| (index, mode)));
             }
             _ => {}
         }
     }
-    if promotes.is_empty() && demotes.is_empty() {
-        return initial;
-    }
-
-    // Rule 2 in its concurrent form: a race between raising and lowering
-    // resolves downwards, on every node, in either merge order.
-    for promote in &promotes {
-        for demote in &demotes {
-            if dag.concurrent(*promote, *demote) {
-                return Some(Role::Member);
-            }
+    let rank = |index: usize| Rank::new(dag.depth(index), operation_id(dag, index));
+    let mut decisions: Vec<(Rank, Decision)> = promotes
+        .iter()
+        .filter(|promote| !demotes.iter().any(|demote| dag.concurrent(**promote, *demote)))
+        .map(|promote| (rank(*promote), Decision::Promote))
+        .chain(demotes.iter().map(|demote| (rank(*demote), Decision::Demote)))
+        .chain(switches.into_iter().map(|(index, mode)| (rank(index), Decision::Switch(mode))))
+        .collect();
+    decisions.sort_by_key(|(rank, _)| *rank);
+    let (mut role, mut mode) = (role, mode);
+    for (_, decision) in decisions {
+        match decision {
+            Decision::Promote if mode != Mode::Light => role = Role::Admin,
+            Decision::Demote => role = Role::Member,
+            Decision::Switch(Mode::Light) if role != Role::Admin => mode = Mode::Light,
+            Decision::Switch(Mode::Full) => mode = Mode::Full,
+            Decision::Promote | Decision::Switch(Mode::Light) => {}
         }
     }
-
-    // Otherwise they are causally ordered with respect to each other, and the
-    // deepest one is the most recent deliberate decision.
-    let deepest_promote =
-        promotes.iter().map(|index| Rank::new(dag.depth(*index), operation_id(dag, *index))).max();
-    let deepest_demote =
-        demotes.iter().map(|index| Rank::new(dag.depth(*index), operation_id(dag, *index))).max();
-    match (deepest_promote, deepest_demote) {
-        (Some(promote), Some(demote)) => {
-            Some(if promote > demote { Role::Admin } else { Role::Member })
-        }
-        (Some(_), None) => Some(Role::Admin),
-        (None, Some(_)) => Some(Role::Member),
-        (None, None) => initial,
-    }
-}
-
-/// The rank of the latest promotion of a device that takes effect, if any.
-fn latest_promote(
-    dag: &Dag,
-    mask: &[bool],
-    device: DeviceId,
-    added_at: Option<usize>,
-) -> Option<Rank> {
-    selected(dag, mask)
-        .filter(|(index, operation)| {
-            matches!(&operation.core().body, OperationBody::Promote { device: target, .. } if *target == device)
-                && applies_to(dag, added_at, *index)
-        })
-        .map(|(index, operation)| Rank::new(dag.depth(index), operation.id()))
-        .max()
+    (role, mode)
 }
 
 /// The id at an index, or a zero id when the index is out of range.
@@ -1459,6 +1656,349 @@ impl Rank {
     /// Ranks an operation.
     fn new(depth: u64, id: OperationId) -> Self {
         Self { depth, id: *id.as_bytes() }
+    }
+}
+
+/// Derivation as it was before batches became layers, kept as the reference
+/// the layered one is held to (`scalable-membership` 16.3). Not used outside
+/// [`derive_reference`].
+mod reference {
+    #[allow(clippy::wildcard_imports, reason = "the reference is the parent's own code")]
+    use super::*;
+
+    /// [`super::resolve_in`] as it was before batches became layers.
+    pub(super) fn resolve_in(
+        dag: &Dag,
+        base: &Base,
+        mask: &[bool],
+        memo: &mut Memo,
+    ) -> Option<RosterState> {
+        let network = base.state.network;
+        let genesis_params = &base.state.params;
+
+        // Rule 1: a revocation wins over every admission it does not precede.
+        //
+        // An admission stands only if it descends from every selected revocation of
+        // its device: a revocation concurrent with it, or after it, removes the
+        // device, in whichever order the two arrived. An admission that causally
+        // follows every revocation is a deliberate act and admits the device again.
+        //
+        // The base contributes no revocations. It holds the devices that were
+        // members when it was taken; a device revoked before it is simply absent.
+        // Every operation still held descends from the base — compaction refuses a
+        // region anything held is concurrent with — so a held revocation of a base
+        // device always follows its admission.
+        let mut revocations: BTreeMap<DeviceId, Vec<usize>> = BTreeMap::new();
+        for (index, operation) in selected(dag, mask) {
+            if let OperationBody::RevokeDevice { device, .. } = &operation.core().body {
+                revocations.entry(*device).or_default().push(index);
+            }
+        }
+        // Only the devices the window names can come out different from the base.
+        // Every rule below reads a device's own operations, and a base device no
+        // held operation names keeps the record and settings the base gives it:
+        // the base is itself a derived state, so it already keeps the rules among
+        // its own devices. The one rule that reaches across devices is an address,
+        // which a device the window assigns it takes from a base device holding
+        // it — so the base's holder of every address the window assigns is
+        // touched too. Everything else is carried over from the base as it is,
+        // which is what lets a window over a million devices cost the window.
+        let mut touched: BTreeSet<DeviceId> = BTreeSet::new();
+        let mut assigning: BTreeSet<[u8; 4]> = BTreeSet::new();
+        for (_, operation) in selected(dag, mask) {
+            match &operation.core().body {
+                OperationBody::AddDevice(spec) => touched.extend(spec.device_id().ok()),
+                OperationBody::AdmitBatch(_) => {
+                    touched.extend(dag.batch_devices(&operation.id()).map(|(device, _)| device));
+                    for entry in dag.entries_of(&operation.id()).unwrap_or_default() {
+                        assigning.extend(entry.ipv4);
+                    }
+                }
+                body => {
+                    if let OperationBody::SetDevice { change, .. } = body {
+                        assigning.extend(change.ipv4.flatten());
+                    }
+                    touched.extend(Dag::target_of(body));
+                }
+            }
+        }
+        for address in assigning {
+            touched.extend(base.state.devices.holding_address(address));
+        }
+
+        let survives = |device: &DeviceId, added_at: Option<usize>| -> bool {
+            let Some(revoking) = revocations.get(device) else { return true };
+            match added_at {
+                None => false,
+                Some(add_index) => {
+                    revoking.iter().all(|revocation| dag.is_ancestor(*revocation, add_index))
+                }
+            }
+        };
+
+        // The record each device was added by. Where two concurrent `add_device`
+        // operations name the same device id — the same signing key, but perhaps a
+        // different transport key — the deeper one wins, ties broken by id, so the
+        // whole record comes from one operation rather than being spliced.
+        let mut claimed = address_claims(dag, mask);
+        let mut added: BTreeMap<DeviceId, (Rank, DeviceSpec, OperationId)> = BTreeMap::new();
+        for id in &touched {
+            let Some(record) = base.state.devices.get(id) else { continue };
+            if !survives(id, None) {
+                continue;
+            }
+            added.insert(
+                *id,
+                (
+                    base.rank,
+                    DeviceSpec {
+                        keys: record.keys.clone(),
+                        name: record.name.clone(),
+                        role: record.role,
+                        founder: record.founder,
+                        capabilities: record.capabilities.clone(),
+                    },
+                    record.added_by,
+                ),
+            );
+        }
+        for (index, operation) in selected(dag, mask) {
+            // A batch admits each of its entries as an `add_device` would, all at
+            // the header's rank, except those that collide with what its own
+            // ancestors hold: those are skipped, and the rest stand.
+            if let OperationBody::AdmitBatch(header) = &operation.core().body {
+                let rank = Rank::new(dag.depth(index), operation.id());
+                let skips = crate::batch::skipped_among(
+                    ancestor_state(dag, base, mask, index, memo)?,
+                    header,
+                    dag.batch_devices(&operation.id()),
+                );
+                for (id, entry) in dag.batch_devices(&operation.id()) {
+                    if skips.contains_key(&id) {
+                        continue;
+                    }
+                    if let Some(address) = entry.ipv4 {
+                        claimed.entry(address).or_default().push((rank, id));
+                    }
+                    if !survives(&id, Some(index)) {
+                        continue;
+                    }
+                    let replace = added.get(&id).is_none_or(|(existing, _, _)| rank < *existing);
+                    if replace {
+                        added.insert(id, (rank, entry.admitted_spec(), operation.id()));
+                    }
+                }
+                continue;
+            }
+            if let OperationBody::AddDevice(spec) = &operation.core().body {
+                let Ok(id) = spec.device_id() else { continue };
+                if !survives(&id, Some(index)) {
+                    continue;
+                }
+                let rank = Rank::new(dag.depth(index), operation.id());
+                // The *first* add wins, not the last. Adding a device that already
+                // exists changes nothing — the mirror of an operation having no
+                // effect before its target exists.
+                //
+                // Last-add-wins would reset the device's name and role, discarding
+                // every rename written before the re-add. A snapshot taken between
+                // two adds has already folded those renames into its state and has
+                // no way to mark them as superseded, so a compacted node would keep
+                // a name an uncompacted one had thrown away. Found by the
+                // compaction property test.
+                //
+                // Where two adds are causally concurrent the shallower wins, ties
+                // broken by the smaller id: arbitrary, but the same on every node.
+                let replace = added.get(&id).is_none_or(|(existing, _, _)| rank < *existing);
+                if replace {
+                    added.insert(id, (rank, spec.clone(), operation.id()));
+                }
+            }
+        }
+
+        // Roles and modes are settled together, below, once the settings are
+        // known: a device's decisions in rank order (`settle_role_and_mode`).
+        let mut roles: BTreeMap<DeviceId, Role> = BTreeMap::new();
+
+        // Founder status is granted and never withdrawn: a founder leaves by
+        // revoking itself, not by ceasing to be one.
+        let mut founders: BTreeSet<DeviceId> = BTreeSet::new();
+        for (device, (_, spec, _)) in &added {
+            if spec.founder {
+                founders.insert(*device);
+            }
+        }
+        for (index, operation) in selected(dag, mask) {
+            if let OperationBody::Promote { device, founder: true } = &operation.core().body {
+                let Some((_, _, added_by)) = added.get(device) else { continue };
+                if !applies_to(dag, dag.position(added_by), index) {
+                    continue;
+                }
+                founders.insert(*device);
+            }
+        }
+
+        // Rule 3: last-writer-wins by causal depth, ties broken by the greater
+        // operation id. Arbitrary, but identical everywhere.
+        let mut names: BTreeMap<DeviceId, (Rank, String)> = BTreeMap::new();
+        for id in &touched {
+            let Some(record) = base.state.devices.get(id) else { continue };
+            // Only where the base's own admission still stands: a device the window
+            // revoked and admitted again starts from its new admission's name.
+            if added.get(id).is_some_and(|(_, _, added_by)| *added_by == record.added_by) {
+                names.insert(*id, (base.rank, record.name.clone()));
+            }
+        }
+        for (index, operation) in selected(dag, mask) {
+            if let OperationBody::Rename { device, name } = &operation.core().body {
+                let Some((_, _, added_by)) = added.get(device) else {
+                    // Nothing to rename.
+                    continue;
+                };
+                if !applies_to(dag, dag.position(added_by), index) {
+                    continue;
+                }
+                let rank = Rank::new(dag.depth(index), operation.id());
+                let replace = names.get(device).is_none_or(|(existing, _)| rank > *existing);
+                if replace {
+                    names.insert(*device, (rank, name.clone()));
+                }
+            }
+        }
+
+        // Parameters, each leaf on its own. A `set_network` sets the leaves where
+        // the parameters it carries differ from those its own ancestors imply, and
+        // the latest writer of each leaf wins. Two admins changing different
+        // parameters at once both take effect; a relay move, which changes the
+        // relay and the relay being left together, still sets both.
+        let mut leaves: BTreeMap<&'static str, (Rank, Option<Parameter>)> =
+            PARAMETER_NAMES.iter().map(|name| (*name, (base.rank, None))).collect();
+        for leaf in genesis_params.leaves() {
+            leaves.insert(leaf.name(), (base.rank, Some(leaf)));
+        }
+        for (index, operation) in selected(dag, mask) {
+            if let OperationBody::SetNetwork(new_params) = &operation.core().body {
+                let before = ancestor_state(dag, base, mask, index, memo)?.params.clone();
+                let rank = Rank::new(dag.depth(index), operation.id());
+                let wanted = leaf_values(new_params);
+                let had = leaf_values(&before);
+                for name in PARAMETER_NAMES {
+                    let value = wanted.get(name).cloned();
+                    if value == had.get(name).cloned() {
+                        continue;
+                    }
+                    if leaves.get(name).is_none_or(|(existing, _)| rank > *existing) {
+                        leaves.insert(name, (rank, value));
+                    }
+                }
+            }
+        }
+        let params = params_from_leaves(
+            leaves.into_values().filter_map(|(_, value)| value).collect(),
+            genesis_params,
+        );
+
+        // Settings, each field of each device on its own, last writer wins. A
+        // device starts from the settings the base held for it, where the base's
+        // admission still stands; every held operation is later than the base.
+        let mut fields: BTreeMap<(DeviceId, u8), (Rank, SettingsChange)> = BTreeMap::new();
+        for (index, operation) in selected(dag, mask) {
+            if let OperationBody::SetDevice { device, change } = &operation.core().body {
+                let Some((_, _, added_by)) = added.get(device) else { continue };
+                if !applies_to(dag, dag.position(added_by), index) {
+                    continue;
+                }
+                let rank = Rank::new(dag.depth(index), operation.id());
+                for (field, single) in change.fields() {
+                    if fields.get(&(*device, field)).is_none_or(|(existing, _)| rank > *existing) {
+                        fields.insert((*device, field), (rank, single));
+                    }
+                }
+            }
+        }
+        let mut settings: BTreeMap<DeviceId, DeviceSettings> = BTreeMap::new();
+        for (device, (_, _, added_by)) in &added {
+            let mut current = match base.state.devices.get(device) {
+                Some(record) if record.added_by == *added_by => base.state.settings_of(device),
+                _ => batch_settings(dag, added_by, device).unwrap_or_default(),
+            };
+            for ((_, _), (_, single)) in fields.range((*device, 0)..=(*device, u8::MAX)) {
+                current = current.changed_by(single);
+            }
+            if current != DeviceSettings::default() {
+                settings.insert(*device, current);
+            }
+        }
+
+        // One address, one device: the latest claim on it keeps it (rule 3),
+        // and every device a later claim overruled has lost it for good.
+        settle_addresses(&mut settings, &fields, &added, base.rank, &mut claimed);
+
+        // Admins are full: an admin signs roots, and must hold the state it vouches
+        // for. A device's promotions, demotions and switches between full and
+        // light are taken in rank order, and the one that would make it a light
+        // admin has no effect, for good (`settle_role_and_mode`).
+        for (device, (_, spec, added_by)) in &added {
+            let starting = match base.state.devices.get(device) {
+                Some(record) if record.added_by == *added_by => base.state.settings_of(device).mode,
+                _ => batch_settings(dag, added_by, device).unwrap_or_default().mode,
+            };
+            let (role, mode) = settle_role_and_mode(
+                dag,
+                mask,
+                *device,
+                dag.position(added_by),
+                spec.role,
+                starting,
+            );
+            roles.insert(*device, role);
+            let current = settings.entry(*device).or_default();
+            current.mode = mode;
+            if *current == DeviceSettings::default() {
+                settings.remove(device);
+            }
+        }
+
+        let mut devices: BTreeMap<DeviceId, DeviceRecord> = BTreeMap::new();
+        for (device, (_, spec, added_by)) in added {
+            let name =
+                names.get(&device).map_or_else(|| spec.name.clone(), |(_, name)| name.clone());
+            devices.insert(
+                device,
+                DeviceRecord {
+                    id: device,
+                    keys: spec.keys,
+                    name,
+                    role: roles.get(&device).copied().unwrap_or(spec.role),
+                    founder: founders.contains(&device),
+                    added_by,
+                    capabilities: spec.capabilities,
+                },
+            );
+        }
+
+        // Revoked, for telling an expelled device from a stranger: devices a held
+        // revocation removed and nothing admitted again. Not committed by the root:
+        // once a checkpoint absorbs the revocation, the device is merely absent.
+        let revoked: BTreeSet<DeviceId> =
+            revocations.keys().filter(|device| !devices.contains_key(*device)).copied().collect();
+
+        // The base's devices, with what the window made of the ones it touched.
+        let mut members = base.state.devices.clone();
+        for device in &touched {
+            match devices.remove(device) {
+                Some(record) => members.insert_leaf(DeviceLeaf {
+                    record,
+                    settings: settings.remove(device).unwrap_or_default(),
+                }),
+                None => {
+                    members.remove(device);
+                }
+            }
+        }
+        let mut state = RosterState { network, params, devices: members, revoked };
+        keep_member_anchors(&mut state);
+        Some(state)
     }
 }
 

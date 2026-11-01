@@ -112,32 +112,14 @@ impl BitSet {
     }
 }
 
-/// A whole batch a graph holds: its entries, and the device each admits.
+/// A whole batch a graph holds: its layer, the entries and the device each
+/// admits, shared with every state the batch is laid in.
 ///
 /// The devices are worked out once, as the batch goes in. Derivation reads
 /// them every time it resolves a state, and working out a device's id checks
 /// every one of its keys: done there, two thousand boards cost a daemon minutes
 /// of start-up (found in the testbed, 18.1).
-#[derive(Debug, Clone)]
-struct HeldBatch {
-    entries: Vec<crate::batch::BatchEntry>,
-    /// Each device an entry admits, with the entry's place, in device order.
-    /// The first entry naming a device is the one kept.
-    devices: Vec<(DeviceId, usize)>,
-}
-
-impl HeldBatch {
-    fn of(entries: Vec<crate::batch::BatchEntry>) -> Self {
-        let mut devices: Vec<(DeviceId, usize)> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(place, entry)| entry.device_id().ok().map(|device| (device, place)))
-            .collect();
-        devices.sort_unstable();
-        devices.dedup_by_key(|(device, _)| *device);
-        Self { entries, devices }
-    }
-}
+type HeldBatch = alloc::sync::Arc<crate::members::Layer>;
 
 /// A causally ordered set of verified operations.
 ///
@@ -432,15 +414,31 @@ impl Dag {
         entries: Vec<crate::batch::BatchEntry>,
     ) -> Result<()> {
         let id = operation.id();
+        let OperationBody::AdmitBatch(header) = &operation.core().body else {
+            return Err(Error::InvalidValue(
+                "a batch's entries under an operation that is no batch",
+            ));
+        };
+        let layer = crate::members::Layer::new(id, header.mode, header.groups.clone(), entries);
         self.insert(operation)?;
-        self.batch_entries.insert(id, HeldBatch::of(entries));
+        self.batch_entries.insert(id, alloc::sync::Arc::new(layer));
         Ok(())
+    }
+
+    /// The layer of a batch this graph holds: its entries, its devices and
+    /// their indexes, shared with every state it is laid in.
+    #[must_use]
+    pub fn batch_layer(
+        &self,
+        batch: &OperationId,
+    ) -> Option<&alloc::sync::Arc<crate::members::Layer>> {
+        self.batch_entries.get(batch)
     }
 
     /// The entries of a batch this graph holds.
     #[must_use]
     pub fn entries_of(&self, batch: &OperationId) -> Option<&[crate::batch::BatchEntry]> {
-        self.batch_entries.get(batch).map(|held| held.entries.as_slice())
+        self.batch_entries.get(batch).map(|held| held.entries())
     }
 
     /// The devices a batch this graph holds admits, each with its entry, in
@@ -450,11 +448,7 @@ impl Dag {
         &self,
         batch: &OperationId,
     ) -> impl Iterator<Item = (DeviceId, &crate::batch::BatchEntry)> {
-        self.batch_entries.get(batch).into_iter().flat_map(|held| {
-            held.devices.iter().filter_map(|(device, place)| {
-                held.entries.get(*place).map(|entry| (*device, entry))
-            })
-        })
+        self.batch_entries.get(batch).into_iter().flat_map(|held| held.devices())
     }
 
     /// The entry admitting `device` in a batch this graph holds.
@@ -464,10 +458,7 @@ impl Dag {
         batch: &OperationId,
         device: &DeviceId,
     ) -> Option<&crate::batch::BatchEntry> {
-        let held = self.batch_entries.get(batch)?;
-        let found = held.devices.binary_search_by_key(device, |(device, _)| *device).ok()?;
-        let (_, place) = held.devices.get(found)?;
-        held.entries.get(*place)
+        self.batch_entries.get(batch)?.entry(device)
     }
 
     /// The snapshot this graph rests on, if it has compacted.

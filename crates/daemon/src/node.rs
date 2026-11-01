@@ -469,7 +469,8 @@ impl Node {
         }
     }
 
-    /// Closes every session that has carried nothing for `idle`.
+    /// Closes every session that has carried nothing for `idle`, but those
+    /// [`held_open`] keeps.
     ///
     /// Not a fault and not recorded: it is the ordinary end of a session nothing
     /// is using, and the next packet that needs one opens it again.
@@ -485,6 +486,20 @@ impl Node {
                     .collect()
             },
         );
+        if held_open(self.is_light(), false) {
+            return;
+        }
+        let stale: Vec<DeviceId> = {
+            let syncer = self.syncer.lock().await;
+            let roster = syncer.roster();
+            stale
+                .into_iter()
+                .filter(|peer| {
+                    let peer_light = roster.mode_of(peer) == Some(roster::leaf::Mode::Light);
+                    !held_open(false, peer_light)
+                })
+                .collect()
+        };
         for peer in stale {
             tracing::info!(network = %self.called, ?peer, "closing a session nothing used");
             let session = self.sessions.lock().await.get(&peer).map(Arc::clone);
@@ -2594,6 +2609,22 @@ impl Node {
         entry.until = now.checked_add(entry.interval).unwrap_or(now);
         entry.interval = entry.interval.saturating_mul(2).min(LONGEST);
     }
+}
+
+/// Whether a session between this device and a peer stays open however long
+/// it carries nothing: where either is a light member.
+///
+/// A session nothing uses costs nothing on the wire: convesso lets its keys
+/// expire and forgets it, and this binding's session outlives that, reopened
+/// by the next frame either side sends. Kept open, it is how a light member
+/// hears of a new root the moment a full member takes it, pushed as anything
+/// new is; closed, it heard only when it next came asking, once an hour,
+/// which cost every light member a session opened and evidence shown both ways
+/// each hour, whether the network had changed or not (`daemon::simulator`).
+/// Between full members nothing changes: they are pushed to as neighbours.
+#[must_use]
+pub(crate) const fn held_open(this_light: bool, peer_light: bool) -> bool {
+    this_light || peer_light
 }
 
 /// Dials in flight, by the peer's transport key, each with where its outcome

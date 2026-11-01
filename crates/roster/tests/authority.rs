@@ -561,6 +561,13 @@ fn the_kept_state_equals_derivation_after_every_admission() {
             "after {}, the kept state is not what derivation says",
             entry.label
         );
+        // Not in the bytes, and kept by a revocation followed in one step.
+        assert_eq!(
+            roster.state().ok().map(|state| state.revoked),
+            roster.derived_state().ok().map(|state| state.revoked),
+            "after {}, the kept revoked set is not what derivation says",
+            entry.label
+        );
     }
 
     let state = roster.state().expect("derives");
@@ -570,6 +577,61 @@ fn the_kept_state_equals_derivation_after_every_admission() {
         state.devices.contains_key(&device_id(3)),
         "an admission that follows the revocation admits the device again"
     );
+}
+
+/// Two devices assigned one address at once, and the one that kept it
+/// revoked: the other lost it for good, and does not take it back, whatever
+/// the roster held of the contest (`roster`, "A device overruled on an address
+/// has lost it"). The kept state is what derivation says.
+#[test]
+fn a_revocation_gives_back_no_address_its_device_won() {
+    let address = [100, 70, 0, 9];
+    let assign = |device: u8| OperationBody::SetDevice {
+        device: device_id(device),
+        change: roster::leaf::SettingsChange {
+            ipv4: Some(Some(address)),
+            ..roster::leaf::SettingsChange::default()
+        },
+    };
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
+    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("add4", 1, &["add3"], OperationBody::AddDevice(device(4, "d", Role::Member, false)));
+    // Two admins assign the address at once, and an act joins the branches.
+    history.op("set3", 1, &["add4"], assign(3));
+    history.op("set4", 2, &["add4"], assign(4));
+    history.op(
+        "joined",
+        1,
+        &["set3", "set4"],
+        OperationBody::Rename { device: device_id(2), name: "pc".to_owned() },
+    );
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    let state = roster.state().expect("derives");
+    let holder = *state.devices.holding_address(address).first().expect("one of them keeps it");
+    let (winner, loser) =
+        if holder == device_id(3) { (3, device_id(4)) } else { (4, device_id(3)) };
+    assert_eq!(state.settings_of(&loser).ipv4, None, "the other lost it");
+
+    history.op(
+        "revoke",
+        1,
+        &["joined"],
+        OperationBody::RevokeDevice { device: device_id(winner), reason: "sold".to_owned() },
+    );
+    let revoke = history.entries().last().expect("the revocation").bytes.clone();
+    assert!(roster.offer_bytes(&revoke).is_accepted());
+
+    let kept = roster.state().expect("kept");
+    let derived = roster.derived_state().expect("derives");
+    assert_eq!(kept.to_bytes(), derived.to_bytes(), "the kept state is what derivation says");
+    assert_eq!(kept.revoked, derived.revoked);
+    assert_eq!(kept.settings_of(&loser).ipv4, None, "and the other does not take it back");
+    assert!(kept.devices.holding_address(address).is_empty(), "nobody holds it");
 }
 
 /// The same, where the graph is not a chain: a merge, and an operation offered
@@ -609,4 +671,79 @@ fn the_kept_state_equals_derivation_when_the_graph_is_not_a_chain() {
     }
     assert_eq!(roster.pending_count(), 0, "everything was placed");
     assert_eq!(roster.dag().len(), 5);
+}
+
+// ---------------------------------------------------------------------------
+// Roles and modes, in rank order
+// ---------------------------------------------------------------------------
+
+/// A promotion and a demotion race, and a later promotion descends from both:
+/// the race went down, and the later promotion raises the device again.
+#[test]
+fn a_promotion_after_a_race_re_promotes() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.op(
+        "add3",
+        1,
+        &["add2"],
+        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
+    );
+    history.op("up", 1, &["add3"], OperationBody::Promote { device: device_id(3), founder: false });
+    history.op("down", 2, &["add3"], OperationBody::Demote { device: device_id(3) });
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    assert!(!roster.state().unwrap().is_admin(&device_id(3)), "the race goes down");
+
+    history.op(
+        "again",
+        1,
+        &["up", "down"],
+        OperationBody::Promote { device: device_id(3), founder: false },
+    );
+    assert!(roster.offer_bytes(&history.bytes("again")).is_accepted());
+    assert!(roster.state().unwrap().is_admin(&device_id(3)), "and the later promotion raises it");
+}
+
+/// A light device promoted stays a member, and switching it to full does not
+/// bring the promotion back: it is promoted again.
+#[test]
+fn a_promotion_voided_for_being_light_does_not_come_back() {
+    let mode = |light: bool| OperationBody::SetDevice {
+        device: device_id(3),
+        change: roster::leaf::SettingsChange {
+            mode: Some(if light { roster::leaf::Mode::Light } else { roster::leaf::Mode::Full }),
+            ..roster::leaf::SettingsChange::default()
+        },
+    };
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("add3", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("light", 1, &["add3"], mode(true));
+    history.op(
+        "up",
+        1,
+        &["light"],
+        OperationBody::Promote { device: device_id(3), founder: false },
+    );
+    history.op("full", 1, &["up"], mode(false));
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    let state = roster.state().unwrap();
+    assert!(!state.is_admin(&device_id(3)), "the promotion while light stays void");
+    assert_eq!(state.settings_of(&device_id(3)).mode, roster::leaf::Mode::Full);
+
+    history.op(
+        "again",
+        1,
+        &["full"],
+        OperationBody::Promote { device: device_id(3), founder: false },
+    );
+    assert!(roster.offer_bytes(&history.bytes("again")).is_accepted());
+    assert!(roster.state().unwrap().is_admin(&device_id(3)), "promoted again once full");
 }

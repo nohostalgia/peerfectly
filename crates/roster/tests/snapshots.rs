@@ -571,6 +571,9 @@ fn later_operations_outrank_values_carried_in_the_snapshot() {
     );
 }
 
+/// A revocation the checkpoint absorbed leaves nothing in the state; the one
+/// after it still names its device as revoked (`roster`, "A revocation leaves
+/// no trace in the state"). Both devices are out.
 #[test]
 fn revocations_inside_and_after_a_snapshot_both_hold() {
     let mut history = History::new();
@@ -607,8 +610,10 @@ fn revocations_inside_and_after_a_snapshot_both_hold() {
     roster.compact().expect("compacts");
 
     let state = roster.state().expect("derives");
-    assert!(state.revoked.contains(&device_id(2)), "the revocation inside the snapshot holds");
-    assert!(state.revoked.contains(&device_id(3)), "and the one after it");
+    assert!(!state.devices.contains_key(&device_id(2)), "the revocation inside the snapshot holds");
+    assert!(!state.revoked.contains(&device_id(2)), "and leaves no trace once absorbed");
+    assert!(!state.devices.contains_key(&device_id(3)), "the one after it holds");
+    assert!(state.revoked.contains(&device_id(3)), "and is still named while it is held");
 }
 
 #[test]

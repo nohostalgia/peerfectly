@@ -256,6 +256,70 @@ async fn next_frame(events: &mut ContextEvents) -> Option<Frame> {
     .expect("a frame comes")
 }
 
+/// **A session outlives convesso's.** Past its keys' life convesso tells the
+/// session idle and forgets it, and each side ends its reader so that the
+/// channel is forgotten too. The next payload, from either side, opens a new
+/// convesso session and arrives on the same session of this binding.
+///
+/// Waits out the keys' life on the real clock: run by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "waits three minutes: cargo test -p transport-convesso --test binding -- --ignored"]
+async fn a_session_carries_on_after_convesso_forgets_its_own() {
+    let (_relay, _network, founder, joiner) = pair().await;
+    let (dialled, accepted) = session(&founder, &joiner).await;
+    dialled.send(b"before").await.unwrap();
+    assert_eq!(accepted.recv().await.unwrap(), b"before".to_vec());
+
+    tokio::time::sleep(Duration::from_secs(200)).await;
+
+    dialled.send(b"after, one way").await.unwrap();
+    let got = tokio::time::timeout(PATIENCE, accepted.recv()).await.expect("arrives").unwrap();
+    assert_eq!(got, b"after, one way".to_vec());
+
+    tokio::time::sleep(Duration::from_secs(200)).await;
+
+    accepted.send(b"after, the other").await.unwrap();
+    let got = tokio::time::timeout(PATIENCE, dialled.recv()).await.expect("arrives").unwrap();
+    assert_eq!(got, b"after, the other".to_vec());
+}
+
+/// **A payload for a session this node does not hold is answered with a
+/// `CLOSE`, once.** What a peer that crashed and came back looks like from
+/// the other side: convesso starts its new session's channels anew without a
+/// reset, so the frames of a session it kept arrive for a session id nobody
+/// holds. Told, the sender ends that session rather than send into nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_for_a_session_nobody_holds_is_answered_with_a_close() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let to_founder = Address::parse(founder_key).unwrap();
+
+    for _ in 0..2 {
+        let stale = Frame::Payload { id: 77, bytes: b"into nothing".to_vec() }.encode();
+        raw.send_message(to_founder, stale).await.unwrap();
+    }
+    assert_eq!(
+        next_frame(&mut events).await,
+        Some(Frame::Close { id: 77, reason: Reason::Ordinary })
+    );
+
+    // Once: the second stale payload brings no second close.
+    let more = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = events.next().await {
+            if let ContextEvent::Message { data, .. } = event {
+                return Frame::decode(&data);
+            }
+        }
+        None
+    })
+    .await;
+    assert!(more.is_err(), "told once: {more:?}");
+}
+
 /// **An `ACCEPT` for a dial given up on is answered with a `CLOSE`.** The far
 /// end took the session and holds it as open; nobody here will read it, and
 /// the far end is told rather than left holding it (`convesso-reach` 5.4).

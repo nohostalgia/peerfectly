@@ -389,7 +389,12 @@ fn a_board_of_a_recent_batch_is_revoked_over_its_batch() {
         OperationBody::RevokeDevice { device: board, reason: "lost".to_owned() },
     );
     assert!(roster.offer_bytes(&history.bytes("revoke")).is_accepted(), "and the act is taken");
-    assert!(!roster.state().unwrap().devices.contains_key(&board), "the board is out");
+    let kept = roster.state().unwrap();
+    assert!(!kept.devices.contains_key(&board), "the board is out");
+    // Followed in one step, over the batch rather than through it.
+    let derived = roster.derived_state().unwrap();
+    assert_eq!(kept.to_bytes(), derived.to_bytes(), "as derivation says");
+    assert_eq!(kept.revoked, derived.revoked);
 }
 
 #[test]
