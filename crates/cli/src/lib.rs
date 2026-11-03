@@ -190,6 +190,8 @@ const WORDS_WITH_ARGUMENTS: &[&str] = &[
     "forget",
     "revoke",
     "set-anchors",
+    "ipv4",
+    "route",
     "rename",
 ];
 
@@ -421,12 +423,23 @@ impl Cli<'_> {
         use std::process::ExitCode;
 
         match self.ask_and_sign(command).await {
-            Ok(Outcome::JoinStarted { label, fingerprint }) => {
+            Ok(Outcome::JoinStarted { label, fingerprint, conflicts }) => {
                 println!();
                 println!("asked to join. This device waits for the admin that invited it.");
                 println!();
                 println!("  its key:  {fingerprint}");
                 println!();
+                // Said now, and sent with the request: the admin approving it
+                // may move the network.
+                if !conflicts.is_empty() {
+                    println!("the network's IPv4 addresses coincide with what this device holds:");
+                    for conflict in &conflicts {
+                        println!("  {}", daemon::control::shown(conflict));
+                    }
+                    println!("the admin is told with the request. Until the network moves, the");
+                    println!("devices at those addresses are reached here by IPv6 only.");
+                    println!();
+                }
                 println!("If you are with the admin, compare it with the key their pending list");
                 println!(
                     "shows before they approve. Nothing else is needed here: this device joins"
@@ -740,6 +753,24 @@ impl Cli<'_> {
         } else if word == "set-anchors" {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             match daemon::control::Command::anchors_setting(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "route" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match daemon::control::Command::route_act(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "ipv4" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match daemon::control::Command::ipv4_act(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
                     eprintln!("{refusal}");
@@ -1322,7 +1353,7 @@ impl Cli<'_> {
             label: file.label.clone(),
             light: asked.light,
             groups: asked.groups.clone(),
-            block: asked.block.clone(),
+            ipv6_only: asked.ipv6_only,
             reviewed,
         };
         let review = match self.ask(admit(None)).await {
@@ -1337,10 +1368,7 @@ impl Cli<'_> {
                     "  groups      {}",
                     if groups.is_empty() { "none".to_owned() } else { groups.join(", ") }
                 );
-                println!(
-                    "  addresses   {}",
-                    block.map_or_else(|| "derived".to_owned(), |block| format!("from {block}"))
-                );
+                println!("  addresses   {}", block.unwrap_or_else(|| "none: IPv6 only".to_owned()));
                 if skipped.is_empty() {
                     println!("  skipped     none");
                 } else {
@@ -1436,12 +1464,24 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
     // predates it cannot read the network.
     let ipv4_range = option(rest, "--ipv4-range");
     if let Some(range) = daemon::founding::ipv4_range(ipv4_range.as_deref())? {
-        println!("every device in this network derives its IPv4 address in {range}.");
-        println!(
-            "devices running peerfectly older than this change cannot read a network that sets a \
-             range."
-        );
+        println!("every device in this network holds its IPv4 address in {range}.");
         println!();
+    }
+    // Without a block named, the daemon proposes one this size, and the status
+    // after says which.
+    let devices = match option(rest, "--devices") {
+        Some(count) => {
+            Some(count.parse::<u32>().ok().filter(|count| *count > 0).ok_or_else(|| {
+                format!("`{count}` is not a number of devices. Nothing was signed.")
+            })?)
+        }
+        None => None,
+    };
+    if ipv4_range.is_some() && devices.is_some() {
+        return Err(format!(
+            "--ipv4-range names the block, --devices asks for one to be proposed: one or the \
+             other.\nusage: {FOUND_USAGE}"
+        ));
     }
 
     // None unless asked for, and said what it buys when it is.
@@ -1478,6 +1518,7 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         },
         relay: relay_address,
         ipv4_range,
+        devices,
         window_days,
     })
 }
@@ -1591,15 +1632,20 @@ fn option(rest: &[String], flag: &str) -> Option<String> {
 }
 
 /// The options `found` takes, each followed by its value.
-const FOUND_OPTIONS: [&str; 5] = ["--name", "--suffix", "--relay", "--ipv4-range", "--window"];
+const FOUND_OPTIONS: [&str; 6] =
+    ["--name", "--suffix", "--relay", "--ipv4-range", "--devices", "--window"];
 
 /// How `found` is spelled, in one place so the usage and the refusal agree.
 const FOUND_USAGE: &str = "peerfectly found <network> [--name N] [--suffix S] \
                            [--relay HOST | https://HOST:PORT | KEY@HOST:PORT] \
-                           [--ipv4-range A.B.C.D/N] [--window DAYS]";
+                           [--ipv4-range A.B.C.D/N | --devices N] [--window DAYS]";
 
 /// What a freshness window buys, said when one is asked for.
-const WINDOW_SENTENCE: &str = "with a window, a device that hears nothing signed by an admin for                                that long turns cautious: a cut-off island stops trusting a                                device revoked elsewhere, and stops working until it hears                                again. A network with an admin on every island wants none,                                which is the default.";
+const WINDOW_SENTENCE: &str = "with a window, a device that hears nothing signed by an admin for \
+                               that long turns cautious: a cut-off island stops trusting a \
+                               device revoked elsewhere, and stops working until it hears \
+                               again. A network with an admin on every island wants none, \
+                               which is the default.";
 
 /// This device's name: the one a person gave, or one made from the machine's.
 ///
@@ -1652,7 +1698,7 @@ const BATCH_PART: usize = 100;
 
 /// How `admit --batch` is spelled.
 const ADMIT_USAGE: &str = "peerfectly admit --batch <file> [--network N] [--light] [--group G]... \
-                           [--ipv4-block A.B.C.D/N]";
+                           [--ipv6-only]";
 
 /// What `admit --batch` was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1661,7 +1707,7 @@ struct AdmittingAsked {
     network: Option<String>,
     light: bool,
     groups: Vec<String>,
-    block: Option<String>,
+    ipv6_only: bool,
 }
 
 /// Reads the words after `admit`.
@@ -1672,7 +1718,7 @@ fn admitting_from(words: &[String]) -> Result<AdmittingAsked, String> {
         network: None,
         light: false,
         groups: Vec::new(),
-        block: None,
+        ipv6_only: false,
     };
     let mut rest = words.iter();
     while let Some(word) = rest.next() {
@@ -1681,7 +1727,7 @@ fn admitting_from(words: &[String]) -> Result<AdmittingAsked, String> {
             "--network" => asked.network = Some(rest.next().ok_or_else(usage)?.clone()),
             "--light" => asked.light = true,
             "--group" => asked.groups.push(rest.next().ok_or_else(usage)?.clone()),
-            "--ipv4-block" => asked.block = Some(rest.next().ok_or_else(usage)?.clone()),
+            "--ipv6-only" => asked.ipv6_only = true,
             _ => return Err(usage()),
         }
     }
@@ -1720,6 +1766,11 @@ fn pending_listed(list: &daemon::control::PendingList) -> String {
                         daemon::control::shown(&held.name),
                         held.id
                     ));
+                }
+                // What the device saw of the network's block against its own:
+                // the network may want moving before it is approved.
+                for conflict in &request.conflicts {
+                    out.push_str(&format!("  its IPv4: {}\n", daemon::control::shown(conflict)));
                 }
                 out.push_str(&format!(
                     "  peerfectly approve {name}   ·   peerfectly reject {name}\n"
@@ -1812,6 +1863,8 @@ fn usage(privileged: &str) -> String {
         FORGET_USAGE,
         Command::RELAY_USAGE,
         Command::SET_ANCHORS_USAGE,
+        Command::IPV4_USAGE,
+        Command::ROUTE_USAGE,
         "peerfectly expose <network> tcp|udp <port>",
         "peerfectly unexpose <network> tcp|udp <port>",
         "peerfectly exposed [network]",
@@ -1867,6 +1920,16 @@ mod tests {
     fn found_without_the_flag_asks_for_the_default() {
         let command = founding_from(&words("casa")).unwrap();
         assert_eq!(range_of(&command), None);
+    }
+
+    #[test]
+    fn found_takes_how_many_devices_or_a_block_and_not_both() {
+        let command = founding_from(&words("casa --devices 500")).unwrap();
+        assert!(matches!(command, Command::Found { devices: Some(500), ipv4_range: None, .. }));
+        let both = founding_from(&words("casa --devices 500 --ipv4-range 10.42.0.0/16"));
+        assert!(both.unwrap_err().contains("one or the other"));
+        assert!(founding_from(&words("casa --devices none")).unwrap_err().contains("not a number"));
+        assert!(super::FOUND_USAGE.contains("--devices"));
     }
 
     #[test]
@@ -1966,6 +2029,7 @@ mod tests {
                             name: "laptop".to_owned(),
                             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
                         }),
+                        conflicts: vec!["100.83.0.0/16 overlaps 100.83.4.0/24".to_owned()],
                     }),
                 },
                 InviteLine {
@@ -1991,6 +2055,7 @@ mod tests {
         assert!(shown.contains("peerfectly approve laptop"), "{shown}");
         assert!(shown.contains("peerfectly reject laptop"), "{shown}");
         assert!(shown.contains("0b0b-0b0b-0b0b-0b0b"), "the device holding the name: {shown}");
+        assert!(shown.contains("its IPv4: 100.83.0.0/16 overlaps"), "what the device saw: {shown}");
         assert!(shown.contains("sensor (casa): used"), "{shown}");
         assert!(shown.contains("9F00-1E2D-3C4B-5A69-7887"), "{shown}");
         assert!(shown.contains("peerfectly cancel joining"), "{shown}");
@@ -2078,14 +2143,14 @@ mod tests {
     fn admitting_a_batch_reads_its_file_and_the_admin_s_choices() {
         let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
         let asked = super::admitting_from(&words(
-            "--batch lot.json --network casa --light --group sensori --group cucina --ipv4-block 100.64.9.0/24",
+            "--batch lot.json --network casa --light --group sensori --group cucina --ipv6-only",
         ))
         .unwrap();
         assert_eq!(asked.file, "lot.json");
         assert_eq!(asked.network.as_deref(), Some("casa"));
         assert!(asked.light);
         assert_eq!(asked.groups, ["sensori", "cucina"]);
-        assert_eq!(asked.block.as_deref(), Some("100.64.9.0/24"));
+        assert!(asked.ipv6_only);
         assert!(super::admitting_from(&words("--light")).is_err(), "no file");
         assert!(super::admitting_from(&words("lot.json")).is_err(), "the file named by its flag");
     }
@@ -2447,6 +2512,7 @@ mod custody {
             suffix: "home.internal".to_owned(),
             relay: None,
             ipv4_range: None,
+            devices: None,
             window_days: None,
         };
 
@@ -2511,6 +2577,7 @@ mod custody {
             Outcome::JoinStarted {
                 label: "joining".to_owned(),
                 fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                conflicts: Vec::new(),
             },
         ]);
         let custody = Willing { unlocks: true, ..Willing::default() };
@@ -2523,6 +2590,7 @@ mod custody {
             Outcome::JoinStarted {
                 label: "joining".to_owned(),
                 fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                conflicts: Vec::new(),
             },
             outcome
         );

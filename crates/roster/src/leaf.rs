@@ -101,6 +101,21 @@ impl Group {
     }
 }
 
+/// A device's IPv4 offset in its network's block, big-endian: its address is
+/// the block's base plus this (`crate::types::Ipv4Range::address_at`).
+///
+/// An offset, not an address, so that moving or resizing a network's block is
+/// one change of its parameters and moves every device at once, none of them
+/// changing what it holds (`scalable-membership` 19). Kept in four bytes as an
+/// address was, so that every index by address — the state's, the stores',
+/// the layers' — and the rule settling two claims on one serve it unchanged.
+pub type Ipv4Offset = [u8; 4];
+
+/// The offset founding gives the founder: its block's first host. Founding is
+/// the founder's admission, and the offset is the one admission gives the
+/// first device, so the genesis carries no field for it.
+pub const FIRST_HOST: Ipv4Offset = [0, 0, 0, 1];
+
 /// What an admin may change about a device after admitting it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceSettings {
@@ -108,8 +123,9 @@ pub struct DeviceSettings {
     pub mode: Mode,
     /// The groups it belongs to, sorted, without repeats.
     pub groups: Vec<Group>,
-    /// An IPv4 address an admin assigned, if any.
-    pub ipv4: Option<[u8; 4]>,
+    /// The IPv4 offset an admin assigned, if any: a device without one holds
+    /// no IPv4 address, and is reached by IPv6.
+    pub ipv4: Option<Ipv4Offset>,
     /// The key of the relay it uses, if an admin set one.
     pub relay: Option<[u8; 32]>,
 }
@@ -167,10 +183,10 @@ impl DeviceSettings {
     /// Reads settings, refusing groups out of order or repeated.
     pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Self> {
         let mut map = reader.map(DEVICE_SETTINGS_SCHEMA)?;
-        let ipv4 = match map.key("ipv4")?.bytes(4, "ipv4 address")? {
+        let ipv4 = match map.key("ipv4")?.bytes(4, "ipv4 offset")? {
             [] => None,
             [a, b, c, d] => Some([*a, *b, *c, *d]),
-            _ => return Err(Error::InvalidValue("ipv4 address length")),
+            _ => return Err(Error::InvalidValue("ipv4 offset length")),
         };
         let mode = Mode::parse(map.key("mode")?.str(limits::MAX_MAP_KEY_LEN, "mode")?)?;
         let relay = match map.key("relay")?.bytes(32, "relay key")? {
@@ -210,8 +226,8 @@ pub struct SettingsChange {
     pub mode: Option<Mode>,
     /// A new set of groups, if this changes them.
     pub groups: Option<Vec<Group>>,
-    /// A new assigned address, or its removal, if this changes it.
-    pub ipv4: Option<Option<[u8; 4]>>,
+    /// A new IPv4 offset, or its removal, if this changes it.
+    pub ipv4: Option<Option<Ipv4Offset>>,
     /// A new relay, or its removal, if this changes it.
     pub relay: Option<Option<[u8; 32]>>,
 }
@@ -301,7 +317,7 @@ impl SettingsChange {
             _ => Some(match value.bytes(4, "ipv4 address")? {
                 [] => None,
                 [a, b, c, d] => Some([*a, *b, *c, *d]),
-                _ => return Err(Error::InvalidValue("ipv4 address length")),
+                _ => return Err(Error::InvalidValue("ipv4 offset length")),
             }),
         };
         let value = map.key("mode")?;
@@ -535,7 +551,7 @@ mod tests {
         let mut reader = Reader::new(&bytes);
         assert_eq!(
             DeviceSettings::decode(&mut reader),
-            Err(Error::InvalidValue("ipv4 address length"))
+            Err(Error::InvalidValue("ipv4 offset length"))
         );
     }
 

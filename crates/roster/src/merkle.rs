@@ -160,6 +160,36 @@ pub trait NodeSource: Send + Sync {
     fn tampered(&self);
 }
 
+/// Where a tree spills the nodes it made, to load them again by hash: what lets
+/// a change too large to hold in memory be made a part at a time.
+pub trait NodeSink: NodeSource {
+    /// Keeps these nodes, by their hashes.
+    fn put_nodes(&self, nodes: &[(Hash, Stored)]);
+}
+
+/// Two sources read as one: the nodes a tree spilled, then the ones it was
+/// rooted in. A node neither holds is the fault of whichever should have, which
+/// is not known, so both are told.
+struct Spilled {
+    spilled: Arc<dyn NodeSink>,
+    rooted: Option<Arc<dyn NodeSource>>,
+}
+
+impl NodeSource for Spilled {
+    fn node(&self, hash: &Hash) -> Option<Stored> {
+        self.spilled
+            .node(hash)
+            .or_else(|| self.rooted.as_ref().and_then(|rooted| rooted.node(hash)))
+    }
+
+    fn tampered(&self) {
+        self.spilled.tampered();
+        if let Some(rooted) = &self.rooted {
+            rooted.tampered();
+        }
+    }
+}
+
 /// One node of the tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum Node {
@@ -396,6 +426,65 @@ impl Node {
         }
     }
 
+    /// Hands `emit` every node from here down that `present` says its keeper
+    /// lacks: those held in memory, and those loaded from `source` beneath a
+    /// stored one it lacks.
+    fn missing(
+        &self,
+        source: Option<&dyn NodeSource>,
+        present: &mut dyn FnMut(&Hash) -> bool,
+        emit: &mut dyn FnMut(Hash, Stored),
+    ) {
+        match self {
+            Self::Empty => {}
+            Self::Stored(hash) => {
+                if !present(hash) {
+                    Self::load(hash, source).missing(source, present, emit);
+                }
+            }
+            Self::Leaf { key, value } => {
+                emit(self.hash(), Stored::Leaf { key: *key, value: *value });
+            }
+            Self::Branch { hash, left, right } => {
+                emit(*hash, Stored::Branch { left: left.hash(), right: right.hash() });
+                left.missing(source, present, emit);
+                right.missing(source, present, emit);
+            }
+        }
+    }
+
+    /// Hands `emit` the hash of every node under `old`, kept in `before`, that
+    /// this subtree no longer holds: a walk down both where they differ.
+    fn replaced(
+        &self,
+        old: Hash,
+        source: Option<&dyn NodeSource>,
+        before: &dyn NodeSource,
+        emit: &mut dyn FnMut(Hash),
+    ) {
+        if old == EMPTY {
+            return;
+        }
+        let loaded = self.read(source);
+        let now = loaded.as_ref().unwrap_or(self);
+        if now.hash() == old {
+            return;
+        }
+        emit(old);
+        if let Some(Stored::Branch { left, right }) = before.node(&old) {
+            match now {
+                Self::Branch { left: now_left, right: now_right, .. } => {
+                    now_left.replaced(left, source, before, emit);
+                    now_right.replaced(right, source, before, emit);
+                }
+                _ => {
+                    Self::Empty.replaced(left, source, before, emit);
+                    Self::Empty.replaced(right, source, before, emit);
+                }
+            }
+        }
+    }
+
     /// Hands every node held in memory to `emit`, stopping at stored ones.
     fn fresh(&self, emit: &mut dyn FnMut(Hash, Stored)) {
         match self {
@@ -539,6 +628,11 @@ pub struct Tree {
     source: Option<Arc<dyn NodeSource>>,
     stored: Option<Hash>,
     dropped: Vec<Hash>,
+    /// Where [`Tree::spill`] puts what the tree made, once told.
+    sink: Option<Arc<dyn NodeSink>>,
+    /// Whether `dropped` no longer says every stored node the tree's changes
+    /// replaced: so once it has spilled, which stops keeping it.
+    untracked: bool,
 }
 
 impl core::fmt::Debug for Tree {
@@ -572,6 +666,8 @@ impl Tree {
             source: Some(source),
             stored: Some(root),
             dropped: Vec::new(),
+            sink: None,
+            untracked: false,
         }
     }
 
@@ -635,15 +731,72 @@ impl Tree {
     /// its source. Some may be made again, unchanged, by the same changes:
     /// whoever writes the change removes these first and then puts every
     /// [`Tree::fresh`] node.
+    ///
+    /// Empty once the tree has spilled, which stops keeping them: a change of
+    /// a million leaves would hold twenty million hashes. [`Tree::tracks_dropped`]
+    /// says which, and [`Tree::replaced`] finds them by walking instead.
     #[must_use]
     pub fn dropped(&self) -> &[Hash] {
         &self.dropped
+    }
+
+    /// Whether [`Tree::dropped`] still says every stored node the changes
+    /// replaced.
+    #[must_use]
+    pub const fn tracks_dropped(&self) -> bool {
+        !self.untracked
+    }
+
+    /// Hands `emit` the hash of every node of the tree rooted at `old` in
+    /// `before` that this tree no longer holds: what a store keeping `old`
+    /// removes to hold this one instead. A walk down both trees where their
+    /// hashes differ, so it costs what changed.
+    pub fn replaced(&self, old: Hash, before: &dyn NodeSource, emit: &mut dyn FnMut(Hash)) {
+        self.root.replaced(old, self.source(), before, emit);
     }
 
     /// Hands every node of the tree held in memory, and not in its source, to
     /// `emit`: for a stored tree, the paths its changes made.
     pub fn fresh(&self, emit: &mut dyn FnMut(Hash, Stored)) {
         self.root.fresh(emit);
+    }
+
+    /// Hands `emit` every node of the tree that `present` says a keeper lacks:
+    /// what is in memory, and what was spilled elsewhere beneath a node the
+    /// keeper does not hold. What a store writes to hold this tree, where some
+    /// of it was spilled to another.
+    pub fn missing(
+        &self,
+        present: &mut dyn FnMut(&Hash) -> bool,
+        emit: &mut dyn FnMut(Hash, Stored),
+    ) {
+        self.root.missing(self.source(), present, emit);
+    }
+
+    /// Spills to `sink` from here on: [`Tree::spill`] puts there what the tree
+    /// holds in memory, and the tree loads it back from there and from where it
+    /// was rooted.
+    pub fn spill_to(&mut self, sink: Arc<dyn NodeSink>) {
+        let rooted = self.source.take();
+        let both: Arc<dyn NodeSource> = Arc::new(Spilled { spilled: Arc::clone(&sink), rooted });
+        self.source = Some(both);
+        self.sink = Some(sink);
+    }
+
+    /// Puts every node held in memory in the sink [`Tree::spill_to`] named,
+    /// and holds the tree as its root alone. Nothing, where no sink was named.
+    pub fn spill(&mut self) {
+        let Some(sink) = &self.sink else { return };
+        let mut nodes = Vec::new();
+        self.root.fresh(&mut |hash, node| nodes.push((hash, node)));
+        if nodes.is_empty() {
+            return;
+        }
+        sink.put_nodes(&nodes);
+        self.root = Node::stub(self.root.hash());
+        // Kept, the stored nodes replaced would grow with every leaf laid.
+        self.dropped = Vec::new();
+        self.untracked = true;
     }
 }
 

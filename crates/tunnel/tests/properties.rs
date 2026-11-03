@@ -7,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use proptest::prelude::*;
 use roster::id::{DeviceId, NetworkId};
-use roster::types::{IPV4_RANGE_BLOCKS, Ipv4Range};
-use tunnel::{Inbound, Ipv4Holdings, Outbound, Prefix, Tunnel, address_of, ipv4_candidate};
+use roster::types::Ipv4Range;
+use tunnel::{Inbound, Ipv4Holdings, Outbound, Prefix, Tunnel, address_of};
 
 /// The device the tunnel under test belongs to.
 fn me() -> DeviceId {
@@ -188,9 +188,7 @@ proptest! {
         tag in any::<u8>(),
     ) {
         let session = DeviceId::from_bytes([tag; 32]);
-        let tunnel = tunnel().with_holdings(Ipv4Holdings::from(
-            &NetworkId::from_bytes([1; 32]),
-            Ipv4Range::DEFAULT,
+        let tunnel = tunnel().with_holdings(Ipv4Holdings::from(Ipv4Range::DEFAULT,
             &[session]));
         let mut bytes = bytes;
         if let Some(first) = bytes.first_mut() {
@@ -200,48 +198,12 @@ proptest! {
         prop_assert!(outcome.is_malformed(), "{:?}", outcome);
     }
 
-    /// A candidate lies inside its range and is never its first or last
-    /// address, for every allowed prefix length.
-    #[test]
-    fn an_ipv4_candidate_is_inside_its_range_for_every_length(
-        block in 0..IPV4_RANGE_BLOCKS.len(),
-        extra in 0u8..=20,
-        bits in any::<u32>(),
-        device in any::<[u8; 32]>(),
-        network in any::<[u8; 32]>(),
-    ) {
-        let (base, block_len) = IPV4_RANGE_BLOCKS.get(block).copied().unwrap();
-        let prefix_len = block_len.saturating_add(extra).min(Ipv4Range::MAX_PREFIX_LEN);
-        let mask_of = |len: u8| u32::MAX.checked_shl(32_u32.saturating_sub(u32::from(len))).unwrap();
-        let mask = mask_of(prefix_len);
-        let block_mask = mask_of(block_len);
-        let address = (u32::from_be_bytes(base) & block_mask) | (bits & mask & !block_mask);
-        let range = Ipv4Range::new(address.to_be_bytes(), prefix_len).expect("inside its block");
-
-        let candidate = ipv4_candidate(
-            &NetworkId::from_bytes(network),
-            &DeviceId::from_bytes(device),
-            &range,
-        );
-        let value = u32::from(candidate);
-        let first = u32::from_be_bytes(range.address());
-        let last = first | !mask;
-
-        prop_assert!(range.contains(candidate.octets()), "{candidate} outside {range}");
-        prop_assert!(value != first && value != last, "{candidate} is an edge of {range}");
-        prop_assert_eq!(
-            candidate,
-            ipv4_candidate(&NetworkId::from_bytes(network), &DeviceId::from_bytes(device), &range)
-        );
-    }
 
     /// Nothing IPv4 is carried to an address no device holds.
     #[test]
     fn no_unheld_ipv4_destination_is_ever_carried(destination in any::<u32>(), tag in any::<u8>()) {
         let holder = DeviceId::from_bytes([tag; 32]);
-        let holdings = Ipv4Holdings::from(
-            &NetworkId::from_bytes([1; 32]),
-            Ipv4Range::DEFAULT,
+        let holdings = Ipv4Holdings::from(Ipv4Range::DEFAULT,
             &[holder]);
         let tunnel = tunnel().with_holdings(holdings.clone());
         let destination = Ipv4Addr::from(destination);
@@ -293,9 +255,7 @@ proptest! {
         honest in any::<bool>(),
     ) {
         let session = DeviceId::from_bytes([tag; 32]);
-        let tunnel = tunnel().with_holdings(Ipv4Holdings::from(
-            &NetworkId::from_bytes([1; 32]),
-            Ipv4Range::DEFAULT,
+        let tunnel = tunnel().with_holdings(Ipv4Holdings::from(Ipv4Range::DEFAULT,
             &[me(), session]));
         let (Some(source), Some(mine)) = (tunnel.ipv4_of(&session), tunnel.own_ipv4()) else {
             // The generated device collides with this one and holds nothing;

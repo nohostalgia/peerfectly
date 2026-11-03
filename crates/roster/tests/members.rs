@@ -17,6 +17,9 @@ use roster::merkle::{self, Hash, NodeSource, Stored};
 use roster::types::{KeyPurpose, Role};
 use support::device;
 
+/// The rows of a derived index: each value, with the device deriving it.
+type DerivedRows = Vec<([u8; 4], DeviceId)>;
+
 /// A store kept in maps, as a disk would keep it, that can be altered behind
 /// the tree's back.
 #[derive(Default)]
@@ -25,6 +28,7 @@ struct Kept {
     keys: Mutex<BTreeMap<(KeyId, DeviceId), KeyPurpose>>,
     addresses: Mutex<BTreeMap<([u8; 4], DeviceId), ()>>,
     nodes: Mutex<BTreeMap<Hash, Stored>>,
+    derived: Mutex<BTreeMap<[u8; 32], DerivedRows>>,
     tampered: AtomicUsize,
 }
 
@@ -59,6 +63,17 @@ impl MemberStore for Kept {
             .filter(|((held, _), _)| held == key)
             .map(|((_, device), purpose)| (*device, *purpose))
             .collect()
+    }
+
+    fn derived_holders(&self, tag: &[u8; 32], value: [u8; 4]) -> Option<Vec<DeviceId>> {
+        let derived = self.derived.lock().unwrap();
+        derived.get(tag).map(|rows| {
+            rows.iter().filter(|(held, _)| *held == value).map(|(_, device)| *device).collect()
+        })
+    }
+
+    fn put_derived(&self, tag: &[u8; 32], rows: &[([u8; 4], DeviceId)]) {
+        self.derived.lock().unwrap().entry(*tag).or_default().extend_from_slice(rows);
     }
 
     fn address_holders(&self, address: [u8; 4]) -> Vec<DeviceId> {

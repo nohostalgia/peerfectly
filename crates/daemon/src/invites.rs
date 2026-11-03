@@ -166,6 +166,7 @@ impl Record {
     pub fn issue(
         relay: &str,
         network: roster::id::NetworkId,
+        block: roster::types::Ipv4Range,
         invited: Invited,
         now: u64,
         lifetime: u64,
@@ -175,7 +176,7 @@ impl Record {
                 cause: "an admin is a full member: it cannot be invited light".to_owned(),
             });
         }
-        let invite = Invite::issue(relay, network)
+        let invite = Invite::issue(relay, network, block)
             .map_err(|cause| Error::Refused { cause: cause.to_string() })?;
         Ok(Self {
             invite,
@@ -385,6 +386,9 @@ struct KeptRequest {
     transport: String,
     attestation: String,
     name: String,
+    /// What the device said of the network's block against its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<String>,
     arrived_at: u64,
     /// `waiting`, `approved` or `rejected`.
     decision: String,
@@ -408,6 +412,7 @@ impl KeptRequest {
             transport: roster::hex::encode(applicant.transport.as_bytes()),
             attestation: roster::hex::encode(applicant.attestation.as_bytes()),
             name: applicant.name.clone(),
+            conflicts: applicant.conflicts.clone(),
             arrived_at: request.arrived_at,
             decision: decision.to_owned(),
             decided_at,
@@ -428,6 +433,7 @@ impl KeptRequest {
             transport: key(Algorithm::Ed25519, &self.transport)?,
             attestation: key(Algorithm::Ed25519, &self.attestation)?,
             name: self.name,
+            conflicts: self.conflicts,
         };
         let decision = match (self.decision.as_str(), self.decided_at) {
             ("waiting", _) => Decision::Waiting,
@@ -586,6 +592,7 @@ mod tests {
         Record::issue(
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:4433",
             roster::id::NetworkId::from_bytes([7; 32]),
+            roster::types::Ipv4Range::DEFAULT,
             invited(),
             NOW,
             DEFAULT_LIFETIME_SECS,
@@ -600,6 +607,7 @@ mod tests {
             transport: device.transport_key().public_key(),
             attestation: device.attestation_key().public_key(),
             name: name.to_owned(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -692,6 +700,7 @@ mod tests {
             Record::issue(
                 "k@relay:1",
                 roster::id::NetworkId::from_bytes([7; 32]),
+                roster::types::Ipv4Range::DEFAULT,
                 light_admin,
                 NOW,
                 60

@@ -44,6 +44,11 @@ pub struct Join {
     /// When the admin's daemon said the request was received, once it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_at: Option<u64>,
+    /// Where the invite's IPv4 block coincides with this device's other
+    /// networks or the subnets it is on, as the join began: told to its person
+    /// then, and carried in the request for the admin approving it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
 }
 
 /// The file and its signature, as written.
@@ -134,6 +139,7 @@ mod tests {
             proof: "00ff".to_owned(),
             started_at: 1_800_000_000,
             requested_at: None,
+            conflicts: Vec::new(),
         }
     }
 

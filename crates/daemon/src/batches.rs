@@ -2,16 +2,16 @@
 //!
 //! The production station collected each board's public keys, serial and
 //! proposed name (`bulk-admission`); the admin chooses the rest when admitting
-//! — the label, the mode, the groups and the address block. Everything is
-//! checked here before anything is shown: a batch the person reviews is the
-//! batch that would be signed.
+//! — the label, the mode, the groups, and whether the boards hold IPv4. Every
+//! check is made here before anything is shown: a batch the person reviews is
+//! the batch that would be signed.
 //!
 //! The entries a batch would skip are read with `roster::batch::skipped`, the
 //! one derivation applies, so what is shown and what happens cannot disagree.
 
 use std::collections::BTreeSet;
 
-use roster::batch::{BatchEntry, BatchHeader, Skip};
+use roster::batch::{BatchEntry, BatchHeader, OffsetRun, Skip};
 use roster::leaf::{Group, Mode};
 use roster::state::RosterState;
 use roster::types::{Algorithm, Ipv4Range, KeyEntry, KeyPurpose};
@@ -20,13 +20,15 @@ use crate::control::{BatchDevice, SkippedLine, shown};
 use crate::service::BatchWanted;
 
 /// The header and the entries of a batch of `devices`, as `wanted` asks, over
-/// `state`: each entry's keys and name checked, and, where there is a block,
-/// an address assigned to each from the block's hosts no member holds, in
-/// device order.
+/// `state`: each entry's keys and name checked, and, unless the boards are
+/// admitted IPv6 only, an offset given each from the lowest run of the
+/// network's block that no member holds and is long enough, in device order
+/// (`scalable-membership` 19.2).
 ///
 /// # Errors
 ///
-/// In words, when the label, a group, the block or an entry will not do.
+/// In words, when the label, a group or an entry will not do, or the block has
+/// no run long enough.
 pub(crate) fn prepared(
     state: &RosterState,
     devices: &[BatchDevice],
@@ -45,23 +47,6 @@ pub(crate) fn prepared(
                 .map_err(|cause| format!("`{}` is not a group: {cause}", shown(group)))
         })
         .collect::<Result<Vec<Group>, String>>()?;
-    let block = wanted
-        .block
-        .as_deref()
-        .map(|block| {
-            block
-                .parse::<Ipv4Range>()
-                .map_err(|cause| format!("`{}` is not an address block: {cause}", shown(block)))
-        })
-        .transpose()?;
-    if let Some(block) = block {
-        let range = state.params.ipv4_range();
-        let last = last_address(&block);
-        if !range.contains(block.address()) || !range.contains(last) {
-            return Err(format!("the block {block} is outside the network's range, {range}"));
-        }
-    }
-
     let mut entries = Vec::with_capacity(devices.len());
     let mut seen = BTreeSet::new();
     for (line, device) in (1_u64..).zip(devices) {
@@ -95,30 +80,44 @@ pub(crate) fn prepared(
         entries.push(entry);
     }
 
-    if let Some(block) = block {
-        // In device order, as derivation judges them: of two entries that could
-        // take one address, the smaller device has it, everywhere.
+    let offsets = if wanted.ipv6_only {
+        None
+    } else {
+        // In device order, as derivation judges them.
         entries.sort_by_key(|entry| entry.device_id().ok());
-        let first = u32::from_be_bytes(block.address());
-        let mut hosts = (1..block.size().saturating_sub(1))
-            .filter_map(|offset| u32::try_from(offset).ok())
-            .filter_map(|offset| first.checked_add(offset))
-            .map(u32::to_be_bytes)
-            .filter(|address| state.devices.holding_address(*address).is_empty());
-        let count = entries.len();
-        for entry in &mut entries {
-            let Some(address) = hosts.next() else {
-                return Err(format!(
-                    "the block {block} has too few free addresses for {count} devices"
-                ));
-            };
-            entry.ipv4 = Some(address);
+        let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        let range = state.params.ipv4_range();
+        let first = state.free_offsets(count).ok_or_else(|| {
+            format!(
+                "the network's block, {range}, has no {count} consecutive free addresses. Grow                  the block, or admit these devices IPv6 only (--ipv6-only)"
+            )
+        })?;
+        let run = OffsetRun::new(first, count).map_err(|cause| cause.to_string())?;
+        for (entry, offset) in entries.iter_mut().zip(run.offsets()) {
+            entry.ipv4 = Some(offset);
         }
-    }
+        Some(run)
+    };
 
-    let header = BatchHeader::for_entries(&entries, mode, groups, block, label)
+    let header = BatchHeader::for_entries(&entries, mode, groups, offsets, label)
         .map_err(|cause| cause.to_string())?;
     Ok((header, entries))
+}
+
+/// The addresses a run of offsets names in `range`, first to last, as a person
+/// reads them.
+pub(crate) fn addresses_of(range: &Ipv4Range, run: &OffsetRun) -> String {
+    let at = |offset| {
+        range.address_at(offset).map_or_else(
+            || format!("offset {}", u32::from_be_bytes(offset)),
+            |address| std::net::Ipv4Addr::from(address).to_string(),
+        )
+    };
+    if run.count() == 1 {
+        at(run.first())
+    } else {
+        format!("{} to {}", at(run.first()), at(run.last()))
+    }
 }
 
 /// The entries of a batch that would have no effect over `state`, and why, in
@@ -142,25 +141,18 @@ pub(crate) fn skipped_lines(
 const fn said(skip: Skip) -> &'static str {
     match skip {
         Skip::AlreadyMember => "already a member of the network",
-        Skip::AddressOutsideBlock => "its address is outside the block",
-        Skip::AddressTaken => "its address is held by another device",
+        Skip::OffsetOutsideRun => "its address is outside the batch's addresses",
+        Skip::OffsetTaken => "its address is held by another device",
     }
-}
-
-/// A block's last address.
-fn last_address(block: &Ipv4Range) -> [u8; 4] {
-    let first = u64::from(u32::from_be_bytes(block.address()));
-    let last = first.saturating_add(block.size()).saturating_sub(1);
-    u32::try_from(last).unwrap_or(u32::MAX).to_be_bytes()
 }
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use identity::NodeIdentity;
-    use roster::id::NetworkId;
+    use roster::id::{DeviceId, NetworkId};
     use roster::types::NetworkParams;
 
     use super::*;
@@ -184,59 +176,93 @@ mod tests {
         }
     }
 
-    fn state() -> RosterState {
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0).unwrap();
+    /// A network in `block` whose founder holds the first host.
+    fn state_in(block: &str) -> RosterState {
+        let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0)
+            .unwrap()
+            .in_ipv4_range(block.parse().unwrap());
+        let founder = DeviceId::from_bytes([1; 32]);
+        let record = roster::types::DeviceRecord {
+            id: founder,
+            keys: Vec::new(),
+            name: "nas".to_owned(),
+            role: roster::types::Role::Admin,
+            founder: true,
+            added_by: roster::id::OperationId::from_bytes([0; 32]),
+            capabilities: Vec::new(),
+        };
+        let settings = roster::leaf::DeviceSettings {
+            ipv4: Some(roster::leaf::FIRST_HOST),
+            ..roster::leaf::DeviceSettings::default()
+        };
         RosterState::from_parts(
             NetworkId::from_bytes([7; 32]),
             params,
-            BTreeMap::new(),
+            [(founder, record)].into_iter().collect(),
             BTreeSet::new(),
-            BTreeMap::new(),
+            [(founder, settings)].into_iter().collect(),
         )
     }
 
-    fn wanted(block: Option<&str>) -> BatchWanted {
+    fn state() -> RosterState {
+        state_in("100.64.0.0/10")
+    }
+
+    fn wanted(ipv6_only: bool) -> BatchWanted {
         BatchWanted {
             label: "lot A".to_owned(),
             light: true,
             groups: vec!["sensori".to_owned()],
-            block: block.map(str::to_owned),
+            ipv6_only,
         }
     }
 
     #[test]
-    fn a_batch_is_prepared_with_an_address_each_from_its_block() {
+    fn a_batch_is_given_the_lowest_free_run_in_device_order() {
         let devices: Vec<BatchDevice> = (0..5).map(|n| device(&format!("board-{n}"))).collect();
-        let (header, entries) =
-            prepared(&state(), &devices, &wanted(Some("100.64.9.0/28"))).unwrap();
+        let (header, entries) = prepared(&state(), &devices, &wanted(false)).unwrap();
         assert_eq!(header.count, 5);
         assert_eq!(header.mode, Mode::Light);
-        let addresses: BTreeSet<[u8; 4]> = entries.iter().filter_map(|entry| entry.ipv4).collect();
-        assert_eq!(addresses.len(), 5, "an address each, none repeated");
-        assert!(!addresses.contains(&[100, 64, 9, 0]) && !addresses.contains(&[100, 64, 9, 15]));
+        let run = header.offsets.expect("a run");
+        assert_eq!((run.first(), run.count()), (2_u32.to_be_bytes(), 5), "after the founder's");
+        let given: Vec<u32> =
+            entries.iter().filter_map(|entry| entry.ipv4.map(u32::from_be_bytes)).collect();
+        assert_eq!(given, [2, 3, 4, 5, 6], "consecutive, in the entries' order");
+        let ids: Vec<DeviceId> = entries.iter().map(|entry| entry.device_id().unwrap()).collect();
+        assert!(ids.is_sorted(), "which is device order");
         assert!(skipped_lines(&state(), &header, &entries).is_empty());
+        assert_eq!(addresses_of(&state().params.ipv4_range(), &run), "100.64.0.2 to 100.64.0.6");
+    }
+
+    #[test]
+    fn a_batch_admitted_ipv6_only_takes_no_offsets() {
+        let devices: Vec<BatchDevice> = (0..3).map(|n| device(&format!("board-{n}"))).collect();
+        let (header, entries) = prepared(&state(), &devices, &wanted(true)).unwrap();
+        assert_eq!(header.offsets, None);
+        assert!(entries.iter().all(|entry| entry.ipv4.is_none()));
     }
 
     #[test]
     fn a_batch_that_will_not_do_is_refused_in_words() {
-        // Fifteen devices, for a block of fourteen hosts.
-        let devices: Vec<BatchDevice> = (0..15).map(|n| device(&format!("board-{n}"))).collect();
-        let outside = prepared(&state(), &devices, &wanted(Some("192.168.1.0/24"))).unwrap_err();
-        assert!(outside.contains("outside the network's range"), "{outside}");
-        let small = prepared(&state(), &devices, &wanted(Some("100.64.9.0/28"))).unwrap_err();
-        assert!(small.contains("too few free addresses"), "{small}");
+        // Fourteen devices, for a block of fourteen hosts the founder holds one of.
+        let devices: Vec<BatchDevice> = (0..14).map(|n| device(&format!("board-{n}"))).collect();
+        let small = prepared(&state_in("10.0.0.0/28"), &devices, &wanted(false)).unwrap_err();
+        assert!(
+            small.contains("no 14 consecutive free") && small.contains("--ipv6-only"),
+            "{small}"
+        );
+        assert!(prepared(&state_in("10.0.0.0/28"), &devices, &wanted(true)).is_ok());
 
         let mut forged = device("board");
         forged.transport = "not hex".to_owned();
-        let refused = prepared(&state(), &[forged], &wanted(None)).unwrap_err();
+        let refused = prepared(&state(), &[forged], &wanted(false)).unwrap_err();
         assert!(refused.contains("entry 1") && refused.contains("transport"), "{refused}");
 
         let twice = device("board");
-        let refused = prepared(&state(), &[twice.clone(), twice], &wanted(None)).unwrap_err();
+        let refused = prepared(&state(), &[twice.clone(), twice], &wanted(false)).unwrap_err();
         assert!(refused.contains("another entry"), "{refused}");
 
-        let mut unlabelled = wanted(None);
+        let mut unlabelled = wanted(false);
         unlabelled.label = "  ".to_owned();
         assert!(prepared(&state(), &[device("board")], &unlabelled).unwrap_err().contains("label"));
     }

@@ -182,7 +182,7 @@ pub struct Node {
     /// networks and interfaces; kept here, because the resolver and the report
     /// already read the node. Empty while down: nothing is routed, so nothing is
     /// withheld from a route.
-    withheld: std::sync::Mutex<Arc<BTreeMap<DeviceId, crate::conflicts::Conflict>>>,
+    withheld: std::sync::Mutex<Arc<Vec<crate::conflicts::Hole>>>,
     /// Live sessions, by the device they belong to.
     sessions: Mutex<BTreeMap<DeviceId, Arc<dyn Session>>>,
     /// Which way each live session was opened, and when, by the same key.
@@ -377,7 +377,7 @@ impl Node {
         let mut router = router;
         router.set_holdings(holdings.clone());
         if let Some(state) = &initial {
-            router.set_members(others(state, &identity.device_id()));
+            router.follow_state(state, &identity.device_id());
         }
         gateway.set_holdings(holdings.clone());
 
@@ -392,7 +392,7 @@ impl Node {
             holdings: watch::Sender::new(Arc::new(holdings)),
             enforced: Mutex::new(initial),
             choices: std::sync::Mutex::new(None),
-            withheld: std::sync::Mutex::new(Arc::new(BTreeMap::new())),
+            withheld: std::sync::Mutex::new(Arc::new(Vec::new())),
             sessions: Mutex::new(BTreeMap::new()),
             openings: std::sync::Mutex::new(BTreeMap::new()),
             dialling: std::sync::Mutex::new(BTreeMap::new()),
@@ -546,6 +546,16 @@ impl Node {
         // So that, with other admins in the network, this device's own
         // attestations do not keep its own roster fresh.
         roster.set_own_device(identity.device_id());
+        // The batches' layers on disk, emptied and filled again as the log is
+        // replayed: a fleet's boards are not held in memory, and nothing the
+        // file held before this start is relied on (`member_store::Layers`).
+        // Where it cannot be opened, the layers stay in memory.
+        if let Some(paths) = log.path().parent().map(crate::state::Paths::under)
+            && let Ok(layers) = crate::state::open_layers(&paths)
+            && layers.clear().is_ok()
+        {
+            roster.keep_layers_in(layers);
+        }
         let held = log.read()?;
         // A log that was compacted rests on a base: the root beneath its window
         // and the state that root commits to. Only the operations that follow
@@ -787,6 +797,31 @@ impl Node {
             .map(|held| held.core().ts)
     }
 
+    /// The devices admitted alone, each by an `add_device` the roster still
+    /// holds signed at `since` or after, in milliseconds since the epoch on its
+    /// author's clock: the newcomers there may be, read from the operations
+    /// held rather than from every member. Not a batch's boards (as
+    /// [`Self::admitted_alone_at`]).
+    pub async fn admitted_alone_since(
+        &self,
+        since: u64,
+    ) -> Vec<(DeviceId, roster::id::OperationId)> {
+        let syncer = self.syncer.lock().await;
+        syncer
+            .roster()
+            .dag()
+            .operations()
+            .iter()
+            .filter(|operation| operation.core().ts >= since)
+            .filter_map(|operation| match &operation.core().body {
+                roster::types::OperationBody::AddDevice(spec) => {
+                    spec.device_id().ok().map(|device| (device, operation.id()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The neighbours this device could choose in `state`: which new members
     /// it brings the network to.
     pub(crate) fn choices(&self, state: &RosterState) -> Option<crate::neighbours::Choices> {
@@ -897,8 +932,15 @@ impl Node {
             if let Ok(mut held) = self.base.lock() {
                 *held = None;
             }
-            for kept in [paths.roster(), paths.pieces(), paths.base_snapshot(), paths.base_store()]
-            {
+            // The layers too, where nothing holds them open any more; one still
+            // open is emptied at the next start anyway.
+            for kept in [
+                paths.roster(),
+                paths.pieces(),
+                paths.base_snapshot(),
+                paths.base_store(),
+                paths.layers(),
+            ] {
                 let _removed = std::fs::remove_file(kept);
             }
         }
@@ -1424,16 +1466,17 @@ impl Node {
         crate::wire::Ipv4View { holdings: self.current_ipv4_holdings(), withheld: self.withheld() }
     }
 
-    /// The peers withheld on this device, and why.
+    /// The holes in this network's block on this device: a peer whose address
+    /// falls in one is withheld here, and why.
     #[must_use]
-    pub fn withheld(&self) -> Arc<BTreeMap<DeviceId, crate::conflicts::Conflict>> {
+    pub fn withheld(&self) -> Arc<Vec<crate::conflicts::Hole>> {
         self.withheld
             .lock()
             .map_or_else(|poisoned| Arc::clone(poisoned.get_ref()), |held| Arc::clone(&held))
     }
 
-    /// Records which peers are withheld on this device.
-    pub fn set_withheld(&self, withheld: BTreeMap<DeviceId, crate::conflicts::Conflict>) {
+    /// Records the holes in this network's block on this device.
+    pub fn set_withheld(&self, withheld: Vec<crate::conflicts::Hole>) {
         let withheld = Arc::new(withheld);
         match self.withheld.lock() {
             Ok(mut held) => *held = withheld,
@@ -2700,11 +2743,6 @@ fn udp_source_port(packet: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([high, low]))
 }
 
-/// Every member but this device, as the router needs them.
-fn others(state: &roster::state::RosterState, me: &DeviceId) -> Vec<DeviceId> {
-    state.devices.keys().filter(|device| device != me && !state.revoked.contains(device)).collect()
-}
-
 /// A device's transport key, as the roster declares it.
 fn transport_key_of(record: &roster::types::DeviceRecord) -> Option<roster::sign::PublicKey> {
     let entry =
@@ -2773,12 +2811,7 @@ impl Node {
         {
             let mut router = self.router.lock().await;
             router.set_holdings(holdings.clone());
-            match &previous {
-                Some(previous) => {
-                    router.follow_members(previous, &state, &self.identity.device_id());
-                }
-                None => router.set_members(others(&state, &self.identity.device_id())),
-            }
+            router.follow_state(&state, &self.identity.device_id());
         }
         self.holdings.send_if_modified(|current| {
             if **current == holdings {
@@ -2789,6 +2822,9 @@ impl Node {
             }
         });
         drop(enforced);
+        if let Some(previous) = &previous {
+            self.tell_lost_offsets(previous, &state).await;
+        }
 
         self.forget_departed(&state).await;
         self.reconsider_carrying().await;
@@ -2830,6 +2866,15 @@ impl Node {
                 (Severity::Event, format!("{peer:?} is no longer in the roster; session closed"))
             };
             self.record(severity, "roster", why).await;
+        }
+    }
+
+    /// Tells an admin of each device that lost its IPv4 offset to another
+    /// given it at the same time (`admitting::lost_offsets`).
+    async fn tell_lost_offsets(&self, previous: &RosterState, state: &RosterState) {
+        let me = self.identity.device_id();
+        for said in crate::admitting::lost_offsets(previous, state, &me) {
+            self.record(Severity::Event, "ipv4", said).await;
         }
     }
 

@@ -119,6 +119,7 @@
     [
       {
         "Found": {
+          "devices": null,
           "ipv4_range": null,
           "label": "casa",
           "name": "pixel",
@@ -324,6 +325,7 @@
             "ipv4": {
               "Held": "100.64.0.4"
             },
+            "ipv4_block": "100.83.0.0/16",
             "label": "home",
             "name": "pixel.home.internal",
             "owner_taken": false,
@@ -454,6 +456,7 @@
             "custody": "KeyStore",
             "id": "4e5f-6a7b-8c9d-0e1f",
             "ipv4": null,
+            "ipv4_block": null,
             "label": "work",
             "name": null,
             "owner_taken": false,
@@ -461,12 +464,7 @@
               {
                 "address": "fd01::2",
                 "id": "5f6a-7b8c-9d0e-1f2a",
-                "ipv4": {
-                  "Collides": {
-                    "id": "6a7b-8c9d-0e1f-2a3b",
-                    "name": "tablet"
-                  }
-                },
+                "ipv4": null,
                 "last_contact": {
                   "Recorded": {
                     "at": {
@@ -529,6 +527,9 @@
     "Done",
     {
       "JoinStarted": {
+        "conflicts": [
+          "100.64.0.0/10 overlaps 100.64.0.0/10, the block of `casa` on this device"
+        ],
         "fingerprint": "AB12-CD34-EF56-7890-1234",
         "label": "joining"
       }
@@ -557,6 +558,9 @@
             "network": "casa",
             "request": {
               "arrived_at": 1758190000,
+              "conflicts": [
+                "100.64.0.0/10 overlaps 100.64.12.0/22, a subnet this device is on"
+              ],
               "fingerprint": "AB12-CD34-EF56-7890-1234",
               "proposed_name": "Mario's tablet",
               "taken": {
@@ -642,7 +646,7 @@
     },
     {
       "BatchReview": {
-        "block": "100.64.9.0/28",
+        "block": "100.64.0.2 to 100.64.0.4",
         "count": 3,
         "groups": [
           "sensori"

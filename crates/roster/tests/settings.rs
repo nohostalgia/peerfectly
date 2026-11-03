@@ -80,7 +80,7 @@ fn of_two_writers_of_one_field_the_later_wins() {
     let state = loaded(&history).state().unwrap();
     assert_eq!(state.settings_of(&device_id(3)).mode, Mode::Full);
     assert!(
-        state.devices.changed_settings().next().is_none(),
+        state.devices.changed_settings().all(|(device, _)| device != device_id(3)),
         "back at the default, nothing is recorded"
     );
 }
@@ -282,4 +282,102 @@ fn an_admission_is_not_in_the_delta() {
         OperationBody::AddDevice(device(4, "new", Role::Member, false)),
     );
     assert!(delta.is_empty(), "an admission invalidates no earlier proof: {delta:?}");
+}
+
+fn offset(value: u32) -> SettingsChange {
+    SettingsChange { ipv4: Some(Some(value.to_be_bytes())), ..SettingsChange::default() }
+}
+
+/// Founding is the founder's admission: it holds the block's first host with
+/// no operation saying so, and the next device admitted is given the second.
+#[test]
+fn the_founder_holds_the_first_host_and_the_next_is_the_second() {
+    let history = founded();
+    let state = loaded(&history).state().unwrap();
+    assert_eq!(state.settings_of(&device_id(1)).ipv4, Some(roster::leaf::FIRST_HOST));
+    assert_eq!(state.free_offsets(1), Some(2_u32.to_be_bytes()));
+}
+
+/// The lowest free offset is taken, a revoked device's included; a run takes
+/// the lowest gap wide enough for it.
+#[test]
+fn the_lowest_free_offsets_are_given() {
+    let mut history = founded();
+    history.op("two", 1, &["member3"], set(2, offset(2)));
+    history.op("three", 1, &["two"], set(3, offset(4)));
+    let state = loaded(&history).state().unwrap();
+    assert_eq!(state.free_offsets(1), Some(3_u32.to_be_bytes()), "the gap at 3");
+    assert_eq!(state.free_offsets(2), Some(5_u32.to_be_bytes()), "3 alone is too narrow");
+
+    history.op(
+        "revoke",
+        1,
+        &["three"],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "sold".into() },
+    );
+    let state = loaded(&history).state().unwrap();
+    assert_eq!(state.free_offsets(2), Some(2_u32.to_be_bytes()), "2 is free again");
+}
+
+/// A block whose hosts are all held has none to give.
+#[test]
+fn a_full_block_gives_none() {
+    let mut history = History::new();
+    let params = support::params().in_ipv4_range("10.0.0.0/28".parse().unwrap());
+    history.genesis_with("g", 1, device(1, "phone", Role::Admin, true), params);
+    let mut previous = "g".to_owned();
+    for seed in 2..=14_u8 {
+        let label = format!("add{seed}");
+        let given = format!("offset{seed}");
+        history.op(
+            &label,
+            1,
+            &[previous.as_str()],
+            OperationBody::AddDevice(device(seed, &format!("d{seed}"), Role::Member, false)),
+        );
+        history.op(&given, 1, &[label.as_str()], set(seed, offset(u32::from(seed))));
+        previous = given;
+    }
+    let state = loaded(&history).state().unwrap();
+    assert_eq!(state.free_offsets(1), None, "fourteen hosts, fourteen held");
+}
+
+/// Two admins admitting at once both give the lowest free offset: the claim
+/// that ranks later keeps it, the other device holds none, and the next
+/// lowest free is what its admin gives it then.
+#[test]
+fn two_admins_admitting_at_once_settle_one_offset_and_the_loser_is_given_the_next() {
+    let mut history = founded();
+    history.op(
+        "four",
+        1,
+        &["member3"],
+        OperationBody::AddDevice(device(4, "a", Role::Member, false)),
+    );
+    history.op(
+        "five",
+        2,
+        &["member3"],
+        OperationBody::AddDevice(device(5, "b", Role::Member, false)),
+    );
+    history.op("give4", 1, &["four"], set(4, offset(2)));
+    history.op("give5", 2, &["five"], set(5, offset(2)));
+    let state = loaded(&history).state().unwrap();
+    let held: Vec<_> = [4_u8, 5]
+        .into_iter()
+        .filter(|seed| state.settings_of(&device_id(*seed)).ipv4 == Some(2_u32.to_be_bytes()))
+        .collect();
+    assert_eq!(held.len(), 1, "one of the two keeps it: {held:?}");
+    let loser = if held == [4] { 5 } else { 4 };
+    assert_eq!(state.settings_of(&device_id(loser)).ipv4, None);
+
+    let next = state.free_offsets(1).unwrap();
+    assert_eq!(next, 3_u32.to_be_bytes());
+    history.op("again", 1, &["give4", "give5"], set(loser, offset(3)));
+    let state = loaded(&history).state().unwrap();
+    assert_eq!(
+        state.settings_of(&device_id(loser)).ipv4,
+        Some(next),
+        "a new claim, not the lost one"
+    );
 }

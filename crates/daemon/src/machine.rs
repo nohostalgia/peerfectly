@@ -64,6 +64,17 @@ pub trait Machine: Send + Sync {
     /// Takes the address back off the adapter.
     async fn remove_address(&self, interface: Interface, address: IpAddr) -> Result<()>;
 
+    /// Whether the adapter holds `address` now, as the machine itself says;
+    /// `None` where this platform cannot tell, which is the default.
+    ///
+    /// Asked once a second of an address this device believes it holds: Windows
+    /// took this device's IPv4 address off the adapter some moments after a
+    /// route covering it was removed, with nothing said (2026-11-02), and an
+    /// address asked for again at once was still there to be "already held".
+    async fn holds_address(&self, _interface: Interface, _address: IpAddr) -> Option<bool> {
+        None
+    }
+
     /// Adds a route.
     async fn install_route(&self, route: &Route) -> Result<()>;
 
@@ -249,7 +260,11 @@ pub(crate) mod testing {
             if self.fail_at == Some(Fail::Address) {
                 return Err(Self::refuse(Step::CreatingAdapter, "told to fail"));
             }
-            self.installed.lock().expect("not poisoned").addresses.push(address);
+            // As every platform takes it: an address already there is no change.
+            let mut installed = self.installed.lock().expect("not poisoned");
+            if !installed.addresses.contains(&address) {
+                installed.addresses.push(address);
+            }
             Ok(())
         }
 

@@ -50,6 +50,9 @@ pub struct Applicant {
     pub attestation: PublicKey,
     /// The name it proposes.
     pub name: String,
+    /// Where the network's block coincides with its other networks or the
+    /// subnets it is on, in its own words: unproved, and deciding nothing.
+    pub conflicts: Vec<String>,
 }
 
 impl From<&enrollment::exchange::Introduction> for Applicant {
@@ -59,6 +62,7 @@ impl From<&enrollment::exchange::Introduction> for Applicant {
             transport: introduction.transport.clone(),
             attestation: introduction.attestation.clone(),
             name: introduction.name.clone(),
+            conflicts: introduction.conflicts.clone(),
         }
     }
 }
@@ -261,12 +265,18 @@ pub fn admission_core(
     Ok((operation, spec_name))
 }
 
-/// The settings an invited device is admitted with, where its invite chose
-/// any other than the default: a `set_device` following the admission.
+/// The settings an invited device is admitted with: a `set_device` following
+/// the admission, giving it its IPv4 offset and whatever else its invite chose.
+///
+/// The offset is the one the invite's address names in the network's block,
+/// or else the lowest no member holds, so that a network's offsets stay
+/// consecutive (`scalable-membership` 19.2). A block with none free admits it
+/// IPv6 only.
 ///
 /// # Errors
 ///
-/// When the operation cannot be made.
+/// When the operation cannot be made, or the invite named an address that is
+/// not one of the block's hosts.
 pub fn settings_core(
     invited: &crate::invites::Invited,
     identity: &NodeIdentity,
@@ -275,7 +285,29 @@ pub fn settings_core(
 ) -> Result<Option<OperationCore>, Refusal> {
     let mode = (invited.mode != roster::leaf::Mode::Full).then_some(invited.mode);
     let groups = (!invited.groups.is_empty()).then(|| invited.groups.clone());
-    let ipv4 = invited.ipv4.map(Some);
+    let range = state.params.ipv4_range();
+    let offset = match invited.ipv4 {
+        Some(address) => Some(range.offset_of(address).ok_or_else(|| {
+            format!(
+                "the invite named {}, which is not an address of the network's block, {range}. \
+                 Nothing was admitted.",
+                std::net::Ipv4Addr::from(address)
+            )
+        })?),
+        None => state.free_offsets(1),
+    };
+    // A later claim keeps an offset, so this one would take it from its holder
+    // for good.
+    if let Some(holder) =
+        offset.and_then(|offset| state.devices.holding_address(offset).first().copied())
+    {
+        let name = state.devices.get(&holder).map(|leaf| leaf.record.name.clone());
+        return Err(format!(
+            "the invite named an address {} already holds. Nothing was admitted.",
+            crate::control::Named::new(&holder, name)
+        ));
+    }
+    let ipv4 = offset.map(Some);
     if mode.is_none() && groups.is_none() && ipv4.is_none() {
         return Ok(None);
     }
@@ -297,6 +329,50 @@ pub fn settings_core(
     )
     .map(Some)
     .map_err(|cause| cause.to_string())
+}
+
+/// What an admin is told of each device that, between `previous` and `state`,
+/// lost its IPv4 offset to another given it at the same time; nothing where
+/// `me` is no admin.
+///
+/// Two admins admitting at once both give the lowest free offset, and the
+/// later claim keeps it (`roster::state`, "an address lost is lost for good").
+/// The device is reached by IPv6 until an admin gives it another (`ipv4
+/// give`). Signing that is a person's act, so the daemon says so rather than
+/// signing it (`scalable-membership` 19.2).
+///
+/// Read only where the two states share a base, from the devices that differ:
+/// never a walk over every member.
+#[must_use]
+pub fn lost_offsets(
+    previous: &RosterState,
+    state: &RosterState,
+    me: &roster::id::DeviceId,
+) -> Vec<String> {
+    if !state.is_admin(me) {
+        return Vec::new();
+    }
+    let Some(differing) = state.devices.differing(&previous.devices) else { return Vec::new() };
+    let mut lost = Vec::new();
+    for device in differing {
+        let (Some(before), Some(now)) = (previous.devices.get(&device), state.devices.get(&device))
+        else {
+            continue;
+        };
+        let (Some(offset), None) = (before.settings.ipv4, now.settings.ipv4) else { continue };
+        let Some(holder) = state.devices.holding_address(offset).first().copied() else {
+            continue;
+        };
+        let taker = state.devices.get(&holder).map(|leaf| leaf.record.name.clone());
+        lost.push(format!(
+            "{} lost its IPv4 address to {}, given it at the same time by another admin; it is \
+             reached by IPv6 until an admin gives it another: peerfectly ipv4 give {}",
+            crate::control::Named::new(&device, Some(now.record.name.clone())),
+            crate::control::Named::new(&holder, taker),
+            crate::control::shown(&now.record.name),
+        ));
+    }
+    lost
 }
 
 /// What a person is told about the name a device was admitted under, where it
@@ -398,9 +474,7 @@ pub fn holder_of(name: &str, state: &RosterState) -> Option<Taken> {
 /// Two devices with one name would make a name ambiguous, and a name is what a
 /// person types. The proposal is kept where it can be.
 fn unused_name(proposed: &str, state: &RosterState) -> String {
-    let taken = |candidate: &str| {
-        state.devices.values().any(|record| record.name.eq_ignore_ascii_case(candidate))
-    };
+    let taken = |candidate: &str| !state.devices.named(candidate).is_empty();
     if !taken(proposed) {
         return proposed.to_owned();
     }
@@ -444,6 +518,7 @@ mod tests {
             transport: joining.transport_key().public_key(),
             attestation: joining.attestation_key().public_key(),
             name: name.to_owned(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -648,5 +723,90 @@ mod tests {
             renamed.device_id().expect("an id"),
             "the device is the same either way: an id follows from the signing key"
         );
+    }
+
+    /// The offset an admission gives, as the `set_device` after it says.
+    fn given(
+        invited: &crate::invites::Invited,
+        state: &RosterState,
+    ) -> Result<Option<u32>, Refusal> {
+        let admin = NodeIdentity::generate().expect("generates");
+        let joining = NodeIdentity::generate().expect("generates");
+        let (admission, _) = admission_core(
+            &applicant(&joining, "board"),
+            invited,
+            &admin,
+            state,
+            Vec::new(),
+            false,
+        )
+        .expect("builds");
+        let settings = settings_core(invited, &admin, state, &admission)?.expect("settings");
+        let OperationBody::SetDevice { change, .. } = settings.body else { panic!("a set_device") };
+        Ok(change.ipv4.flatten().map(u32::from_be_bytes))
+    }
+
+    /// An admission gives the lowest offset no member holds: the founder holds
+    /// the first host, so the first device admitted is given the second.
+    #[test]
+    fn an_admission_gives_the_lowest_free_offset() {
+        let state = state_with(&[]);
+        assert_eq!(given(&invited("board", Role::Member), &state), Ok(Some(2)));
+    }
+
+    /// An invite naming an address gives its offset; one outside the block, or
+    /// held already, admits nothing.
+    #[test]
+    fn an_invited_address_is_given_as_its_offset_or_refused() {
+        let state = state_with(&[]);
+        let mut asked = invited("board", Role::Member);
+        asked.ipv4 = Some([100, 64, 0, 9]);
+        assert_eq!(given(&asked, &state), Ok(Some(9)));
+
+        asked.ipv4 = Some([192, 168, 1, 9]);
+        let refused = given(&asked, &state).unwrap_err();
+        assert!(refused.contains("not an address of the network's block"), "{refused}");
+
+        asked.ipv4 = Some([100, 64, 0, 1]);
+        let refused = given(&asked, &state).unwrap_err();
+        assert!(refused.contains("already holds") && refused.contains("founder"), "{refused}");
+    }
+
+    /// A full block admits the device IPv6 only, giving it no offset.
+    #[test]
+    fn a_full_block_admits_ipv6_only() {
+        let params = roster::types::NetworkParams::new(
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            0,
+        )
+        .expect("valid")
+        .in_ipv4_range("10.0.0.0/28".parse().expect("a block"));
+        let names: Vec<String> = (0..13).map(|n| format!("d{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut state = state_of(params, &names);
+        // The founder holds the first host; the thirteen others the rest.
+        let members: Vec<_> =
+            state.devices.keys().filter(|device| !state.is_founder(device)).collect();
+        for (offset, device) in (2_u32..).zip(members) {
+            let settings = roster::leaf::DeviceSettings {
+                ipv4: Some(offset.to_be_bytes()),
+                ..roster::leaf::DeviceSettings::default()
+            };
+            state.set_settings(device, settings);
+        }
+        let admin = NodeIdentity::generate().expect("generates");
+        let joining = NodeIdentity::generate().expect("generates");
+        let asked = invited("board", Role::Member);
+        let (admission, _) = admission_core(
+            &applicant(&joining, "board"),
+            &asked,
+            &admin,
+            &state,
+            Vec::new(),
+            false,
+        )
+        .expect("builds");
+        assert!(settings_core(&asked, &admin, &state, &admission).expect("made").is_none());
     }
 }

@@ -32,10 +32,9 @@
 //! key changes the device id, so the address moves — but that is already a
 //! re-enrolment: the roster sees a different device.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 
-use roster::id::{DeviceId, NetworkId};
-use roster::types::Ipv4Range;
+use roster::id::DeviceId;
 
 use crate::limits;
 use crate::outcome::{Error, Result};
@@ -49,9 +48,6 @@ const ADDRESS_CONTEXT: &str = "peerfectly tunnel address v1";
 
 /// The context a founder derives a network prefix under.
 const PREFIX_CONTEXT: &str = "peerfectly tunnel prefix v1";
-
-/// The context a device's IPv4 candidate is derived under.
-const IPV4_CONTEXT: &str = "peerfectly tunnel ipv4 v1";
 
 /// A network's address range on the overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,36 +185,6 @@ pub fn address_of(device: &DeviceId, prefix: &Prefix) -> Ipv6Addr {
         *slot = derived.get(index.saturating_sub(whole)).copied().unwrap_or(0);
     }
     Ipv6Addr::from(octets)
-}
-
-/// The IPv4 address a device would hold in a network, if no other device
-/// derives the same one.
-///
-/// A keyed hash of the network id and the device id, reduced into the range
-/// with its first and last addresses left out, so nothing a person might read as
-/// a network or broadcast address is handed out.
-///
-/// The network id is an input because one device holding two networks would
-/// otherwise present one IPv4 address in both, and be linkable by it. IPv6 needs
-/// no such care: the prefix already differs.
-///
-/// A candidate is not yet an address. Thirty-two bits cannot hold every device
-/// id apart, so whether a device holds its candidate is decided by
-/// [`crate::Ipv4Holdings`], against every other device of the network.
-#[must_use]
-pub fn ipv4_candidate(network: &NetworkId, device: &DeviceId, range: &Ipv4Range) -> Ipv4Addr {
-    let mut input = [0u8; 64];
-    for (slot, byte) in input.iter_mut().zip(network.as_bytes().iter().chain(device.as_bytes())) {
-        *slot = *byte;
-    }
-    let derived = blake3::derive_key(IPV4_CONTEXT, &input);
-    let head = derived.first_chunk::<8>().copied().unwrap_or_default();
-    // A range is at most a `/28`, so there are always fourteen or more.
-    let assignable = range.size().saturating_sub(2).max(1);
-    let offset = u64::from_be_bytes(head).checked_rem(assignable).unwrap_or(0);
-    let first = u32::from_be_bytes(range.address());
-    let host = first.saturating_add(1).saturating_add(u32::try_from(offset).unwrap_or(0));
-    Ipv4Addr::from(host)
 }
 
 #[cfg(test)]
@@ -362,44 +328,6 @@ mod tests {
         let one = Prefix::derive_for(&NetworkId::from_bytes([1; 32]));
         let two = Prefix::derive_for(&NetworkId::from_bytes([2; 32]));
         assert_ne!(one.to_parameter(), two.to_parameter());
-    }
-
-    fn range(text: &str) -> Ipv4Range {
-        text.parse().expect("an allowed range")
-    }
-
-    fn network(tag: u8) -> NetworkId {
-        NetworkId::from_bytes([tag; 32])
-    }
-
-    #[test]
-    fn two_nodes_derive_the_same_ipv4_candidate() {
-        let range = Ipv4Range::DEFAULT;
-        assert_eq!(
-            ipv4_candidate(&network(1), &device(1), &range),
-            ipv4_candidate(&network(1), &device(1), &range)
-        );
-    }
-
-    /// One device in two networks is not linkable by its IPv4 address.
-    #[test]
-    fn two_networks_give_one_device_different_ipv4_candidates() {
-        let range = Ipv4Range::DEFAULT;
-        assert_ne!(
-            ipv4_candidate(&network(1), &device(1), &range),
-            ipv4_candidate(&network(2), &device(1), &range)
-        );
-    }
-
-    #[test]
-    fn a_candidate_is_inside_the_range_and_never_its_first_or_last_address() {
-        let range = range("192.168.7.0/28");
-        for tag in 0..=255 {
-            let candidate = u32::from(ipv4_candidate(&network(1), &device(tag), &range));
-            assert!(range.contains(Ipv4Addr::from(candidate).octets()));
-            assert_ne!(candidate, 0xc0a8_0700, "the first address");
-            assert_ne!(candidate, 0xc0a8_070f, "the last address");
-        }
     }
 
     #[test]

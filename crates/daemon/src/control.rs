@@ -351,18 +351,16 @@ impl fmt::Display for Act {
     }
 }
 
-/// A device's IPv4 address in a network, or why it has none here.
+/// A device's IPv4 address in a network, or why it is not usable here.
 ///
 /// An address that silently is not there looks like the network being broken.
 /// Saying why tells a person whether to use the name, the IPv6 address, or move
-/// the network to another range.
+/// the network to another block. A device the network gives no address at all —
+/// one admitted without an offset — has none to report, and is reached by IPv6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ipv4State {
     /// It holds this address, and it is usable on this device.
     Held(Ipv4Addr),
-    /// The network gives it none: this device derives the same address, and
-    /// neither holds it.
-    Collides(Named),
     /// It holds this address, and this device withholds it.
     Withheld {
         /// The address it holds in the network.
@@ -376,12 +374,6 @@ impl fmt::Display for Ipv4State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Held(address) => write!(f, "{address}"),
-            Self::Collides(other) => {
-                write!(
-                    f,
-                    "no IPv4: its address collides with {other}; an admin can assign it a free one"
-                )
-            }
             Self::Withheld { address, with } => {
                 write!(f, "IPv4 {address} withheld here: it conflicts with {}", shown(with))
             }
@@ -607,6 +599,10 @@ pub struct Network {
     /// not come back yet. `None` after the end, whatever the parameters still say.
     #[serde(default)]
     pub relay_leaving: Option<RelayLeaving>,
+    /// The network's IPv4 block, `a.b.c.d/len`, once the parameters are known:
+    /// every device's address is its base plus the device's offset.
+    #[serde(default)]
+    pub ipv4_block: Option<String>,
     /// Devices in it the roster has evidence of having signed two histories.
     ///
     /// Its own field rather than a fault, because only the latest fault is
@@ -1209,6 +1205,9 @@ impl Command {
             | Self::AdmitBatch { network, .. }
             | Self::Rename { network, .. }
             | Self::SetAnchors { network, .. }
+            | Self::SetIpv4Block { network, .. }
+            | Self::GiveIpv4 { network, .. }
+            | Self::Route { network, .. }
             | Self::ChangeRelay { network, .. } => Needs::TheOwnerOf(network.clone()),
             Self::Expose { network, .. } | Self::Unexpose { network, .. } => {
                 Needs::TheOwnerOfAsAdministrator(network.clone())
@@ -1424,13 +1423,19 @@ pub enum Command {
         /// The relay, if the network has one: `key@host:port`, or a host whose
         /// relay container is asked for its key (`crate::relay::Given`).
         relay: Option<String>,
-        /// The IPv4 range every device of the network derives its IPv4 address
-        /// in, as `a.b.c.d/len`, or `None` for the default.
+        /// The network's IPv4 block, as `a.b.c.d/len`, or `None` for one the
+        /// daemon proposes (`devices`).
         ///
         /// Text rather than a parsed range so a surface can hand over what a
         /// person typed and have the refusal come back in the daemon's words,
         /// before anything is signed.
         ipv4_range: Option<String>,
+        /// How many devices the network is expected to hold, where no block is
+        /// named: the daemon proposes one four times that, drawn at random
+        /// among those free of this device's other networks and of the
+        /// subnets it is on. `None` for `founding::DEFAULT_EXPECTED`.
+        #[serde(default)]
+        devices: Option<u32>,
         /// The freshness window, in days, or `None` for none: devices that
         /// hear nothing signed by an admin for that long turn cautious. It
         /// buys a bound on how long a cut-off island keeps talking to a device
@@ -1481,9 +1486,11 @@ pub enum Command {
         light: bool,
         /// The groups every device joins.
         groups: Vec<String>,
-        /// The IPv4 block their addresses are assigned from, inside the
-        /// network's range; `None` for derived addresses.
-        block: Option<String>,
+        /// Whether they are admitted IPv6 only. Otherwise each is given an
+        /// offset from the lowest run of the network's block free and long
+        /// enough for them all.
+        #[serde(default)]
+        ipv6_only: bool,
         /// The entries shown as skipped, once the person has reviewed it.
         reviewed: Option<Vec<String>>,
     },
@@ -1528,6 +1535,48 @@ pub enum Command {
         network: Option<String>,
         /// The devices, by the names they answer to. Empty clears the list.
         anchors: Vec<Target>,
+    },
+
+    /// Move or resize a network's IPv4 block, as its admin.
+    ///
+    /// One change of its parameters: every device keeps its offset and holds
+    /// the address it names in the new block, so every device moves at once
+    /// and nothing is reconnected by hand. A block too small for an offset a
+    /// member holds is refused before anything is signed.
+    SetIpv4Block {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The block, `a.b.c.d/len`, `/10` to `/28`.
+        block: String,
+    },
+
+    /// Exclude a block from a network's IPv4 route, or include it again.
+    ///
+    /// A hole, as a local interface makes one: the peers in it are reached by
+    /// IPv6 only. On this device alone, or, `everywhere`, for every device as
+    /// a signed act of the network's admins.
+    Route {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The block, `a.b.c.d/len` or one address, inside the network's.
+        block: String,
+        /// Whether to include it again rather than exclude it.
+        #[serde(default)]
+        include: bool,
+        /// Whether for every device, as the network's admins.
+        #[serde(default)]
+        everywhere: bool,
+    },
+
+    /// Give a device the lowest IPv4 offset no member holds, as an admin.
+    ///
+    /// For a device that lost its own to another given it at the same time,
+    /// or one admitted with none. A device holding one already is refused.
+    GiveIpv4 {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The device, by the name it answers to.
+        device: Target,
     },
 
     /// The signature a previous answer asked for.
@@ -1810,6 +1859,75 @@ impl Command {
         }
     }
 
+    /// The usage lines for a network's IPv4 block and a device's offset in it.
+    pub const IPV4_USAGE: &'static str = "peerfectly ipv4 block <A.B.C.D/N> [--network N]\n       \
+                                           peerfectly ipv4 give <name> [--network N]";
+
+    /// Reads `ipv4 block` or `ipv4 give` from the words after `ipv4`.
+    ///
+    /// # Errors
+    ///
+    /// When the act is neither, its one argument is missing or doubled, or a
+    /// flag is not one this knows.
+    pub fn ipv4_act(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::IPV4_USAGE);
+        let mut rest = words.iter();
+        let act = rest.next().ok_or_else(usage)?;
+        let mut network = None;
+        let mut argument = None;
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                flag if flag.starts_with("--") => return Err(usage()),
+                "" => return Err(usage()),
+                given if argument.is_none() => argument = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        let argument = argument.ok_or_else(usage)?;
+        match act.as_str() {
+            "block" => Ok(Self::SetIpv4Block { network, block: argument }),
+            "give" => Ok(Self::GiveIpv4 { network, device: Target::Name(argument) }),
+            _ => Err(usage()),
+        }
+    }
+
+    /// The usage lines for excluding a block from a network's route, and
+    /// including it again.
+    pub const ROUTE_USAGE: &'static str = "peerfectly route exclude <A.B.C.D[/N]> [--network N] [--everywhere]\n       \
+         peerfectly route include <A.B.C.D[/N]> [--network N] [--everywhere]";
+
+    /// Reads `route exclude` or `route include` from the words after `route`.
+    ///
+    /// # Errors
+    ///
+    /// When the act is neither, its block is missing or doubled, or a flag is
+    /// not one this knows.
+    pub fn route_act(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::ROUTE_USAGE);
+        let mut rest = words.iter();
+        let include = match rest.next().map(String::as_str) {
+            Some("exclude") => false,
+            Some("include") => true,
+            _ => return Err(usage()),
+        };
+        let mut network = None;
+        let mut block = None;
+        let mut everywhere = false;
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                "--everywhere" => everywhere = true,
+                flag if flag.starts_with("--") => return Err(usage()),
+                "" => return Err(usage()),
+                given if block.is_none() => block = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        let block = block.ok_or_else(usage)?;
+        Ok(Self::Route { network, block, include, everywhere })
+    }
+
     /// The usage line for moving a network to another relay.
     pub const RELAY_USAGE: &'static str =
         "peerfectly relay <HOST | https://HOST:PORT | KEY@HOST:PORT> [--network N] [--now]";
@@ -2043,6 +2161,9 @@ impl Command {
             | Self::RevokeVoiding { .. }
             | Self::Rename { .. }
             | Self::SetAnchors { .. }
+            | Self::SetIpv4Block { .. }
+            | Self::GiveIpv4 { .. }
+            | Self::Route { .. }
             | Self::Signed { .. }
             | Self::TakeOwnership { .. }
             | Self::ChangeRelay { .. }
@@ -2144,6 +2265,10 @@ impl Command {
             Self::AdmitBatch { network, .. } => ("admit batch", network.as_deref()),
             Self::Rename { network, .. } => ("rename", network.as_deref()),
             Self::SetAnchors { network, .. } => ("set-anchors", network.as_deref()),
+            Self::SetIpv4Block { network, .. } => ("ipv4 block", network.as_deref()),
+            Self::GiveIpv4 { network, .. } => ("ipv4 give", network.as_deref()),
+            Self::Route { network, include: false, .. } => ("route exclude", network.as_deref()),
+            Self::Route { network, include: true, .. } => ("route include", network.as_deref()),
             Self::Signed { .. } => ("signed", None),
             Self::TakeOwnership { network } => ("takeownership", network.as_deref()),
             Self::ChangeRelay { network, .. } => ("relay", network.as_deref()),
@@ -2359,6 +2484,11 @@ pub struct RequestLine {
     /// replaces that device, revoking it.
     #[serde(default)]
     pub taken: Option<TakenName>,
+    /// Where the network's IPv4 block coincides with the device's other
+    /// networks or the subnets it is on, as it said: for the person approving,
+    /// who may move the network first. Unproved, and deciding nothing.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 
 /// One of this device's own joins, waiting.
@@ -2415,6 +2545,11 @@ pub enum Outcome {
         /// The fingerprint of this device's new signing key, which the admin
         /// reviewing the request is shown too.
         fingerprint: String,
+        /// Where the network's IPv4 block coincides with this device's other
+        /// networks or the subnets it is on; the request carries them to the
+        /// admin.
+        #[serde(default)]
+        conflicts: Vec<String>,
     },
 
     /// An invite was issued, and the daemon dials the device it brings.
@@ -2532,7 +2667,7 @@ pub enum Outcome {
         mode: String,
         /// The groups they join.
         groups: Vec<String>,
-        /// The block their addresses come from, if any.
+        /// The IPv4 addresses they are given, first to last, if any.
         block: Option<String>,
         /// The entries that would have no effect, and why.
         skipped: Vec<SkippedLine>,
@@ -2680,6 +2815,7 @@ mod tests {
             anchors: Vec::new(),
             relay: Some("https://relay.example:443".to_owned()),
             relay_leaving: None,
+            ipv4_block: Some("100.64.0.0/10".to_owned()),
             accused: Vec::new(),
             peers: vec![Peer {
                 name: "nas.example.internal".to_owned(),
@@ -2697,17 +2833,12 @@ mod tests {
         }
     }
 
-    /// Each IPv4 state reads as what it is: the address, the device it collides
-    /// with, or the conflict that withholds it.
+    /// Each IPv4 state reads as what it is: the address, or the conflict that
+    /// withholds it.
     #[test]
     fn each_ipv4_state_says_what_is_true() {
         let held = Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2));
         assert_eq!(held.to_string(), "100.64.0.2");
-
-        let collides = Ipv4State::Collides(named("tablet", 8));
-        let said = collides.to_string();
-        assert!(said.contains("collides") && said.contains("tablet"), "{said}");
-        assert!(said.contains("assign it a free one"), "and says what fixes it: {said}");
 
         let withheld = Ipv4State::Withheld {
             address: Ipv4Addr::new(192, 168, 1, 9),
@@ -2757,7 +2888,6 @@ mod tests {
     fn every_ipv4_state_round_trips() {
         for state in [
             Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2)),
-            Ipv4State::Collides(named("tablet", 8)),
             Ipv4State::Withheld {
                 address: Ipv4Addr::new(10, 0, 0, 1),
                 with: "the relay".to_owned(),
@@ -3062,6 +3192,8 @@ mod tests {
             "forget",
             "relay",
             "set-anchors",
+            "ipv4",
+            "route",
             "expose",
             "unexpose",
             "admit",
@@ -3203,6 +3335,7 @@ mod tests {
                         name: "laptop".to_owned(),
                         id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
                     }),
+                    conflicts: Vec::new(),
                 }),
             }],
             joins: vec![JoinLine {
@@ -3724,6 +3857,55 @@ mod tests {
         assert!(Command::anchors_setting(&words("nas --none")).is_err(), "not both");
         assert!(Command::anchors_setting(&words("--id 0a1b")).is_err(), "by name only");
         assert!(Command::anchors_setting(&words("nas --network")).is_err(), "a network flag alone");
+    }
+
+    /// `route exclude` and `route include`, here or everywhere.
+    #[test]
+    fn the_route_acts_read_as_typed() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::route_act(&words("exclude 100.64.9.0/24 --network casa --everywhere")),
+            Ok(Command::Route {
+                network: Some("casa".to_owned()),
+                block: "100.64.9.0/24".to_owned(),
+                include: false,
+                everywhere: true,
+            })
+        );
+        assert_eq!(
+            Command::route_act(&words("include 100.64.9.7")),
+            Ok(Command::Route {
+                network: None,
+                block: "100.64.9.7".to_owned(),
+                include: true,
+                everywhere: false,
+            })
+        );
+        for wrong in ["exclude", "drop 10.0.0.0/16", "exclude a b", "include 10.0.0.1 --now"] {
+            assert!(Command::route_act(&words(wrong)).is_err(), "{wrong}");
+        }
+        assert!(Command::word_needs_an_administrator("route"));
+    }
+
+    /// `ipv4 block` and `ipv4 give`, each with its one argument.
+    #[test]
+    fn the_ipv4_acts_read_as_typed() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::ipv4_act(&words("block 10.9.0.0/16 --network casa")),
+            Ok(Command::SetIpv4Block {
+                network: Some("casa".to_owned()),
+                block: "10.9.0.0/16".to_owned()
+            })
+        );
+        assert_eq!(
+            Command::ipv4_act(&words("give laptop")),
+            Ok(Command::GiveIpv4 { network: None, device: Target::Name("laptop".to_owned()) })
+        );
+        for wrong in ["block", "give a b", "move 10.0.0.0/16", "block 10.0.0.0/16 --now"] {
+            assert!(Command::ipv4_act(&words(wrong)).is_err(), "{wrong}");
+        }
+        assert!(Command::word_needs_an_administrator("ipv4"));
     }
 
     #[test]

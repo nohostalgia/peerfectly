@@ -179,7 +179,7 @@ pub const OUTCOME_SCHEMA: &[&str] = &["kind", "taken"];
 
 /// The fields of an introduction, in canonical order.
 pub const INTRODUCE_SCHEMA: &[&str] =
-    &["alg", "kind", "name", "sign", "proof", "trans", "attest", "tproof"];
+    &["alg", "kind", "name", "sign", "proof", "trans", "attest", "tproof", "conflicts"];
 
 /// What an invited device says of itself as the exchange opens: the keys it
 /// minted for this network, the name it proposes, and proof that it holds the
@@ -203,6 +203,11 @@ pub struct Introduction {
     pub possession: Possession,
     /// The same, for the transport key.
     pub transport_possession: Possession,
+    /// Where the network's IPv4 block, as its invite said it, coincides with
+    /// the device's other networks or the subnets it is on, in its own words:
+    /// for the admin approving to see, and perhaps move the network. Nothing
+    /// proves them, and nothing is decided by them.
+    pub conflicts: Vec<String>,
 }
 
 impl Introduction {
@@ -324,7 +329,7 @@ impl Message {
         let body = match self {
             Self::Introduce(introduction) => {
                 let mut writer = Writer::new();
-                writer.map(8);
+                writer.map(9);
                 writer.key("alg").str(introduction.signing.algorithm().as_str());
                 writer.key("kind").str("introduce");
                 writer.key("name").str(&introduction.name);
@@ -333,6 +338,10 @@ impl Message {
                 writer.key("trans").bytes(introduction.transport.as_bytes());
                 writer.key("attest").bytes(introduction.attestation.as_bytes());
                 writer.key("tproof").bytes(introduction.transport_possession.as_bytes());
+                writer.key("conflicts").array(introduction.conflicts.len() as u64);
+                for conflict in &introduction.conflicts {
+                    writer.str(conflict);
+                }
                 writer.finish()
             }
             Self::Received => {
@@ -462,6 +471,12 @@ impl Message {
                 )?;
                 let transport_proof =
                     map.key("tproof")?.bytes(roster::limits::SIGNATURE_LEN, "proof")?.to_vec();
+                let reading = map.key("conflicts")?;
+                let count = reading.array(limits::MAX_CONFLICTS, "conflicts")?;
+                let mut conflicts = Vec::with_capacity(count);
+                for _ in 0..count {
+                    conflicts.push(reading.str(limits::MAX_CONFLICT_LEN, "conflict")?.to_owned());
+                }
                 map.finish()?;
                 reader.finish()?;
                 Ok(Self::Introduce(Introduction {
@@ -471,6 +486,7 @@ impl Message {
                     name,
                     possession: Possession::from_bytes(proof),
                     transport_possession: Possession::from_bytes(transport_proof),
+                    conflicts,
                 }))
             }
             "received" => {
@@ -655,6 +671,7 @@ mod tests {
             possession: Possession::prove(device.signing_key().signer(), material).expect("signs"),
             transport_possession: Possession::prove(device.transport_key().signer(), material)
                 .expect("signs"),
+            conflicts: vec!["the Wi-Fi here is on 100.83.4.0/24".to_owned()],
         })
     }
 
@@ -856,6 +873,7 @@ mod tests {
             possession: Possession::prove(identity.signer(), &request).unwrap(),
             transport_possession: Possession::prove(identity.transport_key().signer(), &material)
                 .unwrap(),
+            conflicts: Vec::new(),
         };
         let message = Message::Introduce(introduction.clone());
         assert_eq!(Message::decode(&message.encode()).unwrap(), message);

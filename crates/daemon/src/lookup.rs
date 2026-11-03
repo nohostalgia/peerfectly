@@ -169,14 +169,14 @@ impl Message {
 #[must_use]
 pub fn resolve(state: &RosterState, query: &Query) -> Option<DeviceId> {
     match query {
-        Query::Name(name) => state
-            .devices
-            .values()
-            .find(|record| record.name.eq_ignore_ascii_case(name))
-            .map(|record| record.id),
+        // Asked of the state's indexes, not of every device: a lookup is
+        // answered for whoever asks, and a fleet has a million of them.
+        Query::Name(name) => state.devices.named(name).first().map(|leaf| leaf.record.id),
         Query::Ipv6(address) => {
             let prefix = tunnel::Prefix::from_parameter(&state.params.ula).ok()?;
-            state.devices.keys().find(|device| tunnel::address_of(device, &prefix) == *address)
+            let mut router = crate::router::Router::new(prefix);
+            router.follow_state(state, &DeviceId::from_bytes([0; 32]));
+            router.member_at(*address)
         }
         Query::Ipv4(address) => tunnel::Ipv4Holdings::of_state(state).holder(*address),
         Query::RootsAfter(_) | Query::Footing(..) => None,
@@ -230,21 +230,19 @@ pub fn decode_roots(mut bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// Whether `leaf` is the member `query` asks for, in a network with these
 /// parameters: checked by the asker, from the leaf alone.
 #[must_use]
-pub fn answers(
-    query: &Query,
-    leaf: &DeviceLeaf,
-    network: &roster::id::NetworkId,
-    params: &roster::types::NetworkParams,
-) -> bool {
+pub fn answers(query: &Query, leaf: &DeviceLeaf, params: &roster::types::NetworkParams) -> bool {
     let device = leaf.record.id;
     match query {
         Query::Name(name) => leaf.record.name.eq_ignore_ascii_case(name),
         Query::Ipv6(address) => tunnel::Prefix::from_parameter(&params.ula)
             .is_ok_and(|prefix| tunnel::address_of(&device, &prefix) == *address),
-        Query::Ipv4(address) => match leaf.settings.ipv4 {
-            Some(assigned) => Ipv4Addr::from(assigned) == *address,
-            None => tunnel::ipv4_candidate(network, &device, &params.ipv4_range()) == *address,
-        },
+        // The address its offset names in the network's block; a device given
+        // none answers for no IPv4 address.
+        Query::Ipv4(address) => leaf
+            .settings
+            .ipv4
+            .and_then(|offset| params.ipv4_range().address_at(offset))
+            .is_some_and(|held| Ipv4Addr::from(held) == *address),
         Query::RootsAfter(_) | Query::Footing(..) => false,
     }
 }
@@ -443,7 +441,7 @@ pub fn take_answer(
     }
     let shown = roster::membership::Evidence::from_bytes(evidence)
         .map_err(|cause| Refusal::NotProved(cause.to_string()))?;
-    if !answers(query, &shown.leaf, &member.network(), member.params()) {
+    if !answers(query, &shown.leaf, member.params()) {
         return Err(Refusal::NotAsked);
     }
     member.learn(evidence).map_err(|cause| Refusal::NotProved(cause.to_string()))
@@ -478,6 +476,14 @@ mod tests {
         })
         .chain(members.iter().zip(["laptop", "phone", "sensor"]).map(|(member, name)| {
             OperationBody::AddDevice(member.device_spec(name, Role::Member, false, vec![]).unwrap())
+        }))
+        // The phone given the block's first host.
+        .chain(std::iter::once(OperationBody::SetDevice {
+            device: members.get(1).unwrap().device_id(),
+            change: roster::leaf::SettingsChange {
+                ipv4: Some(Some(1_u32.to_be_bytes())),
+                ..roster::leaf::SettingsChange::default()
+            },
         }));
         for (index, body) in bodies.enumerate() {
             let core = OperationCore::new(

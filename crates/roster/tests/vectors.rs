@@ -814,7 +814,7 @@ fn the_merge_vectors_say_what_the_requirements_say() {
     // Settings and parameters resolve one field, one leaf, at a time.
     let settings = state_of("concurrent settings of one device both stand");
     let both = settings.settings_of(&support::device_id(2));
-    assert_eq!(both.ipv4, Some([100, 70, 0, 2]), "the assigned address stands");
+    assert_eq!(both.ipv4, Some([0, 0, 0, 2]), "the assigned offset stands");
     assert_eq!(both.groups.len(), 1, "and so do the groups");
     let parameters = state_of("concurrent changes to different parameters both stand");
     assert_eq!(parameters.params.anchors, vec![support::device_id(9)]);

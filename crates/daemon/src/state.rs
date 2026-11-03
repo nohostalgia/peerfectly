@@ -165,6 +165,15 @@ impl Paths {
         self.root.join("base.redb")
     }
 
+    /// The layers of the batches the roster holds: each batch's entries, their
+    /// indexes and the trees laid over them (`member_store::Layers`), so that a
+    /// fleet's boards are not held in memory. Emptied as the node starts, and
+    /// filled again as the log is replayed.
+    #[must_use]
+    pub fn layers(&self) -> PathBuf {
+        self.root.join("layers.redb")
+    }
+
     /// When that snapshot was accepted, on this device's wall clock.
     ///
     /// Kept because freshness is measured from local receipt, and a receipt time
@@ -526,6 +535,72 @@ pub fn open_base_store(paths: &Paths) -> Result<std::sync::Arc<member_store::Sto
         .map_err(|cause| Error::State { path: path.clone(), cause: cause.to_string() })?;
     open.insert(path, std::sync::Arc::downgrade(&store));
     Ok(store)
+}
+
+/// What this device excludes from a network's IPv4 route, kept beside its log
+/// (`route exclude`, `scalable-membership` 19.7): one block per line,
+/// `a.b.c.d/len`. Unsigned and local: it only ever takes routes away.
+pub const EXCLUDED_FILE: &str = "ipv4-excluded";
+
+/// The blocks this device excludes from the network kept under `root`. A
+/// missing or unreadable file excludes nothing; a line that does not read is
+/// left out.
+#[must_use]
+pub fn excluded_here(root: &std::path::Path) -> Vec<roster::types::Excluded> {
+    std::fs::read_to_string(root.join(EXCLUDED_FILE))
+        .map(|text| text.lines().filter_map(|line| line.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Keeps the blocks this device excludes from the network kept under `root`.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn keep_excluded_here(
+    root: &std::path::Path,
+    excluded: &[roster::types::Excluded],
+) -> std::io::Result<()> {
+    let path = root.join(EXCLUDED_FILE);
+    if excluded.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => Err(cause),
+            _ => Ok(()),
+        };
+    }
+    let text: String = excluded.iter().map(|block| format!("{block}\n")).collect();
+    std::fs::write(path, text)
+}
+
+/// How much of a layers file redb may keep in memory: with the base's, inside
+/// the 64 MB a member of a million devices runs within.
+const LAYERS_CACHE: usize = 16 << 20;
+
+/// The layers files open in this process, by path: one owner at a time, as
+/// for the base stores.
+static OPEN_LAYERS: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Weak<member_store::Layers>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Opens the file a network's batch layers are kept in, creating an empty one
+/// where there is none; the one already open, where this process holds it.
+///
+/// # Errors
+///
+/// When the file cannot be opened.
+pub fn open_layers(paths: &Paths) -> Result<std::sync::Arc<member_store::Layers>> {
+    let path = paths.layers();
+    let mut open = OPEN_LAYERS.lock().map_err(|_| Error::State {
+        path: path.clone(),
+        cause: "the open layers are not readable".to_owned(),
+    })?;
+    open.retain(|_, layers| layers.strong_count() > 0);
+    if let Some(layers) = open.get(&path).and_then(std::sync::Weak::upgrade) {
+        return Ok(layers);
+    }
+    let layers = member_store::Layers::open(&path, LAYERS_CACHE)
+        .map_err(|cause| Error::State { path: path.clone(), cause: cause.to_string() })?;
+    open.insert(path, std::sync::Arc::downgrade(&layers));
+    Ok(layers)
 }
 
 /// Keeps the base a compacted log rests on: its root and that root's state.

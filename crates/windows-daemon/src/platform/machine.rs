@@ -93,6 +93,10 @@ impl Machine for Windows {
         route_table::remove_address(interface, address)
     }
 
+    async fn holds_address(&self, interface: Interface, address: IpAddr) -> Option<bool> {
+        route_table::holds_address(interface, address)
+    }
+
     async fn install_route(&self, route: &Route) -> Result<()> {
         route_table::install(route)
     }

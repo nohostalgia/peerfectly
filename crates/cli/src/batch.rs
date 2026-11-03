@@ -443,9 +443,11 @@ fn changes(change: &roster::leaf::SettingsChange) -> String {
         said.push(format!("groups [{}]", names.join(", ")));
     }
     if let Some(ipv4) = change.ipv4 {
+        // An offset in the network's block: the address it names depends on
+        // the block, so the offset is what is signed and what is said.
         said.push(ipv4.map_or_else(
-            || "no assigned IPv4 address".to_owned(),
-            |[a, b, c, d]| format!("IPv4 address {a}.{b}.{c}.{d}"),
+            || "no IPv4 address".to_owned(),
+            |offset| format!("IPv4 offset {} in the network's block", u32::from_be_bytes(offset)),
         ));
     }
     if let Some(relay) = change.relay {
@@ -464,7 +466,11 @@ fn settings(params: &NetworkParams) -> String {
         || "no relay".to_owned(),
         |relay| format!("relay {}", daemon::control::shown(relay)),
     );
-    let mut said = format!("{relay}, IPv4 range {}", params.ipv4_range());
+    let mut said = format!("{relay}, IPv4 block {}", params.ipv4_range());
+    if !params.excluded.is_empty() {
+        let excluded: Vec<String> = params.excluded.iter().map(ToString::to_string).collect();
+        said.push_str(&format!(", excluded from its route {}", excluded.join(" ")));
+    }
     if params.anchors.is_empty() {
         said.push_str(", no anchors");
     } else {

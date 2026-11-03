@@ -23,6 +23,8 @@ roster-sync = { path = "../roster-sync" }
 local-discovery = { path = "../local-discovery" }
 tunnel = { path = "../tunnel" }
 blake3.workspace = true
+# A new network's IPv4 block, drawn at random among the free ones.
+getrandom.workspace = true
 async-trait.workspace = true
 # `io-util`: the control channel's framing reads and writes lines on a stream.
 tokio = { workspace = true, features = ["io-util", "net"] }

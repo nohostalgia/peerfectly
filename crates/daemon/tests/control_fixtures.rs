@@ -57,6 +57,7 @@ fn report() -> Report {
             relay: "https://old-relay.example:443".to_owned(),
             until: at(1_758_300_000),
         }),
+        ipv4_block: Some("100.83.0.0/16".to_owned()),
         // Every act a branch can show, two to an equivocation.
         accused: vec![
             Accused {
@@ -163,6 +164,7 @@ fn report() -> Report {
         anchors: Vec::new(),
         relay: None,
         relay_leaving: None,
+        ipv4_block: None,
         accused: vec![Accused {
             device: named(Some("build-box"), "5f6a-7b8c-9d0e-1f2a"),
             pairs: 1,
@@ -181,7 +183,7 @@ fn report() -> Report {
             name_resolves: true,
             id: "5f6a-7b8c-9d0e-1f2a".to_owned(),
             address: "fd01::2".parse().unwrap(),
-            ipv4: Some(Ipv4State::Collides(named(Some("tablet"), "6a7b-8c9d-0e1f-2a3b"))),
+            ipv4: None,
             reachable: true,
             // Direct when last known: an off network must not draw a path as now either.
             path: Some(daemon::control::Path::Direct),
@@ -232,6 +234,7 @@ fn outcomes() -> Vec<Outcome> {
         Outcome::JoinStarted {
             label: "joining".to_owned(),
             fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+            conflicts: vec!["100.64.0.0/10 overlaps 100.64.0.0/10, the block of `casa` on this device".to_owned()],
         },
         // An invite issued, which the daemon goes on dialling once the command
         // that issued it has closed.
@@ -266,6 +269,10 @@ fn outcomes() -> Vec<Outcome> {
                             name: "tablet".to_owned(),
                             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
                         }),
+                        conflicts: vec![
+                            "100.64.0.0/10 overlaps 100.64.12.0/22, a subnet this device is on"
+                                .to_owned(),
+                        ],
                     }),
                 },
             ],
@@ -334,7 +341,7 @@ fn outcomes() -> Vec<Outcome> {
             label: "lot 2026-10 A".to_owned(),
             mode: "light".to_owned(),
             groups: vec!["sensori".to_owned()],
-            block: Some("100.64.9.0/28".to_owned()),
+            block: Some("100.64.0.2 to 100.64.0.4".to_owned()),
             skipped: vec![daemon::control::SkippedLine {
                 name: "sensore-1".to_owned(),
                 why: "already a member of the network".to_owned(),
@@ -457,6 +464,7 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
             suffix: "casa.internal".to_owned(),
             relay: None,
             ipv4_range: None,
+            devices: None,
             window_days: None,
         },
         Command::Revoke {

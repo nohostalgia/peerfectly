@@ -3,7 +3,7 @@
 //! Run deliberately, never on build:
 //!
 //! ```text
-//! cargo run -p roster --bin gen-vectors
+//! cargo run -p roster --bin gen_vectors
 //! ```
 //!
 //! The corpus is committed, and regenerating it must produce a visible diff. A
@@ -320,7 +320,7 @@ fn body_of(op_type: OperationType) -> OperationBody {
             change: roster::leaf::SettingsChange {
                 mode: Some(roster::leaf::Mode::Light),
                 groups: Some(vec![roster::leaf::Group::new("sensori").expect("a group")]),
-                ipv4: Some(Some([100, 70, 0, 9])),
+                ipv4: Some(Some([0, 0, 0, 9])),
                 relay: None,
             },
         },
@@ -1203,7 +1203,7 @@ fn build_merges() -> Vec<Merge> {
         OperationBody::SetDevice {
             device: seed_device_id(2),
             change: roster::leaf::SettingsChange {
-                ipv4: Some(Some([100, 70, 0, 2])),
+                ipv4: Some(Some([0, 0, 0, 2])),
                 ..roster::leaf::SettingsChange::default()
             },
         },
@@ -1570,21 +1570,21 @@ fn build_merges() -> Vec<Merge> {
 }
 
 /// A batch whose entries collide with what its ancestors hold: a member it
-/// names again, and an address another device holds. Both are skipped, the
+/// names again, and an offset another device holds. Both are skipped, the
 /// rest stand.
 fn batch_skip_vector() -> Merge {
     let entry = |seed: u8| roster::batch::BatchEntry {
         keys: device(seed, "fixture", Role::Member, false).keys,
         name: format!("sensor-{seed}"),
         serial: format!("SN{seed:04}").into_bytes(),
-        ipv4: Some([100, 70, 0, seed]),
+        ipv4: Some([0, 0, 0, seed]),
     };
     let entries: Vec<roster::batch::BatchEntry> = [20, 21, 22, 23].into_iter().map(entry).collect();
     let header = roster::batch::BatchHeader::for_entries(
         &entries,
         roster::leaf::Mode::Light,
         Vec::new(),
-        Some(roster::types::Ipv4Range::new([100, 70, 0, 0], 16).expect("a block")),
+        Some(roster::batch::OffsetRun::new([0, 0, 0, 20], 4).expect("a run")),
         "lot",
     )
     .expect("a header");
@@ -1599,7 +1599,7 @@ fn batch_skip_vector() -> Merge {
         &["add2"],
         OperationBody::AddDevice(device(20, "fixture", Role::Member, false)),
     );
-    // And device 2 is given the address entry 22 was assigned.
+    // And device 2 is given the offset entry 22 was given.
     chain.op(
         "address",
         2,
@@ -1607,7 +1607,7 @@ fn batch_skip_vector() -> Merge {
         OperationBody::SetDevice {
             device: seed_device_id(2),
             change: roster::leaf::SettingsChange {
-                ipv4: Some(Some([100, 70, 0, 22])),
+                ipv4: Some(Some([0, 0, 0, 22])),
                 ..roster::leaf::SettingsChange::default()
             },
         },

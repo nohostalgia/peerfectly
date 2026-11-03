@@ -30,6 +30,10 @@
 //!
 //! [redb]: https://www.redb.org
 
+pub mod layers;
+
+pub use layers::Layers;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -51,6 +55,15 @@ const KEYS: TableDefinition<([u8; 32], [u8; 32]), u8> = TableDefinition::new("ke
 const ADDRESSES: TableDefinition<([u8; 4], [u8; 32]), ()> = TableDefinition::new("addresses");
 const NAMES: TableDefinition<(&str, [u8; 32]), ()> = TableDefinition::new("names");
 const NODES: TableDefinition<[u8; 32], [u8; STORED_LEN]> = TableDefinition::new("nodes");
+/// The devices by a value each derives from its id alone, by the derivation's
+/// tag: an index this process builds as asked, not part of the state, emptied
+/// when the store is opened or written.
+const DERIVED: TableDefinition<DerivedRow, ()> = TableDefinition::new("derived");
+/// The derivations [`DERIVED`] holds whole.
+const BUILT: TableDefinition<[u8; 32], ()> = TableDefinition::new("built");
+
+/// A row of the derived index: the derivation's tag, the value, the device.
+type DerivedRow = ([u8; 32], [u8; 4], [u8; 32]);
 
 /// The state with no devices: the network and its parameters.
 const SKELETON: &str = "skeleton";
@@ -152,6 +165,7 @@ impl Store {
             write.open_table(NODES).map_err(database)?;
             write.commit().map_err(database)?;
         }
+        store.forget_derived()?;
         let count = store.read_meta(COUNT)?.map_or(Ok(0), |bytes| {
             <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_le_bytes)
@@ -207,6 +221,7 @@ impl Store {
     ///
     /// When the database cannot be written.
     pub fn write(&self, state: &RosterState) -> Result<(), Error> {
+        self.forget_derived()?;
         let rests_here = state.devices.store().is_some_and(|store| {
             core::ptr::eq(Arc::as_ptr(store).cast::<()>(), core::ptr::from_ref(self).cast::<()>())
         });
@@ -248,17 +263,37 @@ impl Store {
             }
             let mut nodes = write.open_table(NODES).map_err(database)?;
             let tree = state.devices.tree();
-            for hash in tree.dropped() {
+            // The nodes the change replaced: noted as it was made, or, for a
+            // tree that spilled and stopped noting them, found by walking the
+            // root this store holds against the new one.
+            let mut dropped: std::collections::HashSet<Hash> =
+                tree.dropped().iter().copied().collect();
+            if !tree.tracks_dropped()
+                && let Some(old) = tree.stored_root()
+            {
+                tree.replaced(old, self, &mut |hash| {
+                    dropped.insert(hash);
+                });
+            }
+            for hash in &dropped {
                 nodes.remove(*hash).map_err(database)?;
             }
+            // What the tree made, in memory or spilled to the layers: every
+            // node beneath one this store does not hold. Held is read as it
+            // was before this write, less what it just removed.
+            let before = self.db.begin_read().map_err(database)?;
+            let held = before.open_table(NODES).map_err(database)?;
             let mut failed = None;
-            tree.fresh(&mut |hash, node| {
-                if failed.is_none()
-                    && let Err(cause) = nodes.insert(hash, node.to_bytes())
-                {
-                    failed = Some(database(cause));
-                }
-            });
+            tree.missing(
+                &mut |hash| !dropped.contains(hash) && held.get(*hash).ok().flatten().is_some(),
+                &mut |hash, node| {
+                    if failed.is_none()
+                        && let Err(cause) = nodes.insert(hash, node.to_bytes())
+                    {
+                        failed = Some(database(cause));
+                    }
+                },
+            );
             if let Some(cause) = failed {
                 return Err(cause);
             }
@@ -292,6 +327,7 @@ impl Store {
         leaves: impl IntoIterator<Item = DeviceLeaf>,
         expected: Option<Hash>,
     ) -> Result<Hash, Error> {
+        self.forget_derived()?;
         self.stop_reading();
         let written = self.write_all(skeleton, leaves, expected);
         self.stop_reading();
@@ -638,6 +674,21 @@ impl Store {
         Ok(())
     }
 
+    /// Empties the derived index: what the store held is about to change, or
+    /// this process has not built it.
+    fn forget_derived(&self) -> Result<(), Error> {
+        self.stop_reading();
+        let mut write = self.db.begin_write().map_err(database)?;
+        write.set_durability(Durability::Immediate).map_err(database)?;
+        write.delete_table(DERIVED).map_err(database)?;
+        write.delete_table(BUILT).map_err(database)?;
+        write.open_table(DERIVED).map_err(database)?;
+        write.open_table(BUILT).map_err(database)?;
+        write.commit().map_err(database)?;
+        self.stop_reading();
+        Ok(())
+    }
+
     fn read_meta(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
         let read = self.db.begin_read().map_err(database)?;
         let meta = read.open_table(META).map_err(database)?;
@@ -860,5 +911,35 @@ impl MemberStore for Store {
 
     fn count(&self) -> usize {
         self.count.load(Ordering::SeqCst)
+    }
+
+    fn derived_holders(&self, tag: &[u8; 32], value: [u8; 4]) -> Option<Vec<DeviceId>> {
+        let read = self.db.begin_read().ok()?;
+        read.open_table(BUILT).ok()?.get(*tag).ok()??;
+        let derived = read.open_table(DERIVED).ok()?;
+        let rows = derived.range((*tag, value, [0; 32])..=(*tag, value, [0xff; 32])).ok()?;
+        rows.map(|row| row.ok().map(|(held, _)| DeviceId::from_bytes(held.value().2))).collect()
+    }
+
+    fn put_derived(&self, tag: &[u8; 32], rows: &[([u8; 4], DeviceId)]) {
+        let written = (|| -> Result<(), redb::Error> {
+            let mut write = self.db.begin_write()?;
+            write.set_durability(Durability::None)?;
+            {
+                let mut derived = write.open_table(DERIVED)?;
+                let mut sorted: Vec<DerivedRow> =
+                    rows.iter().map(|(value, device)| (*tag, *value, *device.as_bytes())).collect();
+                sorted.sort_unstable();
+                for row in sorted {
+                    derived.insert(row, ())?;
+                }
+                write.open_table(BUILT)?.insert(*tag, ())?;
+            }
+            write.commit()?;
+            Ok(())
+        })();
+        if written.is_err() {
+            self.told();
+        }
     }
 }

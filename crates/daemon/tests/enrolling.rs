@@ -44,7 +44,8 @@ fn invite_into(state: &roster::state::RosterState, url: &str) -> Record {
         groups: Vec::new(),
         ipv4: None,
     };
-    Record::issue(url, state.network, invited, 1, 1_000_000).expect("issues")
+    Record::issue(url, state.network, state.params.ipv4_range(), invited, 1, 1_000_000)
+        .expect("issues")
 }
 
 /// A signing key this process cannot reach, as a machine key store is.
@@ -131,6 +132,7 @@ fn waiting(
         proof: roster::hex::encode(proof.as_bytes()),
         started_at: 1,
         requested_at: None,
+        conflicts: Vec::new(),
     };
     let (underway, reporting) = Underway::new(Progress::Registering);
     let paths = paths.clone();

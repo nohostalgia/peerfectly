@@ -18,6 +18,10 @@ roster = { path = "../roster" }
 transport = { path = "../transport" }
 identity = { path = "../identity" }
 convesso-core = { workspace = true, features = ["alloc", "ed25519-seed"] }
+# The map from a convesso peer id back to the ed25519 key it is the X25519
+# form of: what lets a handshake be judged by the roster's key index alone.
+# The version ed25519-dalek already brings in.
+curve25519-dalek = "=5.0.0"
 convesso-stream = { workspace = true, features = ["alloc"] }
 convesso-tokio = { workspace = true, features = ["stream", "tls"] }
 async-trait.workspace = true

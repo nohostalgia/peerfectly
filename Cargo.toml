@@ -93,3 +93,8 @@ opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# A full member's layers and base are read through redb, every entry checked
+# against its tree: a million boards' measurement is hours unoptimised.
+[profile.dev.package.redb]
+opt-level = 3

@@ -297,12 +297,16 @@ fn infrastructure(network: &Network) -> String {
     // **Said, because whoever runs the old relay needs to read it.** Switched
     // off before the end, it strands every device that has not come back yet —
     // and nothing else on this screen would tell them it is still in use.
-    match &network.relay_leaving {
+    let line = match &network.relay_leaving {
         Some(leaving) => format!(
             "{line}; moving from {} — everybody stays there until {}, so keep it running until then",
             shown(&leaving.relay),
             crate::drawing::when(leaving.until)
         ),
+        None => line,
+    };
+    match &network.ipv4_block {
+        Some(block) => format!("{line}; IPv4 block {block}"),
         None => line,
     }
 }
@@ -458,6 +462,7 @@ mod tests {
             anchors: Vec::new(),
             relay: Some("https://relay.example:443".to_owned()),
             relay_leaving: None,
+            ipv4_block: Some("100.64.0.0/10".to_owned()),
             accused: Vec::new(),
             peers,
             revoked: Vec::new(),
@@ -545,6 +550,7 @@ mod tests {
             "100.64.0.1",
             "2 devices",
             "relay https://relay.example:443 (trusted by its key)",
+            "IPv4 block 100.64.0.0/10",
         ] {
             assert!(said(&drawn).contains(expected), "status says `{expected}`: {drawn}");
         }

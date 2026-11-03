@@ -535,6 +535,33 @@ impl Roster {
         }
     }
 
+    /// Keeps the layers of the batches that become whole from here on in
+    /// `store` rather than in memory: what a full member of a fleet does, so
+    /// that what it holds in memory follows the operations it holds and not the
+    /// boards they admit. Given before the log is replayed, it holds every
+    /// batch so.
+    pub fn keep_layers_in(&mut self, store: alloc::sync::Arc<dyn crate::members::LayerStore>) {
+        self.dag.keep_layers_in(store);
+    }
+
+    /// The roots of every tree in the layer store this roster still reaches:
+    /// the states it keeps — at its heads, at the root it holds, the base it
+    /// rests on — and each layer's entries tree and the trees it remembers.
+    /// What the store collects around (`member_store::Layers::collect`): a
+    /// node none of them reaches is held for nothing.
+    #[must_use]
+    pub fn layer_roots(&self) -> Vec<crate::merkle::Hash> {
+        let states = [self.at_heads.as_ref(), self.snapshot_state.as_ref(), self.dag.base_state()];
+        let mut roots: Vec<crate::merkle::Hash> =
+            states.into_iter().flatten().map(|state| state.devices.root()).collect();
+        for layer in self.dag.layers() {
+            roots.extend(layer.roots());
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    }
+
     /// An empty roster with an explicit staleness threshold.
     ///
     /// Tightening this narrows the window in which a demoted admin's backdated
@@ -1768,7 +1795,7 @@ impl Roster {
     #[must_use]
     pub fn pieces_held(&self, batch: &OperationId) -> Vec<(u64, Vec<u8>)> {
         if let Some(entries) = self.dag.entries_of(batch) {
-            return crate::batch::pieces_of(batch, entries)
+            return crate::batch::pieces_of(batch, &entries)
                 .map(|pieces| (0_u64..).zip(pieces).collect())
                 .unwrap_or_default();
         }
@@ -1871,7 +1898,7 @@ impl Roster {
             self.dag
                 .operations()
                 .last()
-                .and_then(|operation| crate::state::extend(state, operation, &self.dag))
+                .and_then(|operation| crate::state::extend(state, operation))
         });
         self.at_heads = match extended {
             Some(next) => Some(next),

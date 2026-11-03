@@ -18,14 +18,14 @@
 mod support;
 
 use proptest::prelude::*;
-use roster::batch::{BatchEntry, BatchHeader, pieces_of};
+use roster::batch::{BatchEntry, BatchHeader, OffsetRun, pieces_of};
 use roster::id::DeviceId;
 use roster::leaf::{Mode, SettingsChange};
 use roster::roster::Roster;
 use roster::sign::Signer as _;
 use roster::snapshot::{Covering, Snapshot, sign_snapshot};
 use roster::state::{RosterState, derive, derive_reference};
-use roster::types::{DeviceSpec, Ipv4Range, OperationBody, Role};
+use roster::types::{DeviceSpec, OperationBody, Role};
 use support::{History, device};
 
 /// How many boards the steps choose among: few, so that they collide.
@@ -42,11 +42,11 @@ fn board_id(board: u8) -> DeviceId {
     board_spec(board).device_id().unwrap()
 }
 
-/// One of a few addresses, the last outside the batches' block.
+/// One of a few offsets, the last outside every batch's run.
 fn address(choice: u8) -> [u8; 4] {
     match choice % 4 {
-        3 => [10, 9, 9, 9],
-        other => [100, 70, 0, other.saturating_add(1)],
+        3 => 200_u32.to_be_bytes(),
+        other => [0, 0, 0, other.saturating_add(1)],
     }
 }
 
@@ -166,11 +166,30 @@ fn both_agree(whole: &Roster, compacted: &Roster, after: &str) {
 /// Plays `steps` into two rosters, one compacting whenever it may, checking
 /// after every operation, piece and root.
 fn play(steps: &[Step]) {
+    play_in(steps, false);
+    play_in(steps, true);
+}
+
+/// [`play`], with the batches' layers in memory or in a store.
+fn play_in(steps: &[Step], stored: bool) {
     let mut history = History::new();
     history.genesis("g", 1);
     history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
     let mut roster = Roster::with_staleness_depth(STALENESS);
     let mut compacted = Roster::with_staleness_depth(STALENESS);
+    let stores = [
+        std::sync::Arc::new(support::MemoryLayers::default()),
+        std::sync::Arc::new(support::MemoryLayers::default()),
+    ];
+    if stored {
+        let [one, two] = &stores;
+        roster.keep_layers_in(
+            std::sync::Arc::clone(one) as std::sync::Arc<dyn roster::members::LayerStore>
+        );
+        compacted.keep_layers_in(
+            std::sync::Arc::clone(two) as std::sync::Arc<dyn roster::members::LayerStore>
+        );
+    }
     for entry in history.entries() {
         assert!(roster.offer_bytes(&entry.bytes).is_accepted());
         assert!(compacted.offer_bytes(&entry.bytes).is_accepted());
@@ -232,7 +251,10 @@ fn play(steps: &[Step]) {
                     })
                     .collect();
                 let mode = if *light { Mode::Light } else { Mode::Full };
-                let block = Some(Ipv4Range::new([100, 70, 0, 0], 16).unwrap());
+                // From the first host, as long as the batch: a short batch
+                // leaves the higher offsets outside it.
+                let count = u32::try_from(entries.len()).unwrap();
+                let block = Some(OffsetRun::new(1_u32.to_be_bytes(), count).unwrap());
                 OperationBody::AdmitBatch(
                     BatchHeader::for_entries(
                         &entries,
@@ -298,6 +320,9 @@ fn play(steps: &[Step]) {
                 both_agree(&roster, &compacted, &format!("{label}, piece {number}"));
             }
         }
+    }
+    for store in &stores {
+        assert_eq!(store.told(), 0, "an honest store is never told it lied");
     }
 }
 
@@ -366,4 +391,54 @@ fn a_batch_over_a_base_that_holds_a_layer_and_changes() {
     steps.push(Step { second: true, joins: false, act: Act::Assign(5, Some(0)) });
     steps.push(Step { second: false, joins: true, act: Act::Root });
     play(&steps);
+}
+
+/// A store changed behind the daemon's back can hide a board, never add one
+/// or change what one holds, and is told that it lied.
+#[test]
+fn an_altered_layer_store_hides_and_is_told() {
+    let store = std::sync::Arc::new(support::MemoryLayers::default());
+    let mut roster = Roster::new();
+    roster.keep_layers_in(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn roster::members::LayerStore>
+    );
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let entries: Vec<BatchEntry> = (0..3)
+        .map(|board| {
+            let spec = board_spec(board);
+            BatchEntry { keys: spec.keys, name: spec.name, serial: vec![board], ipv4: None }
+        })
+        .collect();
+    let header = BatchHeader::for_entries(&entries, Mode::Light, Vec::new(), None, "lot").unwrap();
+    history.op("batch", 1, &["g"], OperationBody::AdmitBatch(header));
+    for entry in history.entries() {
+        let _ = roster.offer_bytes(&entry.bytes);
+    }
+    for piece in pieces_of(&history.id("batch"), &entries).unwrap() {
+        let _ = roster.offer_piece(&piece);
+    }
+    let before = roster.state().unwrap();
+    assert!(before.devices.get(&board_id(0)).is_some());
+    assert_eq!(store.told(), 0);
+
+    // Board 0's entry given another name, and a stranger's entry slipped in.
+    let mut renamed = entries.first().unwrap().clone();
+    renamed.name = "someone-else".to_owned();
+    store.alter(&history.id("batch"), &board_id(0), renamed);
+    let stranger = board_spec(7);
+    store.alter(
+        &history.id("batch"),
+        &board_id(7),
+        BatchEntry { keys: stranger.keys, name: stranger.name, serial: vec![7], ipv4: None },
+    );
+
+    let state = roster.state().unwrap();
+    assert!(state.devices.get(&board_id(0)).is_none(), "the altered board is hidden");
+    assert!(state.devices.named("someone-else").is_empty(), "under no name");
+    assert!(state.devices.get(&board_id(7)).is_none(), "the stranger is not added");
+    assert!(!state.devices.keys().any(|device| device == board_id(7)), "nor walked");
+    assert!(state.devices.get(&board_id(1)).is_some(), "the others stand");
+    assert_eq!(state.root(), before.root(), "and the root is the batch's");
+    assert!(store.told() > 0, "the store is told it lied");
 }

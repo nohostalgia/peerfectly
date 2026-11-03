@@ -71,7 +71,17 @@ fn the_schema_is_in_canonical_key_order() {
     assert!(is_canonical_schema(NETWORK_PARAMS_SCHEMA), "{NETWORK_PARAMS_SCHEMA:?}");
     assert_eq!(
         NETWORK_PARAMS_SCHEMA,
-        &["ula", "ipv4", "relay", "policy", "suffix", "anchors", "leaving", "snapshot_window"]
+        &[
+            "ula",
+            "ipv4",
+            "relay",
+            "policy",
+            "suffix",
+            "anchors",
+            "leaving",
+            "excluded",
+            "snapshot_window"
+        ]
     );
 }
 

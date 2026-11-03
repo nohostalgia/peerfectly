@@ -14,6 +14,7 @@ that issued it dials that key. Nobody else knows where the device waits.
 ```text
 Invite = {
   "net":    bstr .size 32,   ; the network id: the only network the device accepts
+  "block":  bstr .size 5,    ; the network's IPv4 block: its base, then its prefix length
   "relay":  tstr,            ; the network's relay, key@host:port
   "secret": bstr .size 16    ; random
 }
@@ -24,7 +25,13 @@ trailing bytes. The relay is 1 to 128 bytes. An invite carries **no** name,
 role, mode or groups: those stay in the admin's local record of the invite,
 with its expiry and whether it was used, and never enter the roster.
 
-The text form is `peerfectly-invite-v1:` followed by the bytes in lowercase
+The block is the network's IPv4 block when the invite was issued, `/10` to `/28`
+inside the private blocks. It is there so the joining device can say, before it
+asks, where the network's addresses would coincide with its other networks or the
+subnets it is on. Nothing signs it: an invite that lied about it misleads only
+that warning, and the block a member holds is the one its roster says.
+
+The text form is `peerfectly-invite-v2:` followed by the bytes in lowercase
 hexadecimal; surrounding whitespace is ignored. A scannable code carries the
 text.
 
@@ -85,7 +92,7 @@ one of two shapes. Each side knows which messages it expects, and one arriving
 out of turn ends the exchange rather than being acted on.
 
 ```text
-joiner -> admin   introduce { alg, kind, name, sign, proof, trans, attest, tproof }
+joiner -> admin   introduce { alg, kind, name, sign, proof, trans, attest, tproof, conflicts }
 
 then, before a person has approved the request:
 admin  -> joiner  received  { kind }                         (the exchange ends)
@@ -100,7 +107,11 @@ joiner -> admin   outcome   { kind, taken }
 A device opens with `introduce`: it presents all three of its keys and proves
 two — `proof` and `tproof` of §3. `alg` covers the signing key only: transport
 and attestation keys are ed25519. Both proofs SHALL be checked before the request
-is kept. `name` is the name it proposes; the admin's record of the invite decides
+is kept. `conflicts` is an array of at most 16 text strings of at most 200 bytes,
+each saying in the device's words where the invite's block coincides with its
+other networks or the subnets it is on; the admin's daemon keeps them with the
+request for the person approving it, and decides nothing by them. `name` is the
+name it proposes; the admin's record of the invite decides
 the name, role, mode, groups and address it is admitted with, and an admission
 whose record chose any of the last four is followed, in the same delivery, by the
 `set_device` that sets them.

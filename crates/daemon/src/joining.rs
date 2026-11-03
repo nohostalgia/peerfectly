@@ -310,7 +310,9 @@ pub async fn run(
                     tokio::time::sleep(PACE).await;
                     continue;
                 };
-                match one_exchange(channel, identity, &proof, &invite, &join.name).await {
+                match one_exchange(channel, identity, &proof, &invite, &join.name, &join.conflicts)
+                    .await
+                {
                     Ok(Exchanged::Received) => {
                         let at = crate::state::wall_seconds();
                         reporting.reached(Progress::Requested { at });
@@ -397,6 +399,7 @@ async fn one_exchange(
     proof: &Possession,
     invite: &enrollment::Invite,
     name: &str,
+    conflicts: &[String],
 ) -> Result<Exchanged, Refusal> {
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let material = channel.material().map_err(|cause| cause.to_string())?;
@@ -415,6 +418,7 @@ async fn one_exchange(
         name: name.to_owned(),
         possession: proof.clone(),
         transport_possession,
+        conflicts: conflicts.to_vec(),
     };
     send(&mut channel, &Message::Introduce(introduction), deadline).await?;
 
@@ -620,6 +624,7 @@ mod tests {
         let invite = enrollment::Invite::issue(
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
             roster::id::NetworkId::from_bytes([7; 32]),
+            roster::types::Ipv4Range::DEFAULT,
         )
         .expect("issues");
 
@@ -646,6 +651,7 @@ mod tests {
         enrollment::Invite::issue(
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
             roster::id::NetworkId::from_bytes([7; 32]),
+            roster::types::Ipv4Range::DEFAULT,
         )
         .expect("issues")
     }

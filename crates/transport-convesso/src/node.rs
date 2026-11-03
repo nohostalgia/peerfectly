@@ -843,15 +843,12 @@ fn ensure_readers(shared: &Arc<Shared>) {
     if shared.judge.is_some() {
         return;
     }
-    let own = shared.node.address().peer_id();
-    let keep: HashSet<PeerId> = shared
-        .members
-        .read()
-        .map(|members| members.others(&own).iter().map(Address::peer_id).collect())
-        .unwrap_or_default();
+    // Asked of each reader's peer, not of every member: a reader is kept for
+    // a peer the roster still names.
+    let Ok(members) = shared.members.read() else { return };
     if let Ok(mut readers) = shared.readers.lock() {
         readers.retain(|peer, reader| {
-            let kept = keep.contains(peer) && !reader.is_finished();
+            let kept = members.member(peer).is_some() && !reader.is_finished();
             if !kept {
                 reader.abort();
             }

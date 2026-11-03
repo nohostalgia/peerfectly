@@ -2,8 +2,9 @@
 //!
 //! Admission order is gone once a roster is compacted, so a rule that read it
 //! would give a node fed a snapshot different addresses from a node fed the
-//! whole history. This builds both nodes from one history, with collisions and
-//! revocations on both sides of the snapshot, and compares.
+//! whole history. This builds both nodes from one history, with offsets
+//! assigned, contended and freed by revocations on both sides of the snapshot,
+//! and compares.
 
 #![allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 
@@ -15,8 +16,8 @@ use roster::types::{OperationBody, Role};
 use support::{History, device, device_id, params};
 use tunnel::Ipv4Holdings;
 
-/// A network in a range of fourteen assignable addresses, with more devices
-/// than that, so collisions are certain; revocations before and after the
+/// A network in a range of fourteen hosts, its devices given offsets as they
+/// are admitted, some of them twice over; revocations before and after the
 /// point a snapshot covers.
 fn crowded() -> History {
     let mut history = History::new();
@@ -35,7 +36,11 @@ fn crowded() -> History {
             &[previous.as_str()],
             OperationBody::AddDevice(device(seed, &format!("d{seed}"), Role::Member, false)),
         );
-        previous = label;
+        // Offsets 1 to 14, then round again: the later claim keeps each.
+        let offset = u32::from(seed.saturating_sub(2)).rem_euclid(14).saturating_add(1);
+        let given = format!("offset{seed}");
+        history.op(&given, 1, &[label.as_str()], assign(seed, offset.to_be_bytes()));
+        previous = given;
     }
     history.op(
         "rev3",
@@ -87,9 +92,18 @@ fn history_and_snapshot_give_identical_holdings() {
     let from_snapshot = Ipv4Holdings::of_state(&compacted.state().expect("derives"));
 
     assert_eq!(from_history, from_snapshot);
-    assert!(from_history.colliding().next().is_some(), "the fixture exercises collisions");
-    assert!(from_history.held().next().is_some(), "and holdings");
+    for seed in 2..=20_u8 {
+        assert_eq!(
+            from_history.of(&device_id(seed)),
+            from_snapshot.of(&device_id(seed)),
+            "device {seed}"
+        );
+    }
+    assert!(from_history.held().next().is_some(), "the fixture holds addresses");
     assert_eq!(from_history.of(&device_id(3)), None, "a revoked device holds nothing");
+    // Offset 1 went to device 2, then again to device 16, which keeps it.
+    assert_eq!(from_history.of(&device_id(2)), None, "an offset lost is lost");
+    assert_eq!(from_history.holder([10, 0, 0, 1].into()), Some(device_id(16)));
 }
 
 /// A founded network in `range`, with a second admin and the members given.
@@ -116,11 +130,12 @@ fn founded_in(range: &str, members: &[u8]) -> History {
     history
 }
 
-fn assign(device: u8, address: [u8; 4]) -> OperationBody {
+/// An admin's act giving `device` the offset `offset` in the network's block.
+fn assign(device: u8, offset: [u8; 4]) -> OperationBody {
     OperationBody::SetDevice {
         device: device_id(device),
         change: roster::leaf::SettingsChange {
-            ipv4: Some(Some(address)),
+            ipv4: Some(Some(offset)),
             ..roster::leaf::SettingsChange::default()
         },
     }
@@ -135,11 +150,12 @@ fn holdings_of(history: &History) -> Ipv4Holdings {
 }
 
 #[test]
-fn of_two_concurrent_assignments_of_one_address_the_later_keeps_it() {
+fn of_two_concurrent_assignments_of_one_offset_the_later_keeps_it() {
     let mut history = founded_in("100.64.0.0/10", &[5, 6]);
+    let offset = 0x0909_u32.to_be_bytes();
     let address = [100, 64, 9, 9];
-    history.op("five", 1, &["add6"], assign(5, address));
-    history.op("six", 2, &["add6"], assign(6, address));
+    history.op("five", 1, &["add6"], assign(5, offset));
+    history.op("six", 2, &["add6"], assign(6, offset));
 
     let holdings = holdings_of(&history);
     let holder = holdings.holder(address.into()).expect("one of them holds it");
@@ -154,110 +170,123 @@ fn of_two_concurrent_assignments_of_one_address_the_later_keeps_it() {
 }
 
 #[test]
-fn an_assigned_address_beats_another_devices_derived_candidate() {
-    let history = founded_in("10.0.0.0/28", &[5]);
-    let derived = holdings_of(&history).of(&device_id(5)).expect("device 5 holds its candidate");
-    let mut history = history;
-    history.op("assign", 1, &["add5"], assign(2, derived.octets()));
-
-    let holdings = holdings_of(&history);
-    assert_eq!(holdings.holder(derived), Some(device_id(2)));
-    assert_eq!(holdings.of(&device_id(5)), None, "the derived candidate loses");
-}
-
-#[test]
-fn a_revoked_devices_candidate_is_free_for_the_next() {
-    // Two seeds deriving one candidate in a narrow range.
-    let network = founded_in("10.0.0.0/28", &[]).network();
-    let range: roster::types::Ipv4Range = "10.0.0.0/28".parse().unwrap();
-    let mut seen: std::collections::BTreeMap<std::net::Ipv4Addr, u8> =
-        std::collections::BTreeMap::new();
-    let (first, second) = (3..=255_u8)
-        .find_map(|seed| {
-            let candidate = tunnel::ipv4_candidate(&network, &device_id(seed), &range);
-            seen.insert(candidate, seed).map(|earlier| (earlier, seed))
-        })
-        .expect("sixteen addresses cannot keep 250 devices apart");
-
-    let mut history = founded_in("10.0.0.0/28", &[first]);
-    let added = format!("add{first}");
+fn a_revoked_devices_offset_is_free_for_the_next() {
+    let mut history = founded_in("10.0.0.0/28", &[5]);
+    history.op("five", 1, &["add5"], assign(5, 4_u32.to_be_bytes()));
     history.op(
         "revoke",
         1,
-        &[added.as_str()],
-        OperationBody::RevokeDevice { device: device_id(first), reason: "sold".into() },
+        &["five"],
+        OperationBody::RevokeDevice { device: device_id(5), reason: "sold".into() },
     );
     history.op(
         "next",
         1,
         &["revoke"],
-        OperationBody::AddDevice(device(second, "next", Role::Member, false)),
+        OperationBody::AddDevice(device(6, "next", Role::Member, false)),
     );
-    let candidate = tunnel::ipv4_candidate(&network, &device_id(second), &range);
-    assert_eq!(holdings_of(&history).of(&device_id(second)), Some(candidate));
+    history.op("six", 1, &["next"], assign(6, 4_u32.to_be_bytes()));
+    assert_eq!(holdings_of(&history).of(&device_id(6)), Some([10, 0, 0, 4].into()));
 }
 
+/// Moving the block is one change of the parameters: every device keeps its
+/// offset and holds the address it names in the new block.
 #[test]
-fn a_batch_assigns_from_its_block_and_nothing_collides() {
-    let mut history = founded_in("100.70.0.0/16", &[]);
-    let entries: Vec<roster::batch::BatchEntry> = (0..1000_u32)
-        .map(|index| {
-            let mut seed = [0_u8; 32];
-            seed[..4].copy_from_slice(&index.to_be_bytes());
-            seed[31] = 0xb0;
-            let signing = roster::sign::Ed25519Signer::from_seed(seed);
-            seed[30] = 1;
-            let attesting = roster::sign::Ed25519Signer::from_seed(seed);
-            use roster::sign::Signer as _;
-            use roster::types::{Algorithm, KeyEntry, KeyPurpose};
-            let mut keys = vec![
-                KeyEntry::new(
-                    Algorithm::Ed25519,
-                    KeyPurpose::Signing,
-                    signing.public_key().as_bytes().to_vec(),
-                )
-                .unwrap(),
-                KeyEntry::new(
-                    Algorithm::Ed25519,
-                    KeyPurpose::Attestation,
-                    attesting.public_key().as_bytes().to_vec(),
-                )
-                .unwrap(),
-            ];
-            keys.sort_by_key(KeyEntry::order_key);
-            let [_, _, high, low] = (index + 10).to_be_bytes();
+fn moving_the_block_moves_every_device_at_once() {
+    let mut history = founded_in("10.0.0.0/28", &[5]);
+    history.op("five", 1, &["add5"], assign(5, 3_u32.to_be_bytes()));
+    let before = holdings_of(&history);
+    let moved = params().in_ipv4_range("10.9.0.0/24".parse().unwrap());
+    history.op("move", 1, &["five"], OperationBody::SetNetwork(moved));
+    let after = holdings_of(&history);
+    assert_eq!(before.of(&device_id(5)), Some([10, 0, 0, 3].into()));
+    assert_eq!(after.of(&device_id(5)), Some([10, 9, 0, 3].into()));
+}
+
+// ---------------------------------------------------------------------------
+// The view of a state is the holdings decided whole
+// ---------------------------------------------------------------------------
+
+/// A network in a range of fourteen addresses, with the members given, some
+/// admitted alone and some by a batch, and some assigned an address: in or out
+/// of the range, contended or not.
+fn crowded_with(alone: &[u8], batch: &[u8], assigned: &[(u8, u8)]) -> roster::state::RosterState {
+    let mut history = founded_in("10.0.0.0/28", alone);
+    let mut previous = alone.last().map_or("admin2".to_owned(), |seed| format!("add{seed}"));
+    let entries: Vec<roster::batch::BatchEntry> = batch
+        .iter()
+        .filter(|seed| !alone.contains(seed))
+        .map(|seed| {
+            let spec = device(*seed, &format!("b{seed}"), Role::Member, false);
             roster::batch::BatchEntry {
-                keys,
-                name: format!("sensor-{index}"),
-                serial: Vec::new(),
-                ipv4: Some([100, 70, high, low]),
+                keys: spec.keys,
+                name: format!("b{seed}"),
+                serial: vec![*seed],
+                ipv4: None,
             }
         })
         .collect();
-    let header = roster::batch::BatchHeader::for_entries(
-        &entries,
-        roster::leaf::Mode::Light,
-        Vec::new(),
-        Some("100.70.0.0/16".parse().unwrap()),
-        "lot",
-    )
-    .unwrap();
-    history.op("batch", 1, &["admin2"], OperationBody::AdmitBatch(header));
-
+    if !entries.is_empty() {
+        let header = roster::batch::BatchHeader::for_entries(
+            &entries,
+            roster::leaf::Mode::Light,
+            Vec::new(),
+            None,
+            "lot",
+        )
+        .unwrap();
+        history.op("batch", 1, &[previous.as_str()], OperationBody::AdmitBatch(header));
+        previous = "batch".to_owned();
+    }
+    for (number, (seed, host)) in assigned.iter().enumerate() {
+        let label = format!("assign{number}");
+        // Offsets 1 to 14 are the block's hosts; 0, 15 and beyond are its
+        // network, its broadcast and outside it, as good as none.
+        history.op(&label, 1, &[previous.as_str()], assign(*seed, u32::from(*host).to_be_bytes()));
+        previous = label;
+    }
     let mut roster = Roster::new();
     for entry in history.entries() {
         let _ = roster.offer_bytes(&entry.bytes);
     }
-    for piece in roster::batch::pieces_of(&history.id("batch"), &entries).unwrap() {
-        let _ = roster.offer_piece(&piece);
+    if !entries.is_empty() {
+        for piece in roster::batch::pieces_of(&history.id("batch"), &entries).unwrap() {
+            let _ = roster.offer_piece(&piece);
+        }
     }
-    let holdings = Ipv4Holdings::of_state(&roster.state().unwrap());
-    for entry in &entries {
-        let address = entry.ipv4.unwrap();
-        assert_eq!(holdings.of(&entry.device_id().unwrap()), Some(address.into()));
+    roster.state().expect("derives")
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 128, ..proptest::prelude::ProptestConfig::default() })]
+
+    /// Every answer the view of a state gives is the one the holdings decided
+    /// whole give: who holds each address, and what each device holds.
+    #[test]
+    fn the_view_of_a_state_is_the_holdings_decided_whole(
+        alone in proptest::collection::btree_set(3u8..30, 0..12),
+        batch in proptest::collection::btree_set(3u8..30, 0..12),
+        assigned in proptest::collection::vec((1u8..30, 0u8..18), 0..6),
+    ) {
+        let alone: Vec<u8> = alone.into_iter().collect();
+        let batch: Vec<u8> = batch.into_iter().collect();
+        let state = crowded_with(&alone, &batch, &assigned);
+        let view = Ipv4Holdings::of_state(&state);
+        let whole = Ipv4Holdings::assigned(
+            state.params.ipv4_range(),
+            state.devices.iter().map(|(device, leaf)| (device, leaf.settings.ipv4)),
+        );
+        for device in state.devices.keys() {
+            proptest::prop_assert_eq!(view.of(&device), whole.of(&device));
+        }
+        for host in 0..=16u8 {
+            let address = std::net::Ipv4Addr::new(10, 0, 0, host);
+            proptest::prop_assert_eq!(view.holder(address), whole.holder(address));
+        }
+        let mut held: Vec<_> = view.held().collect();
+        held.sort();
+        let mut decided: Vec<_> = whole.held().collect();
+        decided.sort();
+        proptest::prop_assert_eq!(held, decided);
     }
-    assert!(
-        entries.iter().all(|entry| holdings.collision(&entry.device_id().unwrap()).is_none()),
-        "no entry collides"
-    );
 }

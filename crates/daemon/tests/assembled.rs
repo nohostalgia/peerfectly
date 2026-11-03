@@ -42,6 +42,9 @@ struct Fixture {
     joiner: Arc<NodeIdentity>,
     genesis: Vec<u8>,
     add: Vec<u8>,
+    /// The joiner's IPv4 offset, given after its admission as an admin's
+    /// daemon gives it.
+    given: Vec<u8>,
     network: NetworkId,
     state: RosterState,
 }
@@ -80,16 +83,34 @@ impl Fixture {
         )
         .expect("well-formed");
         let add_bytes = sign_operation(&add, founder.signer()).expect("signs");
+        let given = OperationCore::new(
+            3,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device: joiner.device_id(),
+                change: roster::leaf::SettingsChange {
+                    ipv4: Some(Some(2_u32.to_be_bytes())),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            vec![add.id()],
+            founder.signing_key().key_id(),
+            network,
+        )
+        .expect("well-formed");
+        let given_bytes = sign_operation(&given, founder.signer()).expect("signs");
 
         let mut node = Roster::with_clock(Box::new(daemon::state::WallClock));
         assert!(node.offer_bytes(&genesis_bytes).is_accepted());
         assert!(node.offer_bytes(&add_bytes).is_accepted());
+        assert!(node.offer_bytes(&given_bytes).is_accepted());
 
         Self {
             founder,
             joiner,
             genesis: genesis_bytes,
             add: add_bytes,
+            given: given_bytes,
             network,
             state: node.state().expect("derives"),
         }
@@ -100,6 +121,7 @@ impl Fixture {
         let mut roster = Roster::with_clock(Box::new(daemon::state::WallClock));
         assert!(roster.offer_bytes(&self.genesis).is_accepted());
         assert!(roster.offer_bytes(&self.add).is_accepted());
+        assert!(roster.offer_bytes(&self.given).is_accepted());
         roster
     }
 
@@ -367,6 +389,8 @@ async fn an_admission_while_up_makes_ipv4_routable_and_a_revocation_refuses_it()
     }
 
     founder.node.admit_without_activating(&fixture.add).await.expect("the founder may add");
+    assert_eq!(watched.borrow_and_update().of(&joiner), None, "admitted, not given one yet");
+    founder.node.admit_without_activating(&fixture.given).await.expect("the founder may set");
     assert!(watched.has_changed().expect("the node is alive"), "the change is signalled");
     assert_eq!(watched.borrow_and_update().of(&joiner), Some(address));
 
@@ -971,6 +995,7 @@ async fn the_roster_is_rebuilt_from_what_arrived() {
 
     log.append(&fixture.genesis).expect("appends");
     log.append(&fixture.add).expect("appends");
+    log.append(&fixture.given).expect("appends");
 
     let mut rebuilt = Roster::with_clock(Box::new(daemon::state::WallClock));
     for operation in log.read().expect("reads") {

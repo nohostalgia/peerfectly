@@ -121,6 +121,18 @@ impl BitSet {
 /// of start-up (found in the testbed, 18.1).
 type HeldBatch = alloc::sync::Arc<crate::members::Layer>;
 
+/// Where a graph keeps the layers of its whole batches: in memory, or in a
+/// store, which a full member of a fleet gives it so that a million boards
+/// are not held in memory.
+#[derive(Clone, Default)]
+struct LayersIn(Option<alloc::sync::Arc<dyn crate::members::LayerStore>>);
+
+impl core::fmt::Debug for LayersIn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.0.is_some() { "a store" } else { "memory" })
+    }
+}
+
 /// A causally ordered set of verified operations.
 ///
 /// Operations are stored in a topological order: an operation's parents always
@@ -180,6 +192,8 @@ pub struct Dag {
     /// concurrent with nothing, and two foundings by one author are two networks
     /// rather than one fork.
     by_author: HashMap<KeyId, Vec<usize>>,
+    /// Where whole batches' layers are kept.
+    layers_in: LayersIn,
     /// How many held operations are not revocations.
     ///
     /// Counted as they are inserted rather than scanned, because it is asked on
@@ -419,10 +433,42 @@ impl Dag {
                 "a batch's entries under an operation that is no batch",
             ));
         };
-        let layer = crate::members::Layer::new(id, header.mode, header.groups.clone(), entries);
+        let layer = match &self.layers_in.0 {
+            // Kept in the store, and read back through the entries root the
+            // signed header names: only what the batch committed to is believed.
+            Some(store) => {
+                store.put(&id, &entries)?;
+                crate::members::Layer::stored(
+                    id,
+                    header.mode,
+                    header.groups.clone(),
+                    alloc::sync::Arc::clone(store),
+                    header.entries,
+                    entries.len(),
+                )
+            }
+            None => crate::members::Layer::new(id, header.mode, header.groups.clone(), entries),
+        };
         self.insert(operation)?;
         self.batch_entries.insert(id, alloc::sync::Arc::new(layer));
         Ok(())
+    }
+
+    /// Keeps the layers of the batches that become whole from here on in
+    /// `store`, rather than in memory.
+    pub fn keep_layers_in(&mut self, store: alloc::sync::Arc<dyn crate::members::LayerStore>) {
+        self.layers_in = LayersIn(Some(store));
+    }
+
+    /// The layers of the whole batches this graph holds.
+    pub fn layers(&self) -> impl Iterator<Item = &alloc::sync::Arc<crate::members::Layer>> {
+        self.batch_entries.values()
+    }
+
+    /// Where the layers of whole batches are kept, if not in memory.
+    #[must_use]
+    pub fn layer_store(&self) -> Option<&alloc::sync::Arc<dyn crate::members::LayerStore>> {
+        self.layers_in.0.as_ref()
     }
 
     /// The layer of a batch this graph holds: its entries, its devices and
@@ -437,7 +483,7 @@ impl Dag {
 
     /// The entries of a batch this graph holds.
     #[must_use]
-    pub fn entries_of(&self, batch: &OperationId) -> Option<&[crate::batch::BatchEntry]> {
+    pub fn entries_of(&self, batch: &OperationId) -> Option<Vec<crate::batch::BatchEntry>> {
         self.batch_entries.get(batch).map(|held| held.entries())
     }
 
@@ -447,7 +493,7 @@ impl Dag {
     pub fn batch_devices(
         &self,
         batch: &OperationId,
-    ) -> impl Iterator<Item = (DeviceId, &crate::batch::BatchEntry)> {
+    ) -> impl Iterator<Item = (DeviceId, crate::batch::BatchEntry)> + '_ {
         self.batch_entries.get(batch).into_iter().flat_map(|held| held.devices())
     }
 
@@ -457,7 +503,7 @@ impl Dag {
         &self,
         batch: &OperationId,
         device: &DeviceId,
-    ) -> Option<&crate::batch::BatchEntry> {
+    ) -> Option<crate::batch::BatchEntry> {
         self.batch_entries.get(batch)?.entry(device)
     }
 
@@ -586,7 +632,11 @@ impl Dag {
             .collect();
         let discarded = self.operations.len().saturating_sub(keep.len());
 
-        let mut rebuilt = Self { network: Some(body.network), ..Self::default() };
+        let mut rebuilt = Self {
+            network: Some(body.network),
+            layers_in: self.layers_in.clone(),
+            ..Self::default()
+        };
 
         // Evidence first, before the operations it points at are gone. Carried
         // forward from an earlier compaction, plus any fork this one would

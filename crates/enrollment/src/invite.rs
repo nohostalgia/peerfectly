@@ -2,11 +2,18 @@
 //!
 //! # It opens a door, once
 //!
-//! An invite carries the network's relay, the network's id and a secret. The
+//! An invite carries the network's relay, the network's id, its IPv4 block and a
+//! secret. The
 //! device that holds it waits at a rendezvous key derived from the secret; the
 //! admin that issued it derives the same key and dials it. Nobody else knows
 //! where to find the device, and the admin decides — before any request exists —
 //! that one device may come in.
+//!
+//! The block is there so the joining device can say, before it asks, where the
+//! network's addresses would coincide with its other networks or the subnets it
+//! is on (`scalable-membership` 19.5). Nothing signs it: an invite that lied
+//! about it misleads only that warning, and the block the device holds is the
+//! one the delivered roster says.
 //!
 //! It carries no name, role, mode or groups: those stay on the admin's device,
 //! in the invite's local record. A person copying an invite carries a key to
@@ -22,15 +29,16 @@
 
 use roster::cbor::{Reader, Writer};
 use roster::id::NetworkId;
+use roster::types::{IPV4_RANGE_LEN, Ipv4Range};
 
 use crate::error::{Error, Result};
 use crate::limits;
 
 /// The text form's prefix, which is also its version.
-pub const TEXT_PREFIX: &str = "peerfectly-invite-v1:";
+pub const TEXT_PREFIX: &str = "peerfectly-invite-v2:";
 
 /// Field names of an invite, in canonical order.
-pub const INVITE_SCHEMA: &[&str] = &["net", "relay", "secret"];
+pub const INVITE_SCHEMA: &[&str] = &["net", "block", "relay", "secret"];
 
 /// How many bytes of secret an invite carries.
 pub const SECRET_LEN: usize = 16;
@@ -45,6 +53,8 @@ pub struct Invite {
     pub relay: String,
     /// The network the device is invited into, and the only one it accepts.
     pub network: NetworkId,
+    /// The network's IPv4 block when the invite was issued, as its admin said.
+    pub block: Ipv4Range,
     /// The secret both sides derive the rendezvous from.
     pub secret: [u8; SECRET_LEN],
 }
@@ -55,6 +65,7 @@ impl core::fmt::Debug for Invite {
         f.debug_struct("Invite")
             .field("relay", &self.relay)
             .field("network", &self.network)
+            .field("block", &self.block)
             .finish_non_exhaustive()
     }
 }
@@ -68,6 +79,7 @@ impl Invite {
     pub fn new(
         relay: impl Into<String>,
         network: NetworkId,
+        block: Ipv4Range,
         secret: [u8; SECRET_LEN],
     ) -> Result<Self> {
         let relay = relay.into();
@@ -77,7 +89,7 @@ impl Invite {
         if relay.len() > limits::MAX_RELAY_LEN {
             return Err(Error::Malformed("the relay is longer than a relay may be"));
         }
-        Ok(Self { relay, network, secret })
+        Ok(Self { relay, network, block, secret })
     }
 
     /// A new invite into `network` at `relay`, with a fresh random secret.
@@ -85,10 +97,10 @@ impl Invite {
     /// # Errors
     ///
     /// As [`Self::new`], and when no randomness can be had.
-    pub fn issue(relay: impl Into<String>, network: NetworkId) -> Result<Self> {
+    pub fn issue(relay: impl Into<String>, network: NetworkId, block: Ipv4Range) -> Result<Self> {
         let mut secret = [0u8; SECRET_LEN];
         getrandom::fill(&mut secret).map_err(|_| Error::Malformed("no randomness for a secret"))?;
-        Self::new(relay, network, secret)
+        Self::new(relay, network, block, secret)
     }
 
     /// The seed of the rendezvous identity: the key the invited device waits
@@ -106,8 +118,9 @@ impl Invite {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.map(3);
+        writer.map(4);
         writer.key("net").bytes(self.network.as_bytes());
+        writer.key("block").bytes(&self.block.to_bytes());
         writer.key("relay").str(&self.relay);
         writer.key("secret").bytes(&self.secret);
         writer.finish()
@@ -127,6 +140,11 @@ impl Invite {
             .map_err(|_| Error::Malformed("not an invite"))?;
         let mut network_bytes = [0u8; 32];
         network_bytes.copy_from_slice(network);
+        let block = map
+            .key("block")
+            .and_then(|value| value.fixed_bytes(IPV4_RANGE_LEN))
+            .and_then(Ipv4Range::from_bytes)
+            .map_err(|_| Error::Malformed("not an invite"))?;
         let relay = map
             .key("relay")
             .and_then(|value| value.str(limits::MAX_RELAY_LEN, "relay length"))
@@ -140,7 +158,7 @@ impl Invite {
         secret_bytes.copy_from_slice(secret);
         map.finish().map_err(|_| Error::Malformed("not an invite"))?;
         reader.finish().map_err(|_| Error::Malformed("not an invite"))?;
-        Self::new(relay, NetworkId::from_bytes(network_bytes), secret_bytes)
+        Self::new(relay, NetworkId::from_bytes(network_bytes), block, secret_bytes)
     }
 
     /// The form a person copies, and a scannable code carries.
@@ -161,7 +179,7 @@ impl Invite {
         let body = text
             .trim()
             .strip_prefix(TEXT_PREFIX)
-            .ok_or(Error::Malformed("it does not begin with peerfectly-invite-v1:"))?;
+            .ok_or(Error::Malformed("it does not begin with peerfectly-invite-v2:"))?;
         let bytes = roster::hex::decode(body.trim())
             .ok_or(Error::Malformed("the part after the prefix is not hexadecimal"))?;
         Self::decode(&bytes)
@@ -179,6 +197,7 @@ mod tests {
         Invite::new(
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:4433",
             NetworkId::from_bytes([7; 32]),
+            "100.83.0.0/16".parse().unwrap(),
             [9; SECRET_LEN],
         )
         .unwrap()
@@ -198,9 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn it_carries_the_relay_the_network_and_the_secret_and_nothing_else() {
+    fn it_carries_the_relay_the_network_the_block_and_the_secret_and_nothing_else() {
         let bytes = invite().encode();
-        assert!(bytes.len() < 160, "small enough for a code: {} bytes", bytes.len());
+        // The block adds thirteen bytes to the 153 before it.
+        assert!(bytes.len() < 176, "small enough for a code: {} bytes", bytes.len());
         for absent in [&b"name"[..], b"role", b"mode", b"groups"] {
             assert!(!bytes.windows(absent.len()).any(|window| window == absent));
         }
@@ -210,7 +230,7 @@ mod tests {
     fn a_corrupted_invite_is_refused() {
         let text = invite().to_text();
         assert!(
-            Invite::from_text(&text.replace("invite-v1", "invite-v2")).is_err(),
+            Invite::from_text(&text.replace("invite-v2", "invite-v1")).is_err(),
             "another version"
         );
         assert!(Invite::from_text(&text[..text.len() - 2]).is_err(), "cut short");
@@ -221,13 +241,18 @@ mod tests {
             *first = 0xa2;
         }
         assert!(Invite::decode(&bytes).is_err(), "a map of the wrong size");
-        assert!(Invite::new("", NetworkId::from_bytes([7; 32]), [0; SECRET_LEN]).is_err());
+        assert!(
+            Invite::new("", NetworkId::from_bytes([7; 32]), Ipv4Range::DEFAULT, [0; SECRET_LEN])
+                .is_err()
+        );
     }
 
     #[test]
     fn two_invites_meet_at_different_keys_and_one_secret_at_one() {
-        let one = Invite::issue("k@relay:1", NetworkId::from_bytes([7; 32])).unwrap();
-        let two = Invite::issue("k@relay:1", NetworkId::from_bytes([7; 32])).unwrap();
+        let one =
+            Invite::issue("k@relay:1", NetworkId::from_bytes([7; 32]), Ipv4Range::DEFAULT).unwrap();
+        let two =
+            Invite::issue("k@relay:1", NetworkId::from_bytes([7; 32]), Ipv4Range::DEFAULT).unwrap();
         assert_ne!(one.secret, two.secret);
         assert_ne!(one.rendezvous_seed(), two.rendezvous_seed());
         let read = Invite::from_text(&one.to_text()).unwrap();

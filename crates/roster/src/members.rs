@@ -75,10 +75,135 @@ pub trait MemberStore: merkle::NodeSource {
 
     /// How many devices the store holds.
     fn count(&self) -> usize;
+
+    /// The devices the store's index of `tag` says derive `value`, or `None`
+    /// where it has not built that index.
+    fn derived_holders(&self, tag: &[u8; 32], value: [u8; 4]) -> Option<Vec<DeviceId>>;
+
+    /// Builds the index of `tag`: every device the store holds, with what it
+    /// derives. Lost when the store is next written.
+    fn put_derived(&self, tag: &[u8; 32], rows: &[([u8; 4], DeviceId)]);
+}
+
+/// A value each device derives from its id alone — its IPv4 candidate in a
+/// network's range, say — and the tag naming that derivation. Devices are
+/// indexed by it where they are kept, once per tag, so that who derives a value
+/// is asked of an index rather than of every device.
+pub struct Derivation<'a> {
+    /// What names the derivation: the same tag, the same value for every id.
+    pub tag: [u8; 32],
+    /// The value a device derives.
+    pub of: &'a (dyn Fn(&DeviceId) -> [u8; 4] + Sync),
 }
 
 /// How many leaves a walk over a store reads at once.
 const PAGE: usize = 512;
+
+/// Where a full member keeps its batches' layers when they are not held in
+/// memory: each batch's entries by device, the indexes over them by key,
+/// address and name, and the nodes of its entries tree; and the nodes a state's
+/// tree spills when a layer is laid in it.
+///
+/// Nothing it answers is believed on its own. An entry stands only where the
+/// batch's entries tree, rooted where the signed header says, holds it at its
+/// device's position; an index hit only where the entry it names says so; a
+/// node only where it hashes to what its parent names. What fails is not
+/// answered, and the store is told.
+pub trait LayerStore: merkle::NodeSink {
+    /// Keeps the entries of batch `batch`, with their indexes and the nodes of
+    /// their tree.
+    ///
+    /// # Errors
+    ///
+    /// When they cannot be written, or are not a batch's entries.
+    fn put(&self, batch: &OperationId, entries: &[BatchEntry]) -> crate::Result<()>;
+
+    /// The entry the store holds for `device` in batch `batch`.
+    fn entry(&self, batch: &OperationId, device: &DeviceId) -> Option<BatchEntry>;
+
+    /// Up to `count` of the batch's entries with device ids after `after` (from
+    /// the first, when `None`), in device order.
+    fn entries_after(
+        &self,
+        batch: &OperationId,
+        after: Option<&DeviceId>,
+        count: usize,
+    ) -> Vec<(DeviceId, BatchEntry)>;
+
+    /// The devices its key index says hold `key`.
+    fn key_holders(&self, batch: &OperationId, key: &KeyId) -> Vec<DeviceId>;
+
+    /// The devices its address index says are assigned `address`.
+    fn address_holders(&self, batch: &OperationId, address: [u8; 4]) -> Vec<DeviceId>;
+
+    /// The addresses its entries assign, each once, in order.
+    fn addresses(&self, batch: &OperationId) -> Vec<[u8; 4]>;
+
+    /// The devices its name index says answer to `name`, in ASCII lower case.
+    fn name_holders(&self, batch: &OperationId, name: &str) -> Vec<DeviceId>;
+
+    /// Lets go of a batch: its entries, and its indexes.
+    fn forget(&self, batch: &OperationId);
+
+    /// The devices of batch `batch` its index of `tag` says derive `value`, or
+    /// `None` where it has not built that index.
+    fn derived_holders(
+        &self,
+        batch: &OperationId,
+        tag: &[u8; 32],
+        value: [u8; 4],
+    ) -> Option<Vec<DeviceId>>;
+
+    /// Builds the index of `tag` for batch `batch`.
+    fn put_derived(&self, batch: &OperationId, tag: &[u8; 32], rows: &[([u8; 4], DeviceId)]);
+}
+
+/// An index of devices by a derived value, in memory: sorted, for a range
+/// lookup.
+type DerivedIndex = Arc<Vec<([u8; 4], DeviceId)>>;
+
+/// The indexes a part of a state built in memory, by derivation tag; few, as a
+/// network's range changes rarely.
+type Derived = Mutex<Vec<([u8; 32], DerivedIndex)>>;
+
+/// The devices `index` says derive `value`.
+fn in_index(index: &[([u8; 4], DeviceId)], value: [u8; 4]) -> impl Iterator<Item = DeviceId> + '_ {
+    let from = index.partition_point(|(held, _)| *held < value);
+    index
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(move |(held, _)| *held == value)
+        .map(|(_, device)| *device)
+}
+
+/// The index of `tag` among `held`, built from `devices` the first time.
+fn built_index(
+    held: &Derived,
+    tag: &[u8; 32],
+    devices: impl Iterator<Item = DeviceId>,
+    of: &(dyn Fn(&DeviceId) -> [u8; 4] + Sync),
+) -> DerivedIndex {
+    if let Ok(held) = held.lock()
+        && let Some((_, index)) = held.iter().find(|(built, _)| built == tag)
+    {
+        return Arc::clone(index);
+    }
+    let mut index: Vec<([u8; 4], DeviceId)> = devices.map(|device| (of(&device), device)).collect();
+    index.sort_unstable();
+    let index = Arc::new(index);
+    if let Ok(mut held) = held.lock() {
+        if held.len() >= 4 {
+            held.remove(0);
+        }
+        held.push((*tag, Arc::clone(&index)));
+    }
+    index
+}
+
+/// How many leaves a layer lays in a stored tree before spilling the paths it
+/// made to the store: the most of a tree held in memory while laying one.
+const SPILL_EVERY: usize = 4_096;
 
 /// How many trees a layer remembers having been laid over: the one the kept
 /// state rests on, the one at the root, and those the states a derivation
@@ -87,30 +212,47 @@ const TREES_REMEMBERED: usize = 8;
 
 /// A whole batch's devices, held once and shared by every state admitting
 /// them: its entries, the device each admits, and indexes by key, address and
-/// name. A device's leaf is built as it is asked for, from its entry and the
-/// batch's header, and is the leaf derivation gives a board nothing else names.
+/// name, in memory or in a [`LayerStore`]. A device's leaf is built as it is
+/// asked for, from its entry and the batch's header, and is the leaf
+/// derivation gives a board nothing else names.
 pub struct Layer {
     batch: OperationId,
     mode: Mode,
     groups: Vec<Group>,
-    entries: Vec<BatchEntry>,
-    /// Each device an entry admits, with the entry's place, in device order.
-    /// The first entry naming a device is the one kept.
-    devices: Vec<(DeviceId, usize)>,
-    /// Every key an admitted device holds, with the device's slot in
-    /// `devices`, in (key, device) order.
-    keys: Vec<(KeyId, u32)>,
-    /// Every address an entry assigns, with the device's slot, in (address,
-    /// device) order.
-    addresses: Vec<([u8; 4], u32)>,
-    /// The device slots in (name in ASCII lower case, device) order.
-    names: Vec<u32>,
+    held: Held,
     /// The trees this layer was laid over, with what it left out, and the tree
     /// that made.
     trees: Mutex<Vec<LaidOver>>,
     /// The devices left out for being skipped against the state the batch's
     /// ancestors imply, by that state's root.
     skipped: Mutex<Vec<Skipped>>,
+    /// Its devices by a derived value, by derivation, where held in memory.
+    derived: Derived,
+}
+
+/// Where a layer's entries are.
+enum Held {
+    Memory {
+        entries: Vec<BatchEntry>,
+        /// Each device an entry admits, with the entry's place, in device
+        /// order. The first entry naming a device is the one kept.
+        devices: Vec<(DeviceId, usize)>,
+        /// Every key an admitted device holds, with the device's slot in
+        /// `devices`, in (key, device) order.
+        keys: Vec<(KeyId, u32)>,
+        /// Every address an entry assigns, with the device's slot, in
+        /// (address, device) order.
+        addresses: Vec<([u8; 4], u32)>,
+        /// The device slots in (name in ASCII lower case, device) order.
+        names: Vec<u32>,
+    },
+    Stored {
+        store: Arc<dyn LayerStore>,
+        /// The batch's entries tree, rooted where its signed header says: what
+        /// every entry read from the store is checked against.
+        entries: merkle::Tree,
+        count: usize,
+    },
 }
 
 /// The devices a batch skips, against the devices root of the state its
@@ -135,14 +277,14 @@ impl core::fmt::Debug for Layer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Layer")
             .field("batch", &self.batch)
-            .field("devices", &self.devices.len())
+            .field("devices", &self.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Layer {
     /// The layer of batch `batch`, admitting in `mode` and `groups` the
-    /// devices `entries` name.
+    /// devices `entries` name, held in memory.
     #[must_use]
     pub fn new(
         batch: OperationId,
@@ -178,17 +320,72 @@ impl Layer {
             };
             lower_order(name(one), name(two)).then(one.cmp(two))
         });
+        Self::with_held(
+            batch,
+            mode,
+            groups,
+            Held::Memory { entries, devices, keys, addresses, names },
+        )
+    }
+
+    /// The layer of batch `batch`, whose entries `store` keeps and whose
+    /// entries tree has root `entries_root`, as its signed header names it.
+    /// `count` is how many entries the header says it holds.
+    #[must_use]
+    pub fn stored(
+        batch: OperationId,
+        mode: Mode,
+        groups: Vec<Group>,
+        store: Arc<dyn LayerStore>,
+        entries_root: merkle::Hash,
+        count: usize,
+    ) -> Self {
+        let source: Arc<dyn merkle::NodeSource> = store.clone();
+        let entries = merkle::Tree::stored(entries_root, source);
+        Self::with_held(batch, mode, groups, Held::Stored { store, entries, count })
+    }
+
+    fn with_held(batch: OperationId, mode: Mode, groups: Vec<Group>, held: Held) -> Self {
         Self {
             batch,
             mode,
             groups,
-            entries,
-            devices,
-            keys,
-            addresses,
-            names,
+            held,
             trees: Mutex::new(Vec::new()),
             skipped: Mutex::new(Vec::new()),
+            derived: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The devices it admits that derive `value` under `derivation`: by an
+    /// index built the first time a derivation is asked, in memory or in the
+    /// layer's store.
+    fn deriving(&self, derivation: &Derivation<'_>, value: [u8; 4]) -> Vec<DeviceId> {
+        match &self.held {
+            Held::Memory { .. } => {
+                let index = built_index(
+                    &self.derived,
+                    &derivation.tag,
+                    self.devices().map(|(device, _)| device),
+                    derivation.of,
+                );
+                in_index(&index, value).collect()
+            }
+            Held::Stored { store, .. } => {
+                if let Some(found) = store.derived_holders(&self.batch, &derivation.tag, value) {
+                    return found;
+                }
+                let mut rows: Vec<([u8; 4], DeviceId)> = Vec::new();
+                for (device, _) in self.devices() {
+                    rows.push(((derivation.of)(&device), device));
+                    if rows.len() >= PAGE.saturating_mul(64) {
+                        store.put_derived(&self.batch, &derivation.tag, &rows);
+                        rows.clear();
+                    }
+                }
+                store.put_derived(&self.batch, &derivation.tag, &rows);
+                store.derived_holders(&self.batch, &derivation.tag, value).unwrap_or_default()
+            }
         }
     }
 
@@ -198,75 +395,254 @@ impl Layer {
         self.batch
     }
 
-    /// The batch's entries, as they arrived.
+    /// The roots in its store this layer still reaches: its entries tree's, and
+    /// those of the trees it remembers having made. Nothing for one in memory.
     #[must_use]
-    pub fn entries(&self) -> &[BatchEntry] {
-        &self.entries
+    pub fn roots(&self) -> Vec<merkle::Hash> {
+        let Held::Stored { entries, .. } = &self.held else { return Vec::new() };
+        let mut roots = vec![entries.root()];
+        if let Ok(trees) = self.trees.lock() {
+            roots.extend(trees.iter().map(|laid| laid.tree.root()));
+        }
+        roots
+    }
+
+    /// The store the layer is kept in, if it is not in memory.
+    #[must_use]
+    pub fn store(&self) -> Option<&Arc<dyn LayerStore>> {
+        match &self.held {
+            Held::Stored { store, .. } => Some(store),
+            Held::Memory { .. } => None,
+        }
+    }
+
+    /// The batch's entries, in device order.
+    #[must_use]
+    pub fn entries(&self) -> Vec<BatchEntry> {
+        self.devices().map(|(_, entry)| entry).collect()
     }
 
     /// How many devices it admits.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.devices.len()
+        match &self.held {
+            Held::Memory { devices, .. } => devices.len(),
+            Held::Stored { count, .. } => *count,
+        }
     }
 
     /// Whether it admits none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.devices.is_empty()
+        self.len() == 0
     }
 
-    /// The devices it admits, each with its entry, in device order.
-    pub fn devices(&self) -> impl Iterator<Item = (DeviceId, &BatchEntry)> {
-        self.devices
-            .iter()
-            .filter_map(|(device, place)| self.entries.get(*place).map(|entry| (*device, entry)))
+    /// The devices it admits, each with its entry, in device order. From a
+    /// store, a page at a time, each entry checked.
+    pub fn devices(&self) -> impl Iterator<Item = (DeviceId, BatchEntry)> + Send + '_ {
+        let mut slot = 0_usize;
+        let mut page: alloc::vec::IntoIter<(DeviceId, BatchEntry)> = Vec::new().into_iter();
+        let mut after: Option<DeviceId> = None;
+        let mut finished = false;
+        core::iter::from_fn(move || match &self.held {
+            Held::Memory { entries, devices, .. } => {
+                let (device, place) = devices.get(slot)?;
+                slot = slot.saturating_add(1);
+                entries.get(*place).map(|entry| (*device, entry.clone()))
+            }
+            Held::Stored { store, .. } => loop {
+                if let Some((device, entry)) = page.next() {
+                    after = Some(device);
+                    if self.checked(&device, &entry) {
+                        return Some((device, entry));
+                    }
+                    continue;
+                }
+                if finished {
+                    return None;
+                }
+                let next = store.entries_after(&self.batch, after.as_ref(), PAGE);
+                finished = next.len() < PAGE;
+                // Out of order would loop or skip: stop believing it.
+                let first_too_low =
+                    next.first().is_some_and(|(first, _)| after.is_some_and(|last| *first <= last));
+                let unordered =
+                    next.windows(2).any(|pair| matches!(pair, [one, two] if one.0 >= two.0));
+                if first_too_low || unordered {
+                    store.tampered();
+                    return None;
+                }
+                if next.is_empty() {
+                    return None;
+                }
+                page = next.into_iter();
+            },
+        })
     }
 
     /// The entry admitting `device`.
     #[must_use]
-    pub fn entry(&self, device: &DeviceId) -> Option<&BatchEntry> {
-        let (_, place) = self.devices.get(self.slot_of(device)?)?;
-        self.entries.get(*place)
+    pub fn entry(&self, device: &DeviceId) -> Option<BatchEntry> {
+        match &self.held {
+            Held::Memory { entries, devices, .. } => {
+                let slot = devices.binary_search_by_key(device, |(held, _)| *held).ok()?;
+                let (_, place) = devices.get(slot)?;
+                entries.get(*place).cloned()
+            }
+            // Absent from the store is taken as absent: a store can hide a
+            // board, as a base can, and asking the tree whether it should have
+            // been there would cost every lookup of a board the layer does not
+            // hold — those of the base and of every other layer — a walk.
+            Held::Stored { store, .. } => {
+                store.entry(&self.batch, device).filter(|entry| self.checked(device, entry))
+            }
+        }
+    }
+
+    /// Whether it admits `device`.
+    #[must_use]
+    pub fn admits(&self, device: &DeviceId) -> bool {
+        match &self.held {
+            Held::Memory { devices, .. } => {
+                devices.binary_search_by_key(device, |(held, _)| *held).is_ok()
+            }
+            Held::Stored { .. } => self.committed(device).is_some(),
+        }
+    }
+
+    /// What the entries tree holds for `device`'s entry.
+    fn committed(&self, device: &DeviceId) -> Option<merkle::Hash> {
+        match &self.held {
+            Held::Stored { entries, .. } => entries.get(&BatchEntry::position(device)),
+            Held::Memory { .. } => None,
+        }
+    }
+
+    /// Whether an entry the store gave for `device` is the batch's: the one
+    /// the entries tree holds at the device's position, naming the device.
+    fn checked(&self, device: &DeviceId, entry: &BatchEntry) -> bool {
+        let Held::Stored { store, .. } = &self.held else { return true };
+        let holds = entry.device_id().is_ok_and(|named| named == *device)
+            && self.committed(device) == Some(entry.value_hash());
+        if !holds {
+            store.tampered();
+        }
+        holds
     }
 
     /// The devices whose entry assigns `address`, in device order.
-    pub fn assigning(&self, address: [u8; 4]) -> impl Iterator<Item = DeviceId> + '_ {
-        let from = self.addresses.partition_point(|(held, _)| *held < address);
-        self.addresses
-            .get(from..)
-            .unwrap_or_default()
-            .iter()
-            .take_while(move |(held, _)| *held == address)
-            .filter_map(|(_, slot)| self.devices.get(*slot as usize).map(|(device, _)| *device))
+    #[must_use]
+    pub fn assigning(&self, address: [u8; 4]) -> Vec<DeviceId> {
+        match &self.held {
+            Held::Memory { devices, addresses, .. } => {
+                let from = addresses.partition_point(|(held, _)| *held < address);
+                addresses
+                    .get(from..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take_while(|(held, _)| *held == address)
+                    .filter_map(|(_, slot)| devices.get(*slot as usize).map(|(device, _)| *device))
+                    .collect()
+            }
+            Held::Stored { store, .. } => store
+                .address_holders(&self.batch, address)
+                .into_iter()
+                .filter(|device| {
+                    self.entry(device).is_some_and(|entry| entry.ipv4 == Some(address))
+                })
+                .collect(),
+        }
     }
 
     /// The addresses its entries assign, each once, in order.
-    pub fn addresses(&self) -> impl Iterator<Item = [u8; 4]> + '_ {
-        let mut last = None;
-        self.addresses.iter().filter_map(move |(address, _)| {
-            if last == Some(*address) {
-                return None;
+    #[must_use]
+    pub fn addresses(&self) -> Vec<[u8; 4]> {
+        match &self.held {
+            Held::Memory { addresses, .. } => {
+                let mut out: Vec<[u8; 4]> = addresses.iter().map(|(address, _)| *address).collect();
+                out.dedup();
+                out
             }
-            last = Some(*address);
-            Some(*address)
-        })
+            // Each is checked as it is asked for: one no entry assigns names
+            // nobody when `assigning` asks it.
+            Held::Stored { store, .. } => store.addresses(&self.batch),
+        }
     }
 
-    fn slot_of(&self, device: &DeviceId) -> Option<usize> {
-        self.devices.binary_search_by_key(device, |(held, _)| *held).ok()
+    /// The devices it admits holding `key`, each with what for.
+    fn holding(&self, key: &KeyId) -> Vec<(DeviceId, KeyPurpose)> {
+        let purpose_in = |entry: &BatchEntry| {
+            entry.keys.iter().find(|held| held.key_id() == *key).map(|held| held.purpose)
+        };
+        match &self.held {
+            Held::Memory { entries, devices, keys, .. } => {
+                let from = keys.partition_point(|(held, _)| held < key);
+                keys.get(from..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take_while(|(held, _)| held == key)
+                    .filter_map(|(_, slot)| {
+                        let (device, place) = devices.get(*slot as usize)?;
+                        purpose_in(entries.get(*place)?).map(|purpose| (*device, purpose))
+                    })
+                    .collect()
+            }
+            Held::Stored { store, .. } => store
+                .key_holders(&self.batch, key)
+                .into_iter()
+                .filter_map(|device| {
+                    let purpose = self.entry(&device).as_ref().and_then(purpose_in);
+                    if purpose.is_none() {
+                        store.tampered();
+                    }
+                    purpose.map(|purpose| (device, purpose))
+                })
+                .collect(),
+        }
     }
 
-    /// The leaf of the device at `slot`, as derivation gives it a board nothing
-    /// else names: its entry's keys and name, a member and not a founder,
-    /// admitted by the batch, with the batch's mode and groups and its entry's
-    /// address.
-    fn leaf_at(&self, slot: usize) -> Option<Arc<DeviceLeaf>> {
-        let (device, place) = self.devices.get(slot)?;
-        let entry = self.entries.get(*place)?;
-        Some(Arc::new(DeviceLeaf {
+    /// The devices it admits answering to `name`, given in ASCII lower case.
+    fn named(&self, lower: &str) -> Vec<DeviceId> {
+        match &self.held {
+            Held::Memory { entries, devices, names, .. } => {
+                let name_of = |slot: &u32| {
+                    devices
+                        .get(*slot as usize)
+                        .and_then(|(_, place)| entries.get(*place))
+                        .map_or("", |entry| entry.name.as_str())
+                };
+                let from = names.partition_point(|slot| lower_order(name_of(slot), lower).is_lt());
+                names
+                    .get(from..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take_while(|slot| lower_order(name_of(slot), lower).is_eq())
+                    .filter_map(|slot| devices.get(*slot as usize).map(|(device, _)| *device))
+                    .collect()
+            }
+            Held::Stored { store, .. } => store
+                .name_holders(&self.batch, lower)
+                .into_iter()
+                .filter(|device| {
+                    let holds = self
+                        .entry(device)
+                        .is_some_and(|entry| entry.name.eq_ignore_ascii_case(lower));
+                    if !holds {
+                        store.tampered();
+                    }
+                    holds
+                })
+                .collect(),
+        }
+    }
+
+    /// The leaf derivation gives a board nothing else names: its entry's keys
+    /// and name, a member and not a founder, admitted by the batch, with the
+    /// batch's mode and groups and its entry's address.
+    fn leaf_of(&self, device: DeviceId, entry: &BatchEntry) -> Arc<DeviceLeaf> {
+        Arc::new(DeviceLeaf {
             record: DeviceRecord {
-                id: *device,
+                id: device,
                 keys: entry.keys.clone(),
                 name: entry.name.clone(),
                 role: Role::Member,
@@ -276,7 +652,7 @@ impl Layer {
             },
             settings: DeviceSettings::new(self.mode, self.groups.clone(), entry.ipv4, None)
                 .unwrap_or_default(),
-        }))
+        })
     }
 
     /// The devices left out for being skipped against a state of root `root`,
@@ -302,7 +678,10 @@ impl Layer {
     }
 
     /// `tree` with the leaf of every device this layer admits, but those in
-    /// `left_out`: built the first time, remembered after.
+    /// `left_out`: built the first time, remembered after. A stored layer
+    /// spills the paths it makes to its store as it goes, and the tree comes
+    /// back rooted in the store and the tree's own source together, holding
+    /// nothing of the layer in memory.
     fn laid_over(&self, tree: &merkle::Tree, left_out: &BTreeSet<DeviceId>) -> merkle::Tree {
         let digest = {
             let mut hasher = blake3::Hasher::new_derive_key("peerfectly layer left out v1");
@@ -320,12 +699,25 @@ impl Layer {
             return laid.tree.clone();
         }
         let mut laid = tree.clone();
-        for slot in 0..self.devices.len() {
-            let Some(leaf) = self.leaf_at(slot) else { continue };
-            if left_out.contains(&leaf.record.id) {
+        let store = self.store().cloned();
+        if let Some(store) = &store {
+            laid.spill_to(Arc::clone(store) as Arc<dyn merkle::NodeSink>);
+        }
+        let mut since_spill = 0_usize;
+        for (device, entry) in self.devices() {
+            if left_out.contains(&device) {
                 continue;
             }
-            laid.insert(DeviceLeaf::position(&leaf.record.id), leaf.value_hash());
+            let leaf = self.leaf_of(device, &entry);
+            laid.insert(DeviceLeaf::position(&device), leaf.value_hash());
+            since_spill = since_spill.saturating_add(1);
+            if store.is_some() && since_spill >= SPILL_EVERY {
+                laid.spill();
+                since_spill = 0;
+            }
+        }
+        if store.is_some() {
+            laid.spill();
         }
         if let Ok(mut held) = self.trees.lock() {
             if held.len() >= TREES_REMEMBERED {
@@ -345,8 +737,8 @@ fn lower_order(one: &str, two: &str) -> core::cmp::Ordering {
 }
 
 /// A layer as a state holds it: the layer, and the devices it leaves out of
-/// it — those skipped against the batch's ancestors, and those named by
-/// something else, which the state's changes answer for.
+/// it — those skipped against the batch's ancestors, and those the base or a
+/// second batch also speaks of, which the state's changes answer for.
 #[derive(Clone)]
 struct Laid {
     layer: Arc<Layer>,
@@ -354,26 +746,18 @@ struct Laid {
 }
 
 impl Laid {
-    fn holds(&self, slot: usize) -> Option<DeviceId> {
-        self.layer
-            .devices
-            .get(slot)
-            .map(|(device, _)| *device)
-            .filter(|device| !self.left_out.contains(device))
-    }
-
     fn get(&self, device: &DeviceId) -> Option<Arc<DeviceLeaf>> {
         if self.left_out.contains(device) {
             return None;
         }
-        self.layer.leaf_at(self.layer.slot_of(device)?)
+        self.layer.entry(device).map(|entry| self.layer.leaf_of(*device, &entry))
     }
 
-    fn iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
-        (0..self.layer.devices.len()).filter_map(move |slot| {
-            let device = self.holds(slot)?;
-            self.layer.leaf_at(slot).map(|leaf| (device, leaf))
-        })
+    fn iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + Send + '_ {
+        self.layer
+            .devices()
+            .filter(|(device, _)| !self.left_out.contains(device))
+            .map(|(device, entry)| (device, self.layer.leaf_of(device, &entry)))
     }
 }
 
@@ -399,6 +783,8 @@ struct Shared {
     keys: BTreeMap<(KeyId, DeviceId), KeyPurpose>,
     addresses: BTreeSet<([u8; 4], DeviceId)>,
     names: BTreeSet<(String, DeviceId)>,
+    /// Its devices by a derived value, by derivation, built as asked.
+    derived: Derived,
 }
 
 /// The devices of a state: their leaves, which device holds which key and which
@@ -502,7 +888,7 @@ impl Members {
     /// a batch's layer before it changes anything, and leaves out what its
     /// batch skipped against its ancestors and what anything else names.
     pub fn lay(&mut self, layer: Arc<Layer>, left_out: Arc<BTreeSet<DeviceId>>) {
-        let leaving = left_out.iter().filter(|device| layer.slot_of(device).is_some()).count();
+        let leaving = left_out.iter().filter(|device| layer.admits(device)).count();
         self.len = self.len.saturating_add(layer.len().saturating_sub(leaving));
         self.tree = layer.laid_over(&self.tree, &left_out);
         self.layers.push(Laid { layer, left_out });
@@ -793,20 +1179,8 @@ impl Members {
             }
         }
         for laid in &self.layers {
-            let keys = &laid.layer.keys;
-            let from = keys.partition_point(|(held, _)| held < key);
-            for (_, slot) in
-                keys.get(from..).unwrap_or_default().iter().take_while(|(held, _)| held == key)
-            {
-                let Some(device) = laid.holds(*slot as usize) else { continue };
-                let purpose = laid.layer.entry(&device).and_then(|entry| {
-                    entry
-                        .keys
-                        .iter()
-                        .find(|entry| entry.key_id() == *key)
-                        .map(|entry| entry.purpose)
-                });
-                if let Some(purpose) = purpose {
+            for (device, purpose) in laid.layer.holding(key) {
+                if !laid.left_out.contains(&device) {
                     holders.insert(device, (purpose, false));
                 }
             }
@@ -892,6 +1266,102 @@ impl Members {
             .collect()
     }
 
+    /// The members that derive `value` under `derivation`, by id: asked of an
+    /// index in the base and each layer, built there the first time the
+    /// derivation is asked, and of the changes, which are few. Every one is
+    /// held to the derivation again and to being a member, so an index a
+    /// store answers can hide a device and never add one.
+    #[must_use]
+    pub fn deriving(&self, derivation: &Derivation<'_>, value: [u8; 4]) -> Vec<DeviceId> {
+        let mut found: BTreeSet<DeviceId> = BTreeSet::new();
+        match &self.base {
+            Base::Memory(shared) => {
+                let index = built_index(
+                    &shared.derived,
+                    &derivation.tag,
+                    shared.leaves.keys().copied(),
+                    derivation.of,
+                );
+                found.extend(in_index(&index, value));
+            }
+            Base::Kept(store) => {
+                let held = store.derived_holders(&derivation.tag, value).unwrap_or_else(|| {
+                    let mut rows: Vec<([u8; 4], DeviceId)> = Vec::new();
+                    for (device, _) in self.base_iter() {
+                        rows.push(((derivation.of)(&device), device));
+                        if rows.len() >= PAGE.saturating_mul(64) {
+                            store.put_derived(&derivation.tag, &rows);
+                            rows.clear();
+                        }
+                    }
+                    store.put_derived(&derivation.tag, &rows);
+                    store.derived_holders(&derivation.tag, value).unwrap_or_default()
+                });
+                found.extend(held);
+            }
+        }
+        for laid in &self.layers {
+            found.extend(
+                laid.layer
+                    .deriving(derivation, value)
+                    .into_iter()
+                    .filter(|device| !laid.left_out.contains(device)),
+            );
+        }
+        for (device, changed) in &self.leaves {
+            if changed.is_some() && (derivation.of)(device) == value {
+                found.insert(*device);
+            }
+        }
+        found
+            .into_iter()
+            .filter(|device| (derivation.of)(device) == value && self.contains_key(device))
+            .collect()
+    }
+
+    /// The full members, by id: few in a fleet of light boards, and found
+    /// without reading the boards. A layer admits all its devices in its
+    /// batch's mode, so a light batch's are passed over whole; the base's are
+    /// asked of an index of its full members, built once the first time; the
+    /// changes are looked at. Every one is held to its leaf saying full.
+    #[must_use]
+    pub fn full_members(&self) -> Vec<DeviceId> {
+        const FULL: [u8; 4] = [1, 0, 0, 0];
+        let mut found: BTreeSet<DeviceId> = BTreeSet::new();
+        match &self.base {
+            Base::Memory(shared) => found.extend(
+                shared
+                    .leaves
+                    .iter()
+                    .filter(|(_, leaf)| leaf.settings.mode == Mode::Full)
+                    .map(|(device, _)| *device),
+            ),
+            Base::Kept(store) => {
+                let tag = *b"peerfectly full members, base v1";
+                let held = store.derived_holders(&tag, FULL).unwrap_or_else(|| {
+                    let rows: Vec<([u8; 4], DeviceId)> = self
+                        .base_iter()
+                        .filter(|(_, leaf)| leaf.settings.mode == Mode::Full)
+                        .map(|(device, _)| (FULL, device))
+                        .collect();
+                    store.put_derived(&tag, &rows);
+                    rows.into_iter().map(|(_, device)| device).collect()
+                });
+                found.extend(held);
+            }
+        }
+        for laid in self.layers.iter().filter(|laid| laid.layer.mode == Mode::Full) {
+            found.extend(laid.iter().map(|(device, _)| device));
+        }
+        found.extend(
+            self.leaves.iter().filter(|(_, changed)| changed.is_some()).map(|(device, _)| *device),
+        );
+        found
+            .into_iter()
+            .filter(|device| self.get(device).is_some_and(|leaf| leaf.settings.mode == Mode::Full))
+            .collect()
+    }
+
     /// The members answering to `name`, ASCII case aside, by id. Names are
     /// unique in a network a person keeps; two answering is a question the
     /// caller asks the person.
@@ -915,24 +1385,8 @@ impl Members {
             }
         }
         for laid in &self.layers {
-            let layer = &laid.layer;
-            let name_of = |slot: &u32| {
-                layer
-                    .devices
-                    .get(*slot as usize)
-                    .and_then(|(_, place)| layer.entries.get(*place))
-                    .map_or("", |entry| entry.name.as_str())
-            };
-            let from =
-                layer.names.partition_point(|slot| lower_order(name_of(slot), &lower).is_lt());
-            for slot in layer
-                .names
-                .get(from..)
-                .unwrap_or_default()
-                .iter()
-                .take_while(|slot| lower_order(name_of(slot), &lower).is_eq())
-            {
-                if let Some(device) = laid.holds(*slot as usize) {
+            for device in laid.layer.named(&lower) {
+                if !laid.left_out.contains(&device) {
                     holders.insert(device, false);
                 }
             }
@@ -1057,6 +1511,7 @@ impl Members {
             keys: shared.keys.clone(),
             addresses: shared.addresses.clone(),
             names: shared.names.clone(),
+            derived: Mutex::new(Vec::new()),
         };
         for (device, leaf) in self.layers.iter().flat_map(Laid::iter) {
             for entry in &leaf.record.keys {

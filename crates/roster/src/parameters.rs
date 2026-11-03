@@ -25,7 +25,7 @@ use crate::id::DeviceId;
 use crate::leaf::Group;
 use crate::limits;
 use crate::merkle::{self, Hash};
-use crate::types::{IPV4_RANGE_LEN, Ipv4Range, LEAVING_SCHEMA, Leaving, NetworkParams};
+use crate::types::{Excluded, IPV4_RANGE_LEN, Ipv4Range, LEAVING_SCHEMA, Leaving, NetworkParams};
 
 /// The context a parameter's position is derived under.
 const POSITION_CONTEXT: &str = "peerfectly parameter position v1";
@@ -38,7 +38,7 @@ pub const RULE_SCHEMA: &[&str] = &["to", "from"];
 
 /// Every parameter name this format knows.
 pub const PARAMETER_NAMES: &[&str] =
-    &["ipv4", "policy", "prefix", "relays", "suffix", "window", "anchors", "leaving"];
+    &["ipv4", "policy", "prefix", "relays", "suffix", "window", "anchors", "leaving", "excluded"];
 
 /// A rule of the access policy: members of `from` may open sessions to
 /// members of `to`.
@@ -69,6 +69,9 @@ pub enum Parameter {
     Policy(Vec<Rule>),
     /// The freshness window, in seconds.
     Window(u64),
+    /// The blocks excluded from the network's IPv4 route, sorted and without
+    /// repeats.
+    Excluded(Vec<Excluded>),
 }
 
 impl Parameter {
@@ -84,6 +87,7 @@ impl Parameter {
             Self::Anchors(_) => "anchors",
             Self::Policy(_) => "policy",
             Self::Window(_) => "window",
+            Self::Excluded(_) => "excluded",
         }
     }
 
@@ -126,6 +130,7 @@ impl Parameter {
             }
             Self::Anchors(anchors) => write_anchors(&mut writer, anchors),
             Self::Policy(rules) => write_policy(&mut writer, rules),
+            Self::Excluded(excluded) => write_excluded(&mut writer, excluded),
             Self::Window(seconds) => {
                 writer.u64(*seconds);
             }
@@ -179,6 +184,7 @@ impl Parameter {
             "anchors" => Self::anchors(read_anchors(&mut reader)?)?,
             "policy" => Self::policy(read_policy(&mut reader)?)?,
             "window" => Self::window(reader.u64()?)?,
+            "excluded" => Self::excluded(read_excluded(&mut reader)?)?,
             _ => return Err(Error::UnknownField),
         };
         reader.finish()?;
@@ -241,6 +247,27 @@ impl Parameter {
         Ok(Self::Policy(rules))
     }
 
+    /// The excluded blocks, sorted, refusing an empty list and excess.
+    ///
+    /// # Errors
+    ///
+    /// When it is empty, too long, or repeats a block.
+    pub fn excluded(mut excluded: Vec<Excluded>) -> Result<Self> {
+        if excluded.is_empty() {
+            return Err(Error::InvalidValue(
+                "an empty excluded list is nothing excluded, which has no leaf",
+            ));
+        }
+        if excluded.len() > Excluded::MAX {
+            return Err(Error::LimitExceeded("excluded blocks"));
+        }
+        excluded.sort();
+        if !strictly_ascending(&excluded) {
+            return Err(Error::InvalidValue("repeated excluded block"));
+        }
+        Ok(Self::Excluded(excluded))
+    }
+
     /// The freshness window, refusing zero.
     ///
     /// # Errors
@@ -273,6 +300,29 @@ pub(crate) fn read_anchors(reader: &mut Reader<'_>) -> Result<Vec<DeviceId>> {
         return Err(Error::NonCanonical);
     }
     Ok(anchors)
+}
+
+/// Writes an excluded list.
+pub(crate) fn write_excluded(writer: &mut Writer, excluded: &[Excluded]) {
+    writer.array(excluded.len() as u64);
+    for block in excluded {
+        writer.bytes(&block.to_bytes());
+    }
+}
+
+/// Reads an excluded list, refusing one out of order or repeated.
+pub(crate) fn read_excluded(reader: &mut Reader<'_>) -> Result<Vec<Excluded>> {
+    let count = reader.array(Excluded::MAX, "excluded blocks")?;
+    let mut excluded = Vec::with_capacity(count);
+    for _ in 0..count {
+        excluded.push(Excluded::from_bytes(
+            reader.bytes(IPV4_RANGE_LEN.saturating_add(1), "excluded block length")?,
+        )?);
+    }
+    if !strictly_ascending(&excluded) {
+        return Err(Error::NonCanonical);
+    }
+    Ok(excluded)
 }
 
 /// Writes an access policy.
@@ -330,6 +380,9 @@ impl NetworkParams {
         if !self.policy.is_empty() {
             leaves.push(Parameter::Policy(self.policy.clone()));
         }
+        if !self.excluded.is_empty() {
+            leaves.push(Parameter::Excluded(self.excluded.clone()));
+        }
         if self.snapshot_window != 0 {
             leaves.push(Parameter::Window(self.snapshot_window));
         }
@@ -363,6 +416,7 @@ impl NetworkParams {
         let mut leaving = None;
         let mut anchors = Vec::new();
         let mut policy = Vec::new();
+        let mut excluded = Vec::new();
         for leaf in leaves {
             if seen.contains(&leaf.name()) {
                 return Err(Error::DuplicateKey);
@@ -377,6 +431,7 @@ impl NetworkParams {
                 Parameter::Leaving(value) => leaving = Some(value),
                 Parameter::Anchors(value) => anchors = value,
                 Parameter::Policy(value) => policy = value,
+                Parameter::Excluded(value) => excluded = value,
             }
         }
         let (Some(prefix), Some(suffix)) = (prefix, suffix) else {
@@ -388,6 +443,7 @@ impl NetworkParams {
         params.ipv4 = ipv4;
         params.anchors = anchors;
         params.policy = policy;
+        params.excluded = excluded;
         match leaving {
             Some(leaving) => params.leaving(leaving),
             None => Ok(params),
@@ -428,7 +484,28 @@ mod tests {
         .unwrap();
         params.anchors = alloc::vec![DeviceId::from_bytes([3; 32]), DeviceId::from_bytes([9; 32])];
         params.policy = alloc::vec![Rule { from: group("sensori"), to: group("controller") }];
+        params.excluded = alloc::vec![
+            Excluded::new([100, 64, 9, 0], 24).unwrap(),
+            Excluded::new([100, 64, 12, 7], 32).unwrap()
+        ];
         params
+    }
+
+    /// An excluded block is `/10` to one address, aligned, and a list of them
+    /// is sorted and without repeats, as every list a parameter holds.
+    #[test]
+    fn an_excluded_block_is_aligned_and_the_list_has_one_spelling() {
+        assert_eq!("100.64.9.0/24".parse::<Excluded>(), Excluded::new([100, 64, 9, 0], 24));
+        assert_eq!("10.0.0.7".parse::<Excluded>(), Excluded::new([10, 0, 0, 7], 32));
+        assert!("100.64.9.1/24".parse::<Excluded>().is_err(), "host bits");
+        assert!("10.0.0.0/9".parse::<Excluded>().is_err(), "wider than a block");
+        let one = Excluded::new([10, 0, 0, 7], 32).unwrap();
+        assert!(Parameter::excluded(alloc::vec![one, one]).is_err());
+        assert!(Parameter::excluded(Vec::new()).is_err());
+        let mut decoded = params();
+        decoded.excluded.reverse();
+        let sorted = params().with_excluded(decoded.excluded).unwrap();
+        assert_eq!(sorted.excluded, params().excluded);
     }
 
     #[test]

@@ -87,6 +87,34 @@ pub struct RosterState {
 const STATE_ROOT_CONTEXT: &str = "peerfectly state root v1";
 
 impl RosterState {
+    /// The first of the lowest `count` consecutive offsets of the network's
+    /// block no member holds: what an admin admitting gives, so that a
+    /// network's offsets stay consecutive (`scalable-membership` 19.2). None
+    /// where the block has no such run.
+    ///
+    /// Asks the state's index once per offset, from the first host up, so it
+    /// costs about as many lookups as members hold offsets below the run.
+    #[must_use]
+    pub fn free_offsets(&self, count: u32) -> Option<crate::leaf::Ipv4Offset> {
+        let hosts = u32::try_from(self.params.ipv4_range().hosts()).unwrap_or(u32::MAX);
+        let mut start = 1_u32;
+        let mut found = 0_u32;
+        let mut offset = 1_u32;
+        while found < count {
+            if offset > hosts {
+                return None;
+            }
+            if self.devices.holding_address(offset.to_be_bytes()).is_empty() {
+                found = found.saturating_add(1);
+            } else {
+                found = 0;
+                start = offset.saturating_add(1);
+            }
+            offset = offset.saturating_add(1);
+        }
+        Some(start.to_be_bytes())
+    }
+
     /// A device's settings: those an admin set, or the default.
     #[must_use]
     pub fn settings_of(&self, device: &DeviceId) -> DeviceSettings {
@@ -504,6 +532,14 @@ impl Base {
                 let id = device.device_id()?;
                 let mut state = RosterState::empty(network, params.clone());
                 state.devices.insert(id, device.clone().into_record(operation.id())?);
+                // Its claim ranks as the genesis, below everything after it.
+                state.set_settings(
+                    id,
+                    DeviceSettings {
+                        ipv4: Some(crate::leaf::FIRST_HOST),
+                        ..DeviceSettings::default()
+                    },
+                );
                 Ok(Self { state, rank: Rank::new(0, operation.id()), genesis: Some(*index) })
             }
             Foundation::Snapshot(footing) => {
@@ -721,8 +757,9 @@ pub fn state_for_parents(dag: &Dag, parents: &[OperationId]) -> Result<RosterSta
 /// derivation then judges.
 ///
 /// A revocation is followed here where it can give nothing back: a member's,
-/// neither admin nor founder, holding no address another operation in `dag`
-/// assigned elsewhere. It removes its device and nothing else. Derived instead,
+/// neither admin nor founder. It removes its device and nothing else: an
+/// address it held goes back to no device that had lost it, and is a later
+/// assignment's to take (`settle_addresses`). Derived instead,
 /// it cost every full member the window, a fleet's batch included, at every
 /// revocation: most of a second at ten thousand devices (`daemon::simulator`).
 ///
@@ -734,7 +771,6 @@ pub fn state_for_parents(dag: &Dag, parents: &[OperationId]) -> Result<RosterSta
 pub fn extend(
     mut next: RosterState,
     operation: &crate::sign::VerifiedOperation,
-    dag: &Dag,
 ) -> Option<RosterState> {
     match &operation.core().body {
         // The founding operation names no parents, so it never extends a head.
@@ -744,11 +780,6 @@ pub fn extend(
         OperationBody::RevokeDevice { device, .. } => {
             if let Some(held) = next.devices.get(device) {
                 if held.record.role == Role::Admin || held.record.founder {
-                    return None;
-                }
-                if let Some(address) = held.settings.ipv4
-                    && assigned_elsewhere(dag, device, address)
-                {
                     return None;
                 }
                 next.devices.remove(device);
@@ -794,22 +825,6 @@ pub fn extend(
     }
     keep_member_anchors(&mut next);
     Some(next)
-}
-
-/// Whether an operation `dag` holds assigns `address` to a device other than
-/// `device`: one that, having lost it to `device`, would take it back once
-/// `device` is gone. Any such operation, whether it won or lost: answering
-/// `true` too often only derives.
-fn assigned_elsewhere(dag: &Dag, device: &DeviceId, address: [u8; 4]) -> bool {
-    dag.operations().iter().any(|operation| match &operation.core().body {
-        OperationBody::SetDevice { device: other, change } => {
-            other != device && change.ipv4 == Some(Some(address))
-        }
-        OperationBody::AdmitBatch(_) => dag
-            .batch_devices(&operation.id())
-            .any(|(other, entry)| other != *device && entry.ipv4 == Some(address)),
-        _ => false,
-    })
 }
 
 /// Drops from the anchor list every entry that names no member.
@@ -1069,7 +1084,7 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
                 }
             }
             for address in smaller.addresses() {
-                if larger.assigning(address).next().is_some() {
+                if !larger.assigning(address).is_empty() {
                     touched.extend(smaller.assigning(address));
                     touched.extend(larger.assigning(address));
                 }
@@ -1144,7 +1159,7 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
             let Some(layer) = dag.batch_layer(&operation.id()) else { continue };
             let rank = Rank::new(dag.depth(index), operation.id());
             let skips = skipped_by(layer, header, ancestor_state(dag, base, mask, index, memo)?);
-            let named: Vec<(DeviceId, &crate::batch::BatchEntry)> = touched
+            let named: Vec<(DeviceId, crate::batch::BatchEntry)> = touched
                 .iter()
                 .filter_map(|device| layer.entry(device).map(|entry| (*device, entry)))
                 .collect();
@@ -1473,7 +1488,13 @@ fn skipped_by(
     ancestors: &RosterState,
 ) -> alloc::sync::Arc<BTreeSet<DeviceId>> {
     layer.skipped_against(ancestors.devices.root(), || {
-        crate::batch::skipped_among(ancestors, header, layer.devices()).into_keys().collect()
+        crate::batch::skipped_among(
+            ancestors,
+            header,
+            layer.devices().map(|(device, entry)| (device, entry.ipv4)),
+        )
+        .into_keys()
+        .collect()
     })
 }
 
@@ -1771,7 +1792,7 @@ mod reference {
                 let skips = crate::batch::skipped_among(
                     ancestor_state(dag, base, mask, index, memo)?,
                     header,
-                    dag.batch_devices(&operation.id()),
+                    dag.batch_devices(&operation.id()).map(|(device, entry)| (device, entry.ipv4)),
                 );
                 for (id, entry) in dag.batch_devices(&operation.id()) {
                     if skips.contains_key(&id) {

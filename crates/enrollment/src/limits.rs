@@ -12,6 +12,13 @@
 /// would be told about it at the wrong moment.
 pub const MAX_PROPOSED_NAME_LEN: usize = roster::limits::MAX_NAME_LEN;
 
+/// How many conflicts a joining device's request may name: one per network it
+/// holds and per subnet it is on, and a few of those are many.
+pub const MAX_CONFLICTS: usize = 16;
+
+/// The longest a conflict's words may be, in bytes.
+pub const MAX_CONFLICT_LEN: usize = 200;
+
 /// The longest relay address an invite may carry, in bytes.
 ///
 /// The same bound the roster puts on the relay it names, so an invite cannot

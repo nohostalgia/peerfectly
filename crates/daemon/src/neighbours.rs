@@ -230,11 +230,10 @@ fn full_member(state: &RosterState, device: &DeviceId) -> Option<Member> {
         .then(|| Member { device: *device, admitted_by: admission(&leaf.record.added_by, device) })
 }
 
-/// Every full member of a state, read as it goes: a million are not listed.
+/// Every full member of a state, asked of its index of them: a fleet's
+/// million light boards are not read to find its few full members.
 fn full_members(state: &RosterState) -> impl Iterator<Item = Member> + '_ {
-    state.devices.iter().filter(|(_, leaf)| leaf.settings.mode == roster::leaf::Mode::Full).map(
-        |(device, leaf)| Member { device, admitted_by: admission(&leaf.record.added_by, &device) },
-    )
+    state.devices.full_members().into_iter().filter_map(|device| full_member(state, &device))
 }
 
 /// Where a member stands in a slot: best first, the device id breaking a tie,

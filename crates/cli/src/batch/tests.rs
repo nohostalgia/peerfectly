@@ -363,6 +363,7 @@ fn a_founding_typed_in_upper_case_is_the_one_asked_for() {
         suffix: "home.internal".to_owned(),
         relay: None,
         ipv4_range: None,
+        devices: None,
         window_days: None,
     };
     assert!(matches_what_was_asked(&asked("Laptop"), &founding));
@@ -455,7 +456,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("prove") && text.contains("no roster changes"), "{text}");
 }
 
-/// A settings change shows the new values: relay, IPv4 range — and that
+/// A settings change shows the new values: relay, IPv4 block — and that
 /// everybody follows them.
 #[test]
 fn a_settings_change_shows_its_values() {
@@ -464,7 +465,7 @@ fn a_settings_change_shows_its_values() {
     let change = admin.core(OperationBody::SetNetwork(changed), Vec::new());
     let text = said(&Read::Operation(Box::new(change)), &Command::Confirm);
     assert!(text.contains("relay.example"), "{text}");
-    assert!(text.contains("IPv4 range"), "{text}");
+    assert!(text.contains("IPv4 block"), "{text}");
     assert!(text.contains("every device in casa follows this"), "{text}");
 }
 

@@ -22,14 +22,87 @@ use alloc::vec::Vec;
 
 use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
+use crate::leaf::Ipv4Offset;
 use crate::leaf::{Group, Mode};
 use crate::limits;
 use crate::merkle::Hash;
-use crate::types::{IPV4_RANGE_LEN, Ipv4Range};
 
 /// Canonical key order of a batch header.
 pub const BATCH_HEADER_SCHEMA: &[&str] =
-    &["mode", "block", "count", "label", "groups", "layout", "pieces", "entries"];
+    &["mode", "count", "label", "groups", "layout", "pieces", "entries", "offsets"];
+
+/// The consecutive IPv4 offsets a batch gives its entries theirs from.
+///
+/// Offsets, not addresses, as a device's are (`leaf::Ipv4Offset`): a batch is
+/// admitted into the network's block wherever the block is moved later. One
+/// run, so that a fleet's boards hold consecutive addresses, which a person
+/// reads as one lot and a packet filter compares as a range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OffsetRun {
+    first: u32,
+    count: u32,
+}
+
+impl OffsetRun {
+    /// The run of `count` offsets from `first`.
+    ///
+    /// # Errors
+    ///
+    /// When it is empty, starts at offset 0 (the block's own address) or runs
+    /// past the last offset there is.
+    pub fn new(first: Ipv4Offset, count: u32) -> Result<Self> {
+        let first = u32::from_be_bytes(first);
+        if count == 0 || first == 0 || first.checked_add(count.saturating_sub(1)).is_none() {
+            return Err(Error::InvalidValue("ipv4 offset run"));
+        }
+        Ok(Self { first, count })
+    }
+
+    /// Its first offset.
+    #[must_use]
+    pub const fn first(&self) -> Ipv4Offset {
+        self.first.to_be_bytes()
+    }
+
+    /// How many offsets it holds.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// Its last offset.
+    #[must_use]
+    pub const fn last(&self) -> Ipv4Offset {
+        // Checked when built.
+        self.first.saturating_add(self.count.saturating_sub(1)).to_be_bytes()
+    }
+
+    /// Whether `offset` is one of its.
+    #[must_use]
+    pub fn contains(&self, offset: Ipv4Offset) -> bool {
+        let offset = u32::from_be_bytes(offset);
+        offset.checked_sub(self.first).is_some_and(|step| step < self.count)
+    }
+
+    /// Its offsets, in order.
+    pub fn offsets(&self) -> impl Iterator<Item = Ipv4Offset> + use<> {
+        let first = self.first;
+        (0..self.count).map(move |step| first.saturating_add(step).to_be_bytes())
+    }
+
+    fn to_bytes(self) -> [u8; 8] {
+        let [a, b, c, d] = self.first.to_be_bytes();
+        let [e, f, g, h] = self.count.to_be_bytes();
+        [a, b, c, d, e, f, g, h]
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let [a, b, c, d, e, f, g, h] = bytes else {
+            return Err(Error::InvalidValue("ipv4 offset run length"));
+        };
+        Self::new([*a, *b, *c, *d], u32::from_be_bytes([*e, *f, *g, *h]))
+    }
+}
 
 /// What a batch's header commits to about its entries and their pieces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +132,9 @@ pub struct BatchHeader {
     pub mode: Mode,
     /// The groups every entry joins, sorted, without repeats.
     pub groups: Vec<Group>,
-    /// The IPv4 block the entries' addresses are assigned from, if any.
-    pub block: Option<Ipv4Range>,
+    /// The offsets the entries are given theirs from, if any: a batch without
+    /// a run admits its boards IPv6 only.
+    pub offsets: Option<OffsetRun>,
     /// A line a person reads: which lot this is.
     pub label: String,
 }
@@ -71,13 +145,14 @@ impl BatchHeader {
     /// # Errors
     ///
     /// When the batch is empty or larger than [`limits::MAX_BATCH_ENTRIES`],
-    /// declares no piece or more pieces than entries, the label is too long, or
-    /// the groups are too many or repeated.
+    /// declares no piece or more pieces than entries, the label is too long,
+    /// the groups are too many or repeated, or the run of offsets is longer
+    /// than the batch.
     pub fn new(
         commitment: Commitment,
         mode: Mode,
         mut groups: Vec<Group>,
-        block: Option<Ipv4Range>,
+        offsets: Option<OffsetRun>,
         label: impl Into<String>,
     ) -> Result<Self> {
         let Commitment { count, entries, pieces, layout } = commitment;
@@ -101,7 +176,11 @@ impl BatchHeader {
         if groups.windows(2).any(|pair| matches!(pair, [first, second] if first == second)) {
             return Err(Error::InvalidValue("repeated group"));
         }
-        Ok(Self { count, entries, pieces, layout, mode, groups, block, label })
+        // A run longer than the batch would hold offsets no entry takes.
+        if offsets.is_some_and(|run| u64::from(run.count) > count) {
+            return Err(Error::InvalidValue("ipv4 offset run longer than the batch"));
+        }
+        Ok(Self { count, entries, pieces, layout, mode, groups, offsets, label })
     }
 
     /// Builds the header for a set of entries, committing to them and to the
@@ -114,10 +193,10 @@ impl BatchHeader {
         entries: &[BatchEntry],
         mode: Mode,
         groups: Vec<Group>,
-        block: Option<Ipv4Range>,
+        offsets: Option<OffsetRun>,
         label: impl Into<String>,
     ) -> Result<Self> {
-        Self::new(commit(entries)?, mode, groups, block, label)
+        Self::new(commit(entries)?, mode, groups, offsets, label)
     }
 
     /// What this header commits to.
@@ -135,9 +214,6 @@ impl BatchHeader {
     pub(crate) fn encode(&self, writer: &mut Writer) {
         writer.map(8);
         writer.key("mode").str(self.mode.as_str());
-        writer
-            .key("block")
-            .bytes(self.block.map_or_else(Vec::new, |range| range.to_bytes().to_vec()).as_slice());
         writer.key("count").u64(self.count);
         writer.key("label").str(&self.label);
         writer.key("groups").array(self.groups.len() as u64);
@@ -147,17 +223,15 @@ impl BatchHeader {
         writer.key("layout").bytes(&self.layout);
         writer.key("pieces").u64(self.pieces);
         writer.key("entries").bytes(&self.entries);
+        writer
+            .key("offsets")
+            .bytes(self.offsets.map_or_else(Vec::new, |run| run.to_bytes().to_vec()).as_slice());
     }
 
     /// Reads a header, refusing anything not in canonical form.
     pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Self> {
         let mut map = reader.map(BATCH_HEADER_SCHEMA)?;
         let mode = Mode::parse(map.key("mode")?.str(limits::MAX_MAP_KEY_LEN, "mode")?)?;
-        let block =
-            match map.key("block")?.bytes(IPV4_RANGE_LEN.saturating_add(1), "ipv4 range length")? {
-                [] => None,
-                bytes => Some(Ipv4Range::from_bytes(bytes)?),
-            };
         let count = map.key("count")?.u64()?;
         let label =
             String::from(map.key("label")?.str(limits::MAX_BATCH_LABEL_LEN, "batch label length")?);
@@ -172,11 +246,15 @@ impl BatchHeader {
         let pieces = map.key("pieces")?.u64()?;
         let entries = <Hash>::try_from(map.key("entries")?.fixed_bytes(32)?)
             .map_err(|_| Error::IdentifierLength)?;
+        let offsets = match map.key("offsets")?.bytes(8, "ipv4 offset run length")? {
+            [] => None,
+            bytes => Some(OffsetRun::from_bytes(bytes)?),
+        };
         map.finish()?;
         if groups.windows(2).any(|pair| matches!(pair, [first, second] if first >= second)) {
             return Err(Error::NonCanonical);
         }
-        Self::new(Commitment { count, entries, pieces, layout }, mode, groups, block, label)
+        Self::new(Commitment { count, entries, pieces, layout }, mode, groups, offsets, label)
     }
 }
 
@@ -222,8 +300,8 @@ pub struct BatchEntry {
     pub name: String,
     /// Its serial number, if it has one: empty otherwise.
     pub serial: Vec<u8>,
-    /// The address assigned from the header's block, if the header has one.
-    pub ipv4: Option<[u8; 4]>,
+    /// The offset given it from the header's run, if the header has one.
+    pub ipv4: Option<Ipv4Offset>,
 }
 
 impl BatchEntry {
@@ -283,6 +361,20 @@ impl BatchEntry {
         writer.finish()
     }
 
+    /// An entry from its canonical bytes, checked as one arriving in a piece
+    /// is.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not one canonical entry, or it breaks the rules every
+    /// device keeps.
+    pub fn from_bytes(input: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(input);
+        let entry = Self::decode(&mut reader)?;
+        reader.finish()?;
+        Ok(entry)
+    }
+
     pub(crate) fn encode(&self, writer: &mut Writer) {
         writer.map(4);
         writer.key("ipv4").bytes(self.ipv4.as_ref().map_or(&[][..], |address| &address[..]));
@@ -296,10 +388,10 @@ impl BatchEntry {
 
     pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Self> {
         let mut map = reader.map(BATCH_ENTRY_SCHEMA)?;
-        let ipv4 = match map.key("ipv4")?.bytes(4, "ipv4 address")? {
+        let ipv4 = match map.key("ipv4")?.bytes(4, "ipv4 offset")? {
             [] => None,
             [a, b, c, d] => Some([*a, *b, *c, *d]),
-            _ => return Err(Error::InvalidValue("ipv4 address length")),
+            _ => return Err(Error::InvalidValue("ipv4 offset length")),
         };
         let keys_reader = map.key("keys")?;
         let count = keys_reader.array(limits::MAX_KEYS_PER_DEVICE, "keys per device")?;
@@ -555,7 +647,7 @@ mod tests {
             Commitment { count: 500, entries: [7; 32], pieces: 40, layout: [8; 32] },
             Mode::Light,
             alloc::vec![Group::new("sensori").unwrap()],
-            Some(Ipv4Range::new([100, 70, 0, 0], 16).unwrap()),
+            Some(OffsetRun::new([0, 0, 0, 9], 500).unwrap()),
             "lotto 2026-10-24 A",
         )
         .unwrap()
@@ -586,7 +678,7 @@ mod tests {
     fn a_header_round_trips() {
         assert_eq!(round_trip(&header()).unwrap(), header());
         let mut plain = header();
-        plain.block = None;
+        plain.offsets = None;
         plain.groups.clear();
         assert_eq!(round_trip(&plain).unwrap(), plain);
     }
@@ -606,11 +698,12 @@ mod tests {
 pub enum Skip {
     /// The device is already a member.
     AlreadyMember,
-    /// Another device already holds the address the entry was assigned.
-    AddressTaken,
-    /// The entry was assigned an address outside the header's block, or one
-    /// when the header declares no block.
-    AddressOutsideBlock,
+    /// Another device already holds the offset the entry was given, or an
+    /// entry before it in device order was given it too.
+    OffsetTaken,
+    /// The entry was given an offset outside the header's run, or one when
+    /// the header declares no run.
+    OffsetOutsideRun,
 }
 
 /// The entries of a batch that would have no effect over `held`, and why.
@@ -621,7 +714,7 @@ pub enum Skip {
 /// outcome cannot disagree.
 ///
 /// Entries are judged in device order, whatever order they are given in: of
-/// two entries assigned one address, the one naming the smaller device keeps
+/// two entries given one offset, the one naming the smaller device keeps
 /// it, on every node.
 #[must_use]
 pub fn skipped(
@@ -629,37 +722,37 @@ pub fn skipped(
     header: &BatchHeader,
     entries: &[BatchEntry],
 ) -> alloc::collections::BTreeMap<crate::id::DeviceId, Skip> {
-    skipped_among(
-        held,
-        header,
-        entries.iter().filter_map(|entry| entry.device_id().ok().map(|device| (device, entry))),
-    )
+    let mut ordered: Vec<(crate::id::DeviceId, Option<[u8; 4]>)> = entries
+        .iter()
+        .filter_map(|entry| entry.device_id().ok().map(|device| (device, entry.ipv4)))
+        .collect();
+    ordered.sort_by_key(|(device, _)| *device);
+    skipped_among(held, header, ordered.into_iter())
 }
 
-/// [`skipped`], over entries whose devices are already worked out: what
-/// derivation holds, which asks this every time it resolves a state.
+/// [`skipped`], over each entry's device and offset, given in device order:
+/// what derivation holds, which asks this every time it resolves a state, and
+/// reads a batch's entries from its layer as they come rather than all at once.
 #[must_use]
-pub fn skipped_among<'entry>(
+pub fn skipped_among(
     held: &crate::state::RosterState,
     header: &BatchHeader,
-    entries: impl Iterator<Item = (crate::id::DeviceId, &'entry BatchEntry)>,
+    entries: impl Iterator<Item = (crate::id::DeviceId, Option<Ipv4Offset>)>,
 ) -> alloc::collections::BTreeMap<crate::id::DeviceId, Skip> {
-    // The addresses entries before this one took; those members hold are asked
+    // The offsets entries before this one took; those members hold are asked
     // of the state's index, rather than gathered from every member.
-    let mut taken: alloc::collections::BTreeSet<[u8; 4]> = alloc::collections::BTreeSet::new();
-    let mut ordered: Vec<(crate::id::DeviceId, &BatchEntry)> = entries.collect();
-    ordered.sort_by_key(|(device, _)| *device);
+    let mut taken: alloc::collections::BTreeSet<Ipv4Offset> = alloc::collections::BTreeSet::new();
     let mut out = alloc::collections::BTreeMap::new();
-    for (device, entry) in ordered {
+    for (device, offset) in entries {
         if held.devices.contains_key(&device) {
             out.insert(device, Skip::AlreadyMember);
             continue;
         }
-        let Some(address) = entry.ipv4 else { continue };
-        if !header.block.is_some_and(|block| block.contains(address)) {
-            out.insert(device, Skip::AddressOutsideBlock);
-        } else if !held.devices.holding_address(address).is_empty() || !taken.insert(address) {
-            out.insert(device, Skip::AddressTaken);
+        let Some(offset) = offset else { continue };
+        if !header.offsets.is_some_and(|run| run.contains(offset)) {
+            out.insert(device, Skip::OffsetOutsideRun);
+        } else if !held.devices.holding_address(offset).is_empty() || !taken.insert(offset) {
+            out.insert(device, Skip::OffsetTaken);
         }
     }
     out

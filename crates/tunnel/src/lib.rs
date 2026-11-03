@@ -50,8 +50,8 @@ pub mod limits;
 pub mod memory;
 pub mod outcome;
 
-pub use address::{Prefix, address_of, ipv4_candidate};
+pub use address::{Prefix, address_of};
 pub use device::{Packets, Tunnel, destination_of};
-pub use holdings::{Collision, Ipv4Holdings};
+pub use holdings::Ipv4Holdings;
 pub use memory::MemoryDevice;
 pub use outcome::{Error, Inbound, Outbound, Result};

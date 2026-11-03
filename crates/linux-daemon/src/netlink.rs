@@ -153,7 +153,7 @@ fn route_message(route: &Route) -> RouteMessage {
                 std::net::Ipv6Addr::from(route.octets()),
             )));
         }
-        Destination::Host(address) => {
+        Destination::Ipv4(address, _) => {
             message.header.address_family = AddressFamily::Inet;
             message.attributes.push(RouteAttribute::Destination(RouteAddress::Inet(address)));
         }

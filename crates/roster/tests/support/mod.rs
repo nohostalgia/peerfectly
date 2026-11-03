@@ -535,3 +535,157 @@ impl Default for History {
         Self::new()
     }
 }
+
+/// The rows of a derived index: each value, with the device deriving it.
+pub type DerivedRows = Vec<([u8; 4], DeviceId)>;
+
+/// A layer store held in memory: what a full member keeps in a file, kept in
+/// maps, so that the layered paths a store takes are tested without one. It
+/// counts how many times it was told it lied, and can be made to lie.
+#[derive(Default)]
+pub struct MemoryLayers {
+    entries: std::sync::Mutex<
+        std::collections::BTreeMap<(OperationId, DeviceId), roster::batch::BatchEntry>,
+    >,
+    nodes:
+        std::sync::Mutex<std::collections::HashMap<roster::merkle::Hash, roster::merkle::Stored>>,
+    derived: std::sync::Mutex<std::collections::BTreeMap<(OperationId, [u8; 32]), DerivedRows>>,
+    told: AtomicU64,
+}
+
+impl MemoryLayers {
+    /// How many times a check of what it answered failed.
+    pub fn told(&self) -> u64 {
+        self.told.load(Ordering::SeqCst)
+    }
+
+    /// Replaces the entry it holds for `device` in `batch`: a store changed
+    /// behind the daemon's back.
+    pub fn alter(&self, batch: &OperationId, device: &DeviceId, entry: roster::batch::BatchEntry) {
+        self.entries.lock().expect("a test store's lock").insert((*batch, *device), entry);
+    }
+
+    /// How many nodes it holds.
+    pub fn node_count(&self) -> usize {
+        self.nodes.lock().expect("a test store's lock").len()
+    }
+
+    fn of(&self, batch: &OperationId) -> Vec<(DeviceId, roster::batch::BatchEntry)> {
+        self.entries
+            .lock()
+            .expect("a test store's lock")
+            .iter()
+            .filter(|((held, _), _)| held == batch)
+            .map(|((_, device), entry)| (*device, entry.clone()))
+            .collect()
+    }
+}
+
+impl roster::merkle::NodeSource for MemoryLayers {
+    fn node(&self, hash: &roster::merkle::Hash) -> Option<roster::merkle::Stored> {
+        self.nodes.lock().expect("a test store's lock").get(hash).cloned()
+    }
+
+    fn tampered(&self) {
+        self.told.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl roster::merkle::NodeSink for MemoryLayers {
+    fn put_nodes(&self, nodes: &[(roster::merkle::Hash, roster::merkle::Stored)]) {
+        self.nodes.lock().expect("a test store's lock").extend(nodes.iter().cloned());
+    }
+}
+
+impl roster::members::LayerStore for MemoryLayers {
+    fn put(
+        &self,
+        batch: &OperationId,
+        entries: &[roster::batch::BatchEntry],
+    ) -> roster::Result<()> {
+        let tree = roster::batch::entries_tree(entries)?;
+        let mut nodes = Vec::new();
+        tree.fresh(&mut |hash, node| nodes.push((hash, node)));
+        roster::merkle::NodeSink::put_nodes(self, &nodes);
+        let mut held = self.entries.lock().expect("a test store's lock");
+        for entry in entries {
+            held.insert((*batch, entry.device_id()?), entry.clone());
+        }
+        Ok(())
+    }
+
+    fn entry(&self, batch: &OperationId, device: &DeviceId) -> Option<roster::batch::BatchEntry> {
+        self.entries.lock().expect("a test store's lock").get(&(*batch, *device)).cloned()
+    }
+
+    fn entries_after(
+        &self,
+        batch: &OperationId,
+        after: Option<&DeviceId>,
+        count: usize,
+    ) -> Vec<(DeviceId, roster::batch::BatchEntry)> {
+        self.of(batch)
+            .into_iter()
+            .filter(|(device, _)| after.is_none_or(|after| device > after))
+            .take(count)
+            .collect()
+    }
+
+    fn key_holders(&self, batch: &OperationId, key: &roster::id::KeyId) -> Vec<DeviceId> {
+        self.of(batch)
+            .into_iter()
+            .filter(|(_, entry)| entry.keys.iter().any(|held| held.key_id() == *key))
+            .map(|(device, _)| device)
+            .collect()
+    }
+
+    fn address_holders(&self, batch: &OperationId, address: [u8; 4]) -> Vec<DeviceId> {
+        self.of(batch)
+            .into_iter()
+            .filter(|(_, entry)| entry.ipv4 == Some(address))
+            .map(|(device, _)| device)
+            .collect()
+    }
+
+    fn addresses(&self, batch: &OperationId) -> Vec<[u8; 4]> {
+        let mut out: Vec<[u8; 4]> =
+            self.of(batch).into_iter().filter_map(|(_, entry)| entry.ipv4).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn name_holders(&self, batch: &OperationId, name: &str) -> Vec<DeviceId> {
+        self.of(batch)
+            .into_iter()
+            .filter(|(_, entry)| entry.name.to_ascii_lowercase() == name)
+            .map(|(device, _)| device)
+            .collect()
+    }
+
+    fn forget(&self, batch: &OperationId) {
+        self.entries.lock().expect("a test store's lock").retain(|(held, _), _| held != batch);
+        self.derived.lock().expect("a test store's lock").retain(|(held, _), _| held != batch);
+    }
+
+    fn derived_holders(
+        &self,
+        batch: &OperationId,
+        tag: &[u8; 32],
+        value: [u8; 4],
+    ) -> Option<Vec<DeviceId>> {
+        let derived = self.derived.lock().expect("a test store's lock");
+        derived.get(&(*batch, *tag)).map(|rows| {
+            rows.iter().filter(|(held, _)| *held == value).map(|(_, device)| *device).collect()
+        })
+    }
+
+    fn put_derived(&self, batch: &OperationId, tag: &[u8; 32], rows: &[([u8; 4], DeviceId)]) {
+        self.derived
+            .lock()
+            .expect("a test store's lock")
+            .entry((*batch, *tag))
+            .or_default()
+            .extend_from_slice(rows);
+    }
+}

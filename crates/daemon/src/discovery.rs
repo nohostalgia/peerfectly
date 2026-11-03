@@ -414,7 +414,16 @@ impl Discovery {
 
         let me = self.node.identity().device_id();
 
-        for device in state.devices.values() {
+        // From the keys heard on the local network, which the cache bounds, to
+        // the members holding them: not every member asked whether it was heard,
+        // which a fleet's million never are.
+        let heard: Vec<roster::id::KeyId> = self.cache.lock().await.keys().copied().collect();
+        for key_id in heard {
+            let Some(device) =
+                state.devices.holding(&key_id, Some(roster::types::KeyPurpose::Transport))
+            else {
+                continue;
+            };
             if device.id == me || self.node.has_session(&device.id).await {
                 continue;
             }
@@ -458,11 +467,12 @@ impl Discovery {
     }
 }
 
-/// Whether a member of this network holds this transport key.
+/// Whether a member of this network holds this transport key: asked of the
+/// state's key index, for every announcement heard.
 fn member_holds(state: &RosterState, key: &PublicKey) -> bool {
-    state.devices.values().any(|device| {
-        transport_key_of(&device).is_some_and(|held| held.as_bytes() == key.as_bytes())
-    })
+    state.devices.holding(&key.key_id(), Some(roster::types::KeyPurpose::Transport)).is_some_and(
+        |device| transport_key_of(&device).is_some_and(|held| held.as_bytes() == key.as_bytes()),
+    )
 }
 
 /// A device's transport key, as the roster declares it.

@@ -102,8 +102,8 @@ enum Resume {
         /// Where its roster stood when the batch was built.
         prepared_against: crate::signing::Moment,
     },
-    /// The network this device calls `label` is changing its parameters: its
-    /// relay.
+    /// The network this device calls `label` is taking one act of an admin's:
+    /// a change of its parameters, or of a device's settings.
     ChangingParameters {
         /// Which network.
         label: Label,
@@ -190,8 +190,8 @@ pub(crate) struct BatchWanted {
     pub(crate) light: bool,
     /// The groups they join.
     pub(crate) groups: Vec<String>,
-    /// The block their addresses come from.
-    pub(crate) block: Option<String>,
+    /// Whether they are admitted IPv6 only, given no IPv4 offset.
+    pub(crate) ipv6_only: bool,
 }
 
 /// What a person is told when the roster moved under a batch they were
@@ -510,6 +510,11 @@ pub struct Service {
     /// Woken when IPv4 routes may need to change: a roster change on a network
     /// that is up. Networks coming up or down reconcile directly.
     reconciling: Arc<tokio::sync::Notify>,
+    /// Held across a reconciliation's planning and applying: two at once — one
+    /// after an act signed here, one after the change reached the node — each
+    /// plan from what it read, and the one read earlier applied last took this
+    /// device's IPv4 address off the adapter on a real machine (2026-11-02).
+    reconciliation: tokio::sync::Mutex<()>,
     /// Woken when the platform says the device's network may have changed, so
     /// the interfaces are read at once rather than at the next check.
     interfaces_moved: Arc<tokio::sync::Notify>,
@@ -751,6 +756,7 @@ impl Service {
             unkeyed: Mutex::new(None),
             stopping: Mutex::new(false),
             reconciling: Arc::new(tokio::sync::Notify::new()),
+            reconciliation: tokio::sync::Mutex::new(()),
             interfaces_moved: Arc::new(tokio::sync::Notify::new()),
             inviting: Arc::new(tokio::sync::Notify::new()),
             machine: None,
@@ -1237,6 +1243,38 @@ impl Service {
             cause: "this device has no address on its own network".to_owned(),
         })?;
 
+        // Two networks up in one block would answer for the same addresses, and
+        // services that pass addresses to each other would reach the wrong
+        // device: the other network is named and asked down first, before
+        // anything is installed (`scalable-membership` 19.6).
+        let block = state.params.ipv4_range();
+        for other in self.all().await {
+            if Arc::ptr_eq(&other, network) || other.up.lock().await.is_none() {
+                continue;
+            }
+            let Ok(theirs) = other.node().state().await else { continue };
+            let theirs = theirs.params.ipv4_range();
+            let taken = crate::conflicts::OtherNetwork {
+                label: other.label().to_string(),
+                own: None,
+                block: Some(theirs),
+            };
+            if !crate::conflicts::overlapping(network.label().as_str(), block, &[taken]).is_empty()
+            {
+                return Err(Error::Parameters {
+                    cause: format!(
+                        "`{}` holds its IPv4 addresses in {block}, which overlaps {theirs}, the \
+                         block of `{}`, up here. Take `{}` down first (peerfectly down {}), or \
+                         move one of the two to another block (peerfectly ipv4 block)",
+                        network.label(),
+                        other.label(),
+                        other.label(),
+                        other.label()
+                    ),
+                });
+            }
+        }
+
         let (installed, device) =
             self.lifecycle.up(network.label().as_str(), &state, resolver).await?;
 
@@ -1458,7 +1496,7 @@ impl Service {
             // Nothing is routed while down, so nothing is withheld from a route;
             // and a peer elsewhere that conflicted with this network no longer
             // does.
-            network.node().set_withheld(BTreeMap::new());
+            network.node().set_withheld(Vec::new());
             self.reconcile().await;
         }
 
@@ -1500,14 +1538,17 @@ impl Service {
                 self.rebuild(&network).await;
             }
         }
+        // After the rebuilds, which take networks down and reconcile in turn.
+        let _one_at_a_time = self.reconciliation.lock().await;
 
         struct Gathered {
             network: Arc<Network>,
             state: roster::state::RosterState,
             interface: crate::routes::Interface,
             own: Ipv6Addr,
-            me: roster::id::DeviceId,
-            addresses: Vec<(roster::id::DeviceId, std::net::Ipv4Addr)>,
+            /// This device's own IPv4 address there, if it holds one: read from
+            /// its own leaf, never from a walk over the members.
+            own_ipv4: Option<std::net::Ipv4Addr>,
         }
 
         // Before the rest: an admin attesting to what its networks say is how
@@ -1531,15 +1572,16 @@ impl Service {
             let Ok(state) = node.state().await else {
                 continue;
             };
-            let me = node.identity().device_id();
-            let addresses = node.current_ipv4_holdings().held().collect();
+            // From the state the block is read from, never the node's holdings,
+            // which follow the state a moment later: just after a move the two
+            // would name different blocks.
+            let own_ipv4 = tunnel::Ipv4Holdings::of_state(&state).of(&node.identity().device_id());
             gathered.push(Gathered {
                 network: Arc::clone(&network),
                 state,
                 interface,
                 own,
-                me,
-                addresses,
+                own_ipv4,
             });
         }
 
@@ -1553,66 +1595,54 @@ impl Service {
             .filter(|interface| !adapters.contains(&interface.index))
             .collect();
 
-        let mut others: Vec<crate::conflicts::OtherNetwork> = gathered
+        let others: Vec<crate::conflicts::OtherNetwork> = gathered
             .iter()
             .map(|each| crate::conflicts::OtherNetwork {
                 label: each.network.label().to_string(),
-                own: each
-                    .addresses
-                    .iter()
-                    .find(|(device, _)| *device == each.me)
-                    .map(|(_, at)| *at),
-                routed: Vec::new(),
+                own: each.own_ipv4,
+                block: Some(each.state.params.ipv4_range()),
             })
             .collect();
 
-        // `all` is in label order, so every earlier network's routed peers are
-        // known by the time a later one is decided.
+        // Each network's block less its holes: two routes a network, its prefix
+        // and its block, whatever its size, and a few more around a hole.
         let mut served: Vec<transport::Range> = Vec::new();
-        for (index, each) in gathered.iter().enumerate() {
+        for each in &gathered {
             let label = each.network.label().to_string();
+            let block = each.state.params.ipv4_range();
             let infrastructure =
                 crate::conflicts::Infrastructure::literal(each.state.params.relay.as_deref());
-            let withheld = crate::conflicts::withheld(
+            let excluded = crate::conflicts::Excluded {
+                here: crate::state::excluded_here(each.network.paths.root()),
+                everywhere: each.state.params.excluded.clone(),
+            };
+            let holes = crate::conflicts::holes_excluding(
                 &label,
+                block,
                 &local,
                 &infrastructure,
                 &others,
-                each.addresses.iter().copied(),
+                &excluded,
             );
-            let own_ipv4 = each
-                .addresses
-                .iter()
-                .find(|(device, _)| *device == each.me && !withheld.contains_key(device))
-                .map(|(_, at)| *at);
-            let routed: Vec<(roster::id::DeviceId, std::net::Ipv4Addr)> = each
-                .addresses
-                .iter()
-                .filter(|(device, _)| *device != each.me && !withheld.contains_key(device))
-                .copied()
-                .collect();
-            if let Some(entry) = others.get_mut(index) {
-                entry.routed.clone_from(&routed);
-            }
+            let own_ipv4 =
+                each.own_ipv4.filter(|at| crate::conflicts::withheld_by(&holes, *at).is_none());
 
             // What this network's tunnel actually carries, for the loop check
-            // below. Gathered here because this is where the withheld addresses
-            // are known: an address that is withheld has no route into the
+            // below: a part of the block that is a hole has no route into the
             // adapter, so a path to it is an ordinary path.
             served.extend(crate::routes::served(
                 &each.state.params,
                 own_ipv4,
-                routed.iter().map(|(_, at)| *at),
+                &crate::conflicts::routed(block, &holes),
             ));
 
             let node = each.network.node();
-            node.set_withheld(withheld);
             let plan = match crate::routes::Plan::wanted(
                 &each.state.params,
                 each.interface,
                 Some(each.own),
                 own_ipv4,
-                routed.iter().map(|(_, at)| *at),
+                Some(&holes),
             ) {
                 Ok(plan) => plan,
                 Err(failure) => {
@@ -1621,6 +1651,7 @@ impl Service {
                     continue;
                 }
             };
+            node.set_withheld(holes);
             let mut up = each.network.up.lock().await;
             if let Some(up) = up.as_mut()
                 && let Err(failure) = self.lifecycle.reconcile(up, &plan).await
@@ -1684,6 +1715,7 @@ impl Service {
             // And what changed is vouched for, grouped.
             self.keep_checkpoints(false).await;
             if !woken {
+                self.keep_ipv4_addresses().await;
                 let now = listed(&self.own_adapters().await);
                 // Catching up waits for a change that holds; reconciling below
                 // follows every change at once, since it contacts nobody.
@@ -1709,6 +1741,31 @@ impl Service {
                 seen = now;
             }
             self.reconcile().await;
+        }
+    }
+
+    /// Gives each adapter that is up its IPv4 address back where the machine
+    /// says it lost it, and says so in the log and the network's events.
+    async fn keep_ipv4_addresses(&self) {
+        for network in self.all().await {
+            let up = network.up.lock().await;
+            let Some(up) = up.as_ref() else { continue };
+            match self.lifecycle.keep_ipv4(up).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    let said = format!(
+                        "this device's IPv4 address {} was gone from the adapter, and was given back",
+                        up.ipv4().map_or_else(String::new, |address| address.to_string())
+                    );
+                    network.node().record(crate::node::Severity::Event, "routes", said).await;
+                }
+                Err(failure) => {
+                    network
+                        .node()
+                        .record(crate::node::Severity::Problem, "routes", failure.to_string())
+                        .await;
+                }
+            }
         }
     }
 
@@ -1980,6 +2037,7 @@ impl Service {
                 anchors: Vec::new(),
                 relay: None,
                 relay_leaving: None,
+                ipv4_block: None,
                 accused: Vec::new(),
                 peers: Vec::new(),
                 revoked: Vec::new(),
@@ -1996,20 +2054,13 @@ impl Service {
         let holdings = tunnel::Ipv4Holdings::of_state(&state);
         let withheld = node.withheld();
         let ipv4 = |device: &roster::id::DeviceId| -> Option<crate::control::Ipv4State> {
-            if let (Some(address), Some(conflict)) = (holdings.of(device), withheld.get(device)) {
-                return Some(crate::control::Ipv4State::Withheld {
-                    address,
-                    with: conflict.to_string(),
-                });
-            }
-            if let Some(address) = holdings.of(device) {
-                return Some(crate::control::Ipv4State::Held(address));
-            }
-            let other = holdings.collision(device)?.with.first().copied()?;
-            Some(crate::control::Ipv4State::Collides(crate::control::Named::new(
-                &other,
-                state.devices.get(&other).map(|record| record.name.clone()),
-            )))
+            let address = holdings.of(device)?;
+            Some(match crate::conflicts::withheld_by(&withheld, address) {
+                Some(conflict) => {
+                    crate::control::Ipv4State::Withheld { address, with: conflict.to_string() }
+                }
+                None => crate::control::Ipv4State::Held(address),
+            })
         };
 
         let mut peers = Vec::new();
@@ -2059,6 +2110,7 @@ impl Service {
                 .get(&me)
                 .is_some_and(|record| record.role == roster::types::Role::Admin),
             relay: state.params.relay.clone(),
+            ipv4_block: Some(state.params.ipv4_range().to_string()),
             relay_leaving: state.params.leaving_at(crate::clock::now_ms()).map(|leaving| {
                 crate::control::RelayLeaving {
                     relay: leaving.relay.clone(),
@@ -2592,8 +2644,8 @@ impl Service {
     /// Reviews, or signs, the batch put together for a network.
     ///
     /// Everything is checked before anything is shown: the keys, the names,
-    /// the block inside the network's range and large enough, every address
-    /// assigned. Without `reviewed`, what it would do comes back and nothing is
+    /// and a run of the network's block free and long enough, every offset
+    /// given. Without `reviewed`, what it would do comes back and nothing is
     /// signed; with it, the entries the person was shown as skipped must still
     /// be the ones, or nothing is signed.
     async fn admit_batch(
@@ -2654,7 +2706,9 @@ impl Service {
                 label: header.label.clone(),
                 mode: header.mode.as_str().to_owned(),
                 groups: header.groups.iter().map(|group| group.as_str().to_owned()).collect(),
-                block: header.block.map(|block| block.to_string()),
+                block: header
+                    .offsets
+                    .map(|run| crate::batches::addresses_of(&state.params.ipv4_range(), &run)),
                 skipped,
             };
         };
@@ -2830,6 +2884,215 @@ impl Service {
         self.sign_parameters(&network, &label, &state, params, issued).await
     }
 
+    /// The network an admin's act on its roster is for, with its state, where
+    /// this device may sign one now; refused in words otherwise, with nothing
+    /// signed.
+    async fn for_an_admin_act(
+        &self,
+        which: Option<&Label>,
+        act: &str,
+    ) -> core::result::Result<(Arc<Network>, roster::state::RosterState), Outcome> {
+        let network = self.which(which).await.map_err(|cause| Outcome::Failed {
+            message: cause.to_string(),
+            left_behind: Vec::new(),
+        })?;
+        let state = network.node().state().await.map_err(|cause| Outcome::Failed {
+            message: format!("the roster does not describe a network: {cause}"),
+            left_behind: Vec::new(),
+        })?;
+        if !state.is_admin(&network.node().identity().device_id()) {
+            return Err(Outcome::refused(format!(
+                "only an admin of the network {act}. Nothing was signed."
+            )));
+        }
+        if let Some(refusal) = self.keys.admin_refusal() {
+            return Err(Outcome::refused(format!(
+                "this network makes this device an admin, and {refusal}. Nothing was signed."
+            )));
+        }
+        if let Some(refusal) = self.already_waiting().await {
+            return Err(refusal);
+        }
+        Ok((network, state))
+    }
+
+    /// Moves or resizes a network's IPv4 block, as its admin: one change of
+    /// its parameters, every offset kept (`scalable-membership` 19.4).
+    async fn set_ipv4_block(&self, which: Option<&Label>, text: &str) -> Outcome {
+        let (network, state) = match self.for_an_admin_act(which, "moves its IPv4 block").await {
+            Ok(held) => held,
+            Err(refused) => return refused,
+        };
+        let block = match crate::founding::ipv4_range(Some(text)) {
+            Ok(block) => block.unwrap_or(roster::types::Ipv4Range::DEFAULT),
+            Err(refusal) => return Outcome::refused(refusal),
+        };
+        let current = state.params.ipv4_range();
+        if block == current {
+            return Outcome::refused(format!(
+                "{block} is the network's block already. Nothing was signed."
+            ));
+        }
+        // Each offset must name one of the new block's hosts, or its device
+        // would lose its address.
+        let hosts = block.hosts();
+        let highest = state
+            .devices
+            .iter()
+            .filter_map(|(device, leaf)| {
+                leaf.settings.ipv4.map(|offset| (u32::from_be_bytes(offset), device))
+            })
+            .max_by_key(|(offset, _)| *offset);
+        if let Some((offset, device)) = highest
+            && u64::from(offset) > hosts
+        {
+            let name = state.devices.get(&device).map(|leaf| leaf.record.name.clone());
+            let needed = crate::founding::prefix_for_hosts(u64::from(offset));
+            return Outcome::refused(format!(
+                "{block} holds {hosts} hosts, and {} holds offset {offset}, {}. A block of /{needed} \
+                 or wider keeps every device's address. Nothing was signed.",
+                crate::control::Named::new(&device, name),
+                current
+                    .address_at(offset.to_be_bytes())
+                    .map_or_else(String::new, |address| std::net::Ipv4Addr::from(address)
+                        .to_string()),
+            ));
+        }
+        let params = state.params.clone().in_ipv4_range(block);
+        let label = network.label().clone();
+        let issued = crate::clock::signing_time();
+        self.sign_parameters(&network, &label, &state, params, issued).await
+    }
+
+    /// Excludes a block from a network's IPv4 route, or includes it again: on
+    /// this device, kept beside the network's log, or `everywhere`, as one
+    /// signed change of the network's parameters (`scalable-membership` 19.7).
+    async fn route_exclusion(
+        &self,
+        which: Option<&Label>,
+        text: &str,
+        include: bool,
+        everywhere: bool,
+    ) -> Outcome {
+        let block = match text.parse::<roster::types::Excluded>() {
+            Ok(block) => block,
+            Err(cause) => {
+                return Outcome::refused(format!(
+                    "`{}` is not a block ({cause}): write a.b.c.d/len, from /10 to one address, \
+                     or a.b.c.d. Nothing was changed.",
+                    crate::control::shown(text)
+                ));
+            }
+        };
+        let (network, state) = if everywhere {
+            match self.for_an_admin_act(which, "excludes from its route for everyone").await {
+                Ok(held) => held,
+                Err(refused) => return refused,
+            }
+        } else {
+            let network = match self.which(which).await {
+                Ok(network) => network,
+                Err(cause) => {
+                    return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+                }
+            };
+            let state = match network.node().state().await {
+                Ok(state) => state,
+                Err(cause) => {
+                    return Outcome::Failed {
+                        message: format!("the roster does not describe a network: {cause}"),
+                        left_behind: Vec::new(),
+                    };
+                }
+            };
+            (network, state)
+        };
+        let range = state.params.ipv4_range();
+        let inside = range.prefix_len() <= block.prefix_len() && range.contains(block.address());
+        if !include && !inside {
+            return Outcome::refused(format!(
+                "{block} is not inside the network's block, {range}: nothing of it is routed to \
+                 exclude. Nothing was changed."
+            ));
+        }
+        let mut list = if everywhere {
+            state.params.excluded.clone()
+        } else {
+            crate::state::excluded_here(network.paths.root())
+        };
+        let held = list.contains(&block);
+        match (include, held) {
+            (false, true) => {
+                return Outcome::refused(format!(
+                    "{block} is excluded already. Nothing was changed."
+                ));
+            }
+            (true, false) => {
+                return Outcome::refused(format!(
+                    "{block} is not excluded {}. Nothing was changed.",
+                    if everywhere { "for everyone" } else { "on this device" }
+                ));
+            }
+            (false, false) => list.push(block),
+            (true, true) => list.retain(|held| *held != block),
+        }
+        if everywhere {
+            let params = match state.params.with_excluded(list) {
+                Ok(params) => params,
+                Err(cause) => return Outcome::refused(format!("{cause}. Nothing was signed.")),
+            };
+            let label = network.label().clone();
+            let issued = crate::clock::signing_time();
+            return self.sign_parameters(&network, &label, &state, params, issued).await;
+        }
+        list.sort();
+        if let Err(cause) = crate::state::keep_excluded_here(network.paths.root(), &list) {
+            return Outcome::Failed {
+                message: format!("the exclusion could not be kept: {cause}"),
+                left_behind: Vec::new(),
+            };
+        }
+        self.reconcile().await;
+        Outcome::Reported(self.report().await)
+    }
+
+    /// Gives a device the lowest IPv4 offset no member holds, as an admin.
+    async fn give_ipv4(&self, which: Option<&Label>, target: &crate::control::Target) -> Outcome {
+        const CHOOSE: &str = "Rename one of them first, so that each answers to a name of its own.";
+        let (network, state) = match self.for_an_admin_act(which, "gives IPv4 addresses").await {
+            Ok(held) => held,
+            Err(refused) => return refused,
+        };
+        let found = match crate::revoking::find(&state, target, CHOOSE) {
+            Ok(found) => found,
+            Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was signed.")),
+        };
+        let named = crate::control::Named::new(&found.record.id, Some(found.record.name.clone()));
+        let range = state.params.ipv4_range();
+        if let Some(address) = found.settings.ipv4.and_then(|offset| range.address_at(offset)) {
+            return Outcome::refused(format!(
+                "{named} holds {} already. Nothing was signed.",
+                std::net::Ipv4Addr::from(address)
+            ));
+        }
+        let Some(offset) = state.free_offsets(1) else {
+            return Outcome::refused(format!(
+                "the network's block, {range}, has no address free. Grow it with `ipv4 block`. \
+                 Nothing was signed."
+            ));
+        };
+        let body = roster::types::OperationBody::SetDevice {
+            device: found.record.id,
+            change: roster::leaf::SettingsChange {
+                ipv4: Some(Some(offset)),
+                ..roster::leaf::SettingsChange::default()
+            },
+        };
+        let label = network.label().clone();
+        let issued = crate::clock::signing_time();
+        self.sign_one(&network, &label, &state, body, issued).await
+    }
+
     /// Signs new parameters for a network as its admin, and carries them.
     ///
     /// **One path for every parameter change**, so the admin check, the custody
@@ -2843,13 +3106,28 @@ impl Service {
         params: roster::types::NetworkParams,
         issued: u64,
     ) -> Outcome {
+        let body = roster::types::OperationBody::SetNetwork(params);
+        self.sign_one(network, label, state, body, issued).await
+    }
+
+    /// Signs one operation as the network's admin, and carries it: here where
+    /// the key answers here, elsewhere where it does not, the snapshot owed
+    /// beside it.
+    async fn sign_one(
+        &self,
+        network: &Arc<Network>,
+        label: &Label,
+        state: &roster::state::RosterState,
+        body: roster::types::OperationBody,
+        issued: u64,
+    ) -> Outcome {
         let node = network.node();
         let identity = node.identity();
         let prepared_against = node.moment().await;
         let core = match roster::types::OperationCore::new(
             issued,
             identity.signing_key().algorithm(),
-            roster::types::OperationBody::SetNetwork(params),
+            body,
             prepared_against.heads.clone(),
             identity.signing_key().key_id(),
             state.network,
@@ -3387,10 +3665,10 @@ impl Service {
                 staged.1.extend(devices);
                 Outcome::Staged { count: u64::try_from(staged.1.len()).unwrap_or(u64::MAX) }
             }
-            Command::AdmitBatch { network, label, light, groups, block, reviewed } => {
+            Command::AdmitBatch { network, label, light, groups, ipv6_only, reviewed } => {
                 match Self::wanted(network.clone()) {
                     Ok(which) => {
-                        let wanted = BatchWanted { label, light, groups, block };
+                        let wanted = BatchWanted { label, light, groups, ipv6_only };
                         self.admit_batch(network, which.as_ref(), &wanted, reviewed).await
                     }
                     Err(cause) => Self::said(Err(cause)),
@@ -3398,6 +3676,26 @@ impl Service {
             }
             Command::SetAnchors { network, anchors } => match Self::wanted(network) {
                 Ok(label) => self.set_anchors(label.as_ref(), &anchors).await,
+                Err(cause) => {
+                    Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                }
+            },
+            Command::SetIpv4Block { network, block } => match Self::wanted(network) {
+                Ok(label) => self.set_ipv4_block(label.as_ref(), &block).await,
+                Err(cause) => {
+                    Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                }
+            },
+            Command::Route { network, block, include, everywhere } => match Self::wanted(network) {
+                Ok(label) => {
+                    self.route_exclusion(label.as_ref(), &block, include, everywhere).await
+                }
+                Err(cause) => {
+                    Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                }
+            },
+            Command::GiveIpv4 { network, device } => match Self::wanted(network) {
+                Ok(label) => self.give_ipv4(label.as_ref(), &device).await,
                 Err(cause) => {
                     Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
                 }
@@ -3452,7 +3750,7 @@ impl Service {
             }
             Command::Forget { label, last_admin } => self.forget(&label, last_admin).await,
             Command::Waiting => self.waiting_on().await,
-            Command::Found { label, name, suffix, relay, ipv4_range, window_days } => {
+            Command::Found { label, name, suffix, relay, ipv4_range, devices, window_days } => {
                 let name = match crate::names::usable(&name) {
                     Ok(name) => name,
                     Err(unusable) => {
@@ -3472,7 +3770,27 @@ impl Service {
                 };
                 // Before anything else, and before any host is asked: a range
                 // that is not allowed is refused with nothing signed.
-                let ipv4_range = match crate::founding::ipv4_range(ipv4_range.as_deref()) {
+                let named = ipv4_range.as_deref().map(str::trim).filter(|text| !text.is_empty());
+                let ipv4_range = match named {
+                    Some(_) => crate::founding::ipv4_range(named),
+                    // Proposed: at random, so two founders who never met do
+                    // not both take the first free block.
+                    None => crate::founding::propose_block(
+                        devices.unwrap_or(crate::founding::DEFAULT_EXPECTED),
+                        &self.taken_blocks().await,
+                        &mut |count| {
+                            let mut bytes = [0_u8; 8];
+                            // Without randomness, the first free block after
+                            // the first: still free, only less spread.
+                            if getrandom::fill(&mut bytes).is_err() {
+                                return 0;
+                            }
+                            u64::from_le_bytes(bytes).checked_rem(count).unwrap_or(0)
+                        },
+                    )
+                    .map(|block| (block != roster::types::Ipv4Range::DEFAULT).then_some(block)),
+                };
+                let ipv4_range = match ipv4_range {
                     Ok(range) => range,
                     Err(refusal) => {
                         return Outcome::Failed { message: refusal, left_behind: Vec::new() };
@@ -3827,11 +4145,17 @@ impl Service {
             ));
         }
         let name = invited.name.clone();
-        let record =
-            match crate::invites::Record::issue(&relay, state.network, invited, now, lifetime) {
-                Ok(record) => record,
-                Err(cause) => return Self::said(Err(cause)),
-            };
+        let record = match crate::invites::Record::issue(
+            &relay,
+            state.network,
+            state.params.ipv4_range(),
+            invited,
+            now,
+            lifetime,
+        ) {
+            Ok(record) => record,
+            Err(cause) => return Self::said(Err(cause)),
+        };
         let text = record.invite.to_text();
         let expires_at = record.expires_at;
         invites.add(record);
@@ -3930,6 +4254,7 @@ impl Service {
                     proposed_name: request.applicant.name.clone(),
                     fingerprint: crate::joining::fingerprint(&request.applicant.signing),
                     arrived_at: request.arrived_at,
+                    conflicts: request.applicant.conflicts.clone(),
                     taken: state
                         .as_ref()
                         .filter(|_| record.standing(now) == crate::invites::Standing::Requested)
@@ -4289,20 +4614,18 @@ impl Service {
             // device is one that brings it the network at all. Only those are
             // asked when they were admitted, and whether they were met.
             let choices = node.choices(&state);
-            for (device, record) in state.devices.iter() {
-                if device == me {
+            // Those admitted alone within the patience, from the operations
+            // held: a fleet's million members are not each asked when they
+            // were admitted.
+            let since = crate::clock::now_ms().saturating_sub(patience).saturating_add(1);
+            for (device, admission) in node.admitted_alone_since(since).await {
+                let Some(record) = state.devices.get(&device) else { continue };
+                if device == me || record.added_by != admission {
                     continue;
                 }
                 let anchor =
                     crate::seeking::anchors_for(&device, &state.params.anchors).contains(&me);
                 if !anchor && !choices.as_ref().is_some_and(|held| held.could_choose(&device)) {
-                    continue;
-                }
-                let recent = node
-                    .admitted_alone_at(&record.added_by)
-                    .await
-                    .is_some_and(|signed| crate::clock::now_ms().saturating_sub(signed) < patience);
-                if !recent {
                     continue;
                 }
                 // Met: a session with it is the end of this, for good. Not
@@ -4811,12 +5134,19 @@ impl Service {
         identity: &identity::NodeIdentity,
         proof: &enrollment::exchange::Possession,
     ) -> Outcome {
+        // Said now, before anything is asked, and carried in the request: the
+        // admin approving it sees them too, and may move the network.
+        let conflicts = match enrollment::Invite::from_text(&invite) {
+            Ok(read) => self.join_conflicts(&read.block).await,
+            Err(_) => Vec::new(),
+        };
         let join = crate::joins::Join {
             invite,
             name: name.to_owned(),
             proof: roster::hex::encode(proof.as_bytes()),
             started_at: crate::state::wall_seconds(),
             requested_at: None,
+            conflicts: conflicts.clone(),
         };
         let paths = self.home.paths_for(&label);
         if let Some(machine) = &self.machine
@@ -4827,7 +5157,45 @@ impl Service {
         }
         let fingerprint = crate::joining::fingerprint(&identity.signing_key().public_key());
         self.run_join(label.clone(), join).await;
-        Outcome::JoinStarted { label: label.to_string(), fingerprint }
+        Outcome::JoinStarted { label: label.to_string(), fingerprint, conflicts }
+    }
+
+    /// Where a network's IPv4 block, as its invite says it, coincides with
+    /// this device's other networks or the subnets it is on, in words
+    /// (`scalable-membership` 19.5).
+    async fn join_conflicts(&self, block: &roster::types::Ipv4Range) -> Vec<String> {
+        let mut said = Vec::new();
+        for network in self.all().await {
+            let Ok(state) = network.node().state().await else { continue };
+            let theirs = state.params.ipv4_range();
+            let taken = crate::founding::Taken {
+                address: theirs.address().into(),
+                prefix_len: theirs.prefix_len(),
+            };
+            if taken.overlaps_block(block) {
+                said.push(format!(
+                    "{block} overlaps {theirs}, the block of `{}` on this device",
+                    network.label()
+                ));
+            }
+        }
+        for interface in self.interfaces.list() {
+            for subnet in interface.subnets {
+                let taken = crate::founding::Taken {
+                    address: subnet.address,
+                    prefix_len: subnet.prefix_len,
+                };
+                if taken.overlaps_block(block) {
+                    said.push(format!(
+                        "{block} overlaps {}/{}, a subnet this device is on",
+                        subnet.address, subnet.prefix_len
+                    ));
+                }
+            }
+        }
+        said.dedup();
+        said.truncate(enrollment::limits::MAX_CONFLICTS);
+        said
     }
 
     /// Runs a join kept on disk, as a task that ends with it.
@@ -5566,6 +5934,30 @@ impl Service {
         Outcome::ConfirmingRelay { relay, key, moving: None }
     }
 
+    /// The blocks a new network's must not overlap: every network's here, and
+    /// every subnet this machine is on.
+    async fn taken_blocks(&self) -> Vec<crate::founding::Taken> {
+        let mut taken = Vec::new();
+        for network in self.all().await {
+            if let Ok(state) = network.node().state().await {
+                let block = state.params.ipv4_range();
+                taken.push(crate::founding::Taken {
+                    address: block.address().into(),
+                    prefix_len: block.prefix_len(),
+                });
+            }
+        }
+        for interface in self.interfaces.list() {
+            for subnet in interface.subnets {
+                taken.push(crate::founding::Taken {
+                    address: subnet.address,
+                    prefix_len: subnet.prefix_len,
+                });
+            }
+        }
+        taken
+    }
+
     /// Signs the founding and takes the network on.
     async fn finish_founding(
         &self,
@@ -5796,7 +6188,7 @@ fn invited_from(
             if !range.contains(octets) {
                 return Err(format!("{address} is outside the network's range, {range}"));
             }
-            if state.devices.values().any(|leaf| leaf.settings.ipv4 == Some(octets)) {
+            if !state.devices.holding_address(octets).is_empty() {
                 return Err(format!("{address} is assigned to a device already"));
             }
             Some(octets)
@@ -5939,6 +6331,9 @@ mod tests {
             Arc::clone(connectivity) as Arc<dyn Connectivity>,
             Arc::clone(names) as Arc<dyn Resolving>,
         )
+        // On no interface of this machine's: what the routes become depends on
+        // the test, never on the machine running it.
+        .with_interfaces(Arc::new(Moving(std::sync::Mutex::new(Vec::new()))))
     }
 
     /// A second service over the same state directory, standing in for a restart.
@@ -6184,6 +6579,7 @@ mod tests {
             transport: stranger.transport_key().public_key(),
             attestation: stranger.attestation_key().public_key(),
             name: "laptop".to_owned(),
+            conflicts: Vec::new(),
         };
         assert!(invites.arrived(&secret, applicant, crate::state::wall_seconds()));
         file.save(&invites).expect("planted");
@@ -6233,6 +6629,23 @@ mod tests {
             Arc::new(Names::new()) as Arc<dyn Resolving>,
         )
         .expect("assembles");
+        Arc::new(service)
+    }
+
+    /// A joining daemon over `home`, on the interfaces given.
+    fn joiner_on(
+        home: &Home,
+        interfaces: Vec<crate::connectivity::LocalInterface>,
+    ) -> Arc<Service> {
+        home.create().expect("creates");
+        let service = Service::over(
+            home.clone(),
+            Lifecycle::new(Arc::new(Recording::new()) as Arc<dyn Machine>),
+            Arc::new(InProcess::new()) as Arc<dyn Connectivity>,
+            Arc::new(Names::new()) as Arc<dyn Resolving>,
+        )
+        .expect("assembles")
+        .with_interfaces(Arc::new(Moving(std::sync::Mutex::new(interfaces))));
         Arc::new(service)
     }
 
@@ -6336,13 +6749,23 @@ mod tests {
         );
         assert_eq!(service.handle(Command::Waiting).await, Outcome::Done, "nothing on a person");
 
-        // The device joins later, and is answered at once with its fingerprint.
+        // The device joins later, and is answered at once with its fingerprint,
+        // and with where the network's block coincides with a subnet it is on.
         let elsewhere = tempfile::tempdir().expect("a scratch directory");
-        let joiner = joiner_over(&Home::under(elsewhere.path()));
+        let mut on_the_block = wifi(7, [100, 64, 12, 7]);
+        on_the_block.subnets = vec![crate::connectivity::Subnet {
+            address: std::net::Ipv4Addr::new(100, 64, 12, 7),
+            prefix_len: 22,
+        }];
+        let joiner = joiner_on(&Home::under(elsewhere.path()), vec![on_the_block]);
         let _joining = tokio::spawn(Arc::clone(&joiner).reconcile_forever());
         let started = joiner.handle(Command::Join { invite, name: "board".to_owned() }).await;
-        let Outcome::JoinStarted { fingerprint, .. } = started else { panic!("{started:?}") };
+        let Outcome::JoinStarted { fingerprint, conflicts, .. } = started else {
+            panic!("{started:?}")
+        };
         assert_eq!(fingerprint.len(), 24, "{fingerprint}");
+        let [conflict] = conflicts.as_slice() else { panic!("one conflict: {conflicts:?}") };
+        assert!(conflict.contains("100.64.12.7/22"), "{conflict}");
 
         // The admin's daemon takes the request on its own, and keeps it.
         let listed =
@@ -6352,6 +6775,7 @@ mod tests {
         assert_eq!(request.proposed_name, "board");
         assert_eq!(request.fingerprint, fingerprint, "the fingerprint both screens show");
         assert_eq!(request.taken, None);
+        assert_eq!(request.conflicts, conflicts, "what the device saw, for the admin to see");
         let network = service.all().await.first().map(Arc::clone).expect("the network");
         // Said once the request is kept, so a moment after the list shows it.
         let mut told = network.node().event().await;
@@ -6397,7 +6821,7 @@ mod tests {
         let settings = state.settings_of(&device);
         assert_eq!(settings.mode, roster::leaf::Mode::Light);
         assert_eq!(settings.groups, vec![roster::leaf::Group::new("sensori").expect("a group")]);
-        assert_eq!(settings.ipv4, Some([100, 64, 0, 9]));
+        assert_eq!(settings.ipv4, Some([0, 0, 0, 9]), "the offset of the address invited");
         assert_eq!(arrived.node().identity().device_id(), device, "the device that asked");
 
         // It arrived holding a root over its own admission, following one the
@@ -7152,6 +7576,7 @@ mod tests {
                 suffix: "example.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -7185,6 +7610,7 @@ mod tests {
             suffix: "example.internal".to_owned(),
             relay: Some(relay.to_owned()),
             ipv4_range: None,
+            devices: None,
             window_days: None,
         };
 
@@ -7245,6 +7671,7 @@ mod tests {
                 suffix: "example.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -7269,6 +7696,7 @@ mod tests {
                 suffix: "example.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -7320,6 +7748,7 @@ mod tests {
                 suffix: "example.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -7354,6 +7783,7 @@ mod tests {
             suffix: "example.internal".to_owned(),
             relay: Some(format!("https://127.0.0.1:{port}")),
             ipv4_range: None,
+            devices: None,
             window_days: None,
         };
 
@@ -7395,6 +7825,7 @@ mod tests {
             suffix: "example.internal".to_owned(),
             relay: Some(format!("https://127.0.0.1:{port}")),
             ipv4_range: None,
+            devices: None,
             window_days: None,
         };
         assert!(matches!(service.handle(found).await, Outcome::ConfirmingRelay { .. }));
@@ -7418,6 +7849,7 @@ mod tests {
             suffix: "example.internal".to_owned(),
             relay: Some(format!("https://127.0.0.1:{port}")),
             ipv4_range: None,
+            devices: None,
             window_days: None,
         };
         match service.handle(found).await {
@@ -8297,6 +8729,7 @@ mod tests {
                 suffix: "lavoro.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -8415,6 +8848,26 @@ mod tests {
         }
     }
 
+    /// The founder given its block's first host, after `genesis`.
+    fn first_host(founder: &NodeIdentity, genesis: &OperationCore) -> Vec<u8> {
+        let core = OperationCore::new(
+            2,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device: founder.device_id(),
+                change: roster::leaf::SettingsChange {
+                    ipv4: Some(Some(1_u32.to_be_bytes())),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            vec![genesis.id()],
+            founder.signing_key().key_id(),
+            NetworkId::from_bytes(*genesis.id().as_bytes()),
+        )
+        .expect("well-formed");
+        sign_operation(&core, founder.signer()).expect("signs")
+    }
+
     async fn fixture(fail_at: Option<Fail>) -> Fixture {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::new(
@@ -8440,6 +8893,7 @@ mod tests {
 
         let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted());
+        assert!(roster.offer_bytes(&first_host(&founder, &genesis)).is_accepted());
         let state = roster.state().expect("derives");
 
         let scratch = tempfile::tempdir().expect("a scratch directory");
@@ -8498,7 +8952,11 @@ mod tests {
         home.create().expect("creates");
 
         let mut networks = Vec::new();
-        for (name, ula) in [("casa", 0x11_u8), ("lavoro", 0x22)] {
+        // Each in a block of its own: in one, both founders would hold its first
+        // host, and conflict.
+        for (name, ula, block) in
+            [("casa", 0x11_u8, "10.11.0.0/16"), ("lavoro", 0x22, "10.22.0.0/16")]
+        {
             let label = Label::new(name).expect("a usable label");
             let paths = home.paths_for(&label);
             paths.create().expect("creates");
@@ -8509,7 +8967,8 @@ mod tests {
                 format!("{name}.internal"),
                 2_592_000,
             )
-            .expect("valid");
+            .expect("valid")
+            .in_ipv4_range(block.parse().expect("an allowed block"));
             let genesis = OperationCore::new(
                 1,
                 founder.signing_key().algorithm(),
@@ -8524,11 +8983,14 @@ mod tests {
             .expect("well-formed");
             let bytes = sign_operation(&genesis, founder.signer()).expect("signs");
 
+            let given = first_host(&founder, &genesis);
             let log = Log::at(paths.roster());
             log.append(&bytes).expect("writes");
+            log.append(&given).expect("writes");
 
             let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
             assert!(roster.offer_bytes(&bytes).is_accepted());
+            assert!(roster.offer_bytes(&given).is_accepted());
             let state = roster.state().expect("derives");
             let prefix = Prefix::from_parameter(&state.params.ula).expect("usable");
 
@@ -8855,14 +9317,10 @@ mod tests {
             let told: Vec<String> = transport.avoided().iter().map(ToString::to_string).collect();
             assert!(told.contains(&"fd11::/64".to_owned()), "casa's prefix: {told:?}");
             assert!(told.contains(&"fd22::/64".to_owned()), "lavoro's prefix: {told:?}");
-            // Each network's own IPv4 address, as a single address rather than
-            // as the range it was derived from. An IPv4 range prints as a
-            // `/32` too, so the count is of the ones carrying a dot.
-            assert_eq!(
-                told.iter().filter(|range| range.contains('.')).count(),
-                2,
-                "one address per network, both told to both: {told:?}"
-            );
+            // Each network's own IPv4 address and its block, both told to both.
+            for carried in ["10.11.0.1/32", "10.11.0.0/16", "10.22.0.1/32", "10.22.0.0/16"] {
+                assert!(told.contains(&carried.to_owned()), "{carried}: {told:?}");
+            }
         }
 
         // A tunnel that goes down takes what it carried with it: a path through
@@ -8872,6 +9330,124 @@ mod tests {
         let told: Vec<String> = lavoro.avoided().iter().map(ToString::to_string).collect();
         assert!(told.contains(&"fd22::/64".to_owned()), "{told:?}");
         assert!(!told.contains(&"fd11::/64".to_owned()), "casa is down: {told:?}");
+    }
+
+    /// Moving the block while the network is up moves this device's own
+    /// address on the adapter with it, and the route, with nothing restarted.
+    #[tokio::test]
+    async fn moving_the_block_while_up_moves_the_address_on_the_adapter() {
+        let fixture = fixture(None).await;
+        fixture.service.bring_up(None).await.expect("comes up");
+        fixture.service.reconcile().await;
+        let ipv4 = || -> Vec<String> {
+            let installed = fixture.machine.installed();
+            installed
+                .addresses
+                .iter()
+                .filter(|address| address.is_ipv4())
+                .map(ToString::to_string)
+                .chain(
+                    installed
+                        .routes
+                        .iter()
+                        .filter(|route| route.ipv4_block().is_some())
+                        .map(crate::routes::Route::prefix_text),
+                )
+                .collect()
+        };
+        assert_eq!(ipv4(), ["100.64.0.1", "100.64.0.0/10"]);
+
+        let moved = fixture
+            .service
+            .handle(Command::SetIpv4Block { network: None, block: "10.77.0.0/24".to_owned() })
+            .await;
+        assert!(matches!(moved, Outcome::Reported(_)), "{moved:?}");
+        fixture.service.reconcile().await;
+        assert_eq!(ipv4(), ["10.77.0.1", "10.77.0.0/24"]);
+    }
+
+    /// A block excluded on this device is a hole in the route and the reason a
+    /// peer in it is withheld; included again, the block is routed whole. For
+    /// everyone, it is a signed parameter.
+    #[tokio::test]
+    async fn a_block_excluded_here_or_everywhere_is_a_hole_in_the_route() {
+        let fixture = fixture(None).await;
+        fixture.service.bring_up(None).await.expect("comes up");
+        let route = |block: &str, include: bool, everywhere: bool| Command::Route {
+            network: None,
+            block: block.to_owned(),
+            include,
+            everywhere,
+        };
+        let ipv4 = || {
+            let mut routes: Vec<String> = fixture
+                .machine
+                .installed()
+                .routes
+                .iter()
+                .filter(|route| route.ipv4_block().is_some())
+                .map(crate::routes::Route::prefix_text)
+                .collect();
+            routes.sort();
+            routes
+        };
+        fixture.service.reconcile().await;
+        assert_eq!(ipv4(), ["100.64.0.0/10"]);
+
+        let excluded = fixture.service.handle(route("100.64.0.0/11", false, false)).await;
+        assert!(matches!(excluded, Outcome::Reported(_)), "{excluded:?}");
+        assert_eq!(ipv4(), ["100.96.0.0/11"], "the half that is not excluded");
+        let node = fixture.service.node().await.expect("a network");
+        assert_eq!(
+            crate::conflicts::withheld_by(&node.withheld(), std::net::Ipv4Addr::new(100, 64, 0, 1)),
+            Some(&crate::conflicts::Conflict::Excluded { everywhere: false })
+        );
+        let again = fixture.service.handle(route("100.64.0.0/11", false, false)).await;
+        assert!(matches!(again, Outcome::Declined { .. } | Outcome::Failed { .. }), "{again:?}");
+
+        let included = fixture.service.handle(route("100.64.0.0/11", true, false)).await;
+        assert!(matches!(included, Outcome::Reported(_)), "{included:?}");
+        assert_eq!(ipv4(), ["100.64.0.0/10"]);
+
+        let outside = fixture.service.handle(route("192.168.1.0/24", false, false)).await;
+        assert!(
+            matches!(outside, Outcome::Declined { .. } | Outcome::Failed { .. }),
+            "{outside:?}"
+        );
+
+        let signed = fixture.service.handle(route("100.64.9.0/24", false, true)).await;
+        assert!(matches!(signed, Outcome::Reported(_)), "{signed:?}");
+        let state = node.state().await.expect("derives");
+        assert_eq!(state.params.excluded, vec!["100.64.9.0/24".parse().expect("a block")]);
+        fixture.service.reconcile().await;
+        assert!(!ipv4().contains(&"100.64.0.0/10".to_owned()), "split around it: {:?}", ipv4());
+    }
+
+    /// Two networks in one block would answer for the same addresses: bringing
+    /// the second up names the first and asks for it down, and installs
+    /// nothing; with the first down it comes up.
+    #[tokio::test]
+    async fn a_network_overlapping_one_up_is_refused_naming_it() {
+        let (service, machine, _scratch) = two_networks().await;
+        let moved = service
+            .handle(Command::SetIpv4Block {
+                network: Some("lavoro".to_owned()),
+                block: "10.11.0.0/16".to_owned(),
+            })
+            .await;
+        assert!(matches!(moved, Outcome::Reported(_)), "{moved:?}");
+        // Signing it brought `lavoro` up to carry it.
+        service.take_down(Some(&label("lavoro"))).await.expect("goes down");
+
+        service.bring_up(Some(&label("casa"))).await.expect("comes up");
+        let before = machine.installed();
+        let refused = service.bring_up(Some(&label("lavoro"))).await.expect_err("overlaps");
+        let said = refused.to_string();
+        assert!(said.contains("`casa`") && said.contains("peerfectly down casa"), "{said}");
+        assert_eq!(machine.installed().adapters, before.adapters, "nothing installed");
+
+        service.take_down(Some(&label("casa"))).await.expect("goes down");
+        service.bring_up(Some(&label("lavoro"))).await.expect("alone, it comes up");
     }
 
     /// The whole point of the change, as a person meets it.
@@ -8911,7 +9487,20 @@ mod tests {
             installed.addresses.iter().filter(|held| held.is_ipv4()).count() <= 1,
             "and at most its IPv4 address beside it"
         );
-        assert_eq!(installed.routes.len(), 1, "one route left");
+        assert_eq!(
+            installed.routes.iter().filter(|route| route.prefix().is_some()).count(),
+            1,
+            "one prefix route left"
+        );
+        assert!(
+            installed.routes.iter().all(|route| route.ipv4_block().is_none_or(|(address, _)| {
+                !"10.11.0.0/16"
+                    .parse::<roster::types::Ipv4Range>()
+                    .unwrap()
+                    .contains(address.octets())
+            })),
+            "and nothing of casa's block: {installed:?}"
+        );
         assert_eq!(installed.rules.len(), 1, "one rule left");
 
         assert!(!casa.is_driving().await, "the loops of the network that went down are stopped");
@@ -8966,6 +9555,7 @@ mod tests {
                 suffix: "cliente.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -9008,9 +9598,9 @@ mod tests {
         assert!(under_networks.next().is_none(), "a daemon holding nothing writes nothing");
     }
 
-    /// A chosen IPv4 range is written into the signed parameters; no range, or
-    /// the default by name, leaves the key out; a range that is not allowed is
-    /// refused with nothing signed.
+    /// A chosen IPv4 range is written into the signed parameters; no range
+    /// writes a `/16` drawn in the shared space; the default by name leaves the
+    /// key out; a range that is not allowed is refused with nothing signed.
     #[tokio::test]
     async fn founding_writes_a_chosen_ipv4_range_and_leaves_the_default_unwritten() {
         let scratch = tempfile::tempdir().expect("a scratch directory");
@@ -9030,12 +9620,12 @@ mod tests {
             suffix: format!("{label}.internal"),
             relay: None,
             ipv4_range: range.map(str::to_owned),
+            devices: None,
             window_days: None,
         };
 
         for (label, range, expected) in [
             ("scelto", Some("10.42.0.0/16"), Some("10.42.0.0/16")),
-            ("predefinito", None, None),
             ("nominato", Some("100.64.0.0/10"), None),
         ] {
             let outcome = service.handle(found(label, range)).await;
@@ -9048,6 +9638,16 @@ mod tests {
                 "{label}"
             );
         }
+        // Proposed: a `/16` overlapping neither network above. The second holds
+        // the whole shared space, so it is drawn in the next pool.
+        let outcome = service.handle(found("proposto", None)).await;
+        assert!(matches!(outcome, Outcome::Reported(_)), "{outcome:?}");
+        let network = service.named(&Label::new("proposto").unwrap()).await.expect("held");
+        let block = network.node().state().await.expect("a network").params.ipv4_range();
+        assert_eq!(block.prefix_len(), 16, "{block}");
+        assert!(!roster::types::Ipv4Range::DEFAULT.contains(block.address()), "{block}");
+        assert_eq!(block.address()[0], 10, "{block}");
+        assert!(!block.contains([10, 42, 0, 0]), "{block}");
 
         let outcome = service.handle(found("pubblico", Some("8.8.8.0/24"))).await;
         match outcome {
@@ -9092,6 +9692,7 @@ mod tests {
                     suffix: format!("{name}.internal"),
                     relay: None,
                     ipv4_range: None,
+                    devices: None,
                     window_days: None,
                 })
                 .await;
@@ -9267,9 +9868,14 @@ mod tests {
             "a packet whose source belongs to another network is refused"
         );
 
-        // And on the machine: two routes, each for its own prefix, neither
-        // covering the other.
-        let routes = machine.installed().routes;
+        // And on the machine: two prefix routes, each for its own prefix,
+        // neither covering the other.
+        let routes: Vec<crate::routes::Route> = machine
+            .installed()
+            .routes
+            .into_iter()
+            .filter(|route| route.prefix().is_some())
+            .collect();
         assert_eq!(routes.len(), 2);
         assert_ne!(
             routes.first().map(crate::routes::Route::prefix_text),
@@ -9682,6 +10288,7 @@ mod tests {
                 suffix: "casa.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -9714,6 +10321,7 @@ mod tests {
                     suffix: overlapping.to_owned(),
                     relay: None,
                     ipv4_range: None,
+                    devices: None,
                     window_days: None,
                 })
                 .await;
@@ -9742,6 +10350,7 @@ mod tests {
                 suffix: "cliente.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -9763,6 +10372,7 @@ mod tests {
                 suffix: "altro.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -9938,7 +10548,10 @@ mod tests {
         let fixture = fixture(None).await;
         fixture.service.bring_up(None).await.expect("comes up");
         fixture.service.bring_up(None).await.expect("already up is not a failure");
-        assert_eq!(fixture.machine.installed().routes.len(), 1, "and does not install twice");
+        let prefixes = |installed: crate::machine::testing::Installed| {
+            installed.routes.iter().filter(|route| route.prefix().is_some()).count()
+        };
+        assert_eq!(prefixes(fixture.machine.installed()), 1, "and does not install twice");
     }
 
     #[tokio::test]
@@ -10345,7 +10958,14 @@ mod tests {
             fixture.service.node().await.expect("the fixture holds a network").is_reachable().await
         );
         assert_eq!(fixture.connectivity.started(), 2, "a fresh transport each time");
-        assert_eq!(fixture.machine.installed().routes.len(), 1, "and one route, not two");
+        let prefixes = fixture
+            .machine
+            .installed()
+            .routes
+            .iter()
+            .filter(|route| route.prefix().is_some())
+            .count();
+        assert_eq!(prefixes, 1, "and one prefix route, not two");
     }
 
     // ---- changing a network's relay ----------------------------------------
@@ -10369,9 +10989,13 @@ mod tests {
 
     /// An invite into some network, met at the relay at `host`.
     fn invited_at(host: &str) -> String {
-        enrollment::Invite::issue(at(host), NetworkId::from_bytes([7; 32]))
-            .expect("issues")
-            .to_text()
+        enrollment::Invite::issue(
+            at(host),
+            NetworkId::from_bytes([7; 32]),
+            roster::types::Ipv4Range::DEFAULT,
+        )
+        .expect("issues")
+        .to_text()
     }
 
     fn change(relay: &str, immediately: bool) -> Command {
@@ -11238,6 +11862,80 @@ mod tests {
         assert!(state.params.anchors.is_empty(), "cleared");
     }
 
+    /// An admin gives a device the lowest free offset, once; moving the block
+    /// moves every device at once and keeps every offset; a block too small
+    /// for an offset held is refused with nothing signed.
+    #[tokio::test]
+    async fn an_admin_gives_an_offset_and_moves_the_block() {
+        use roster::types::{OperationBody, OperationCore};
+
+        let fixture = fixture(None).await;
+        let founder = Arc::clone(
+            fixture.service.node().await.expect("the fixture holds a network").identity(),
+        );
+        let laptop = add_a_device(&fixture.service, &founder).await;
+        fixture.service.admit(&laptop).await.expect("admits");
+        let node = fixture.service.node().await.expect("the fixture holds a network");
+        let give = || Command::GiveIpv4 {
+            network: None,
+            device: crate::control::Target::Name("laptop".to_owned()),
+        };
+
+        let given = fixture.service.handle(give()).await;
+        assert!(matches!(given, Outcome::Reported(_)), "{given:?}");
+        let state = node.state().await.expect("derives");
+        let laptop_id = state.devices.named("laptop").first().expect("admitted").record.id;
+        assert_eq!(
+            state.settings_of(&laptop_id).ipv4,
+            Some(2_u32.to_be_bytes()),
+            "after the founder's"
+        );
+        let again = fixture.service.handle(give()).await;
+        let (Outcome::Declined { message } | Outcome::Failed { message, .. }) = again else {
+            panic!("{again:?}")
+        };
+        assert!(message.contains("already"), "{message}");
+
+        let block = |text: &str| Command::SetIpv4Block { network: None, block: text.to_owned() };
+        let moved = fixture.service.handle(block("10.9.0.0/24")).await;
+        assert!(matches!(moved, Outcome::Reported(_)), "{moved:?}");
+        let state = node.state().await.expect("derives");
+        let holdings = tunnel::Ipv4Holdings::of_state(&state);
+        assert_eq!(holdings.of(&founder.device_id()), Some(std::net::Ipv4Addr::new(10, 9, 0, 1)));
+        assert_eq!(holdings.of(&laptop_id), Some(std::net::Ipv4Addr::new(10, 9, 0, 2)));
+        assert_eq!(state.settings_of(&laptop_id).ipv4, Some(2_u32.to_be_bytes()), "kept");
+
+        // An offset of 20 does not fit a /28's fourteen hosts.
+        let far = OperationCore::new(
+            9,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device: laptop_id,
+                change: roster::leaf::SettingsChange {
+                    ipv4: Some(Some(20_u32.to_be_bytes())),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            node.heads().await,
+            founder.signing_key().key_id(),
+            state.network,
+        )
+        .expect("well-formed");
+        let signed = roster::sign::sign_operation(&far, founder.signer()).expect("signs");
+        fixture.service.admit(&signed).await.expect("admits");
+        let small = fixture.service.handle(block("10.9.0.0/28")).await;
+        let (Outcome::Declined { message } | Outcome::Failed { message, .. }) = small else {
+            panic!("{small:?}")
+        };
+        assert!(message.contains("offset 20") && message.contains("/27"), "{message}");
+        assert!(message.contains("Nothing was signed"), "{message}");
+        let same = fixture.service.handle(block("10.9.0.0/24")).await;
+        let (Outcome::Declined { message } | Outcome::Failed { message, .. }) = same else {
+            panic!("{same:?}")
+        };
+        assert!(message.contains("already"), "{message}");
+    }
+
     /// A light member is not an anchor: light members turn to an anchor for
     /// what they do not hold, and a light member holds no more.
     #[tokio::test]
@@ -11325,7 +12023,7 @@ mod tests {
             label: "lot A".to_owned(),
             light: true,
             groups: Vec::new(),
-            block: Some("100.64.9.0/28".to_owned()),
+            ipv6_only: false,
             reviewed,
         };
         let review = fixture.service.handle(admit(None)).await;
@@ -11526,6 +12224,7 @@ mod tests {
                 suffix: "work.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -12365,7 +13064,12 @@ mod tests {
         let state = service.node().await.expect("a network").state().await.expect("derives");
         assert_eq!(state.network, rule.network);
         assert!(rule.remote_addresses.starts_with("fd"), "its prefix: {}", rule.remote_addresses);
-        assert!(rule.remote_addresses.ends_with(",100.64.0.0/10"), "and its range");
+        let block = format!(",{}", state.params.ipv4_range());
+        assert!(
+            rule.remote_addresses.ends_with(&block),
+            "and its block: {}",
+            rule.remote_addresses
+        );
 
         let nothing = service
             .handle_for(
@@ -12426,6 +13130,7 @@ mod tests {
             suffix: "home.internal".to_owned(),
             relay: None,
             ipv4_range: None,
+            devices: None,
             window_days: None,
         }
     }
@@ -12742,6 +13447,7 @@ mod tests {
                 suffix: "work.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;
@@ -12811,6 +13517,7 @@ mod tests {
                     suffix: suffix.to_owned(),
                     relay: None,
                     ipv4_range: None,
+                    devices: None,
                     window_days: None,
                 })
                 .await;
@@ -12874,6 +13581,7 @@ mod tests {
                 suffix: "home.internal".to_owned(),
                 relay: None,
                 ipv4_range: None,
+                devices: None,
                 window_days: None,
             })
             .await;

@@ -71,6 +71,7 @@ fn joining(
         proof: roster::hex::encode(proof.as_bytes()),
         started_at: 1,
         requested_at: None,
+        conflicts: Vec::new(),
     };
     let (underway, reporting) = Underway::new(Progress::Registering);
     let paths = paths.clone();
@@ -169,7 +170,9 @@ async fn an_invited_device_joins_as_its_invite_says() {
     let admin_home = tempfile::tempdir().unwrap();
     let admin_paths = Paths::under(admin_home.path());
     let (admin, state) = founded(&admin_paths, &url);
-    let record = Record::issue(&url, state.network, invited(), 1, 1_000_000).unwrap();
+    let record =
+        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
+            .unwrap();
 
     let joiner_home = tempfile::tempdir().unwrap();
     let joiner_paths = Paths::under(joiner_home.path());
@@ -207,7 +210,9 @@ async fn a_leaked_secret_cannot_pull_the_device_into_another_network() {
     let url = relay.written();
     let admin_home = tempfile::tempdir().unwrap();
     let (_admin, state) = founded(&Paths::under(admin_home.path()), &url);
-    let record = Record::issue(&url, state.network, invited(), 1, 1_000_000).unwrap();
+    let record =
+        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
+            .unwrap();
 
     // Somebody who learned the secret, with a network of their own, takes the
     // request and admits the device into it.
@@ -289,7 +294,9 @@ async fn a_device_invited_into_a_compacted_network_rests_on_the_state_beneath_it
     let (roster, base) = compacted(&admin, &admin_paths);
     let mut window = roster.retained_operations();
     let state = roster.state().unwrap();
-    let record = Record::issue(&url, state.network, invited(), 1, 1_000_000).unwrap();
+    let record =
+        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
+            .unwrap();
 
     let joiner_home = tempfile::tempdir().unwrap();
     let joiner_paths = Paths::under(joiner_home.path());
@@ -329,7 +336,9 @@ async fn a_base_that_does_not_make_its_root_is_refused() {
     let state = roster.state().unwrap();
     // A state that is not the one the root commits to.
     base.state = state.clone();
-    let record = Record::issue(&url, state.network, invited(), 1, 1_000_000).unwrap();
+    let record =
+        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
+            .unwrap();
 
     let joiner_home = tempfile::tempdir().unwrap();
     let joiner_paths = Paths::under(joiner_home.path());

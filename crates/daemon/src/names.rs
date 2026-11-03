@@ -22,7 +22,6 @@
 //! declaring a DNS server means receiving every query on the device. A forwarder
 //! here would put the daemon in the path of resolution it was never asked about.
 
-use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
@@ -30,26 +29,34 @@ use roster::id::DeviceId;
 use roster::state::RosterState;
 use tunnel::{Ipv4Holdings, Prefix, address_of};
 
-use crate::conflicts::Conflict;
+use crate::conflicts::{Conflict, Hole, withheld_by};
 
 /// Which IPv4 address each device of a network is answered with on this device.
 ///
-/// The holdings the roster implies, less the peers withheld here. Read from the
-/// node when a query arrives, like the roster itself: a device revoked, or a peer
-/// withheld because this machine moved, stops being answered `A` at once.
+/// The holdings the roster implies, less the addresses in a hole here. Read from
+/// the node when a query arrives, like the roster itself: a device revoked, or a
+/// peer withheld because this machine moved, stops being answered `A` at once.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ipv4View {
     /// Which device holds which address in the network.
     pub holdings: Arc<Ipv4Holdings>,
-    /// The peers withheld on this device, and why.
-    pub withheld: Arc<BTreeMap<DeviceId, Conflict>>,
+    /// The holes in the network's block on this device: what is not routed
+    /// here, and why.
+    pub withheld: Arc<Vec<Hole>>,
 }
 
 impl Ipv4View {
     /// The IPv4 address a device is answered with here, if any.
     #[must_use]
     pub fn answered(&self, device: &DeviceId) -> Option<Ipv4Addr> {
-        self.holdings.of(device).filter(|_| !self.withheld.contains_key(device))
+        self.holdings.of(device).filter(|address| withheld_by(&self.withheld, *address).is_none())
+    }
+
+    /// The address a device holds and why it is withheld here, where it is.
+    #[must_use]
+    pub fn withheld(&self, device: &DeviceId) -> Option<(Ipv4Addr, Conflict)> {
+        let address = self.holdings.of(device)?;
+        withheld_by(&self.withheld, address).map(|why| (address, why.clone()))
     }
 }
 
@@ -500,6 +507,15 @@ mod tests {
         state_with_suffix(devices, "example.internal")
     }
 
+    /// Device 1 given the block's first host.
+    fn first_host() -> std::collections::BTreeMap<DeviceId, roster::leaf::DeviceSettings> {
+        let settings = roster::leaf::DeviceSettings {
+            ipv4: Some(1_u32.to_be_bytes()),
+            ..roster::leaf::DeviceSettings::default()
+        };
+        [(DeviceId::from_bytes([1; 32]), settings)].into_iter().collect()
+    }
+
     fn state_with_suffix(devices: Vec<DeviceRecord>, suffix: &str) -> RosterState {
         RosterState::from_parts(
             NetworkId::from_bytes([1; 32]),
@@ -511,7 +527,7 @@ mod tests {
             .expect("valid"),
             devices.into_iter().map(|record| (record.id, record)).collect(),
             BTreeSet::new(),
-            Default::default(),
+            first_host(),
         )
     }
 
@@ -623,16 +639,15 @@ mod tests {
         assert_ne!(before, after, "a different prefix is a different address");
     }
 
+    /// The view of `state` with a hole at the address of each device tagged.
     fn view(state: &RosterState, withheld: &[u8]) -> Ipv4View {
-        Ipv4View {
-            holdings: Arc::new(Ipv4Holdings::of_state(state)),
-            withheld: Arc::new(
-                withheld
-                    .iter()
-                    .map(|tag| (DeviceId::from_bytes([*tag; 32]), Conflict::LocalAddress))
-                    .collect(),
-            ),
-        }
+        let holdings = Ipv4Holdings::of_state(state);
+        let holes = withheld
+            .iter()
+            .filter_map(|tag| holdings.of(&DeviceId::from_bytes([*tag; 32])))
+            .map(|address| Hole { address, prefix_len: 32, why: Conflict::LocalAddress })
+            .collect();
+        Ipv4View { holdings: Arc::new(holdings), withheld: Arc::new(holes) }
     }
 
     /// Both addresses for a device that holds IPv4 and is not withheld.

@@ -38,12 +38,60 @@ pub struct Router {
     /// address is routed to its holder, where the holder is routable at its
     /// IPv6 one.
     holdings: Ipv4Holdings,
-    /// Address to device, for every member, session or not.
+    /// Who is at an address, for every member, session or not.
     ///
     /// What lets a packet for a member with no session open one: the router has
     /// to know whose address it is before anyone can be asked to answer at it.
     /// Derived from the roster's members, never supplied.
-    members: BTreeMap<Ipv6Addr, DeviceId>,
+    members: Members,
+}
+
+/// The members a packet may open a session to: a list, or a roster state asked
+/// by its index of the addresses its devices derive. Not a map of every
+/// member's address: 50 bytes a device at a fleet's size, made again at every
+/// change (`scalable-membership` 16.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Members {
+    Listed(BTreeMap<Ipv6Addr, DeviceId>),
+    Of { state: Box<roster::state::RosterState>, me: DeviceId },
+}
+
+/// Names the derivation the index of interface identifiers is built for.
+const INTERFACE_TAG: [u8; 32] = *b"peerfectly ipv6 interface ids v1";
+
+impl Members {
+    /// The member at `address`, under `prefix`.
+    fn at(&self, address: Ipv6Addr, prefix: &Prefix) -> Option<DeviceId> {
+        match self {
+            Self::Listed(listed) => listed.get(&address).copied(),
+            Self::Of { state, me } => {
+                // The first four bytes of the device's part, which a /64 prefix
+                // leaves alone: the same whatever the prefix, so the index
+                // outlives a change of it. Every hit is held to the whole
+                // address again.
+                let interface = |device: &DeviceId| {
+                    let octets = address_of(device, prefix).octets();
+                    [octets[8], octets[9], octets[10], octets[11]]
+                };
+                let octets = address.octets();
+                let value = [octets[8], octets[9], octets[10], octets[11]];
+                let derivation = roster::members::Derivation { tag: INTERFACE_TAG, of: &interface };
+                state
+                    .devices
+                    .deriving(&derivation, value)
+                    .into_iter()
+                    .find(|device| device != me && address_of(device, prefix) == address)
+            }
+        }
+    }
+
+    /// Whether `device` is one of them.
+    fn holds(&self, device: &DeviceId, prefix: &Prefix) -> bool {
+        match self {
+            Self::Listed(listed) => listed.contains_key(&address_of(device, prefix)),
+            Self::Of { state, me } => device != me && state.devices.contains_key(device),
+        }
+    }
 }
 
 impl Router {
@@ -54,7 +102,7 @@ impl Router {
             prefix,
             live: BTreeMap::new(),
             holdings: Ipv4Holdings::default(),
-            members: BTreeMap::new(),
+            members: Members::Listed(BTreeMap::new()),
         }
     }
 
@@ -63,31 +111,16 @@ impl Router {
     /// Each address is derived here from the device id, as [`Self::opened`]
     /// derives a live one; the caller names devices, never addresses.
     pub fn set_members(&mut self, devices: impl IntoIterator<Item = DeviceId>) {
-        self.members =
-            devices.into_iter().map(|device| (address_of(&device, &self.prefix), device)).collect();
+        self.members = Members::Listed(
+            devices.into_iter().map(|device| (address_of(&device, &self.prefix), device)).collect(),
+        );
     }
 
-    /// Follows the members from `previous` to `state`, every member but `me`:
-    /// only the devices that changed are looked at, where the two states rest
-    /// on one base, and every member otherwise.
-    pub fn follow_members(
-        &mut self,
-        previous: &roster::state::RosterState,
-        state: &roster::state::RosterState,
-        me: &DeviceId,
-    ) {
-        let Some(changed) = state.devices.differing(&previous.devices) else {
-            self.set_members(state.devices.keys().filter(|device| device != me));
-            return;
-        };
-        for device in changed {
-            let address = address_of(&device, &self.prefix);
-            if device != *me && state.devices.contains_key(&device) {
-                self.members.insert(address, device);
-            } else {
-                self.members.remove(&address);
-            }
-        }
+    /// Takes every member of `state` but `me` as the members a packet may open
+    /// a session to: a copy of the state, asked as packets come, which costs
+    /// what copying a state costs.
+    pub fn follow_state(&mut self, state: &roster::state::RosterState, me: &DeviceId) {
+        self.members = Members::Of { state: Box::new(state.clone()), me: *me };
     }
 
     /// The member whose address this is, whether or not a session to it is open.
@@ -96,12 +129,15 @@ impl Router {
     #[must_use]
     pub fn member_at(&self, destination: impl Into<IpAddr>) -> Option<DeviceId> {
         match destination.into() {
-            IpAddr::V6(address) => self.members.get(&address).copied(),
-            IpAddr::V4(address) => self.holder_in(address, &self.members),
+            IpAddr::V6(address) => self.members.at(address, &self.prefix),
+            IpAddr::V4(address) => self
+                .holdings
+                .holder(address)
+                .filter(|device| self.members.holds(device, &self.prefix)),
         }
     }
 
-    /// The holder of an IPv4 address, where it is among `routable`.
+    /// The holder of an IPv4 address, where it has a live session.
     fn holder_in(
         &self,
         address: Ipv4Addr,
@@ -180,6 +216,74 @@ mod tests {
         DeviceId::from_bytes([tag; 32])
     }
 
+    /// A state of these devices, some in its base and some laid by a batch.
+    fn state_of(base: &[u8], batch: &[u8]) -> roster::state::RosterState {
+        let params = roster::types::NetworkParams::new(
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            0,
+        )
+        .unwrap();
+        let entry = |tag: &u8| {
+            let key = |purpose, name: &str| {
+                roster::types::KeyEntry::new(
+                    roster::types::Algorithm::Ed25519,
+                    purpose,
+                    blake3::hash(format!("{name}{tag}").as_bytes()).as_bytes().to_vec(),
+                )
+                .unwrap()
+            };
+            let mut keys = vec![
+                key(roster::types::KeyPurpose::Signing, "s"),
+                key(roster::types::KeyPurpose::Transport, "t"),
+                key(roster::types::KeyPurpose::Attestation, "a"),
+            ];
+            keys.sort_by_key(roster::types::KeyEntry::order_key);
+            roster::batch::BatchEntry {
+                keys,
+                name: format!("d{tag}"),
+                serial: vec![*tag],
+                ipv4: None,
+            }
+        };
+        let layer = |tags: &[u8]| {
+            roster::members::Layer::new(
+                roster::id::OperationId::from_bytes([9; 32]),
+                roster::leaf::Mode::Full,
+                Vec::new(),
+                tags.iter().map(entry).collect(),
+            )
+        };
+        let mut state =
+            roster::state::RosterState::empty(roster::id::NetworkId::from_bytes([7; 32]), params);
+        let mut held = roster::members::Members::new();
+        held.lay(std::sync::Arc::new(layer(base)), std::sync::Arc::default());
+        state.devices = held.values().map(|leaf| (*leaf).clone()).collect();
+        state.devices.lay(std::sync::Arc::new(layer(batch)), std::sync::Arc::default());
+        state
+    }
+
+    /// Of a state, the members are asked of its index of addresses: each found
+    /// at its own, a batch's as well as the base's, this device and a stranger
+    /// not.
+    #[test]
+    fn of_a_state_every_member_is_found_at_its_address() {
+        let state = state_of(&[1, 2, 3], &[4, 5, 6]);
+        let me = state.devices.keys().next().unwrap();
+        let mut router = Router::new(prefix());
+        router.follow_state(&state, &me);
+        for device in state.devices.keys() {
+            let expected = (device != me).then_some(device);
+            assert_eq!(router.member_at(router.address_of(&device)), expected);
+        }
+        assert_eq!(router.member_at(router.address_of(&device(200))), None, "a stranger is not");
+        assert_eq!(
+            router.route(router.address_of(&state.devices.keys().nth(4).unwrap())),
+            None,
+            "nor routed without a session"
+        );
+    }
+
     #[test]
     fn a_packet_goes_to_the_session_for_its_destination() {
         let mut router = Router::new(prefix());
@@ -250,11 +354,7 @@ mod tests {
     }
 
     fn holdings(devices: &[DeviceId]) -> Ipv4Holdings {
-        Ipv4Holdings::from(
-            &roster::id::NetworkId::from_bytes([3; 32]),
-            roster::types::Ipv4Range::DEFAULT,
-            devices,
-        )
+        Ipv4Holdings::from(roster::types::Ipv4Range::DEFAULT, devices)
     }
 
     #[test]

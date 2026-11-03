@@ -2,9 +2,13 @@
 //!
 //! convesso asks the application whether to admit a peer during the handshake,
 //! synchronously, by the peer's X25519 id. The roster names devices by their
-//! ed25519 transport keys. This is the one place the second becomes the first:
-//! a map rebuilt whole from the roster state each time newer state arrives, so
-//! it is a function of that state and never a second opinion beside it.
+//! ed25519 transport keys. This is the one place the second becomes the first,
+//! asked of the state each time rather than kept beside it: a peer id is the
+//! X25519 form of an ed25519 key, the map back gives that key's two possible
+//! encodings (the form keeps no sign), and the state's key index says which
+//! device, if any, holds either. A map of every member's key, rebuilt at every
+//! change, held 179 bytes a device and walked a million at a fleet's size
+//! (`scalable-membership` 16.6).
 //!
 //! What each key is told comes from `transport::auth::authorize`, the decision
 //! every binding takes. A key no device holds is a stranger. A key whose device
@@ -12,14 +16,12 @@
 //! roster has dropped altogether is, by its key alone, a stranger — exactly what
 //! the interface's own check says.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use convesso_core::handshake::{Admission, Decision, RefusalCode};
 use convesso_core::identity::{Address, PeerId};
-use roster::id::DeviceId;
+use roster::id::{DeviceId, KeyId};
 use roster::state::RosterState;
-use roster::types::{Algorithm, KeyPurpose};
 use transport::error::Error;
 
 /// The handshake's refusal of a stranger.
@@ -27,65 +29,58 @@ pub const NOT_A_MEMBER: u16 = 0x0100;
 /// The handshake's refusal of a revoked device.
 pub const REVOKED: u16 = 0x0101;
 
-/// What the roster says about one transport key.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    /// The key as convesso dials it.
-    pub address: Address,
-    /// The device, or why it is refused.
-    pub verdict: Result<DeviceId, Error>,
-}
-
-/// Every transport key the roster names, by the id convesso authenticates.
+/// What the roster says about the transport keys convesso authenticates.
 #[derive(Debug, Default, Clone)]
 pub struct Members {
-    by_peer: HashMap<[u8; 32], Entry>,
+    state: Option<RosterState>,
 }
 
 impl Members {
-    /// The map for this state.
+    /// The members of this state: a copy of it, which costs its changes.
     #[must_use]
     pub fn from_state(state: &RosterState) -> Self {
-        let mut by_peer = HashMap::new();
-        for record in state.devices.values() {
-            for entry in &record.keys {
-                if entry.purpose != KeyPurpose::Transport || entry.alg != Algorithm::Ed25519 {
-                    continue;
-                }
-                let Ok(bytes) = <[u8; 32]>::try_from(entry.value.as_slice()) else { continue };
-                // A key convesso cannot read can reach nobody here, so it is
-                // left out rather than refused: it would never present itself.
-                let Ok(address) = Address::parse(bytes) else { continue };
-                let verdict = transport::auth::authorize(state, &entry.key_id());
-                by_peer.insert(*address.peer_id().as_bytes(), Entry { address, verdict });
-            }
-        }
-        Self { by_peer }
+        Self { state: Some(state.clone()) }
+    }
+
+    /// The transport key, among the two a peer id may stand for, that a
+    /// device of the state holds, with the address convesso dials it at.
+    fn held(&self, peer: &PeerId) -> Option<(KeyId, Address)> {
+        let state = self.state.as_ref()?;
+        let montgomery = curve25519_dalek::montgomery::MontgomeryPoint(*peer.as_bytes());
+        // Sign 0 first: of two devices whose keys differ in sign alone, which
+        // no honest pair of keys does, the same one on every node.
+        [0_u8, 1].into_iter().find_map(|sign| {
+            let bytes = montgomery.to_edwards(sign)?.compress().to_bytes();
+            // A key convesso cannot read can reach nobody here: it would never
+            // present itself, and is not a member's for that.
+            let address =
+                Address::parse(bytes).ok().filter(|address| address.peer_id() == *peer)?;
+            let key = KeyId::of_public_key(&bytes);
+            state
+                .device_for_key_of_purpose(&key, roster::types::KeyPurpose::Transport)
+                .filter(|leaf| {
+                    leaf.record.keys.iter().any(|entry| {
+                        entry.key_id() == key && entry.alg == roster::types::Algorithm::Ed25519
+                    })
+                })
+                .map(|_| (key, address))
+        })
     }
 
     /// What the roster says about the peer convesso authenticated.
     ///
     /// A peer nothing names is a stranger.
     pub fn verdict(&self, peer: &PeerId) -> Result<DeviceId, Error> {
-        self.by_peer
-            .get(peer.as_bytes())
-            .map_or(Err(Error::NotAMember), |entry| entry.verdict.clone())
+        let (Some(state), Some((key, _))) = (self.state.as_ref(), self.held(peer)) else {
+            return Err(Error::NotAMember);
+        };
+        transport::auth::authorize(state, &key)
     }
 
     /// The address a peer is dialled at, if the roster names its key.
     #[must_use]
     pub fn address(&self, peer: &PeerId) -> Option<Address> {
-        self.by_peer.get(peer.as_bytes()).map(|entry| entry.address)
-    }
-
-    /// Every member's key as convesso dials it, but `own`.
-    #[must_use]
-    pub fn others(&self, own: &PeerId) -> Vec<Address> {
-        self.by_peer
-            .values()
-            .filter(|entry| entry.verdict.is_ok() && entry.address.peer_id() != *own)
-            .map(|entry| entry.address)
-            .collect()
+        self.held(peer).map(|(_, address)| address)
     }
 
     /// The device a peer is, if it is a member.
@@ -165,6 +160,30 @@ mod tests {
         assert_eq!(members.member(&peer_of(&joiner)), Some(joiner.device_id()));
         let mut gate = Gate(Arc::new(RwLock::new(members)), false);
         assert_eq!(gate.admit(&peer_of(&joiner), b"peerfectly"), Decision::Accept { psk: None });
+    }
+
+    /// Every member's key is found back from its peer id, whichever sign its
+    /// ed25519 encoding has: a peer id keeps none, and the map back tries both.
+    #[test]
+    fn every_member_is_found_by_its_peer_id_whatever_its_sign() {
+        let (mut state, _, _) = network();
+        let devices: Vec<Arc<NodeIdentity>> =
+            (0..32).map(|_| Arc::new(NodeIdentity::generate().unwrap())).collect();
+        let mut signs = std::collections::BTreeSet::new();
+        for device in &devices {
+            let spec =
+                device.device_spec("board", roster::types::Role::Member, false, vec![]).unwrap();
+            let record = spec.into_record(roster::id::OperationId::from_bytes([3; 32])).unwrap();
+            state.devices.insert(device.device_id(), record);
+            let key = device.transport_key().public_key().as_bytes().to_vec();
+            signs.insert(key.last().copied().unwrap_or(0) >> 7);
+        }
+        assert_eq!(signs.len(), 2, "keys of both signs among them");
+        let members = Members::from_state(&state);
+        for device in &devices {
+            assert_eq!(members.member(&peer_of(device)), Some(device.device_id()));
+            assert!(members.address(&peer_of(device)).is_some());
+        }
     }
 
     #[test]

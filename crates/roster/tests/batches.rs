@@ -5,7 +5,9 @@
 
 mod support;
 
-use roster::batch::{BatchEntry, BatchHeader, BatchPiece, Skip, entries_tree, pieces_of, skipped};
+use roster::batch::{
+    BatchEntry, BatchHeader, BatchPiece, OffsetRun, Skip, entries_tree, pieces_of, skipped,
+};
 use roster::cbor::is_canonical_schema;
 use roster::id::OperationId;
 use roster::leaf::{Group, Mode};
@@ -44,14 +46,13 @@ fn entry(index: u32) -> BatchEntry {
         keys,
         name: format!("sensor-{index}"),
         serial: format!("SN{index:06}").into_bytes(),
-        ipv4: Some([
-            100,
-            70,
-            u8::try_from(index / 256).unwrap(),
-            u8::try_from(index % 256).unwrap(),
-        ]),
+        // Above the founder's and the admins', one an entry.
+        ipv4: Some(index.saturating_add(FIRST_OFFSET).to_be_bytes()),
     }
 }
+
+/// The first offset a lot's entries are given.
+const FIRST_OFFSET: u32 = 101;
 
 fn lot(count: u32) -> (Vec<BatchEntry>, BatchHeader) {
     let entries: Vec<BatchEntry> = (0..count).map(entry).collect();
@@ -59,7 +60,7 @@ fn lot(count: u32) -> (Vec<BatchEntry>, BatchHeader) {
         &entries,
         Mode::Light,
         vec![Group::new("sensori").unwrap()],
-        Some(roster::types::Ipv4Range::new([100, 70, 0, 0], 16).unwrap()),
+        Some(OffsetRun::new(FIRST_OFFSET.to_be_bytes(), count).unwrap()),
         "lot A",
     )
     .unwrap();
@@ -208,7 +209,7 @@ fn a_header_whose_count_understates_its_tree_never_completes() {
         roster::batch::Commitment { count: 59, ..honest.commitment() },
         honest.mode,
         honest.groups.clone(),
-        honest.block,
+        honest.offsets.map(|run| OffsetRun::new(run.first(), 59).unwrap()),
         honest.label.clone(),
     )
     .unwrap();
@@ -282,7 +283,7 @@ fn one_duplicate_in_five_hundred_is_skipped_and_reported_and_the_rest_stand() {
     let mut history = founded();
     // Already a member, admitted on its own before the batch was signed.
     history.op("single", 1, &["admin2"], OperationBody::AddDevice(duplicate.spec().unwrap()));
-    // And another device already holds the address entry 9 was assigned.
+    // And another device already holds the offset entry 9 was given.
     let holder = roster::leaf::SettingsChange {
         ipv4: Some(entries.get(9).unwrap().ipv4),
         ..roster::leaf::SettingsChange::default()
@@ -300,7 +301,7 @@ fn one_duplicate_in_five_hundred_is_skipped_and_reported_and_the_rest_stand() {
     let taken_id = entries.get(9).unwrap().device_id().unwrap();
     assert_eq!(preview.len(), 2, "{preview:?}");
     assert_eq!(preview.get(&duplicate_id), Some(&Skip::AlreadyMember));
-    assert_eq!(preview.get(&taken_id), Some(&Skip::AddressTaken));
+    assert_eq!(preview.get(&taken_id), Some(&Skip::OffsetTaken));
 
     history.op("batch", 1, &["address"], OperationBody::AdmitBatch(header));
     let mut roster = loaded(&history);
@@ -314,22 +315,22 @@ fn one_duplicate_in_five_hundred_is_skipped_and_reported_and_the_rest_stand() {
         history.id("single"),
         "the member keeps the record it had"
     );
-    assert!(!state.devices.contains_key(&taken_id), "the address stays with its holder");
+    assert!(!state.devices.contains_key(&taken_id), "the offset stays with its holder");
     let reversed = roster::state::derive(roster.dag()).unwrap();
     assert_eq!(reversed.root(), state.root(), "a full derivation agrees");
 }
 
 #[test]
-fn an_address_outside_the_block_is_skipped() {
+fn an_offset_outside_the_run_is_skipped() {
     let (mut entries, _) = lot(3);
     if let Some(first) = entries.first_mut() {
-        first.ipv4 = Some([10, 0, 0, 1]);
+        first.ipv4 = Some(1000_u32.to_be_bytes());
     }
     let header = BatchHeader::for_entries(
         &entries,
         Mode::Light,
         Vec::new(),
-        Some(roster::types::Ipv4Range::new([100, 70, 0, 0], 16).unwrap()),
+        Some(OffsetRun::new(FIRST_OFFSET.to_be_bytes(), 3).unwrap()),
         "lot B",
     )
     .unwrap();
@@ -337,7 +338,7 @@ fn an_address_outside_the_block_is_skipped() {
     let skips = skipped(&state, &header, &entries);
     assert_eq!(
         skips.get(&entries.first().unwrap().device_id().unwrap()),
-        Some(&Skip::AddressOutsideBlock)
+        Some(&Skip::OffsetOutsideRun)
     );
     assert_eq!(skips.len(), 1);
 }
