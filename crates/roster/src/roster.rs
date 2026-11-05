@@ -24,8 +24,11 @@
 //! Discarding an operation because its parents have not arrived is not an
 //! option. The operation that cannot yet be placed may be a revocation.
 
-use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use crate::prelude::*;
+use alloc::borrow::Cow;
+use alloc::collections::VecDeque;
+
+use crate::collections::{HashMap, HashSet};
 
 use crate::attestation::{RawAttestation, SignedAttestation};
 use crate::dag::Dag;
@@ -80,7 +83,7 @@ struct Incomplete {
     header: crate::batch::BatchHeader,
     /// The pieces in so far, by index, as they arrived: each checked against
     /// the header's layout, and passed on as it is.
-    pieces: std::collections::BTreeMap<u64, Vec<u8>>,
+    pieces: alloc::collections::BTreeMap<u64, Vec<u8>>,
 }
 
 /// A batch whose header a roster holds and whose pieces it does not all hold.
@@ -153,12 +156,14 @@ pub trait Clock: core::fmt::Debug + Send + Sync {
 }
 
 /// The clock a daemon uses: elapsed time since process start.
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct SystemClock {
     /// When this clock was created.
     origin: std::time::Instant,
 }
 
+#[cfg(feature = "std")]
 impl SystemClock {
     /// Starts a clock.
     #[must_use]
@@ -167,12 +172,14 @@ impl SystemClock {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for SystemClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "std")]
 impl Clock for SystemClock {
     fn now_seconds(&self) -> u64 {
         // `Instant` is monotonic on every platform this runs on, so this cannot
@@ -444,6 +451,7 @@ pub struct Roster {
     clock: Box<dyn Clock>,
 }
 
+#[cfg(feature = "std")]
 impl Default for Roster {
     fn default() -> Self {
         Self::new()
@@ -504,6 +512,7 @@ pub struct Preview {
 
 impl Roster {
     /// An empty roster using the default staleness threshold.
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn new() -> Self {
         Self::with_clock(Box::new(SystemClock::new()))
@@ -540,7 +549,7 @@ impl Roster {
     /// that what it holds in memory follows the operations it holds and not the
     /// boards they admit. Given before the log is replayed, it holds every
     /// batch so.
-    pub fn keep_layers_in(&mut self, store: alloc::sync::Arc<dyn crate::members::LayerStore>) {
+    pub fn keep_layers_in(&mut self, store: crate::sync::Arc<dyn crate::members::LayerStore>) {
         self.dag.keep_layers_in(store);
     }
 
@@ -567,6 +576,7 @@ impl Roster {
     /// Tightening this narrows the window in which a demoted admin's backdated
     /// operation can be admitted, at the cost of refusing honest work from a
     /// device that was legitimately away. It cannot affect derived state.
+    #[cfg(feature = "std")]
     #[must_use]
     pub fn with_staleness_depth(depth: u64) -> Self {
         Self { staleness_depth: depth, ..Self::new() }
@@ -1588,7 +1598,7 @@ impl Roster {
         let header = header.clone();
         self.incomplete.insert(
             id,
-            Incomplete { operation, header, pieces: std::collections::BTreeMap::new() },
+            Incomplete { operation, header, pieces: alloc::collections::BTreeMap::new() },
         );
         Admission::AwaitingPieces(id)
     }
@@ -1638,7 +1648,7 @@ impl Roster {
 
         // The kept operations are closed under ancestry, so their heads are
         // those no kept operation names as a parent.
-        let mut named: std::collections::HashSet<OperationId> = std::collections::HashSet::new();
+        let mut named: HashSet<OperationId> = HashSet::new();
         for (index, operation) in operations.iter().enumerate() {
             if !left_out.get(index).copied().unwrap_or(true) {
                 named.extend(operation.core().parents.iter().copied());

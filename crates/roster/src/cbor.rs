@@ -26,6 +26,7 @@
 
 use crate::error::{Error, Result};
 use crate::limits;
+use crate::prelude::*;
 
 /// CBOR major types this format uses.
 mod major {
@@ -89,7 +90,7 @@ pub struct Writer {
 /// Wraps `Vec<u8>` so the writer owns a concrete, infallible sink.
 mod alloc_vec {
     /// An in-memory sink for encoded bytes.
-    pub type Sink = Vec<u8>;
+    pub type Sink = alloc::vec::Vec<u8>;
 }
 
 impl Default for Writer {

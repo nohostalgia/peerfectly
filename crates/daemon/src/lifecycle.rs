@@ -202,14 +202,21 @@ impl Lifecycle {
         let mut left = Vec::new();
         let mut failed = None;
 
-        let stale: Vec<Route> = up
-            .routes
-            .iter()
-            .filter(|route| route.ipv4_block().is_some() && !wanted_blocks.contains(route))
-            .copied()
-            .collect();
-        let fresh: Vec<Route> =
-            wanted_blocks.into_iter().filter(|route| !up.routes.contains(route)).collect();
+        let held_blocks: Vec<Route> =
+            up.routes.iter().filter(|route| route.ipv4_block().is_some()).copied().collect();
+        let routes_move = held_blocks.iter().any(|route| !wanted_blocks.contains(route))
+            || wanted_blocks.iter().any(|route| !up.routes.contains(route));
+        // Where any IPv4 route moves, all of them do: off, and on again after
+        // the address, as when the network comes up. Linux takes every IPv4
+        // route of an interface away with its last IPv4 address, so a route
+        // kept across the address going would be believed installed and gone.
+        let wanted_ipv4 = wanted.ipv4();
+        let address_goes = up.ipv4.is_some() && (routes_move || up.ipv4 != wanted_ipv4);
+        let (stale, fresh) = if routes_move || address_goes {
+            (held_blocks, wanted_blocks)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // **The address off before any route covering it moves, and on again
         // after.** Windows, asked to remove an IPv4 route covering this
@@ -219,11 +226,7 @@ impl Lifecycle {
         // again (2026-11-02, a person's PC, `route include` after `route
         // exclude`). Taken off cleanly first, as a move of the block always
         // did, it comes back whole.
-        let wanted_ipv4 = wanted.ipv4();
-        let routes_move = !stale.is_empty() || !fresh.is_empty();
-        if (routes_move || up.ipv4 != wanted_ipv4)
-            && let Some(old) = up.ipv4.take()
-        {
+        if address_goes && let Some(old) = up.ipv4.take() {
             // Not residue on its own, as in `undo`: it goes with the adapter.
             let _removed = self.machine.remove_address(up.interface, old.into()).await;
         }
@@ -784,6 +787,85 @@ mod tests {
                 machine.installed().addresses.contains(&IpAddr::V4(at("100.64.0.1"))),
                 "on the adapter after {holes:?}"
             );
+        }
+    }
+
+    /// A machine that, as Linux does, takes every IPv4 route of an interface
+    /// away with its last IPv4 address, and finds no route to remove after.
+    struct Flushing(Arc<Recording>);
+
+    #[async_trait::async_trait]
+    impl Machine for Flushing {
+        async fn create_adapter(
+            &self,
+            name: &str,
+            guid: [u8; 16],
+        ) -> Result<(Interface, Arc<dyn tunnel::Packets>)> {
+            self.0.create_adapter(name, guid).await
+        }
+        async fn remove_adapter(&self, interface: Interface) -> Result<()> {
+            self.0.remove_adapter(interface).await
+        }
+        async fn assign_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.0.assign_address(interface, address).await
+        }
+        async fn remove_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.0.remove_address(interface, address).await?;
+            if !self.0.installed().addresses.iter().any(IpAddr::is_ipv4) {
+                for route in self.0.installed().routes {
+                    if route.ipv4_block().is_some() {
+                        self.0.remove_route(&route).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        async fn install_route(&self, route: &Route) -> Result<()> {
+            self.0.install_route(route).await
+        }
+        async fn remove_route(&self, route: &Route) -> Result<()> {
+            self.0.remove_route(route).await
+        }
+        async fn install_rule(&self, rule: &Rule) -> Result<()> {
+            self.0.install_rule(rule).await
+        }
+        async fn remove_rule(&self, rule: &Rule) -> Result<()> {
+            self.0.remove_rule(rule).await
+        }
+        async fn sweep_rules(&self) -> Result<bool> {
+            self.0.sweep_rules().await
+        }
+    }
+
+    /// Where the machine takes the routes away with the address, every route
+    /// wanted is there after each change: a hole, its going, a new address.
+    #[tokio::test]
+    async fn routes_taken_with_the_address_are_all_put_back() {
+        let machine = Arc::new(Recording::new());
+        let lifecycle =
+            Lifecycle::new(Arc::new(Flushing(Arc::clone(&machine))) as Arc<dyn Machine>);
+        let (mut up, _device) = lifecycle.up("test", &state(), resolver()).await.expect("comes up");
+        for (own, holes) in [
+            ("100.64.0.1", &[][..]),
+            ("100.64.0.1", &["100.64.0.2/32"]),
+            ("100.64.0.1", &[]),
+            ("100.64.0.9", &[]),
+        ] {
+            let plan = wanted(Some(own), holes);
+            lifecycle.reconcile(&mut up, &plan).await.expect("ok");
+            let mut held: Vec<String> = machine
+                .installed()
+                .routes
+                .iter()
+                .filter(|route| route.ipv4_block().is_some())
+                .map(Route::prefix_text)
+                .collect();
+            let mut planned: Vec<String> =
+                plan.ipv4_routes().map(|route| route.prefix_text()).collect();
+            held.sort();
+            planned.sort();
+            assert_eq!(held, planned, "after {own} less {holes:?}");
+            assert!(machine.installed().addresses.contains(&IpAddr::V4(at(own))));
         }
     }
 

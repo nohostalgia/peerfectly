@@ -107,12 +107,21 @@ pub fn add_route(route: &Route) -> io::Result<()> {
 /// Removes a route — only through its own interface, so a route somebody else
 /// has for the same destination is left alone.
 ///
+/// A route that is not there is the outcome asked for: the kernel takes every
+/// IPv4 route of an interface away with its last IPv4 address, which the
+/// lifecycle removes before the routes it moves (`ESRCH`, seen in the testbed
+/// on 2026-11-03, the routes then believed installed and never put back).
+///
 /// # Errors
 ///
-/// When the kernel refuses, naming the errno.
+/// When the kernel refuses otherwise, naming the errno.
 pub fn remove_route(route: &Route) -> io::Result<()> {
-    ask(RouteNetlinkMessage::DelRoute(route_message(route)), 0)
-        .map_err(|cause| named(cause, format!("removing the route {route}")))
+    /// `ESRCH`: no such route.
+    const NO_SUCH_ROUTE: i32 = 3;
+    match ask(RouteNetlinkMessage::DelRoute(route_message(route)), 0) {
+        Err(cause) if cause.raw_os_error() == Some(NO_SUCH_ROUTE) => Ok(()),
+        other => other.map_err(|cause| named(cause, format!("removing the route {route}"))),
+    }
 }
 
 /// The message for one of this device's addresses.

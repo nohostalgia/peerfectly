@@ -1,7 +1,10 @@
 //! A light member: what a device holding no roster keeps, and how it keeps it.
 //!
 //! It holds:
-//! - its own evidence — its leaf, the proof of it, and the root they rest on;
+//! - its own evidence — its leaf, the proof of it, and the root they rest on —
+//!   or, a board provisioned before it was admitted, the public keys it made
+//!   and nothing more, until a full member gives it its proof
+//!   ([`LightMember::awaiting`]);
 //! - its view of the network's roots ([`LightView`]): the current one, the
 //!   chain before it it can remember, and the invalidations not yet joined;
 //! - the network's parameters, as far as it uses them;
@@ -32,13 +35,17 @@ use crate::membership::{Evidence, MembershipProof};
 use crate::merkle::Hash;
 use crate::snapshot::{RawSnapshot, Snapshot};
 use crate::state::RosterState;
-use crate::types::NetworkParams;
+use crate::types::{KeyEntry, KeyPurpose, NetworkParams};
 
 /// Canonical key order of a light member.
 pub const LIGHT_MEMBER_SCHEMA: &[&str] = &["own", "view", "peers", "params", "contact", "network"];
 
 /// Canonical key order of a peer a light member checked.
 pub const KNOWN_PEER_SCHEMA: &[&str] = &["leaf", "proof", "against"];
+
+/// Canonical key order of what a light member awaiting admission keeps of
+/// itself.
+pub const AWAITING_SCHEMA: &[&str] = &["keys"];
 
 /// How many roots a light member remembers unless told otherwise.
 pub const DEFAULT_BUDGET: usize = 64;
@@ -52,11 +59,22 @@ struct Known {
     against: Hash,
 }
 
+/// What a light member is of itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant, reason = "one per light member, nearly always admitted")]
+enum Own {
+    /// Admitted: the evidence its admission, or its last renewal, gave it.
+    Admitted(Evidence),
+    /// Provisioned and not yet admitted: the public keys it made, which its
+    /// leaf must name once it is, and the device they make.
+    Awaiting { device: DeviceId, keys: Vec<KeyEntry> },
+}
+
 /// What a light member holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LightMember {
     network: NetworkId,
-    own: Evidence,
+    own: Own,
     view: LightView,
     params: NetworkParams,
     peers: BTreeMap<DeviceId, Known>,
@@ -104,10 +122,56 @@ impl LightMember {
             network: root.network,
             view: LightView::starting_from(&root, budget),
             contact: root.signer.clone(),
-            own,
+            own: Own::Admitted(own),
             params,
             peers: BTreeMap::new(),
         })
+    }
+
+    /// A member provisioned before it was admitted: the public `keys` it made,
+    /// the signed `root` it starts from, which it trusts by how it arrived (the
+    /// board's cable), and the parameters under it, believed only with the
+    /// root of the devices' tree beside them making that root.
+    ///
+    /// It shows nothing as a session opens, and its peers judge it by their
+    /// rosters: refused until its batch is admitted, then given its proof by
+    /// asking, as a renewal ([`Self::renew`]).
+    ///
+    /// # Errors
+    ///
+    /// When the keys name no signing key, the root does not verify under its
+    /// signer's key, or the parameters do not make it.
+    pub fn awaiting(
+        keys: Vec<KeyEntry>,
+        root: &[u8],
+        devices_root: &Hash,
+        params: NetworkParams,
+        budget: usize,
+    ) -> Result<Self> {
+        let signing = keys
+            .iter()
+            .find(|entry| entry.purpose == KeyPurpose::Signing)
+            .ok_or(Error::MissingSigningKey)?;
+        let device = DeviceId::of_signing_key(&signing.value);
+        let root = signed_root(root)?;
+        let made = RosterState::root_of(&root.network, devices_root, &params.tree().root());
+        if made != root.root {
+            return Err(Error::SnapshotStateMismatch);
+        }
+        Ok(Self {
+            network: root.network,
+            view: LightView::starting_from(&root, budget),
+            contact: root.signer.clone(),
+            own: Own::Awaiting { device, keys },
+            params,
+            peers: BTreeMap::new(),
+        })
+    }
+
+    /// Whether this member was admitted: it holds its own proof.
+    #[must_use]
+    pub const fn is_admitted(&self) -> bool {
+        matches!(self.own, Own::Admitted(_))
     }
 
     /// The network.
@@ -119,13 +183,20 @@ impl LightMember {
     /// This device.
     #[must_use]
     pub const fn device(&self) -> DeviceId {
-        self.own.leaf.record.id
+        match &self.own {
+            Own::Admitted(own) => own.leaf.record.id,
+            Own::Awaiting { device, .. } => *device,
+        }
     }
 
-    /// What this device shows a peer, as bytes.
+    /// What this device shows a peer, as bytes: nothing while it awaits
+    /// admission.
     #[must_use]
     pub fn evidence(&self) -> Vec<u8> {
-        self.own.to_bytes()
+        match &self.own {
+            Own::Admitted(own) => own.to_bytes(),
+            Own::Awaiting { .. } => Vec::new(),
+        }
     }
 
     /// The parameters this member uses.
@@ -224,7 +295,9 @@ impl LightMember {
     /// it, or no root it remembers is the one its proof rests on.
     #[must_use]
     pub fn needs_renewal(&self) -> bool {
-        let Ok(root) = RawSnapshot::decode(&self.own.root) else { return true };
+        // Awaiting admission, its proof is what it asks for.
+        let Own::Admitted(own) = &self.own else { return true };
+        let Ok(root) = RawSnapshot::decode(&own.root) else { return true };
         self.view.standing(&self.device(), &root.body().root) != ProofVerdict::Accepted
     }
 
@@ -237,9 +310,12 @@ impl LightMember {
         // current root, and not needing to be — it is only dialled, and proves
         // itself as any peer does when the session opens.
         let contact = (!self.view.invalidated(&self.contact.record.id)).then_some(&self.contact);
-        let leaves = core::iter::once(&self.own.leaf)
-            .chain(contact)
-            .chain(self.peers.values().map(|known| &known.leaf));
+        let own = match &self.own {
+            Own::Admitted(own) => Some(&own.leaf),
+            Own::Awaiting { .. } => None,
+        };
+        let leaves =
+            own.into_iter().chain(contact).chain(self.peers.values().map(|known| &known.leaf));
         for leaf in leaves {
             state.devices.insert(leaf.record.id, leaf.record.clone());
             state.set_settings(leaf.record.id, leaf.settings.clone());
@@ -317,7 +393,10 @@ impl LightMember {
     /// What this member shows without the root, as bytes: for an announcement.
     #[must_use]
     pub fn shown(&self) -> Vec<u8> {
-        self.own.shown().map_or_else(|_| Vec::new(), |shown| shown.to_bytes())
+        match &self.own {
+            Own::Admitted(own) => own.shown().map_or_else(|_| Vec::new(), |shown| shown.to_bytes()),
+            Own::Awaiting { .. } => Vec::new(),
+        }
     }
 
     /// Checks a peer's compact evidence against a root this member remembers,
@@ -344,14 +423,26 @@ impl LightMember {
         Ok(device)
     }
 
-    /// Replaces this member's own evidence with a renewed one.
+    /// Replaces this member's own evidence with a renewed one: for a member
+    /// awaiting admission, the first, which must name exactly the keys it
+    /// made.
     ///
     /// # Errors
     ///
-    /// When it is not this device's, or this member does not believe it.
+    /// When it is not this device's, names other keys than those it made, or
+    /// this member does not believe it.
     pub fn renew(&mut self, evidence: Evidence) -> Result<()> {
         if evidence.leaf.record.id != self.device() {
             return Err(Error::InvalidValue("another device's evidence"));
+        }
+        if let Own::Awaiting { keys, .. } = &self.own {
+            let mut named = evidence.leaf.record.keys.clone();
+            let mut made = keys.clone();
+            named.sort_by(|one, other| one.value.cmp(&other.value));
+            made.sort_by(|one, other| one.value.cmp(&other.value));
+            if named != made {
+                return Err(Error::InvalidValue("a leaf naming other keys than this device made"));
+            }
         }
         let root = RawSnapshot::decode(&evidence.root)?;
         if self.view.judge(&evidence.leaf, &evidence.proof, &root.body().root)
@@ -359,7 +450,7 @@ impl LightMember {
         {
             return Err(Error::SignatureInvalid);
         }
-        self.own = evidence;
+        self.own = Own::Admitted(evidence);
         Ok(())
     }
 
@@ -401,7 +492,7 @@ impl LightMember {
     pub fn from_bytes(input: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(input);
         let mut map = reader.map(LIGHT_MEMBER_SCHEMA)?;
-        let own = Evidence::from_bytes(map.key("own")?.bytes(usize::MAX, "evidence")?)?;
+        let own = Own::from_bytes(map.key("own")?.bytes(usize::MAX, "evidence")?)?;
         let view = LightView::decode(map.key("view")?)?;
         let peers_reader = map.key("peers")?;
         let count = peers_reader.array(input.len(), "known peers")?;
@@ -424,6 +515,42 @@ impl LightMember {
     }
 }
 
+impl Own {
+    /// Its bytes: the evidence, or what a member awaiting admission keeps.
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Admitted(own) => own.to_bytes(),
+            Self::Awaiting { keys, .. } => {
+                let mut writer = Writer::new();
+                writer.map(1);
+                writer.key("keys").array(keys.len() as u64);
+                for entry in keys {
+                    entry.encode(&mut writer);
+                }
+                writer.finish()
+            }
+        }
+    }
+
+    /// Reads it back: evidence, or the keys of a member awaiting admission.
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if let Ok(own) = Evidence::from_bytes(bytes) {
+            return Ok(Self::Admitted(own));
+        }
+        let mut reader = Reader::new(bytes);
+        let mut map = reader.map(AWAITING_SCHEMA)?;
+        let keys = crate::types::decode_keys(map.key("keys")?)?;
+        map.finish()?;
+        reader.finish()?;
+        let signing = keys
+            .iter()
+            .find(|entry| entry.purpose == KeyPurpose::Signing)
+            .ok_or(Error::MissingSigningKey)?;
+        let device = DeviceId::of_signing_key(&signing.value);
+        Ok(Self::Awaiting { device, keys })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +560,6 @@ mod tests {
     fn the_schemas_are_canonical() {
         assert!(is_canonical_schema(LIGHT_MEMBER_SCHEMA));
         assert!(is_canonical_schema(KNOWN_PEER_SCHEMA));
+        assert!(is_canonical_schema(AWAITING_SCHEMA));
     }
 }

@@ -321,6 +321,16 @@
             "arrived": "tv",
             "confirmation": null,
             "custody": "KeyStore",
+            "full_members": [
+              {
+                "id": "0a1b-2c3d-4e5f-6a7b",
+                "name": "nas"
+              },
+              {
+                "id": "1b2c-3d4e-5f6a-7b8c",
+                "name": "laptop"
+              }
+            ],
             "id": "3d4e-5f6a-7b8c-9d0e",
             "ipv4": {
               "Held": "100.64.0.4"
@@ -329,6 +339,7 @@
             "label": "home",
             "name": "pixel.home.internal",
             "owner_taken": false,
+            "peer_count": 250,
             "peers": [
               {
                 "address": "fd00::2",
@@ -367,6 +378,7 @@
                 "standing": "Current"
               }
             ],
+            "peers_after": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
             "problem": {
               "at": {
                 "nanos_since_epoch": 0,
@@ -375,6 +387,7 @@
               "cause": "certificate not trusted",
               "subsystem": "relay"
             },
+            "reachable_count": 1,
             "relay": "https://relay.example:443",
             "relay_leaving": {
               "relay": "https://old-relay.example:443",
@@ -454,12 +467,14 @@
             "arrived": null,
             "confirmation": "Stale",
             "custody": "KeyStore",
+            "full_members": [],
             "id": "4e5f-6a7b-8c9d-0e1f",
             "ipv4": null,
             "ipv4_block": null,
             "label": "work",
             "name": null,
             "owner_taken": false,
+            "peer_count": 1,
             "peers": [
               {
                 "address": "fd01::2",
@@ -487,7 +502,9 @@
                 }
               }
             ],
+            "peers_after": null,
             "problem": null,
+            "reachable_count": 0,
             "relay": null,
             "relay_leaving": null,
             "revoked": [],
@@ -525,6 +542,61 @@
       }
     },
     "Done",
+    {
+      "Peers": {
+        "after": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "network": "home",
+        "peers": [
+          {
+            "address": "fd00::2",
+            "id": "0a1b-2c3d-4e5f-6a7b",
+            "ipv4": {
+              "Held": "100.64.0.2"
+            },
+            "last_contact": {
+              "Recorded": {
+                "at": {
+                  "nanos_since_epoch": 0,
+                  "secs_since_epoch": 1757700000
+                }
+              }
+            },
+            "name": "nas.home.internal",
+            "name_resolves": true,
+            "path": "Relay",
+            "reachable": true,
+            "standing": "Current"
+          },
+          {
+            "address": "fd00::7",
+            "id": "1b2c-3d4e-5f6a-7b8c",
+            "ipv4": {
+              "Withheld": {
+                "address": "192.168.1.7",
+                "with": "the local subnet 192.168.1.0/24"
+              }
+            },
+            "last_contact": "NoneRecorded",
+            "name": "laptop.home.internal",
+            "name_resolves": true,
+            "path": null,
+            "reachable": false,
+            "standing": "Current"
+          }
+        ]
+      }
+    },
+    {
+      "Provisioning": {
+        "anchors": [
+          "d4"
+        ],
+        "devices_root": "b2",
+        "params": "c3",
+        "relay": "ab@relay.example:8443",
+        "root": "a1"
+      }
+    },
     {
       "JoinStarted": {
         "conflicts": [

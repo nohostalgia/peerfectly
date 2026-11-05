@@ -29,8 +29,10 @@
 //! This module uses `core` and `alloc` only, so that the verification half can
 //! be built for a microcontroller.
 
-use alloc::sync::Arc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+
+use crate::sync::Arc;
 
 /// A 32-byte hash: a key, a value's hash, or a node.
 pub type Hash = [u8; 32];
@@ -165,6 +167,40 @@ pub trait NodeSource: Send + Sync {
 pub trait NodeSink: NodeSource {
     /// Keeps these nodes, by their hashes.
     fn put_nodes(&self, nodes: &[(Hash, Stored)]);
+}
+
+/// A store read as no more than a source or a sink of nodes.
+///
+/// What turns an `Arc<dyn LayerStore>` into an `Arc<dyn NodeSink>`: the shared
+/// pointer of a build without `std` does not turn one trait object into another
+/// on stable Rust, so the store is wrapped and the wrapper made one through a
+/// `Box`, the same way with `std` and without.
+struct Through<S: ?Sized>(Arc<S>);
+
+impl<S: NodeSource + ?Sized> NodeSource for Through<S> {
+    fn node(&self, hash: &Hash) -> Option<Stored> {
+        self.0.node(hash)
+    }
+
+    fn tampered(&self) {
+        self.0.tampered();
+    }
+}
+
+impl<S: NodeSink + ?Sized> NodeSink for Through<S> {
+    fn put_nodes(&self, nodes: &[(Hash, Stored)]) {
+        self.0.put_nodes(nodes);
+    }
+}
+
+/// `store` as a source of nodes.
+pub(crate) fn source_of<S: NodeSource + ?Sized + 'static>(store: Arc<S>) -> Arc<dyn NodeSource> {
+    Arc::from(Box::new(Through(store)) as Box<dyn NodeSource>)
+}
+
+/// `store` as a sink of nodes.
+pub(crate) fn sink_of<S: NodeSink + ?Sized + 'static>(store: Arc<S>) -> Arc<dyn NodeSink> {
+    Arc::from(Box::new(Through(store)) as Box<dyn NodeSink>)
 }
 
 /// Two sources read as one: the nodes a tree spilled, then the ones it was
@@ -335,6 +371,90 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Puts every leaf of `run`, sorted by key and without repeats, beneath
+    /// this node at `depth`: each node on the way read once for all of them,
+    /// rather than once for each. Where a sink is given, a subtree finished at
+    /// [`RUN_SPILL_DEPTH`] goes to it, and only its hash is kept.
+    fn insert_run(
+        self,
+        run: &[(Hash, Hash)],
+        depth: usize,
+        lazy: &mut Lazy<'_>,
+        sink: &mut Option<Gathering<'_>>,
+    ) -> Self {
+        let node = match run {
+            [] => return self,
+            [(key, value)] => self.insert(*key, *value, depth, lazy),
+            _ => match self.open(lazy) {
+                Self::Empty | Self::Stored(_) => Self::build(run, depth, sink),
+                Self::Leaf { key: held, value: held_value } => {
+                    // The leaf held joins them, unless one of them replaces it.
+                    let at = run.partition_point(|(key, _)| *key < held);
+                    if run.get(at).is_some_and(|(key, _)| *key == held) {
+                        Self::build(run, depth, sink)
+                    } else {
+                        let mut merged = Vec::with_capacity(run.len().saturating_add(1));
+                        merged.extend_from_slice(run.get(..at).unwrap_or_default());
+                        merged.push((held, held_value));
+                        merged.extend_from_slice(run.get(at..).unwrap_or_default());
+                        Self::build(&merged, depth, sink)
+                    }
+                }
+                Self::Branch { left, right, .. } => {
+                    let next = depth.saturating_add(1);
+                    let (low, high) =
+                        run.split_at(run.partition_point(|(key, _)| !bit(key, depth)));
+                    let left = if low.is_empty() {
+                        left
+                    } else {
+                        Arc::new(Arc::unwrap_or_clone(left).insert_run(low, next, lazy, sink))
+                    };
+                    let right = if high.is_empty() {
+                        right
+                    } else {
+                        Arc::new(Arc::unwrap_or_clone(right).insert_run(high, next, lazy, sink))
+                    };
+                    Self::shared(left, right)
+                }
+            },
+        };
+        node.spilled_at(depth, sink)
+    }
+
+    /// The subtree holding exactly the leaves of `run`, sorted by key and
+    /// without repeats, rooted at `depth`.
+    fn build(run: &[(Hash, Hash)], depth: usize, sink: &mut Option<Gathering<'_>>) -> Self {
+        let node = match run {
+            [] => return Self::Empty,
+            [(key, value)] => return Self::Leaf { key: *key, value: *value },
+            [(key, value), ..] if depth >= KEY_BITS => {
+                // Two keys always differ within 256 bits; as in `two`.
+                return Self::Leaf { key: *key, value: *value };
+            }
+            _ => {
+                let next = depth.saturating_add(1);
+                let (low, high) = run.split_at(run.partition_point(|(key, _)| !bit(key, depth)));
+                Self::branch(Self::build(low, next, sink), Self::build(high, next, sink))
+            }
+        };
+        node.spilled_at(depth, sink)
+    }
+
+    /// This subtree as it stands at `depth`: handed to `sink` and kept by its
+    /// hash where the depth is the one subtrees are spilled at.
+    fn spilled_at(self, depth: usize, sink: &mut Option<Gathering<'_>>) -> Self {
+        let Some(gathering) = sink.as_mut().filter(|_| depth == RUN_SPILL_DEPTH) else {
+            return self;
+        };
+        let before = gathering.nodes.len();
+        self.fresh(&mut |hash, node| gathering.nodes.push((hash, node)));
+        if gathering.nodes.len() == before {
+            return self;
+        }
+        gathering.flush_if_full();
+        Self::stub(self.hash())
     }
 
     /// Removes `key`, collapsing any branch left holding a single leaf.
@@ -689,6 +809,40 @@ impl Tree {
         self.root = root.insert(key, value, 0, &mut lazy);
     }
 
+    /// Puts every leaf of `leaves`, replacing what was at each key: as many
+    /// [`Tree::insert`]s, the same root, in one pass.
+    ///
+    /// Keys must come in increasing order, each once; leaves that do not are
+    /// put one at a time instead. Each node on the way is read once for all
+    /// of them, rather than once for each, which is what laying a batch of
+    /// tens of thousands over a tree of a million in a store costs
+    /// (`scalable-membership` 16.7). Where the tree spills
+    /// ([`Tree::spill_to`]), every subtree finished goes to the sink as it is
+    /// made, and the tree holds no more than a path of the change.
+    pub fn insert_sorted(&mut self, leaves: &[(Hash, Hash)]) {
+        if !leaves.windows(2).all(|pair| matches!(pair, [one, two] if one.0 < two.0)) {
+            for (key, value) in leaves {
+                self.insert(*key, *value);
+            }
+            return;
+        }
+        let root = core::mem::take(&mut self.root);
+        let sink = self.sink.clone();
+        let mut gathering = sink.as_deref().map(|sink| Gathering { sink, nodes: Vec::new() });
+        let mut lazy = Lazy { source: self.source.as_deref(), dropped: &mut self.dropped };
+        self.root = root.insert_run(leaves, 0, &mut lazy, &mut gathering);
+        // Handed before anything reads them back: a subtree kept by its hash
+        // is loaded from the sink.
+        if let Some(gathering) = gathering.as_mut() {
+            gathering.flush();
+        }
+        if sink.is_some() {
+            // As `spill` does: what spilled no longer tracks what it replaced.
+            self.dropped = Vec::new();
+            self.untracked = true;
+        }
+    }
+
     /// Removes what is at `key`, if anything.
     pub fn remove(&mut self, key: &Hash) {
         let root = core::mem::take(&mut self.root);
@@ -778,7 +932,8 @@ impl Tree {
     /// was rooted.
     pub fn spill_to(&mut self, sink: Arc<dyn NodeSink>) {
         let rooted = self.source.take();
-        let both: Arc<dyn NodeSource> = Arc::new(Spilled { spilled: Arc::clone(&sink), rooted });
+        let both: Box<dyn NodeSource> = Box::new(Spilled { spilled: Arc::clone(&sink), rooted });
+        let both = Arc::from(both);
         self.source = Some(both);
         self.sink = Some(sink);
     }
@@ -885,6 +1040,36 @@ impl<F: FnMut(Hash, Stored)> Builder<F> {
             (self.emit)(hash, branch);
         }
         hash
+    }
+}
+
+/// The level [`Tree::insert_sorted`] spills its finished subtrees at, where
+/// the tree has a sink: 256 subtrees, each out of memory once made.
+const RUN_SPILL_DEPTH: usize = 8;
+
+/// How many spilled nodes are gathered before the sink is handed them: each
+/// handing is a write a store commits, so they are few and large, and what
+/// waits is bounded, some 7 MB.
+const SPILL_GATHERED: usize = 1 << 16;
+
+/// The nodes spilled subtrees made, waiting to be handed to the sink at once.
+struct Gathering<'a> {
+    sink: &'a dyn NodeSink,
+    nodes: Vec<(Hash, Stored)>,
+}
+
+impl Gathering<'_> {
+    fn flush_if_full(&mut self) {
+        if self.nodes.len() >= SPILL_GATHERED {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.nodes.is_empty() {
+            self.sink.put_nodes(&self.nodes);
+            self.nodes.clear();
+        }
     }
 }
 
@@ -1151,6 +1336,106 @@ mod tests {
             }
             seen
         }
+    }
+
+    /// A sink keeping what it is handed in `Kept`, counting the calls.
+    struct Sunk {
+        kept: Arc<Kept>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NodeSource for Sunk {
+        fn node(&self, hash: &Hash) -> Option<Stored> {
+            self.kept.node(hash)
+        }
+
+        fn tampered(&self) {
+            self.kept.tampered();
+        }
+    }
+
+    impl NodeSink for Sunk {
+        fn put_nodes(&self, nodes: &[(Hash, Stored)]) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut held = self.kept.nodes.lock().unwrap();
+            for (hash, node) in nodes {
+                held.insert(*hash, *node);
+            }
+        }
+    }
+
+    fn sorted_leaves(numbers: &[u32]) -> Vec<(Hash, Hash)> {
+        let mut leaves: Vec<(Hash, Hash)> =
+            numbers.iter().map(|n| (key(*n), value(n.wrapping_mul(7)))).collect();
+        leaves.sort_unstable();
+        leaves.dedup_by_key(|(key, _)| *key);
+        leaves
+    }
+
+    proptest! {
+        /// Leaves put in one pass make the root as many inserts do: over an
+        /// empty tree, over a tree in memory holding some of the same keys
+        /// with other values, and over a stored tree spilling to a sink.
+        #[test]
+        fn leaves_put_in_one_pass_make_the_root_inserts_make(
+            held in proptest::collection::vec(0_u32..3_000, 0..400),
+            laid in proptest::collection::vec(0_u32..3_000, 0..400),
+        ) {
+            let leaves = sorted_leaves(&laid);
+            let mut one_by_one = Tree::new();
+            for n in &held {
+                one_by_one.insert(key(*n), value(*n));
+            }
+            let mut in_one_pass = one_by_one.clone();
+            for (key, value) in &leaves {
+                one_by_one.insert(*key, *value);
+            }
+            in_one_pass.insert_sorted(&leaves);
+            prop_assert_eq!(in_one_pass.root(), one_by_one.root());
+
+            let (kept, root) = Kept::built(&held);
+            let sink = Arc::new(Sunk { kept: Arc::clone(&kept), calls: Default::default() });
+            let mut stored = Tree::stored(root, kept.clone());
+            stored.spill_to(sink.clone());
+            stored.insert_sorted(&leaves);
+            stored.spill();
+            prop_assert_eq!(stored.root(), one_by_one.root());
+            for (key, value) in &leaves {
+                prop_assert_eq!(stored.get(key), Some(*value));
+            }
+            prop_assert_eq!(kept.tampered.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    /// Leaves out of order are put one at a time: the same root still.
+    #[test]
+    fn leaves_out_of_order_are_put_one_at_a_time() {
+        let mut leaves = sorted_leaves(&(0..50).collect::<Vec<_>>());
+        leaves.reverse();
+        let mut tree = Tree::new();
+        tree.insert_sorted(&leaves);
+        let mut expected = Tree::new();
+        for (key, value) in &leaves {
+            expected.insert(*key, *value);
+        }
+        assert_eq!(tree.root(), expected.root());
+    }
+
+    /// Laid over a stored tree, a large run is written a subtree at a time:
+    /// no more calls than there are subtrees at the depth spilled at, however
+    /// many leaves.
+    #[test]
+    fn a_run_spills_a_subtree_at_a_time() {
+        let (kept, root) = Kept::built(&(0..20_000).collect::<Vec<_>>());
+        let sink = Arc::new(Sunk { kept: Arc::clone(&kept), calls: Default::default() });
+        let mut tree = Tree::stored(root, kept.clone());
+        tree.spill_to(sink.clone());
+        tree.insert_sorted(&sorted_leaves(&(20_000..40_000).collect::<Vec<_>>()));
+        let calls = sink.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(calls <= 2, "a few large writes, not one a subtree: {calls} calls");
+        tree.spill();
+        assert_eq!(tree.get(&key(39_999)), Some(value(39_999_u32.wrapping_mul(7))));
+        assert_eq!(tree.get(&key(5)), Some(value(5)));
     }
 
     #[test]

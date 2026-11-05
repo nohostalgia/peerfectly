@@ -110,27 +110,10 @@ impl Fault {
     }
 }
 
-/// What a light member's upkeep owes.
-#[derive(Debug, Default)]
-struct Owed {
-    /// A root that could not be placed, and the peer that sent it.
-    chain: Option<(DeviceId, Vec<u8>)>,
-    /// Whether its own proof wants renewing.
-    renewal: bool,
-}
-
-impl Owed {
-    /// Whether anything is owed.
-    const fn is_some(&self) -> bool {
-        self.chain.is_some() || self.renewal
-    }
-}
-
-/// A root a light member adopted from a peer — shown as a session opened, or
-/// sent on one — and the peer: written down, and the peer asked what the
-/// member stands on, by the upkeep. Neither the judgement that adopted it nor
-/// the session's reader can wait for an answer that comes on the same session.
-type AdoptedFrom = Arc<std::sync::Mutex<Option<DeviceId>>>;
+/// A light member and its upkeep, as `light_node::engine` runs them: shared
+/// by the node and the transport's judging, which only ever lock it briefly
+/// and never across an await.
+type Light = Arc<std::sync::Mutex<light_node::engine::Engine>>;
 
 /// The assembled node.
 pub struct Node {
@@ -207,32 +190,20 @@ pub struct Node {
     log: Log,
     /// What this device holds where it is a light member here: in place of a
     /// roster, whose syncer then stays empty.
-    light: std::sync::RwLock<Option<Arc<std::sync::Mutex<roster::member::LightMember>>>>,
+    light: std::sync::RwLock<Option<Light>>,
     /// Set when this node changed mode — full to light or light to full — so
     /// the service builds it again from what it now keeps.
     switched: std::sync::atomic::AtomicBool,
     /// Set while a light member that became full fetches the state it rests on.
     becoming_full: std::sync::atomic::AtomicBool,
-    /// Lookups this node asked and awaits, by id.
-    lookups: std::sync::Mutex<BTreeMap<u32, tokio::sync::oneshot::Sender<Vec<u8>>>>,
-    /// The id the next lookup is given: unique among those this node awaits.
-    /// Also how many it has ever asked.
-    next_lookup: std::sync::atomic::AtomicU32,
-    /// What a light member's upkeep owes, raised by events and never by a
-    /// clock: a root it could not place, from whom; and whether its own proof
-    /// wants renewing.
-    owed: std::sync::Mutex<Owed>,
-    /// A root adopted as a session opened, and from whom.
-    adopted_from: AdoptedFrom,
-    /// Whether a light member still owes itself the question of what it
-    /// stands on, since it started: asked of the first full member it meets.
-    footing_due: std::sync::atomic::AtomicBool,
-    /// The digest of the footing this light member last took, since it
-    /// started: what it asks with, so that one unchanged comes back as that
-    /// digest alone.
-    footing_held: std::sync::Mutex<Option<[u8; 32]>>,
-    /// Wakes the light member's upkeep.
+    /// Wakes the light member's upkeep, to carry out what its engine asks.
     upkeep: Arc<tokio::sync::Notify>,
+    /// Held while what a light member's engine asks is carried out, so that
+    /// its outputs are acted on in the order it gave them.
+    driving: Mutex<()>,
+    /// When this node was built: the light member's engine counts time from
+    /// it.
+    born: tokio::time::Instant,
     /// Held while the log is written: appended to, or rewritten after a
     /// compaction, so that a rewrite never drops an operation appended while it
     /// was being made.
@@ -404,13 +375,9 @@ impl Node {
             light: std::sync::RwLock::new(None),
             switched: std::sync::atomic::AtomicBool::new(false),
             becoming_full: std::sync::atomic::AtomicBool::new(false),
-            lookups: std::sync::Mutex::new(BTreeMap::new()),
-            next_lookup: std::sync::atomic::AtomicU32::new(0),
-            owed: std::sync::Mutex::new(Owed::default()),
-            adopted_from: Arc::default(),
-            footing_due: std::sync::atomic::AtomicBool::new(true),
-            footing_held: std::sync::Mutex::new(None),
             upkeep: Arc::new(tokio::sync::Notify::new()),
+            driving: Mutex::new(()),
+            born: tokio::time::Instant::now(),
             log_guard: Mutex::new(()),
             keeper: std::sync::OnceLock::new(),
             base: std::sync::Mutex::new(None),
@@ -682,7 +649,9 @@ impl Node {
             Log::at(paths.roster()),
             crate::schedule::Schedule::provisional(),
         );
-        node.set_light(Some(Arc::new(std::sync::Mutex::new(member))));
+        node.set_light(Some(Arc::new(std::sync::Mutex::new(light_node::engine::Engine::new(
+            member,
+        )))));
         Ok(Some(Arc::new(node)))
     }
 
@@ -831,7 +800,7 @@ impl Node {
     /// The network a light member's node belongs to.
     #[must_use]
     pub fn light_network(&self) -> Option<roster::id::NetworkId> {
-        self.light().and_then(|member| member.lock().ok().map(|member| member.network()))
+        self.light().and_then(|light| light.lock().ok().map(|light| light.member().network()))
     }
 
     /// Names a base about to be written in the checkpoint first. Whether the
@@ -864,12 +833,72 @@ impl Node {
     }
 
     /// The light member this node runs on, if it is one now.
-    fn light(&self) -> Option<Arc<std::sync::Mutex<roster::member::LightMember>>> {
+    fn light(&self) -> Option<Light> {
         self.light.read().map_or(None, |held| held.clone())
     }
 
+    /// A copy of the light member this node runs on, if it is one now.
+    fn light_member(&self) -> Option<roster::member::LightMember> {
+        self.light().and_then(|light| light.lock().ok().map(|light| light.member().clone()))
+    }
+
+    /// Milliseconds since this node was built: the light member's engine's
+    /// clock.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Gives the light member's engine something that happened, and carries
+    /// out what it asks in return. Nothing where this node is not light.
+    async fn tell_light(&self, event: impl FnOnce(&mut light_node::engine::Engine, u64)) {
+        let Some(light) = self.light() else { return };
+        let now = self.now_ms();
+        if let Ok(mut engine) = light.lock() {
+            event(&mut engine, now);
+        }
+        self.drive_light().await;
+    }
+
+    /// Carries out what the light member's engine asks, in its order: sends
+    /// its questions, keeps the member before acting on what follows, judges
+    /// the sessions again, follows the state.
+    async fn drive_light(&self) {
+        let _driving = self.driving.lock().await;
+        loop {
+            let Some(light) = self.light() else { return };
+            let next = light.lock().ok().and_then(|mut engine| engine.poll_output());
+            let Some(output) = next else { return };
+            match output {
+                light_node::engine::Output::Send { peer, channel, body } => {
+                    self.send_to(peer, channel, &body).await;
+                }
+                light_node::engine::Output::Keep => {
+                    if let Some(member) = self.light_member() {
+                        self.keep_light(&member).await;
+                    }
+                }
+                light_node::engine::Output::Renewed => {
+                    self.refresh_evidence().await;
+                    // Its leaf may now say it is full.
+                    let _asked = self.begin_full().await;
+                }
+                light_node::engine::Output::Reconsider => {
+                    let transport = self.transport.lock().await.clone();
+                    if let Some(transport) = transport {
+                        transport.reconsider();
+                    }
+                }
+                light_node::engine::Output::StateChanged => self.enforce_roster().await,
+                // The upkeep sleeps until the earliest deadline anyway, and
+                // nothing here asks the engine to find a member.
+                light_node::engine::Output::WakeAt(_)
+                | light_node::engine::Output::Found { .. } => {}
+            }
+        }
+    }
+
     /// Makes this node a light member's, or a full member's.
-    fn set_light(&self, member: Option<Arc<std::sync::Mutex<roster::member::LightMember>>>) {
+    fn set_light(&self, member: Option<Light>) {
         if let Ok(mut held) = self.light.write() {
             *held = member;
         }
@@ -944,7 +973,9 @@ impl Node {
                 let _removed = std::fs::remove_file(kept);
             }
         }
-        self.set_light(Some(Arc::new(std::sync::Mutex::new(member))));
+        self.set_light(Some(Arc::new(std::sync::Mutex::new(light_node::engine::Engine::new(
+            member,
+        )))));
         self.switched.store(true, std::sync::atomic::Ordering::SeqCst);
         true
     }
@@ -954,9 +985,8 @@ impl Node {
     /// the syncer, which rests on it once it is whole and checked. Returns the
     /// message sent, for a caller that carries it itself.
     async fn begin_full(&self) -> Option<roster_sync::message::Message> {
-        let member = self.light()?;
-        let (evidence, contact) =
-            member.lock().ok().map(|member| (member.evidence(), member.contact()))?;
+        let member = self.light_member()?;
+        let (evidence, contact) = (member.evidence(), member.contact());
         let shown = roster::membership::Evidence::from_bytes(&evidence).ok()?;
         if shown.leaf.settings.mode != roster::leaf::Mode::Full {
             return None;
@@ -988,8 +1018,8 @@ impl Node {
     /// What this device shows of its membership without the root, as bytes: for
     /// an announcement. Empty where it holds no root.
     pub async fn shown(&self) -> Vec<u8> {
-        if let Some(member) = self.light() {
-            return member.lock().map_or_else(|_| Vec::new(), |member| member.shown());
+        if let Some(light) = self.light() {
+            return light.lock().map_or_else(|_| Vec::new(), |light| light.member().shown());
         }
         crate::snapshots::shown_of(self.syncer.lock().await.roster(), &self.identity.device_id())
     }
@@ -1007,9 +1037,9 @@ impl Node {
         if !names_key {
             return false;
         }
-        let kept = member.lock().ok().and_then(|mut member| {
-            member.learn_shown(shown).ok()?;
-            Some(member.clone())
+        let kept = member.lock().ok().and_then(|mut light| {
+            light.member_mut().learn_shown(shown).ok()?;
+            Some(light.member().clone())
         });
         let Some(kept) = kept else { return false };
         self.keep_light(&kept).await;
@@ -1035,11 +1065,11 @@ impl Node {
     /// (`daemon::simulator`).
     #[must_use]
     pub fn light_binding(&self) -> Option<(Vec<u8>, transport_convesso::node::Judge)> {
-        let member = self.light()?;
-        let shown = member.lock().ok()?.shown();
-        let judging = Arc::clone(&member);
+        let light = self.light()?;
+        let shown = light.lock().ok()?.member().shown();
+        let judging = Arc::clone(&light);
         let judge: transport_convesso::node::Judge =
-            Arc::new(move |shown| judging.lock().is_ok_and(|member| member.believes_shown(shown)));
+            Arc::new(move |shown| judging.lock().is_ok_and(|light| light.judge(shown)));
         Some((shown, judge))
     }
 
@@ -1052,24 +1082,17 @@ impl Node {
     /// them, and had nobody left to ask (testbed, 18.1).
     #[must_use]
     pub fn catching_up(&self) -> Option<transport::session::CatchingUp> {
-        let member = self.light()?;
-        let asking = Arc::clone(&member);
-        let behind: transport::session::Behind = Arc::new(move |shown: &[u8]| {
-            let shown = roster::membership::Shown::from_bytes(shown).ok()?;
-            asking.lock().ok()?.behind(&shown.against)
-        });
-        let adopted_from = Arc::clone(&self.adopted_from);
+        let light = self.light()?;
+        let asking = Arc::clone(&light);
+        let behind: transport::session::Behind =
+            Arc::new(move |shown: &[u8]| asking.lock().ok()?.behind(shown));
         let upkeep = Arc::clone(&self.upkeep);
+        let born = self.born;
         let take: transport::session::TakeRoots = Arc::new(move |shown: &[u8], roots: &[u8]| {
-            let Some(chain) = crate::lookup::decode_roots(roots) else { return false };
-            let taken = member.lock().is_ok_and(|mut member| member.take_chain(&chain));
+            let now = u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let taken = light.lock().is_ok_and(|mut light| light.take_roots(shown, roots, now));
             if taken {
                 // Kept, and what it stands on asked, by the upkeep.
-                if let Ok(shown) = roster::membership::Shown::from_bytes(shown)
-                    && let Ok(mut from) = adopted_from.lock()
-                {
-                    *from = Some(shown.leaf.record.id);
-                }
                 upkeep.notify_one();
             }
             taken
@@ -1077,16 +1100,29 @@ impl Node {
         Some(transport::session::CatchingUp { behind, take })
     }
 
+    /// Reads the roster, as a full member holds it: `None` for a light node,
+    /// which holds none.
+    pub async fn read_roster<T>(
+        &self,
+        read: impl FnOnce(&roster::roster::Roster) -> T,
+    ) -> Option<T> {
+        if self.is_light() {
+            return None;
+        }
+        Some(read(self.syncer.lock().await.roster()))
+    }
+
     /// What a full member answers a light member that cannot place its root:
-    /// the roots it took after the one named, as many as one answer holds.
+    /// the roots it took after the one named, as many as the room its answer
+    /// has, which is what the asking peer takes.
     pub fn roots_source(self: &Arc<Self>) -> transport::session::RootsAfter {
         let node = Arc::downgrade(self);
-        Arc::new(move |since: [u8; 32]| {
+        Arc::new(move |since: [u8; 32], room: usize| {
             let node = node.clone();
             Box::pin(async move {
                 let Some(node) = node.upgrade() else { return Vec::new() };
                 let roots = node.syncer.lock().await.roster().roots_after(&since);
-                crate::lookup::encode_roots_within(&roots, transport_convesso::frame::MAX_ROOTS)
+                crate::lookup::encode_roots_within(&roots, room)
             })
         })
     }
@@ -1094,56 +1130,14 @@ impl Node {
     /// Takes roster traffic as a light member does: roots, and nothing else.
     ///
     /// An adopted root is kept, and every open session judged again under it,
-    /// so a peer it revokes is cut off now.
-    async fn received_light(
-        &self,
-        peer: DeviceId,
-        member: &Arc<std::sync::Mutex<roster::member::LightMember>>,
-        body: &[u8],
-    ) {
+    /// so a peer it revokes is cut off now (`light_node::engine`).
+    async fn received_light(&self, peer: DeviceId, body: &[u8]) {
         let Ok(roster_sync::message::Message::Snapshot(bytes)) =
             roster_sync::message::Message::decode(body)
         else {
             return;
         };
-        let adopted = member.lock().ok().and_then(|mut member| {
-            let outcome = member.offer_root(&bytes).ok()?;
-            if outcome == roster::light::RootOutcome::NeedsChain {
-                // Roots were missed: the one who sent this has the chain.
-                if let Ok(mut owed) = self.owed.lock() {
-                    owed.chain = Some((peer, bytes.clone()));
-                }
-                self.upkeep.notify_one();
-                return None;
-            }
-            matches!(
-                outcome,
-                roster::light::RootOutcome::Adopted
-                    | roster::light::RootOutcome::Switched
-                    | roster::light::RootOutcome::KeptAside
-            )
-            .then(|| member.clone())
-        });
-        let Some(kept) = adopted else { return };
-        self.keep_light(&kept).await;
-        // What the member stands on under it is asked by the upkeep: asked
-        // from here, the answer would wait behind this very message, on the
-        // same session.
-        if let Ok(mut from) = self.adopted_from.lock() {
-            *from = Some(peer);
-        }
-        self.upkeep.notify_one();
-        if kept.needs_renewal() {
-            if let Ok(mut owed) = self.owed.lock() {
-                owed.renewal = true;
-            }
-            self.upkeep.notify_one();
-        }
-        let transport = self.transport.lock().await.clone();
-        if let Some(transport) = transport {
-            transport.reconsider();
-        }
-        self.enforce_roster().await;
+        self.tell_light(|engine, now| engine.root_pushed(peer, &bytes, now)).await;
     }
 
     /// Answers a lookup, as a full member: the evidence of the member asked
@@ -1161,125 +1155,31 @@ impl Node {
         }
         let syncer = self.syncer.lock().await;
         if let crate::lookup::Query::RootsAfter(since) = query {
-            return crate::lookup::encode_roots(&syncer.roster().roots_after(since));
+            // Within what every peer takes: a microcontroller asks this too.
+            return crate::lookup::encode_roots_within(
+                &syncer.roster().roots_after(since),
+                crate::lookup::MAX_ROOTS_ANSWER,
+            );
         }
         let Ok(state) = syncer.roster().state() else { return Vec::new() };
         crate::lookup::resolve(&state, query)
             .map_or_else(Vec::new, |device| crate::snapshots::evidence_of(syncer.roster(), &device))
     }
 
-    /// Lookup traffic from a peer: a question to answer, or an answer awaited.
+    /// Lookup traffic from a peer: a question to answer, or, for a light
+    /// member, an answer its engine awaits.
     async fn received_lookup(&self, peer: DeviceId, body: &[u8]) {
-        match crate::lookup::Message::decode(body) {
-            Some(crate::lookup::Message::Request { id, query }) => {
-                let evidence = self.answer_lookup(&query).await;
-                let answer = crate::lookup::Message::Answer { id, evidence };
-                self.send_to(peer, Channel::Lookup, &answer.encode()).await;
-            }
-            Some(crate::lookup::Message::Answer { id, evidence }) => {
-                let waiting = self.lookups.lock().ok().and_then(|mut held| held.remove(&id));
-                if let Some(waiting) = waiting {
-                    let _ = waiting.send(evidence);
-                }
-            }
-            None => {}
+        if self.is_light() {
+            self.tell_light(|engine, now| engine.lookup(peer, body, now)).await;
+            return;
         }
-    }
-
-    /// Asks `peer` — a full member this node holds a session with — for the
-    /// member `query` names, as a light member does, and learns it where the
-    /// answer holds.
-    ///
-    /// `None` where this node is not light, the peer did not answer in time,
-    /// knew nothing, or answered with something that does not hold.
-    pub async fn look_up(&self, peer: DeviceId, query: crate::lookup::Query) -> Option<DeviceId> {
-        let member = self.light()?;
-        let evidence = self.ask(peer, query.clone()).await?;
-        let (device, kept) = {
-            let mut member = member.lock().ok()?;
-            let device = crate::lookup::take_answer(&mut member, &query, &evidence).ok()?;
-            (device, member.clone())
-        };
-        self.keep_light(&kept).await;
-        // Routable now: the member is in the state this node knows.
-        self.enforce_roster().await;
-        Some(device)
-    }
-
-    /// Finds the member `query` names, as a light member does: in what it
-    /// already checked, then by asking the members it holds sessions with,
-    /// then its anchors among them — in the order `seeking` gives.
-    ///
-    /// A full member answers from its state. `None` where nobody asked knew.
-    pub async fn find(&self, query: crate::lookup::Query) -> Option<DeviceId> {
-        let state = self.state().await.ok()?;
-        if let Some(device) = crate::lookup::resolve(&state, &query) {
-            return Some(device);
+        if let Some(crate::lookup::Message::Request { id, query }) =
+            crate::lookup::Message::decode(body)
+        {
+            let evidence = self.answer_lookup(&query).await;
+            let answer = crate::lookup::Message::Answer { id, evidence };
+            self.send_to(peer, Channel::Lookup, &answer.encode()).await;
         }
-        let Some(member) = &self.light() else { return None };
-        let anchors = member.lock().ok().map(|member| {
-            crate::seeking::anchors_for(&member.device(), &member.params().anchors)
-        })?;
-        let in_session: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
-        // Anchors are asked once reached; reaching one this node holds no
-        // session with is the dialling layer's, through the key it knows.
-        let reachable: Vec<DeviceId> =
-            anchors.iter().filter(|anchor| in_session.contains(anchor)).copied().collect();
-        for source in crate::seeking::lookup_order(&[], &in_session, &reachable) {
-            let peer = match source {
-                crate::seeking::Source::Cache => continue,
-                crate::seeking::Source::Lan(peer)
-                | crate::seeking::Source::Session(peer)
-                | crate::seeking::Source::Anchor(peer) => peer,
-            };
-            if let Some(device) = self.look_up(peer, query.clone()).await {
-                return Some(device);
-            }
-        }
-        None
-    }
-
-    /// Asks `peer` a lookup question and waits for its answer's bytes.
-    async fn ask(&self, peer: DeviceId, query: crate::lookup::Query) -> Option<Vec<u8>> {
-        let id = self.next_lookup.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (answer, answered) = tokio::sync::oneshot::channel();
-        self.lookups.lock().ok()?.insert(id, answer);
-        let request = crate::lookup::Message::Request { id, query };
-        self.send_to(peer, Channel::Lookup, &request.encode()).await;
-        let body = tokio::time::timeout(crate::limits::LOOKUP_PATIENCE, answered).await;
-        if let Ok(mut held) = self.lookups.lock() {
-            held.remove(&id);
-        }
-        body.ok()?.ok()
-    }
-
-    /// Asks `peer`, a full member that has just brought newer roots, what this
-    /// light member stands on: the parameters under them — an anchor list or a
-    /// relay changed since — and the full members to turn to. Takes what holds.
-    ///
-    /// Whether an answer came back to take from.
-    async fn take_footing_from(&self, peer: DeviceId) -> bool {
-        let Some(member) = self.light() else { return false };
-        let Some(me) = member.lock().ok().map(|member| member.device()) else { return false };
-        let held = self.footing_held.lock().ok().and_then(|held| *held);
-        let Some(answer) = self.ask(peer, crate::lookup::Query::Footing(me, held)).await else {
-            return false;
-        };
-        // Its own digest back: nothing it keeps has changed.
-        if held.is_some_and(|held| answer == held) {
-            return true;
-        }
-        let Some(footing) = crate::lookup::Footing::decode(&answer) else { return false };
-        let kept = member.lock().ok().and_then(|mut member| {
-            crate::lookup::take_footing(&mut member, &footing).then(|| member.clone())
-        });
-        if let Some(kept) = kept {
-            self.keep_light(&kept).await;
-        }
-        if let Ok(mut held) = self.footing_held.lock() {
-            *held = Some(footing.digest());
-        }
-        true
     }
 
     /// Which devices this one was in contact with lately, or is: what a full
@@ -1299,7 +1199,7 @@ impl Node {
     /// How many lookups, renewals and chain requests this node ever asked.
     #[must_use]
     pub fn asked(&self) -> u32 {
-        self.next_lookup.load(std::sync::atomic::Ordering::Relaxed)
+        self.light().and_then(|light| light.lock().ok().map(|light| light.asked())).unwrap_or(0)
     }
 
     /// Keeps a light member beside the identity.
@@ -1320,119 +1220,30 @@ impl Node {
         }
     }
 
-    /// A light member's upkeep, for as long as the node runs: it renews its
-    /// proof and fetches roots it missed when, and only when, an event says it
-    /// owes them — a root naming it, a root it could not place, a peer telling
-    /// it so, a start after a gap. Never on a clock: a quiet network costs
-    /// nothing.
+    /// A light member's upkeep, for as long as the node runs: it carries out
+    /// what its engine asks, and tells it the time when a question it asked
+    /// is due. The engine renews its proof and fetches roots it missed when,
+    /// and only when, an event says it owes them — a root naming it, a root it
+    /// could not place, a peer telling it so, a start after a gap. Never on a
+    /// clock: a quiet network costs nothing.
     pub async fn keep_up_forever(self: Arc<Self>) {
-        if self.light().is_none() {
-            return;
-        }
         // A start: the proof may have aged while this device was off.
-        if self
-            .light()
-            .is_some_and(|member| member.lock().is_ok_and(|member| member.needs_renewal()))
-            && let Ok(mut owed) = self.owed.lock()
-        {
-            owed.renewal = true;
-        }
+        self.tell_light(|engine, now| engine.start(now)).await;
         loop {
-            let pending = self.owed.lock().map(|owed| owed.is_some()).unwrap_or(false)
-                || self.adopted_from.lock().map(|from| from.is_some()).unwrap_or(false);
-            if !pending {
-                self.upkeep.notified().await;
-            }
-            self.keep_up().await;
-        }
-    }
-
-    /// Settles what the upkeep owes, once.
-    pub async fn keep_up(&self) {
-        let owed = self
-            .owed
-            .lock()
-            .map_or_else(|_| Owed::default(), |mut owed| std::mem::take(&mut *owed));
-        if let Some((peer, root)) = owed.chain {
-            self.fetch_missed_roots(peer, &root).await;
-        }
-        let adopted = self.adopted_from.lock().ok().and_then(|mut from| from.take());
-        if let Some(peer) = adopted {
-            let kept =
-                self.light().and_then(|member| member.lock().ok().map(|member| member.clone()));
-            if let Some(kept) = kept {
-                self.keep_light(&kept).await;
-                if !self.take_footing_from(peer).await {
-                    // Nothing came back — a light peer, or no answer in time:
-                    // asked again of the next member met.
-                    self.footing_due.store(true, std::sync::atomic::Ordering::SeqCst);
+            let Some(light) = self.light() else { return };
+            let due = light.lock().ok().and_then(|engine| engine.next_deadline());
+            let due =
+                due.and_then(|due| self.born.checked_add(std::time::Duration::from_millis(due)));
+            match due {
+                Some(at) => {
+                    tokio::select! {
+                        () = self.upkeep.notified() => {}
+                        () = tokio::time::sleep_until(at) => {}
+                    }
                 }
-                self.enforce_roster().await;
+                None => self.upkeep.notified().await,
             }
-        }
-        if owed.renewal {
-            self.renew().await;
-        }
-    }
-
-    /// Fetches the roots missed between the current one and `root`, from
-    /// `peer`, and takes them in order, then `root`.
-    async fn fetch_missed_roots(&self, peer: DeviceId, root: &[u8]) {
-        let Some(member) = &self.light() else { return };
-        let Some(current) = member.lock().ok().and_then(|member| member.current()) else { return };
-        let Some(answer) = self.ask(peer, crate::lookup::Query::RootsAfter(current)).await else {
-            return;
-        };
-        let Some(chain) = crate::lookup::decode_roots(&answer) else { return };
-        let kept = member.lock().ok().map(|mut member| {
-            for missed in chain.iter().map(Vec::as_slice).chain(core::iter::once(root)) {
-                let _ = member.offer_root(missed);
-            }
-            member.clone()
-        });
-        if let Some(kept) = kept {
-            self.keep_light(&kept).await;
-            self.take_footing_from(peer).await;
-            if kept.needs_renewal() {
-                self.renew().await;
-            }
-        }
-        let transport = self.transport.lock().await.clone();
-        if let Some(transport) = transport {
-            transport.reconsider();
-        }
-        self.enforce_roster().await;
-    }
-
-    /// Renews a light member's own proof from a full member it is in touch
-    /// with: its contact first, then any it holds a session with.
-    async fn renew(&self) {
-        let Some(member) = &self.light() else { return };
-        let Some((me, contact, params)) = member
-            .lock()
-            .ok()
-            .map(|member| (member.device(), member.contact(), member.params().clone()))
-        else {
-            return;
-        };
-        let Ok(prefix) = tunnel::Prefix::from_parameter(&params.ula) else { return };
-        let query = crate::lookup::Query::Ipv6(tunnel::address_of(&me, &prefix));
-        let mut asked: Vec<DeviceId> = vec![contact];
-        asked.extend(self.sessions.lock().await.keys().copied().filter(|peer| *peer != contact));
-        for peer in asked {
-            let Some(evidence) = self.ask(peer, query.clone()).await else { continue };
-            let Ok(shown) = roster::membership::Evidence::from_bytes(&evidence) else { continue };
-            let renewed = member.lock().ok().and_then(|mut member| {
-                member.renew(shown).ok()?;
-                Some(member.clone())
-            });
-            if let Some(kept) = renewed {
-                self.keep_light(&kept).await;
-                self.refresh_evidence().await;
-                // Its leaf may now say it is full.
-                let _asked = self.begin_full().await;
-                return;
-            }
+            self.tell_light(|engine, now| engine.tick(now)).await;
         }
     }
 
@@ -1687,10 +1498,10 @@ impl Node {
     /// When the roster cannot derive a state, which means the operations held do
     /// not describe a network.
     pub async fn state(&self) -> roster::Result<RosterState> {
-        if let Some(member) = &self.light() {
-            return member
+        if let Some(light) = &self.light() {
+            return light
                 .lock()
-                .map(|member| member.state())
+                .map(|light| light.member().state())
                 .map_err(|_| roster::Error::InvalidValue("the light member is unreadable"));
         }
         self.syncer.lock().await.roster().state()
@@ -1737,7 +1548,7 @@ impl Node {
     /// alone, and catches up to a root it does not know.
     async fn refresh_evidence(&self) {
         let evidence = match &self.light() {
-            Some(member) => member.lock().map_or_else(|_| Vec::new(), |member| member.shown()),
+            Some(light) => light.lock().map_or_else(|_| Vec::new(), |light| light.member().shown()),
             None => crate::snapshots::shown_of(
                 self.syncer.lock().await.roster(),
                 &self.identity.device_id(),
@@ -2337,12 +2148,7 @@ impl Node {
         // A light member asks the first member it meets after starting what it
         // stands on: the parameters may have moved while it was off. Asked by
         // the upkeep, never here, where the answer would wait behind this.
-        if self.is_light() && self.footing_due.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            if let Ok(mut from) = self.adopted_from.lock() {
-                from.get_or_insert(peer);
-            }
-            self.upkeep.notify_one();
-        }
+        self.tell_light(|engine, now| engine.session_opened(peer, now)).await;
 
         // Packets are read beside payloads, never in the same `select!`: a payload
         // receive reads a length and then a body, and dropping it half-way would
@@ -2435,8 +2241,7 @@ impl Node {
         let Ok(state) = self.state().await else { return Vec::new() };
         // A light member chooses no neighbours: it keeps in touch with its
         // anchors it knows and, failing them, the admin whose root it holds.
-        if let Some(member) = &self.light() {
-            let Ok(member) = member.lock() else { return Vec::new() };
+        if let Some(member) = self.light_member() {
             let anchors: Vec<DeviceId> =
                 crate::seeking::anchors_for(&member.device(), &member.params().anchors)
                     .into_iter()
@@ -2912,6 +2717,11 @@ impl Node {
 
     /// Forgets the session held with a device, whichever one it is.
     pub async fn closed(&self, peer: &DeviceId) {
+        if let Some(light) = self.light()
+            && let Ok(mut engine) = light.lock()
+        {
+            engine.session_closed(peer);
+        }
         self.router.lock().await.closed(peer);
         self.sessions.lock().await.remove(peer);
         if let Ok(mut openings) = self.openings.lock() {
@@ -2934,6 +2744,12 @@ impl Node {
     /// sessions and this is false for everyone, which is the truth.
     pub async fn has_session(&self, peer: &DeviceId) -> bool {
         self.sessions.lock().await.contains_key(peer)
+    }
+
+    /// The devices this node has a session with now: few, whatever the
+    /// network's size.
+    pub async fn session_peers(&self) -> Vec<DeviceId> {
+        self.sessions.lock().await.keys().copied().collect()
     }
 
     /// Whether the session with `peer` is direct or through the relay, as the
@@ -3024,10 +2840,8 @@ impl Node {
         // taken per packet would be paid on the path that carries everything.
         self.note_contact(peer).await;
 
-        if let Some(member) = &self.light()
-            && !self.becoming_full.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            self.received_light(peer, member, body).await;
+        if self.is_light() && !self.becoming_full.load(std::sync::atomic::Ordering::SeqCst) {
+            self.received_light(peer, body).await;
             return;
         }
         let reception = self.syncer.lock().await.receive(peer, body);
@@ -3584,9 +3398,12 @@ impl Node {
                         // A light member refused as a stranger: the peer does not
                         // believe its proof any more, which is the peer asking
                         // it to renew.
-                        if self.is_light() {
-                            if let Ok(mut owed) = self.owed.lock() {
-                                owed.renewal = true;
+                        // Told, and left to the upkeep: this dial may be one the
+                        // upkeep itself is making, which would wait on itself.
+                        if let Some(light) = self.light() {
+                            let now = self.now_ms();
+                            if let Ok(mut engine) = light.lock() {
+                                engine.refused_as_a_stranger(now);
                             }
                             self.upkeep.notify_one();
                         }
@@ -4452,7 +4269,7 @@ mod light {
         );
         assert!((catching.take)(&next.to_bytes(), &answer), "the chain is taken");
         assert!(judge(&next), "and the peer believed");
-        assert_eq!(node.light().unwrap().lock().unwrap().current(), Some(next.against));
+        assert_eq!(node.light().unwrap().lock().unwrap().member().current(), Some(next.against));
     }
 
     /// Two roots behind, a light member asks the peer for the roots after its
@@ -4511,7 +4328,7 @@ mod light {
         assert!((catching.take)(&shown, &answer), "the chain is taken");
         assert!(judge(&far), "and the peer believed");
         assert_eq!((catching.behind)(&shown), None, "nothing more to ask");
-        assert_eq!(node.light().unwrap().lock().unwrap().current(), Some(far.against));
+        assert_eq!(node.light().unwrap().lock().unwrap().member().current(), Some(far.against));
         assert!(
             !(catching.take)(&shown, b"not roots"),
             "nothing is taken from bytes that are not roots"
@@ -4625,7 +4442,7 @@ mod light {
         assert!(!paths.roster().exists(), "and there is no roster file");
         let restarted = Node::from_light(sensor, &paths).unwrap().unwrap();
         assert_eq!(
-            restarted.light().unwrap().lock().unwrap().current(),
+            restarted.light().unwrap().lock().unwrap().member().current(),
             Some(taken),
             "restarted, it holds the root it took"
         );
@@ -4868,7 +4685,7 @@ mod light {
 
         assert!(node.is_light());
         let member = node.light().unwrap();
-        let kept = member.lock().unwrap().known_fulls();
+        let kept = member.lock().unwrap().member().known_fulls();
         assert_eq!(kept, vec![laptop.device_id()], "the laptop, besides the admin");
         assert!(node.chosen_neighbours().await.contains(&laptop.device_id()), "and turns to it");
     }
@@ -4896,8 +4713,8 @@ mod light {
         {
             let held = node.light().unwrap();
             let mut held = held.lock().unwrap();
-            held.offer_root(&latest).unwrap();
-            held.renew(roster.evidence_for(&sensor.device_id()).unwrap()).unwrap();
+            held.member_mut().offer_root(&latest).unwrap();
+            held.member_mut().renew(roster.evidence_for(&sensor.device_id()).unwrap()).unwrap();
         }
         let request = node.begin_full().await.expect("it asks for the state");
 

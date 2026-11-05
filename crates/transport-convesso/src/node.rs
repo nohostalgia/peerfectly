@@ -26,7 +26,7 @@ use transport::limits;
 use transport::session::{CatchingUp, Path, RootsAfter, Session, Transport};
 
 use crate::error::{BuildError, Result};
-use crate::frame::{Frame, MAX_MESSAGE, Reason, SessionId, Stream, VERSION};
+use crate::frame::{Frame, MAX_MESSAGE, OWN, Reason, SessionId, Stream, VERSION};
 use crate::members::{Gate, Members};
 use crate::session::{DATAGRAM_ROOM, Live, SessionHandle};
 
@@ -172,6 +172,8 @@ impl Policy {
 struct Shared {
     node: Node,
     context: Context,
+    /// What each peer takes, and what it is sending in parts.
+    wire: Arc<crate::wire::Wire>,
     members: Arc<RwLock<Members>>,
     state: Mutex<RosterState>,
     /// What this node shows a peer as a session opens; empty for nothing.
@@ -401,6 +403,7 @@ impl ConvessoTransport {
         let shared = Arc::new(Shared {
             node,
             context,
+            wire: Arc::default(),
             members,
             state: Mutex::new(state.clone()),
             evidence: std::sync::Mutex::new(Vec::new()),
@@ -430,7 +433,7 @@ impl ConvessoTransport {
         let tasks = vec![
             tokio::spawn(read_node_events(Arc::clone(&shared), node_events)),
             tokio::spawn(read_context_events(Arc::clone(&shared), context_events)),
-            tokio::spawn(send_queued(shared.context.clone(), queued)),
+            tokio::spawn(send_queued(shared.context.clone(), Arc::clone(&shared.wire), queued)),
         ];
         Ok(Self { shared, accepted: Mutex::new(accepted), tasks })
     }
@@ -513,7 +516,8 @@ impl Transport for ConvessoTransport {
         // Registered before the far end can answer, so nothing it sends right
         // after taking the session is dropped for want of somewhere to go.
         let live = verdict.as_ref().ok().map(|device| {
-            let live = Live::new(id, *device, address, shared.context.clone());
+            let live =
+                Live::new(id, *device, address, shared.context.clone(), Arc::clone(&shared.wire));
             if let Ok(mut sessions) = shared.sessions.lock() {
                 sessions.insert(id, Arc::clone(&live));
             }
@@ -528,8 +532,10 @@ impl Transport for ConvessoTransport {
             }
         };
 
-        let open = Frame::Open { version: VERSION, id, evidence: own_evidence(shared) }.encode();
-        if let Err(cause) = shared.context.send_message(address, open).await {
+        let open =
+            Frame::Open { version: VERSION, id, limits: OWN, evidence: own_evidence(shared) }
+                .encode();
+        if let Err(cause) = send_framed(shared, address, open).await {
             forget();
             return Err(Error::PeerUnreachable { cause: Some(cause.to_string()) });
         }
@@ -990,15 +996,49 @@ fn refresh_addresses(shared: &Arc<Shared>) {
     });
 }
 
-/// Sends what the readers and the transport queued, in order.
-async fn send_queued(context: Context, mut queued: mpsc::UnboundedReceiver<Out>) {
+/// Sends what the readers and the transport queued, in order: each frame cut
+/// to what its peer takes.
+async fn send_queued(
+    context: Context,
+    wire: Arc<crate::wire::Wire>,
+    mut queued: mpsc::UnboundedReceiver<Out>,
+) {
     while let Some(out) = queued.recv().await {
-        let _ = match out {
-            Out::Message(address, bytes) => context.send_message(address, bytes).await,
-            Out::Reply(peer, bytes) => context.send_message_to_peer(peer, bytes).await,
-            Out::Close(peer, code) => context.close(peer, code).await,
-        };
+        match out {
+            Out::Message(address, bytes) => {
+                let _sending = wire.sending(&address.peer_id()).await;
+                for piece in wire.messages(&address.peer_id(), bytes) {
+                    if context.send_message(address, piece).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Out::Reply(peer, bytes) => {
+                let _sending = wire.sending(&peer).await;
+                for piece in wire.messages(&peer, bytes) {
+                    if context.send_message_to_peer(peer, piece).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Out::Close(peer, code) => {
+                let _ = context.close(peer, code).await;
+            }
+        }
     }
+}
+
+/// Sends one frame to `address` now, cut to what its peer takes.
+async fn send_framed(
+    shared: &Shared,
+    address: Address,
+    frame: Vec<u8>,
+) -> core::result::Result<(), convesso_tokio::NodeError> {
+    let _sending = shared.wire.sending(&address.peer_id()).await;
+    for piece in shared.wire.messages(&address.peer_id(), frame) {
+        shared.context.send_message(address, piece).await?;
+    }
+    Ok(())
 }
 
 /// Reads the node's own events: the relay's availability, the addresses it
@@ -1086,6 +1126,7 @@ fn session_of(shared: &Shared, id: SessionId, peer: &PeerId) -> Option<Arc<Live>
 
 /// Ends every session with `peer`, and every dial to it.
 fn lose_peer(shared: &Shared, peer: &PeerId, dial_error: &Error) {
+    shared.wire.forget(peer);
     if let Ok(sessions) = shared.sessions.lock() {
         for live in sessions.values().filter(|live| live.peer == *peer) {
             live.shut(Error::ClosedByPeer);
@@ -1180,7 +1221,7 @@ async fn judged_catching_up(
         waiting.insert(id, (address.peer_id(), tell));
     }
     let behind = Frame::Behind { id, root }.encode();
-    let asked = shared.context.send_message(address, behind).await.is_ok();
+    let asked = send_framed(shared, address, behind).await.is_ok();
     let roots = if asked { tokio::time::timeout(CATCH_UP_PATIENCE, told).await.ok() } else { None };
     if let Ok(mut waiting) = shared.catch_ups.lock() {
         waiting.remove(&id);
@@ -1244,11 +1285,14 @@ fn answer_behind(shared: &Shared, peer: PeerId, id: SessionId, root: [u8; 32]) {
         return;
     }
     let outbound = shared.outbound.clone();
+    // As many as the peer puts back together in one frame.
+    let room = crate::frame::MAX_ROOTS
+        .min(shared.wire.limits(&peer).frame_len().saturating_sub(crate::frame::PAYLOAD_HEADER));
     tokio::spawn(async move {
-        let roots = source(root).await;
+        let roots = source(root, room).await;
         // Whole roots fitting one frame are the source's to choose: cut here,
         // the last would be half a root, and the rest unreadable with it.
-        if roots.len() <= crate::frame::MAX_ROOTS {
+        if roots.len() <= room {
             let _ = outbound.send(Out::Reply(peer, Frame::Roots { id, roots }.encode()));
         }
     });
@@ -1361,7 +1405,7 @@ fn opened(
         refuse(Reason::NotAllowed);
         return;
     }
-    let live = Live::new(id, device, address, shared.context.clone());
+    let live = Live::new(id, device, address, shared.context.clone(), Arc::clone(&shared.wire));
     live.set_evidence(evidence.to_vec());
     live.set_inbound();
     sessions.insert(id, Arc::clone(&live));
@@ -1384,19 +1428,33 @@ fn opened(
         refuse(Reason::Ordinary);
         return;
     }
-    let accept = Frame::Accept { id, evidence: own_evidence(shared) };
+    let accept = Frame::Accept { id, limits: OWN, evidence: own_evidence(shared) };
     let _ = shared.outbound.send(Out::Reply(peer, accept.encode()));
 }
 
 /// A reliable message from `peer`.
 async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
-    match Frame::decode(data) {
-        Some(Frame::Open { version, id, evidence }) => {
+    // A part waits for the rest of its frame. From a peer this node does not
+    // yet speak to, nothing larger than an opening: a node holding no roster
+    // admits every handshake, and a stranger would make it hold frames' worth
+    // of memory for nothing.
+    let largest = if speaks_to(shared, &peer) {
+        crate::frame::OWN.frame_len()
+    } else {
+        transport_wire::parts::MAX_OPENING
+    };
+    let Some(data) = shared.wire.join(peer, data, largest) else { return };
+    match Frame::decode(&data) {
+        Some(Frame::Open { version, id, limits, evidence }) => {
+            if version == VERSION {
+                shared.wire.heard(peer, limits);
+            }
             opened(shared, peer, version, id, &evidence, true);
         }
         Some(Frame::Behind { id, root }) => answer_behind(shared, peer, id, root),
         Some(Frame::Roots { id, roots }) => roots_arrived(shared, peer, id, roots),
-        Some(Frame::Accept { id, evidence }) => {
+        Some(Frame::Accept { id, limits, evidence }) => {
+            shared.wire.heard(peer, limits);
             answer_dial(shared, id, &peer, Answer::Accepted(evidence));
         }
         Some(Frame::Refuse { id, reason }) => {
@@ -1414,6 +1472,14 @@ async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
         // A packet sent as a message is not one: ignored.
         Some(Frame::Packet { .. }) | None => {}
     }
+}
+
+/// Whether this node speaks to `peer`: a session with it, a dial to it, or
+/// its open held while roots are asked for.
+fn speaks_to(shared: &Shared, peer: &PeerId) -> bool {
+    shared.sessions.lock().is_ok_and(|sessions| sessions.values().any(|live| live.peer == *peer))
+        || shared.dials.lock().is_ok_and(|dials| dials.values().any(|dial| dial.peer == *peer))
+        || shared.held_opens.lock().is_ok_and(|held| held.values().any(|open| open.peer == *peer))
 }
 
 /// A datagram from `peer`.

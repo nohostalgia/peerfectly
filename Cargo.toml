@@ -5,6 +5,7 @@ members = [
     "crates/daemon",
     "crates/enrollment",
     "crates/identity",
+    "crates/light-node",
     "crates/linux-daemon",
     "crates/local-discovery",
     "crates/member-store",
@@ -14,6 +15,7 @@ members = [
     "crates/roster-sync",
     "crates/transport",
     "crates/transport-convesso",
+    "crates/transport-wire",
     "crates/tunnel",
     "crates/windows-daemon",
 ]
@@ -43,10 +45,16 @@ convesso-relay = { git = "https://github.com/nohostalgia/convesso", rev = "257a2
 # Canonical CBOR. Chosen over serde-based codecs so encoding stays byte-exact and
 # under our control.
 minicbor = { version = "2.3.0", features = ["alloc"] }
-blake3 = "1.8.7"
+# Without their `std` defaults, so the roster builds for a microcontroller
+# (`no_std` + `alloc`); a crate that runs on an operating system asks for `std`.
+blake3 = { version = "1.8.7", default-features = false }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
-p256 = { version = "0.14.0", features = ["ecdsa"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
 signature = "3.0.0"
+# The shared pointer of a build without `std`, on any microcontroller: native
+# atomics where the chip has them; where it has none (an ESP32-C3), what the
+# firmware tells `portable-atomic` to use.
+portable-atomic-util = { version = "0.2.8", default-features = false, features = ["alloc"] }
 getrandom = "0.4.3"
 tokio = { version = "1.48.0", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1.90"

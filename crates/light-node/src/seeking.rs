@@ -23,6 +23,9 @@
 //!
 //! Pure: everything is handed in.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use roster::id::DeviceId;
 
 /// How many anchors a member keeps.

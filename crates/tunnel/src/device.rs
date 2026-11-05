@@ -30,9 +30,12 @@
 //! The same split as `transport` and `transport-convesso`, which runs the
 //! transport's behavioural suite unchanged.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use roster::sync::Arc;
 
+#[cfg(feature = "std")]
 use async_trait::async_trait;
 use roster::id::DeviceId;
 
@@ -371,6 +374,7 @@ pub fn destination_of(packet: &[u8]) -> Option<IpAddr> {
 /// Deliberately small, and free of any platform type, so the real device can be
 /// replaced without touching the rules above. A `windows-daemon` implementation
 /// and an `android-client` one both sit here.
+#[cfg(feature = "std")]
 #[async_trait]
 pub trait Packets: Send + Sync {
     /// Hands a packet to the host's networking stack.

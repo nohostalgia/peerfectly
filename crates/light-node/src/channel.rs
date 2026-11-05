@@ -24,9 +24,10 @@
 //! that matters, and treating it as one of the two we do know is how a node acts
 //! on a message it did not understand.
 
+use alloc::vec::Vec;
+
 /// What a payload on a session is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Channel {
     /// Roster reconciliation, for `roster-sync`.
     Roster,
@@ -131,7 +132,18 @@ mod tests {
     /// path would have refused anyway.
     #[test]
     fn the_tag_carries_no_authority() {
-        let code = crate::code_of(include_str!("channel.rs"));
+        let code: String = include_str!("channel.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
         for forbidden in ["sign", "verify", "DeviceId", "PublicKey"] {
             assert!(!code.contains(forbidden), "`{forbidden}` would suggest the tag decides who");
         }

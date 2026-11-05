@@ -16,7 +16,9 @@
 //! reaches derived state by another path, and no judgement about validity,
 //! membership or authority is made here.
 
-use std::collections::BTreeSet;
+use alloc::collections::BTreeSet;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use roster::id::{DeviceId, OperationId};
 use roster::roster::{Admission, AttestationAdmission, PieceAdmission, Roster};

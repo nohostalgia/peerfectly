@@ -38,6 +38,7 @@ use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::id::{DeviceId, KeyId, NetworkId, OperationId};
 use crate::limits;
+use crate::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -634,7 +635,7 @@ impl DeviceSpec {
 }
 
 /// Reads a device's key list.
-fn decode_keys(reader: &mut Reader<'_>) -> Result<Vec<KeyEntry>> {
+pub(crate) fn decode_keys(reader: &mut Reader<'_>) -> Result<Vec<KeyEntry>> {
     let count = reader.array(limits::MAX_KEYS_PER_DEVICE, "keys per device")?;
     let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
@@ -903,7 +904,7 @@ impl core::str::FromStr for Ipv4Range {
     fn from_str(text: &str) -> Result<Self> {
         let (address, prefix_len) =
             text.split_once('/').ok_or(Error::InvalidValue("ipv4 range syntax"))?;
-        let address: std::net::Ipv4Addr =
+        let address: core::net::Ipv4Addr =
             address.parse().map_err(|_| Error::InvalidValue("ipv4 range syntax"))?;
         let prefix_len: u8 =
             prefix_len.parse().map_err(|_| Error::InvalidValue("ipv4 range syntax"))?;

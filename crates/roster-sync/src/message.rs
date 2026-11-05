@@ -28,6 +28,9 @@
 //! length-first ordering rule alone has already been got wrong once in this
 //! codebase, caught only because roster asserts its schemas are canonical.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use roster::cbor::{Reader, Writer};
 use roster::id::OperationId;
 use roster::limits as roster_limits;

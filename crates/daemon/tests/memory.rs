@@ -114,5 +114,14 @@ fn what_a_full_members_daemon_holds_beside_its_roster() {
     let members = transport_convesso::members::Members::from_state(&state);
     report("the transport's members", live().saturating_sub(before));
 
-    drop((holdings, router, members));
+    // What the report reads: a page of the devices, not every one, and the
+    // admins asked when this device is revoked.
+    let before = live();
+    let page: Vec<_> = state.devices.iter_after(None).take(daemon::control::PEERS_PAGE).collect();
+    report("a page of the report's devices", live().saturating_sub(before));
+    let before = live();
+    let admins = state.devices.admins();
+    report("the admins found", live().saturating_sub(before));
+
+    drop((holdings, router, members, page, admins));
 }

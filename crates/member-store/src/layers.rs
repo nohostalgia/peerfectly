@@ -519,6 +519,29 @@ impl LayerStore for Layers {
         out
     }
 
+    fn address_claims_from(
+        &self,
+        batch: &OperationId,
+        from: ([u8; 4], DeviceId),
+        count: usize,
+    ) -> Vec<([u8; 4], DeviceId)> {
+        let batch = *batch.as_bytes();
+        self.rows_of(|reading| {
+            reading
+                .addresses
+                .range((batch, from.0, *from.1.as_bytes())..=(batch, [0xff; 4], [0xff; 32]))?
+                .take(count)
+                .map(|row| {
+                    row.map(|(held, _)| {
+                        let (_, address, device) = held.value();
+                        (address, DeviceId::from_bytes(device))
+                    })
+                })
+                .collect::<Result<_, redb::StorageError>>()
+                .map_err(redb::Error::from)
+        })
+    }
+
     fn name_holders(&self, batch: &OperationId, name: &str) -> Vec<DeviceId> {
         let batch = *batch.as_bytes();
         self.rows_of(|reading| {

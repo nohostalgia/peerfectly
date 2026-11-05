@@ -124,6 +124,11 @@ fn report() -> Report {
                 last_contact: Contact::NoneRecorded,
             },
         ],
+        // A page of a larger network: the rest are asked after the cursor.
+        peer_count: 250,
+        reachable_count: 1,
+        peers_after: Some("0a".repeat(32)),
+        full_members: vec![nas.clone(), laptop.clone()],
         revoked: vec![Revoked {
             device: gone.clone(),
             revocations: vec![
@@ -190,6 +195,10 @@ fn report() -> Report {
             standing: Standing::LastKnown { at: at(1_757_600_000) },
             last_contact: Contact::Recorded { at: at(1_757_600_000) },
         }],
+        peer_count: 1,
+        reachable_count: 0,
+        peers_after: None,
+        full_members: Vec::new(),
         revoked: Vec::new(),
         problem: None,
     };
@@ -230,6 +239,20 @@ fn outcomes() -> Vec<Outcome> {
             could_stop_the_daemon: false,
         }),
         Outcome::Done,
+        // A page of a network's devices after the report's first.
+        Outcome::Peers(daemon::control::PeersPage {
+            network: "home".to_owned(),
+            peers: report().networks.first().map(|home| home.peers.clone()).unwrap_or_default(),
+            after: Some("0b".repeat(32)),
+        }),
+        // What a production station takes for the boards it provisions.
+        Outcome::Provisioning(daemon::control::Provisioning {
+            root: "a1".to_owned(),
+            devices_root: "b2".to_owned(),
+            params: "c3".to_owned(),
+            relay: "ab@relay.example:8443".to_owned(),
+            anchors: vec!["d4".to_owned()],
+        }),
         // A join begun: the fingerprint both screens show, and nothing else.
         Outcome::JoinStarted {
             label: "joining".to_owned(),

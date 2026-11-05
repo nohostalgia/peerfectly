@@ -56,7 +56,6 @@
 pub mod admitting;
 pub mod attesting;
 pub(crate) mod batches;
-pub mod channel;
 pub mod checkpoint;
 pub(crate) mod clock;
 pub mod conflicts;
@@ -92,8 +91,10 @@ pub mod router;
 pub mod routes;
 pub mod rule;
 pub mod schedule;
-pub mod seeking;
 pub(crate) mod service;
+
+// A light member's rules, which a full member's answers follow too.
+pub(crate) use light_node::{channel, seeking};
 pub mod signing;
 #[cfg(test)]
 mod simulator;
@@ -150,7 +151,6 @@ mod surface {
     const OFFERED: &[&str] = &[
         "admitting",
         "attesting",
-        "channel",
         "checkpoint",
         "conflicts",
         "connectivity",
@@ -178,7 +178,6 @@ mod surface {
         "routes",
         "rule",
         "schedule",
-        "seeking",
         "signing",
         "snapshots",
         "state",

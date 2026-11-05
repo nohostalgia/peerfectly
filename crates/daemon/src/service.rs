@@ -2040,6 +2040,10 @@ impl Service {
                 ipv4_block: None,
                 accused: Vec::new(),
                 peers: Vec::new(),
+                peer_count: 0,
+                reachable_count: 0,
+                peers_after: None,
+                full_members: Vec::new(),
                 revoked: Vec::new(),
                 problem: node.problem(std::time::SystemTime::now()).await,
             };
@@ -2051,38 +2055,23 @@ impl Service {
         // id, so that an accusation or a revocation never silently loses its
         // subject.
         let membership = node.membership(&state).await;
-        let holdings = tunnel::Ipv4Holdings::of_state(&state);
-        let withheld = node.withheld();
-        let ipv4 = |device: &roster::id::DeviceId| -> Option<crate::control::Ipv4State> {
-            let address = holdings.of(device)?;
-            Some(match crate::conflicts::withheld_by(&withheld, address) {
-                Some(conflict) => {
-                    crate::control::Ipv4State::Withheld { address, with: conflict.to_string() }
-                }
-                None => crate::control::Ipv4State::Held(address),
-            })
-        };
-
-        let mut peers = Vec::new();
-        for record in state.devices.values() {
-            if record.id == me {
-                continue;
-            }
-            peers.push(Peer {
-                name: format!("{}.{}", record.name, state.params.suffix),
-                name_resolves: crate::names::resolvable(&record.name),
-                id: membership.directory.named(&record.id).id,
-                address: Prefix::from_parameter(&state.params.ula)
-                    .map_or(Ipv6Addr::UNSPECIFIED, |prefix| {
-                        tunnel::address_of(&record.id, &prefix)
-                    }),
-                ipv4: ipv4(&record.id),
-                reachable: node.has_session(&record.id).await,
-                path: node.path_to(&record.id).await.map(crate::control::Path::from),
-                standing,
-                last_contact: crate::describing::contact(&membership.contacts, &record.id),
-            });
-        }
+        let (peers, peers_after) =
+            Self::peers_page(node, &state, &membership, standing, None).await;
+        let peer_count =
+            state.devices.len().saturating_sub(usize::from(state.devices.contains_key(&me)));
+        let reachable_count = node
+            .session_peers()
+            .await
+            .iter()
+            .filter(|device| **device != me && state.devices.contains_key(device))
+            .count();
+        let full_members = state
+            .devices
+            .full_members()
+            .iter()
+            .filter(|device| **device != me)
+            .map(|device| membership.directory.named(device))
+            .collect();
 
         crate::control::Network {
             label,
@@ -2099,7 +2088,7 @@ impl Service {
                 .map(|device| membership.directory.named(device))
                 .collect(),
             address: Self::own_address(node, &state),
-            ipv4: ipv4(&me),
+            ipv4: Self::ipv4_state(node, &state, &me),
             name: state
                 .devices
                 .get(&me)
@@ -2120,9 +2109,109 @@ impl Service {
             }),
             accused: membership.accused,
             peers,
+            peer_count,
+            reachable_count,
+            peers_after,
+            full_members,
             revoked: membership.revoked,
             problem: node.problem(std::time::SystemTime::now()).await,
         }
+    }
+
+    /// A device's IPv4 address in a network, or why it holds none here.
+    fn ipv4_state(
+        node: &Node,
+        state: &roster::state::RosterState,
+        device: &roster::id::DeviceId,
+    ) -> Option<crate::control::Ipv4State> {
+        let address = tunnel::Ipv4Holdings::of_state(state).of(device)?;
+        Some(match crate::conflicts::withheld_by(&node.withheld(), address) {
+            Some(conflict) => {
+                crate::control::Ipv4State::Withheld { address, with: conflict.to_string() }
+            }
+            None => crate::control::Ipv4State::Held(address),
+        })
+    }
+
+    /// A page of a network's other devices after `after` (`None`: the first),
+    /// by id, and where the next begins while more remain. Only the page is
+    /// read: a network of a million boards is not walked to show a hundred
+    /// (`scalable-membership` 16.6).
+    async fn peers_page(
+        node: &Node,
+        state: &roster::state::RosterState,
+        membership: &crate::describing::Membership,
+        standing: Standing,
+        after: Option<roster::id::DeviceId>,
+    ) -> (Vec<Peer>, Option<String>) {
+        let me = node.identity().device_id();
+        let holdings = tunnel::Ipv4Holdings::of_state(state);
+        let withheld = node.withheld();
+        let prefix = Prefix::from_parameter(&state.params.ula).ok();
+        let mut listed = state.devices.iter_after(after).filter(|(device, _)| *device != me);
+        let page: Vec<_> = listed.by_ref().take(crate::control::PEERS_PAGE).collect();
+        let more = listed.next().is_some();
+        let mut peers = Vec::with_capacity(page.len());
+        for (device, leaf) in &page {
+            let record = &leaf.record;
+            peers.push(Peer {
+                name: format!("{}.{}", record.name, state.params.suffix),
+                name_resolves: crate::names::resolvable(&record.name),
+                id: membership.directory.named(device).id,
+                address: prefix
+                    .map_or(Ipv6Addr::UNSPECIFIED, |prefix| tunnel::address_of(device, &prefix)),
+                ipv4: holdings.of(device).map(|address| {
+                    match crate::conflicts::withheld_by(&withheld, address) {
+                        Some(conflict) => crate::control::Ipv4State::Withheld {
+                            address,
+                            with: conflict.to_string(),
+                        },
+                        None => crate::control::Ipv4State::Held(address),
+                    }
+                }),
+                reachable: node.has_session(device).await,
+                path: node.path_to(device).await.map(crate::control::Path::from),
+                standing,
+                last_contact: crate::describing::contact(&membership.contacts, device),
+            });
+        }
+        let next = more.then(|| page.last().map(|(device, _)| device.to_hex())).flatten();
+        (peers, next)
+    }
+
+    /// The page of a network's other devices after `after`, a cursor a report
+    /// or the page before gave.
+    async fn peers_after(&self, network: &Arc<Network>, after: &str) -> Outcome {
+        let cursor = hex::decode(after)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .map(roster::id::DeviceId::from_bytes);
+        let Some(cursor) = cursor else {
+            return Outcome::Failed {
+                message: "that is not where a page of devices begins".to_owned(),
+                left_behind: Vec::new(),
+            };
+        };
+        let node = network.node();
+        let standing = match network.tunnel().await {
+            Tunnel::Up => Standing::Current,
+            Tunnel::Down => Standing::LastKnown { at: *network.known_at.lock().await },
+        };
+        let Ok(state) = node.state().await else {
+            return Outcome::Peers(crate::control::PeersPage {
+                network: network.label().to_string(),
+                peers: Vec::new(),
+                after: None,
+            });
+        };
+        let membership = node.membership(&state).await;
+        let (peers, after) =
+            Self::peers_page(node, &state, &membership, standing, Some(cursor)).await;
+        Outcome::Peers(crate::control::PeersPage {
+            network: network.label().to_string(),
+            peers,
+            after,
+        })
     }
 
     /// The networks the person last left on, which is what a restore brings back.
@@ -2916,6 +3005,39 @@ impl Service {
         Ok((network, state))
     }
 
+    /// What a board provisioned for a network starts from: read by its admin's
+    /// production station (`scalable-membership` 15.4).
+    async fn provisioning(&self, which: Option<&Label>) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let state = match network.node().state().await {
+            Ok(state) => state,
+            Err(cause) => {
+                return Outcome::Failed {
+                    message: format!("the roster does not describe a network: {cause}"),
+                    left_behind: Vec::new(),
+                };
+            }
+        };
+        if !state.is_admin(&network.node().identity().device_id()) {
+            return Outcome::refused(
+                "only an admin of the network provisions boards for it: this device is not one."
+                    .to_owned(),
+            );
+        }
+        match network.node().read_roster(crate::snapshots::provisioning).await.flatten() {
+            Some(provisioning) => Outcome::Provisioning(provisioning),
+            None => Outcome::refused(
+                "this device holds no root of the network naming a relay, so a board has nothing to start from."
+                    .to_owned(),
+            ),
+        }
+    }
+
     /// Moves or resizes a network's IPv4 block, as its admin: one change of
     /// its parameters, every offset kept (`scalable-membership` 19.4).
     async fn set_ipv4_block(&self, which: Option<&Label>, text: &str) -> Outcome {
@@ -3555,7 +3677,18 @@ impl Service {
             // not.
             // `peers` looks before it answers: without background dialling a
             // device does not know, unprompted, which members are up.
-            Command::Peers { network } => match Self::wanted(network) {
+            Command::Peers { network, after: Some(after) } => match Self::wanted(network) {
+                Ok(Some(label)) => match self.named(&label).await {
+                    Ok(found) => self.peers_after(&found, &after).await,
+                    Err(refusal) => Self::said(Err(refusal)),
+                },
+                Ok(None) => Outcome::Failed {
+                    message: "a page of devices is asked of one network: name it".to_owned(),
+                    left_behind: Vec::new(),
+                },
+                Err(cause) => Self::said(Err(cause)),
+            },
+            Command::Peers { network, after: None } => match Self::wanted(network) {
                 Ok(Some(label)) => match self.named(&label).await {
                     Ok(_) => {
                         self.probe(Some(&label)).await;
@@ -3567,6 +3700,10 @@ impl Service {
                     self.probe(None).await;
                     Outcome::Reported(self.report().await)
                 }
+                Err(cause) => Self::said(Err(cause)),
+            },
+            Command::Provisioning { network } => match Self::wanted(network) {
+                Ok(label) => self.provisioning(label.as_ref()).await,
                 Err(cause) => Self::said(Err(cause)),
             },
             Command::Address { network } => match Self::wanted(network) {
@@ -5574,8 +5711,9 @@ impl Service {
     async fn is_its_only_admin(network: &Arc<Network>) -> bool {
         let Ok(state) = network.node().state().await else { return false };
         let me = network.node().identity().device_id();
-        state.is_admin(&me)
-            && !state.devices.keys().any(|device| device != me && state.is_admin(&device))
+        // Asked of the admins' index: a network of a million members is not
+        // walked to find its two admins (`scalable-membership` 16.6).
+        state.is_admin(&me) && state.devices.admins().iter().all(|device| *device == me)
     }
 
     /// What the act waiting on a person has got to.
@@ -9116,7 +9254,7 @@ mod tests {
         let (service, _machine, _scratch) = two_networks().await;
 
         for command in [
-            Command::Peers { network: Some("cliente".to_owned()) },
+            Command::Peers { network: Some("cliente".to_owned()), after: None },
             Command::Address { network: Some("cliente".to_owned()) },
         ] {
             match service.handle(command).await {
@@ -9134,9 +9272,11 @@ mod tests {
     async fn a_reading_command_with_no_network_named_describes_them_all() {
         let (service, _machine, _scratch) = two_networks().await;
 
-        for command in
-            [Command::Peers { network: None }, Command::Address { network: None }, Command::Status]
-        {
+        for command in [
+            Command::Peers { network: None, after: None },
+            Command::Address { network: None },
+            Command::Status,
+        ] {
             match service.handle(command).await {
                 Outcome::Reported(report) => {
                     assert_eq!(report.networks.len(), 2, "both networks are covered");
@@ -11551,10 +11691,10 @@ mod tests {
 
         assert_eq!(Needs::Nobody, Command::Status.needs());
         assert_eq!(Needs::Nobody, Command::Waiting.needs());
-        assert_eq!(Needs::Nobody, Command::Peers { network: None }.needs());
+        assert_eq!(Needs::Nobody, Command::Peers { network: None, after: None }.needs());
         assert_eq!(
             Needs::TheOwnerOf(Some("casa".to_owned())),
-            Command::Peers { network: Some("casa".to_owned()) }.needs(),
+            Command::Peers { network: Some("casa".to_owned()), after: None }.needs(),
             "naming one is asking about that one"
         );
 
@@ -12044,6 +12184,89 @@ mod tests {
         assert_eq!(boards.len(), 6);
         for (_, record) in boards {
             assert_eq!(node.admitted_alone_at(&record.added_by).await, None, "{}", record.name);
+        }
+    }
+
+    /// A network larger than a page lists its devices a page at a time: the
+    /// report holds the first and counts them all, and the pages after it hold
+    /// every other device once, to the last (`scalable-membership` 16.6).
+    #[tokio::test]
+    async fn a_large_network_lists_its_devices_a_page_at_a_time() {
+        use roster::types::KeyPurpose;
+
+        const BOARDS: u32 = 250;
+        let fixture = fixture(None).await;
+        let device = |n: u32| {
+            let board = NodeIdentity::generate().expect("generates");
+            let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+            let hex_of = |purpose: KeyPurpose| {
+                spec.keys
+                    .iter()
+                    .find(|entry| entry.purpose == purpose)
+                    .map(|entry| hex::encode(&entry.value))
+                    .expect("held")
+            };
+            crate::control::BatchDevice {
+                name: format!("board-{n}"),
+                serial: format!("SN{n}"),
+                signing: hex_of(KeyPurpose::Signing),
+                transport: hex_of(KeyPurpose::Transport),
+                attestation: hex_of(KeyPurpose::Attestation),
+            }
+        };
+        for part in (0..BOARDS).step_by(50) {
+            let devices = (part..part.saturating_add(50)).map(device).collect();
+            let staged =
+                fixture.service.handle(Command::StageBatch { network: None, devices }).await;
+            assert!(matches!(staged, Outcome::Staged { .. }), "{staged:?}");
+        }
+        let admitted = fixture
+            .service
+            .handle(Command::AdmitBatch {
+                network: None,
+                label: "lot A".to_owned(),
+                light: true,
+                groups: Vec::new(),
+                ipv6_only: false,
+                reviewed: Some(Vec::new()),
+            })
+            .await;
+        assert!(matches!(admitted, Outcome::Reported(_)), "{admitted:?}");
+
+        let asked = fixture.service.handle(Command::Peers { network: None, after: None }).await;
+        let Outcome::Reported(report) = asked else { panic!("a report: {asked:?}") };
+        let network = report.only().expect("one network");
+        assert_eq!(network.peers.len(), crate::control::PEERS_PAGE, "the first page");
+        assert_eq!(network.peer_count, BOARDS as usize, "counted whole");
+        assert!(network.full_members.is_empty(), "light boards, and the founder is this device");
+        let mut seen: BTreeSet<String> =
+            network.peers.iter().map(|peer| peer.name.clone()).collect();
+        let mut after = network.peers_after.clone();
+        let label = network.label.clone();
+        let mut pages = 1_usize;
+        while let Some(cursor) = after {
+            let asked = fixture
+                .service
+                .handle(Command::Peers { network: Some(label.clone()), after: Some(cursor) })
+                .await;
+            let Outcome::Peers(page) = asked else { panic!("a page: {asked:?}") };
+            assert!(page.peers.len() <= crate::control::PEERS_PAGE);
+            for peer in page.peers {
+                assert!(seen.insert(peer.name.clone()), "{} listed twice", peer.name);
+            }
+            after = page.after;
+            pages = pages.saturating_add(1);
+        }
+        assert_eq!(seen.len(), BOARDS as usize, "every board, once");
+        assert_eq!(pages, 3);
+
+        // A cursor that is none, and a page asked of no network, are refused.
+        for wrong in [
+            Command::Peers { network: Some(label.clone()), after: Some("zz".to_owned()) },
+            Command::Peers { network: None, after: Some("00".repeat(32)) },
+        ] {
+            let refused = fixture.service.handle(wrong).await;
+            assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
         }
     }
 

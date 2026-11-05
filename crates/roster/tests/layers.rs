@@ -125,6 +125,33 @@ fn agree(roster: &Roster, after: &str) {
         "after {after}, the kept state is not the reference"
     );
     assert_eq!(revoked(&kept), revoked(&reference), "after {after}, the kept revoked set differs");
+    // The lowest offsets free, found in one pass over the indexes, are those
+    // asking each offset finds: in the derived state, the kept one, and the
+    // reference's, and for runs as well as one. A listing begins after any
+    // member as the whole one goes on, over the batches' layers too, and the
+    // admins asked of the indexes are those a pass finds.
+    for state in [&derived, &kept, &reference].into_iter().flatten() {
+        let ids: Vec<DeviceId> = state.devices.keys().collect();
+        for (at, from) in core::iter::once(None).chain(ids.iter().copied().map(Some)).enumerate() {
+            let rest: Vec<DeviceId> =
+                state.devices.iter_after(from).map(|(device, _)| device).collect();
+            assert_eq!(
+                rest,
+                ids.get(at..).unwrap_or_default(),
+                "after {after}, a listing after {at}"
+            );
+        }
+        let admins: Vec<DeviceId> =
+            ids.iter().copied().filter(|device| state.is_admin(device)).collect();
+        assert_eq!(state.devices.admins(), admins, "after {after}, the admins");
+        for count in [1_u32, 2, 3, 6] {
+            assert_eq!(
+                state.free_offsets(count),
+                state.free_offsets_by_lookup(count),
+                "after {after}, the lowest {count} offsets free differ"
+            );
+        }
+    }
 }
 
 /// How far behind the frontier an operation may be anchored, in both rosters:
@@ -441,4 +468,55 @@ fn an_altered_layer_store_hides_and_is_told() {
     assert!(state.devices.get(&board_id(1)).is_some(), "the others stand");
     assert_eq!(state.root(), before.root(), "and the root is the batch's");
     assert!(store.told() > 0, "the store is told it lied");
+}
+
+/// A whole pass over a stored layer checks the batch at once against its
+/// signed root, and gives what a pass checking each entry gives: everything,
+/// where the store is honest; and, where it is not, the altered board hidden,
+/// the stranger left out, and the store told.
+#[test]
+fn a_whole_pass_over_a_stored_layer_is_checked_as_each_entry_is() {
+    let store = std::sync::Arc::new(support::MemoryLayers::default());
+    let mut roster = Roster::new();
+    roster.keep_layers_in(
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn roster::members::LayerStore>
+    );
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let entries: Vec<BatchEntry> = (0..5)
+        .map(|board| {
+            let spec = board_spec(board);
+            BatchEntry { keys: spec.keys, name: spec.name, serial: vec![board], ipv4: None }
+        })
+        .collect();
+    let header = BatchHeader::for_entries(&entries, Mode::Light, Vec::new(), None, "lot").unwrap();
+    history.op("batch", 1, &["g"], OperationBody::AdmitBatch(header));
+    for entry in history.entries() {
+        let _ = roster.offer_bytes(&entry.bytes);
+    }
+    for piece in pieces_of(&history.id("batch"), &entries).unwrap() {
+        let _ = roster.offer_piece(&piece);
+    }
+    let state = roster.state().unwrap();
+    let (layer, _) = state.devices.layers().next().expect("the batch's layer");
+    let each: Vec<DeviceId> = layer.devices().map(|(device, _)| device).collect();
+    let whole: Vec<DeviceId> = layer.all_devices().into_iter().map(|(device, _)| device).collect();
+    assert_eq!(whole, each, "the same devices, in the same order");
+    assert_eq!(whole.len(), 5);
+    assert_eq!(store.told(), 0, "an honest store is never told");
+
+    let mut renamed = entries.get(2).unwrap().clone();
+    renamed.name = "someone-else".to_owned();
+    store.alter(&history.id("batch"), &board_id(2), renamed);
+    let stranger = board_spec(7);
+    store.alter(
+        &history.id("batch"),
+        &board_id(7),
+        BatchEntry { keys: stranger.keys, name: stranger.name, serial: vec![7], ipv4: None },
+    );
+    let whole: Vec<DeviceId> = layer.all_devices().into_iter().map(|(device, _)| device).collect();
+    assert!(!whole.contains(&board_id(2)), "the altered board is hidden");
+    assert!(!whole.contains(&board_id(7)), "the stranger is not added");
+    assert_eq!(whole.len(), 4, "the others stand");
+    assert!(store.told() > 0, "and the store is told it lied");
 }

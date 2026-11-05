@@ -1,0 +1,27 @@
+[package]
+name = "light-node"
+description = "A light member's protocol, with no input or output of its own: what it asks, of whom, and what it believes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+# Everything a machine with an operating system has. Without it the crate is
+# `no_std` + `alloc`, for a microcontroller member.
+default = ["std"]
+std = ["roster/std", "tunnel/std", "blake3/std", "roster-sync/std"]
+
+[dependencies]
+roster = { path = "../roster", default-features = false }
+tunnel = { path = "../tunnel", default-features = false }
+transport-wire = { path = "../transport-wire" }
+roster-sync = { path = "../roster-sync", default-features = false }
+blake3.workspace = true
+
+[dev-dependencies]
+identity = { path = "../identity" }
+
+[lints]
+workspace = true

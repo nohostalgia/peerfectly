@@ -609,8 +609,25 @@ pub struct Network {
     /// shown and a detection would vanish behind a dial failure that repeats
     /// every minute.
     pub accused: Vec<Accused>,
-    /// The other devices in it.
+    /// The other devices in it: the first page of them, by id, at most
+    /// [`PEERS_PAGE`]. The rest are asked a page at a time
+    /// ([`Command::Peers`] with `after`): a network of a million boards is not
+    /// put into every answer.
     pub peers: Vec<Peer>,
+    /// How many other devices it holds, listed here or not. Zero from a
+    /// daemon before pages, whose `peers` were all of them.
+    #[serde(default)]
+    pub peer_count: usize,
+    /// How many of them this device has a session with now.
+    #[serde(default)]
+    pub reachable_count: usize,
+    /// Where the next page of `peers` begins, while more remain.
+    #[serde(default)]
+    pub peers_after: Option<String>,
+    /// Its full members other than this device: the devices its light members
+    /// turn to, and those an anchor is chosen from. Few in any network.
+    #[serde(default)]
+    pub full_members: Vec<Named>,
     /// The devices this device holds as revoked from it.
     ///
     /// What this device knows, not an account of the network: a revocation signed
@@ -792,6 +809,20 @@ impl fmt::Display for Trouble {
             }
         })
     }
+}
+
+/// How many devices a page of a network's peers holds at most.
+pub const PEERS_PAGE: usize = 100;
+
+/// A page of a network's other devices, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersPage {
+    /// The network.
+    pub network: String,
+    /// The devices, at most [`PEERS_PAGE`].
+    pub peers: Vec<Peer>,
+    /// Where the next page begins, while more remain.
+    pub after: Option<String>,
 }
 
 /// What the daemon answers.
@@ -1179,7 +1210,7 @@ impl Command {
         match self {
             // Reading. What comes back is bounded by what the reader may see.
             Self::Status | Self::Waiting => Needs::Nobody,
-            Self::Peers { network } | Self::Address { network } | Self::Pending { network } => {
+            Self::Peers { network, .. } | Self::Address { network } | Self::Pending { network } => {
                 match network {
                     // Naming none is asking about everything this person holds,
                     // which is the same question as `Status`.
@@ -1198,6 +1229,7 @@ impl Command {
             | Self::Invite { network, .. }
             | Self::Withdraw { network, .. }
             | Self::Approve { network, .. }
+            | Self::Provisioning { network }
             | Self::Reject { network, .. }
             | Self::Revoke { network, .. }
             | Self::RevokeVoiding { network, .. }
@@ -1256,6 +1288,11 @@ pub enum Command {
     Peers {
         /// Which network, or `None` when only one could be meant.
         network: Option<String>,
+        /// The page after this one, as [`Network::peers_after`] or
+        /// [`PeersPage::after`] gave it; `None` asks for the report, whose
+        /// networks carry the first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
     /// Show this device's own overlay address in a network.
     Address {
@@ -1302,6 +1339,14 @@ pub enum Command {
         network: Option<String>,
         /// The name the invite was issued for.
         name: String,
+    },
+
+    /// What a board provisioned for a network starts from, before it is
+    /// admitted: what a production station writes into it
+    /// (`scalable-membership` 15.4). Read only, and an administrator's.
+    Provisioning {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
     },
 
     /// Everything waiting: the invites this device issued and the requests
@@ -2099,7 +2144,7 @@ impl Command {
             "status" => Ok(Self::Status),
             "up" => Ok(Self::Up { network }),
             "down" => Ok(Self::Down { network }),
-            "peers" => Ok(Self::Peers { network }),
+            "peers" => Ok(Self::Peers { network, after: None }),
             "address" => Ok(Self::Address { network }),
             "stop" => Ok(Self::Stop),
             "takeownership" => Ok(Self::TakeOwnership { network }),
@@ -2148,6 +2193,7 @@ impl Command {
             | Self::Invite { .. }
             | Self::Withdraw { .. }
             | Self::Approve { .. }
+            | Self::Provisioning { .. }
             | Self::Reject { .. }
             | Self::Join { .. }
             | Self::Confirm
@@ -2247,6 +2293,8 @@ impl Command {
             | Self::Exposed { .. } => return None,
             Self::Up { network } => ("up", network.as_deref()),
             Self::Down { network } => ("down", network.as_deref()),
+            // A read, and still logged: a station took what boards start from.
+            Self::Provisioning { network } => ("provisioning", network.as_deref()),
             Self::Stop => ("stop", None),
             Self::Invite { network, .. } => ("invite", network.as_deref()),
             Self::Withdraw { network, .. } => ("withdraw", network.as_deref()),
@@ -2289,6 +2337,8 @@ impl Outcome {
         match self {
             Self::Reported(_) => "reported",
             Self::Done => "done",
+            Self::Provisioning(_) => "provisioning",
+            Self::Peers(_) => "peers",
             Self::Invited { .. } => "invited",
             Self::JoinStarted { .. } => "joining",
             Self::Pending(_) => "pending",
@@ -2393,6 +2443,23 @@ pub struct BatchDevice {
     pub transport: String,
     /// Its attestation key: every member holds one.
     pub attestation: String,
+}
+
+/// What a board provisioned before its admission starts from: all of it public,
+/// and checked by the board as it is taken (`roster::member::LightMember::
+/// awaiting`), every byte hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provisioning {
+    /// The root this node holds, signed.
+    pub root: String,
+    /// The root of the devices' tree under it.
+    pub devices_root: String,
+    /// The network's parameters under it.
+    pub params: String,
+    /// The network's relay, as written in its parameters.
+    pub relay: String,
+    /// The evidence of each of the network's anchors, against that root.
+    pub anchors: Vec<String>,
 }
 
 /// The name of the one format of a batch file this build reads.
@@ -2534,6 +2601,12 @@ pub enum Outcome {
     Reported(Report),
     /// The command succeeded and there is nothing to say.
     Done,
+
+    /// What a board provisioned for the network starts from.
+    Provisioning(Provisioning),
+
+    /// A page of a network's other devices, after the one asked.
+    Peers(PeersPage),
 
     /// A join has begun, and waits until it is admitted or cancelled.
     ///
@@ -2828,6 +2901,10 @@ mod tests {
                 standing,
                 last_contact: Contact::NoneRecorded,
             }],
+            peer_count: 0,
+            reachable_count: 0,
+            peers_after: None,
+            full_members: Vec::new(),
             revoked: Vec::new(),
             problem: None,
         }
@@ -3114,7 +3191,7 @@ mod tests {
     fn reading_and_up_and_down_need_no_administrator_and_everything_else_does() {
         for reading in [
             Command::Status,
-            Command::Peers { network: None },
+            Command::Peers { network: None, after: None },
             Command::Address { network: None },
             Command::Exposed { network: None },
             Command::Pending { network: None },
@@ -3256,7 +3333,7 @@ mod tests {
             Command::Status,
             Command::Up { network: None },
             Command::Down { network: None },
-            Command::Peers { network: None },
+            Command::Peers { network: None, after: None },
             Command::Address { network: None },
             Command::Stop,
             Command::Invite {

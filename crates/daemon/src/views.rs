@@ -45,6 +45,15 @@ impl Report {
         Address { report: self, network }
     }
 
+    /// Where each network's devices go on past the report's first page: its
+    /// label and the cursor to ask the next with, for those that do.
+    #[must_use]
+    pub fn peers_continuing(&self, network: Option<&str>) -> Vec<(String, String)> {
+        self.covered(network)
+            .filter_map(|held| held.peers_after.clone().map(|after| (held.label.clone(), after)))
+            .collect()
+    }
+
     /// The networks this report covers, narrowed to one when a name is given.
     fn covered<'a>(&'a self, network: Option<&'a str>) -> impl Iterator<Item = &'a Network> {
         self.networks.iter().filter(move |held| match network {
@@ -61,6 +70,21 @@ pub struct Peers<'a> {
     report: &'a Report,
     /// The network asked about, if one was named.
     network: Option<&'a str>,
+}
+
+/// A page of a network's devices after the report's first, as `peers` draws
+/// each.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerRows<'a>(pub &'a [Peer]);
+
+impl fmt::Display for PeerRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for peer in self.0 {
+            writeln!(f)?;
+            write!(f, "{}", entry_for(peer))?;
+        }
+        Ok(())
+    }
 }
 
 /// This device's own address, as `address` draws it.
@@ -272,7 +296,9 @@ fn entry_for(peer: &Peer) -> Block {
 /// device is counted when the roster names it, and is not when it does not —
 /// which is the state a device is in between joining and being admitted.
 fn counted(network: &Network) -> String {
-    let others = network.peers.len();
+    // All of them, where the report lists a page: a daemon before pages
+    // listed every one and counted none.
+    let others = network.peer_count.max(network.peers.len());
     let devices = others.saturating_add(usize::from(network.name.is_some()));
     let word = if devices == 1 { "device" } else { "devices" };
     if network.revoked.is_empty() {
@@ -465,6 +491,10 @@ mod tests {
             ipv4_block: Some("100.64.0.0/10".to_owned()),
             accused: Vec::new(),
             peers,
+            peer_count: 0,
+            reachable_count: 0,
+            peers_after: None,
+            full_members: Vec::new(),
             revoked: Vec::new(),
             problem: None,
         }

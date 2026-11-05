@@ -30,8 +30,10 @@
 //! maps of every device, which held 649 bytes a device at a fleet's size and
 //! were decided again whole at every change (`scalable-membership` 16.6).
 
-use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::net::Ipv4Addr;
 
 use roster::id::DeviceId;
 use roster::leaf::Ipv4Offset;
@@ -73,11 +75,15 @@ impl core::fmt::Debug for View {
 }
 
 /// Two views are equal where their states hold the same devices, settings and
-/// all, in the same network and block: the holdings are a function of those.
+/// all, in the same network under the same parameters: the holdings are a
+/// function of the devices and the block, and the parameters besides — the
+/// blocks excluded from the route above all — are what a node watching the
+/// holdings re-plans its routes on (`scalable-membership` 19.7).
 impl PartialEq for View {
     fn eq(&self, other: &Self) -> bool {
         self.state.network == other.state.network
             && self.range == other.range
+            && self.state.params == other.state.params
             && self.state.devices.root() == other.state.devices.root()
     }
 }

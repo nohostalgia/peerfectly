@@ -655,6 +655,23 @@ impl roster::members::LayerStore for MemoryLayers {
         out
     }
 
+    fn address_claims_from(
+        &self,
+        batch: &OperationId,
+        from: ([u8; 4], DeviceId),
+        count: usize,
+    ) -> Vec<([u8; 4], DeviceId)> {
+        let mut claims: Vec<([u8; 4], DeviceId)> = self
+            .of(batch)
+            .into_iter()
+            .filter_map(|(device, entry)| entry.ipv4.map(|address| (address, device)))
+            .filter(|claim| *claim >= from)
+            .collect();
+        claims.sort_unstable();
+        claims.truncate(count);
+        claims
+    }
+
     fn name_holders(&self, batch: &OperationId, name: &str) -> Vec<DeviceId> {
         self.of(batch)
             .into_iter()

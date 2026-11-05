@@ -189,6 +189,24 @@ fn a_revoked_devices_offset_is_free_for_the_next() {
     assert_eq!(holdings_of(&history).of(&device_id(6)), Some([10, 0, 0, 4].into()));
 }
 
+/// A change of the parameters that moves no address still changes the view,
+/// so a node watching its holdings re-plans its routes: a block excluded for
+/// everyone is one.
+#[test]
+fn excluding_a_block_changes_the_view_and_no_address() {
+    let mut history = founded_in("10.0.0.0/24", &[5]);
+    history.op("five", 1, &["add5"], assign(5, 3_u32.to_be_bytes()));
+    let before = holdings_of(&history);
+    let excluded = params()
+        .in_ipv4_range("10.0.0.0/24".parse().unwrap())
+        .with_excluded(vec!["10.0.0.128/25".parse().unwrap()])
+        .unwrap();
+    history.op("exclude", 1, &["five"], OperationBody::SetNetwork(excluded));
+    let after = holdings_of(&history);
+    assert_ne!(before, after, "the view changed");
+    assert_eq!(before.of(&device_id(5)), after.of(&device_id(5)), "and no address did");
+}
+
 /// Moving the block is one change of the parameters: every device keeps its
 /// offset and holds the address it names in the new block.
 #[test]

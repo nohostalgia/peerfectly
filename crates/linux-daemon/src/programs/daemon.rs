@@ -269,8 +269,13 @@ mod tests {
                 "`{speaking}` in the startup path would reach something"
             );
         }
+        // On the path with a firewall: headless, an anchor has no table and
+        // resumes at once, by design.
+        let with_a_firewall =
+            code.split_once("let firewall =").map(|(_, rest)| rest).unwrap_or_default();
+        let ensured = with_a_firewall.find("firewall.ensure()");
         assert!(
-            code.find("firewall.ensure()") < code.find("service.resume()"),
+            ensured.is_some() && ensured < with_a_firewall.find("service.resume()"),
             "the table before anything comes up"
         );
     }

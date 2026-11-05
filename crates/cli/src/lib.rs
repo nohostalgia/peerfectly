@@ -827,8 +827,54 @@ impl Cli<'_> {
             let answer = self.ask_and_sign(command).await;
             let answer = self.when_only_admin(answer, said_yes).await;
             let answer = self.when_voiding(&asked, answer, said_yes).await;
-            self.shown(&asked, answer)
+            // `peers` lists every device, a page at a time: the report holds
+            // the first of each network, and the rest are asked as they are
+            // drawn, so that neither end holds a million at once.
+            let continuing = match (&asked, &answer) {
+                (Command::Peers { network, .. }, Ok(Outcome::Reported(report))) => {
+                    report.peers_continuing(network.as_deref())
+                }
+                _ => Vec::new(),
+            };
+            let code = self.shown(&asked, answer);
+            for (label, after) in continuing {
+                if !self.rest_of_peers(&label, after).await {
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            code
         })
+    }
+
+    /// Draws a network's devices after the report's first page, a page at a
+    /// time, until the last. Whether every page was read.
+    async fn rest_of_peers(&self, label: &str, mut after: String) -> bool {
+        println!();
+        println!("{label}, continued");
+        loop {
+            let asked = Command::Peers { network: Some(label.to_owned()), after: Some(after) };
+            match self.ask(asked).await {
+                Ok(Outcome::Peers(page)) => {
+                    print!("{}", daemon::views::PeerRows(&page.peers));
+                    match page.after {
+                        Some(next) => after = next,
+                        None => return true,
+                    }
+                }
+                Ok(Outcome::Failed { message, .. }) => {
+                    eprintln!("the rest of `{label}`'s devices could not be read: {message}");
+                    return false;
+                }
+                Ok(_) => {
+                    eprintln!("the rest of `{label}`'s devices could not be read");
+                    return false;
+                }
+                Err(cause) => {
+                    eprintln!("the rest of `{label}`'s devices could not be read: {cause}");
+                    return false;
+                }
+            }
+        }
     }
 
     /// Puts the question a revocation that voids acts asks, before anything is
@@ -905,7 +951,7 @@ impl Cli<'_> {
         match answer {
             Ok(Outcome::Reported(report)) => {
                 match asked {
-                    Command::Peers { network } => {
+                    Command::Peers { network, .. } => {
                         print!("{}", report.peers(network.as_deref()))
                     }
                     Command::Address { network } => {

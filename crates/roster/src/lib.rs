@@ -127,7 +127,40 @@
 //! # Ok::<(), roster::Error>(())
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
 extern crate alloc;
+
+/// The part of `std`'s prelude that comes from `alloc`, named where a module
+/// needs it, so a module reads the same with `std` and without.
+mod prelude {
+    pub(crate) use alloc::borrow::ToOwned;
+    pub(crate) use alloc::boxed::Box;
+    pub(crate) use alloc::string::String;
+    pub(crate) use alloc::vec;
+    pub(crate) use alloc::vec::Vec;
+}
+
+/// The shared pointer: `std`'s where there is `std`. Without it, on any
+/// microcontroller, `portable-atomic-util`'s, whose counts are native atomics
+/// where the chip has them and a critical section where it has none. It does
+/// not turn an `Arc<T>` into an `Arc<dyn Trait>` by itself on stable Rust, so
+/// the crate makes those through a `Box`.
+pub mod sync {
+    #[cfg(feature = "std")]
+    pub use alloc::sync::Arc;
+    #[cfg(not(feature = "std"))]
+    pub use portable_atomic_util::Arc;
+}
+
+/// Hash maps where there is `std`. Without it, ordered maps from `alloc`, which
+/// the keys here allow: a microcontroller member holds few.
+mod collections {
+    #[cfg(not(feature = "std"))]
+    pub(crate) use alloc::collections::{BTreeMap as HashMap, BTreeSet as HashSet};
+    #[cfg(feature = "std")]
+    pub(crate) use std::collections::{HashMap, HashSet};
+}
 
 pub mod attestation;
 pub mod batch;

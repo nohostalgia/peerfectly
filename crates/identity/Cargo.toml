@@ -12,7 +12,7 @@ roster = { path = "../roster" }
 # The same curve implementation the roster verifies with, so a key store's
 # encodings are read here rather than by each platform; `pkcs8` is what reads
 # a SubjectPublicKeyInfo.
-p256 = { workspace = true, features = ["pkcs8"] }
+p256 = { workspace = true, features = ["pkcs8", "std", "pem", "precomputed-tables"] }
 minicbor.workspace = true
 getrandom.workspace = true
 # A signing key sealed with a passphrase (`passphrase`): Argon2id stretches it,

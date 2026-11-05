@@ -43,7 +43,8 @@
 //! device it named. An act nobody was entitled to make is not a removal, and
 //! removes nothing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::prelude::*;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use crate::cbor::{Reader, Writer};
 use crate::dag::{Dag, Foundation};
@@ -92,10 +93,19 @@ impl RosterState {
     /// network's offsets stay consecutive (`scalable-membership` 19.2). None
     /// where the block has no such run.
     ///
-    /// Asks the state's index once per offset, from the first host up, so it
-    /// costs about as many lookups as members hold offsets below the run.
+    /// One pass over the indexes of offsets, in order (`Members::lowest_unclaimed`).
     #[must_use]
     pub fn free_offsets(&self, count: u32) -> Option<crate::leaf::Ipv4Offset> {
+        let hosts = u32::try_from(self.params.ipv4_range().hosts()).unwrap_or(u32::MAX);
+        self.devices.lowest_unclaimed(hosts, count).map(u32::to_be_bytes)
+    }
+
+    /// [`Self::free_offsets`] as it was found: the state's index asked once
+    /// per offset, from the first host up. Kept for tests, which hold the pass
+    /// to it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn free_offsets_by_lookup(&self, count: u32) -> Option<crate::leaf::Ipv4Offset> {
         let hosts = u32::try_from(self.params.ipv4_range().hosts()).unwrap_or(u32::MAX);
         let mut start = 1_u32;
         let mut found = 0_u32;
@@ -237,7 +247,7 @@ impl RosterState {
     /// for a device with one signing key and differ for a device that also
     /// holds an enclave key, so this lookup is not the identity function.
     #[must_use]
-    pub fn device_for_key(&self, key: &KeyId) -> Option<alloc::sync::Arc<DeviceLeaf>> {
+    pub fn device_for_key(&self, key: &KeyId) -> Option<crate::sync::Arc<DeviceLeaf>> {
         self.device_for_key_of_purpose(key, crate::types::KeyPurpose::Signing)
     }
 
@@ -256,7 +266,7 @@ impl RosterState {
         &self,
         key: &KeyId,
         purpose: crate::types::KeyPurpose,
-    ) -> Option<alloc::sync::Arc<DeviceLeaf>> {
+    ) -> Option<crate::sync::Arc<DeviceLeaf>> {
         self.devices.holding(key, Some(purpose))
     }
 
@@ -1051,7 +1061,7 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     // something else decides are touched (`scalable-membership` 16.4).
     let mut touched: BTreeSet<DeviceId> = BTreeSet::new();
     let mut assigning: BTreeSet<[u8; 4]> = BTreeSet::new();
-    let mut batches: Vec<(usize, &crate::batch::BatchHeader, &alloc::sync::Arc<Layer>)> =
+    let mut batches: Vec<(usize, &crate::batch::BatchHeader, &crate::sync::Arc<Layer>)> =
         Vec::new();
     for (index, operation) in selected(dag, mask) {
         match &operation.core().body {
@@ -1390,7 +1400,7 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
                 left_out.insert(*device);
             }
         }
-        members.lay(alloc::sync::Arc::clone(layer), alloc::sync::Arc::new(left_out));
+        members.lay(crate::sync::Arc::clone(layer), crate::sync::Arc::new(left_out));
     }
     for device in &touched {
         match devices.remove(device) {
@@ -1486,7 +1496,7 @@ fn skipped_by(
     layer: &Layer,
     header: &crate::batch::BatchHeader,
     ancestors: &RosterState,
-) -> alloc::sync::Arc<BTreeSet<DeviceId>> {
+) -> crate::sync::Arc<BTreeSet<DeviceId>> {
     layer.skipped_against(ancestors.devices.root(), || {
         crate::batch::skipped_among(
             ancestors,

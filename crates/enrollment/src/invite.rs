@@ -27,6 +27,10 @@
 //! hexadecimal, after a prefix that is also its version; a scannable code
 //! carries the text.
 
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use roster::cbor::{Reader, Writer};
 use roster::id::NetworkId;
 use roster::types::{IPV4_RANGE_LEN, Ipv4Range};
@@ -97,6 +101,7 @@ impl Invite {
     /// # Errors
     ///
     /// As [`Self::new`], and when no randomness can be had.
+    #[cfg(feature = "std")]
     pub fn issue(relay: impl Into<String>, network: NetworkId, block: Ipv4Range) -> Result<Self> {
         let mut secret = [0u8; SECRET_LEN];
         getrandom::fill(&mut secret).map_err(|_| Error::Malformed("no randomness for a secret"))?;

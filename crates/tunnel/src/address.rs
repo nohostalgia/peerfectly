@@ -32,7 +32,8 @@
 //! key changes the device id, so the address moves — but that is already a
 //! re-enrolment: the roster sees a different device.
 
-use std::net::Ipv6Addr;
+use alloc::vec::Vec;
+use core::net::Ipv6Addr;
 
 use roster::id::DeviceId;
 

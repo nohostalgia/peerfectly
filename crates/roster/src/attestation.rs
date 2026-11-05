@@ -61,6 +61,7 @@ use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::id::{KeyId, NetworkId, OperationId};
 use crate::limits;
+use crate::prelude::*;
 use crate::sign::{PublicKey, Signer};
 
 /// The domain-separation tag every attestation signature carries.

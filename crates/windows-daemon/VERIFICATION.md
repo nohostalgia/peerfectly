@@ -2575,3 +2575,48 @@ how many Windows dialogs appeared — one for the whole act, or one per signatur
 **Result**: run, 2026-10-27/28, by the person, on the MSI of this branch (`peerfectly-0.4.1-windows-x64.msi`, built 2026-10-27, unsigned) and the phone running this branch's debug app (`android/VERIFICATION.md` S3, the same session). Every expectation held, as the person reported them: unelevated, `status` and `pending` answered and `invite` was refused before reaching the daemon; `prova` founded on the VPS's relay; the phone joined by invite, showed its key and no code, and the same key was in `pending`; `approve` signed and the phone was in `prova` within seconds; the batch of `lot-windows.json` (three boards, keys made with `openssl` for this run) was reviewed and signed on one consent; `withdraw` and `pending` as expected.
 
 For 13.4, the dialogs, as the person counted them: `found` showed one to set the key's password, when the key was made, and then **one** for its signatures; the approval (two signatures) and the batch showed one each. One dialog per act, whatever the number of signatures through the handle.
+
+## C5. The phone invites the PC, the PC invites the phone as a light member, and a web page over the network
+
+`scalable-membership` 18.2, on the builds the change ends with: the MSI of this branch installed over
+the one before, and the phone on this branch's debug app (`android/VERIFICATION.md` S4, the same
+session). From an elevated console.
+
+1. On the phone, a network founded (`provatel`) and an invite for `pc`; on the PC:
+
+   ```powershell
+   peerfectly join <the invite's text> --name pc
+   ```
+
+   On the phone, *approve* on the pending page. Then on the PC: `peerfectly status`, `peerfectly
+   peers --network provatel`, and `ping` to the phone's IPv6 and IPv4 addresses there.
+2. On the PC:
+
+   ```powershell
+   peerfectly found provapc
+   ```
+   ```powershell
+   peerfectly invite telefono --network provapc --light
+   ```
+
+   On the phone, join with the invite; on the PC, `peerfectly pending` and `peerfectly approve
+   telefono --network provapc`. Then `ping` to the phone in `provapc`, over IPv6 and IPv4.
+3. A web server on the PC on port 8000 (`python -m http.server 8000 --bind ::`), exposed in
+   `provapc`:
+
+   ```powershell
+   peerfectly expose provapc tcp 8000
+   ```
+
+   and opened in the phone's browser, by the PC's name in the network and by its addresses.
+
+**Expect**: the PC joins the phone's network once approved there, and reaches the phone; the phone
+joins the PC's as a light member once approved, and both reach each other over IPv6 and IPv4; the
+page opens on the phone, by name and by address.
+
+**Result**: run, 2026-11-05, by the person, on `peerfectly-0.4.1-windows-x64.msi` built that day
+from this branch (`deploy/windows/package.ps1`, unsigned; Wintun pinned and its signature valid) and
+the phone's debug app built the same day, installed over wireless adb. Everything worked, as the
+person reported it: the phone invited the PC and the PC joined; the PC invited the phone as a light
+member and the phone joined; both reached each other; the page on port 8000 opened in the phone's
+browser.

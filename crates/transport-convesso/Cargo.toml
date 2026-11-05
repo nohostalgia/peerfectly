@@ -14,6 +14,8 @@ default = []
 fixture = ["dep:convesso-relay", "dep:rcgen", "dep:windows-sys"]
 
 [dependencies]
+# The frames, and a frame too large for a peer cut into parts.
+transport-wire = { path = "../transport-wire" }
 roster = { path = "../roster" }
 transport = { path = "../transport" }
 identity = { path = "../identity" }
@@ -43,6 +45,8 @@ windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"], optio
 
 [dev-dependencies]
 proptest.workspace = true
+# A microcontroller's sessions, held to this binding (`tests/light_sessions.rs`).
+light-node = { path = "../light-node" }
 # Depending on itself with the feature on is what makes `cargo test` enable it
 # without a flag, while an ordinary build still cannot see it.
 transport-convesso = { path = ".", features = ["fixture"] }

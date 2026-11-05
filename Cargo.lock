@@ -642,6 +642,7 @@ dependencies = [
  "hex",
  "hickory-proto",
  "identity",
+ "light-node",
  "local-discovery",
  "member-store",
  "netdev",
@@ -1683,6 +1684,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "light-node"
+version = "0.4.1"
+dependencies = [
+ "blake3",
+ "identity",
+ "roster",
+ "roster-sync",
+ "transport-wire",
+ "tunnel",
+]
+
+[[package]]
 name = "linux-daemon"
 version = "0.4.1"
 dependencies = [
@@ -2246,6 +2259,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2556,6 +2578,7 @@ dependencies = [
  "hex",
  "minicbor",
  "p256",
+ "portable-atomic-util",
  "proptest",
  "serde_json",
  "signature",
@@ -3230,6 +3253,7 @@ dependencies = [
  "proptest",
  "roster",
  "tokio",
+ "transport-wire",
 ]
 
 [[package]]
@@ -3245,6 +3269,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "identity",
+ "light-node",
  "proptest",
  "rcgen",
  "roster",
@@ -3252,7 +3277,15 @@ dependencies = [
  "tracing",
  "transport",
  "transport-convesso",
+ "transport-wire",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "transport-wire"
+version = "0.4.1"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 roster = { path = "../roster" }
 identity = { path = "../identity" }
-blake3.workspace = true
+blake3 = { workspace = true, features = ["std"] }
 getrandom.workspace = true
 # A real AEAD rather than a bare stream cipher. The payload is already signed,
 # so integrity is arguably covered — but relying on that means reasoning about

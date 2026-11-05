@@ -896,6 +896,24 @@ impl MemberStore for Store {
         read().unwrap_or_default()
     }
 
+    fn address_claims_from(
+        &self,
+        from: ([u8; 4], DeviceId),
+        count: usize,
+    ) -> Vec<([u8; 4], DeviceId)> {
+        let read = || -> Result<Vec<([u8; 4], DeviceId)>, redb::Error> {
+            let Some(reading) = self.reading() else { return Ok(Vec::new()) };
+            let mut claims = Vec::with_capacity(count);
+            for entry in reading.addresses.range((from.0, *from.1.as_bytes())..)?.take(count) {
+                let (held, _) = entry?;
+                let (address, device) = held.value();
+                claims.push((address, DeviceId::from_bytes(device)));
+            }
+            Ok(claims)
+        };
+        read().unwrap_or_default()
+    }
+
     fn name_holders(&self, name: &str) -> Vec<DeviceId> {
         let read = || -> Result<Vec<DeviceId>, redb::Error> {
             let Some(reading) = self.reading() else { return Ok(Vec::new()) };

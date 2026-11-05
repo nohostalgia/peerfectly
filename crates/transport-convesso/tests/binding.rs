@@ -16,8 +16,9 @@ use roster::types::Algorithm;
 use transport::error::Error;
 use transport::session::{Path, Session, Transport};
 use transport_convesso::fixture::{Network, TestRelay};
-use transport_convesso::frame::{Frame, Reason};
+use transport_convesso::frame::{Frame, Limits, OWN, Reason, VERSION};
 use transport_convesso::{BuildError, ConvessoTransport};
+use transport_wire::parts::Joiner;
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -226,7 +227,8 @@ async fn another_version_is_refused_as_such() {
     let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
 
     let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
-    let open = Frame::Open { version: 99, id: 42, evidence: Vec::new() }.encode();
+    let open =
+        Frame::Open { version: 99, id: 42, limits: Limits::LEAST, evidence: Vec::new() }.encode();
     raw.send_message(Address::parse(founder_key).unwrap(), open).await.unwrap();
 
     let answer = tokio::time::timeout(PATIENCE, async {
@@ -254,6 +256,53 @@ async fn next_frame(events: &mut ContextEvents) -> Option<Frame> {
     })
     .await
     .expect("a frame comes")
+}
+
+/// A peer that says it takes small messages, as a microcontroller does, is
+/// sent a payload larger than that in parts, each within what it said, and
+/// puts it back together whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_taking_small_messages_is_sent_a_large_payload_in_parts() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let to_founder = Address::parse(founder_key).unwrap();
+
+    let open = Frame::Open { version: VERSION, id: 5, limits: Limits::LEAST, evidence: Vec::new() };
+    raw.send_message(to_founder, open.encode()).await.unwrap();
+    let Some(Frame::Accept { id: 5, limits, .. }) = next_frame(&mut events).await else {
+        panic!("the open is accepted");
+    };
+    assert_eq!(limits, OWN, "and the founder says what it takes");
+    let session = tokio::time::timeout(PATIENCE, founder.accept()).await.unwrap().unwrap();
+
+    let payload = vec![7u8; 10_000];
+    session.send(&payload).await.unwrap();
+    let mut joiner = Joiner::new();
+    let mut messages = 0_usize;
+    let arrived = tokio::time::timeout(PATIENCE, async {
+        while let Some(event) = events.next().await {
+            if let ContextEvent::Message { data, .. } = event {
+                assert!(data.len() <= Limits::LEAST.message_len(), "{} bytes", data.len());
+                messages += 1;
+                if let Some(frame) = joiner.take(&data, Limits::LEAST.frame_len()) {
+                    return Frame::decode(&frame);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .expect("the payload comes");
+    assert_eq!(arrived, Some(Frame::Payload { id: 5, bytes: payload }));
+    assert!(messages > 1, "in parts");
+
+    // Larger than it puts back together: refused here rather than lost there.
+    let too_large = vec![1u8; Limits::LEAST.frame_len()];
+    assert!(matches!(session.send(&too_large).await, Err(Error::PayloadTooLarge { .. })));
 }
 
 /// **A session outlives convesso's.** Past its keys' life convesso tells the
@@ -359,9 +408,12 @@ async fn an_accept_for_a_dial_given_up_on_is_closed() {
     dialling.abort();
     let _ = dialling.await;
 
-    raw.send_message(to_founder, Frame::Accept { id, evidence: Vec::new() }.encode())
-        .await
-        .unwrap();
+    raw.send_message(
+        to_founder,
+        Frame::Accept { id, limits: Limits::LEAST, evidence: Vec::new() }.encode(),
+    )
+    .await
+    .unwrap();
     assert_eq!(next_frame(&mut events).await, Some(Frame::Close { id, reason: Reason::Ordinary }));
 }
 
@@ -1010,7 +1062,7 @@ fn catching_up_on(
 
 /// Roots served for `held` alone: `chain`.
 fn serving(held: [u8; 32], chain: &'static [u8]) -> transport::session::RootsAfter {
-    Arc::new(move |since: [u8; 32]| {
+    Arc::new(move |since: [u8; 32], _room: usize| {
         Box::pin(async move { if since == held { chain.to_vec() } else { Vec::new() } })
     })
 }

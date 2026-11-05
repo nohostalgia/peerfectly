@@ -269,7 +269,6 @@ mod tests {
             ("admitting.rs", include_str!("admitting.rs")),
             ("attesting.rs", include_str!("attesting.rs")),
             ("batches.rs", include_str!("batches.rs")),
-            ("channel.rs", include_str!("channel.rs")),
             ("clock.rs", include_str!("clock.rs")),
             ("conflicts.rs", include_str!("conflicts.rs")),
             ("connectivity.rs", include_str!("connectivity.rs")),
@@ -287,7 +286,6 @@ mod tests {
             ("invites.rs", include_str!("invites.rs")),
             ("checkpoint.rs", include_str!("checkpoint.rs")),
             ("lookup.rs", include_str!("lookup.rs")),
-            ("seeking.rs", include_str!("seeking.rs")),
             ("limits.rs", include_str!("limits.rs")),
             ("logging.rs", include_str!("logging.rs")),
             ("machine.rs", include_str!("machine.rs")),
@@ -341,13 +339,16 @@ mod tests {
             );
         }
 
-        // Inside the service, only the report may name it.
+        // Inside the service, only the report may name it: a network described,
+        // and a page of its devices.
         let service = crate::code_of(include_str!("service.rs"));
-        let outside_the_report = service.replace(body_of(&service, "async fn describe("), "");
+        let outside_the_report = service
+            .replace(body_of(&service, "async fn describe("), "")
+            .replace(body_of(&service, "async fn peers_page("), "");
         for token in TOKENS {
             assert!(
                 !outside_the_report.contains(token),
-                "`service.rs` names `{token}` outside `describe`, where only the report is built"
+                "`service.rs` names `{token}` outside `describe` and `peers_page`, where only the                  report is built"
             );
         }
 

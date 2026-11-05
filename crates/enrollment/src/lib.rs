@@ -56,12 +56,18 @@
 //! - Membership, roles and authority — the roster's, entirely. An admin decides
 //!   what a joining device is permitted to be; the device only proposes a name.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod adopt;
 pub mod error;
 pub mod exchange;
 pub mod invite;
 pub mod limits;
 
+#[cfg(feature = "std")]
 pub use adopt::Adopted;
 pub use error::{Error, Result};
 pub use exchange::{DOMAIN_POSSESSION, DOMAIN_REQUEST, Possession, request_material};

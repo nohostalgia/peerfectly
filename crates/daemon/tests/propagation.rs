@@ -17,8 +17,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{a_network, node_off, node_on, within};
-use daemon::channel::{Channel, frame};
 use daemon::node::Node;
+use light_node::channel::{Channel, frame};
 use roster::id::OperationId;
 use roster::sign::RawOperation;
 use roster_sync::message::{Message, Offer};

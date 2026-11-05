@@ -415,7 +415,18 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
             consequence: format!("every device in {network} follows this"),
         },
         OperationBody::SetDevice { device, change } => Described {
-            act: format!("change the settings of ({}): {}", short(device), changes(change)),
+            act: format!(
+                "change the settings of {}({}): {}",
+                // The name the person typed, as with a revocation.
+                match asked {
+                    Command::GiveIpv4 { device: daemon::control::Target::Name(name), .. } => {
+                        format!("`{}` ", daemon::control::shown(name))
+                    }
+                    _ => String::new(),
+                },
+                short(device),
+                changes(change)
+            ),
             consequence: "every device in the network follows this from the next root".to_owned(),
         },
         OperationBody::AdmitBatch(header) => Described {

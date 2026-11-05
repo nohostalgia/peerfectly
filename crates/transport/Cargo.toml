@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 roster = { path = "../roster" }
 identity = { path = "../identity" }
+# The rules of cutting packets, shared with a microcontroller member.
+transport-wire = { path = "../transport-wire" }
 async-trait.workspace = true
 tokio.workspace = true
 

@@ -7,14 +7,21 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+# Keys held by this machine, fresh secrets and adopting a whole roster. Without
+# it the crate is `no_std` + `alloc`: the invite and the exchange a joining
+# microcontroller member speaks.
+default = ["std"]
+std = ["roster/std", "blake3/std", "dep:identity", "dep:getrandom"]
+
 [dependencies]
-roster = { path = "../roster" }
-identity = { path = "../identity" }
+roster = { path = "../roster", default-features = false }
+identity = { path = "../identity", optional = true }
 # The domain-separated derivations: the confirmation code, and the input the
 # joining device signs to prove it holds the key its identity comes from.
 blake3.workspace = true
 # The invite's secret.
-getrandom.workspace = true
+getrandom = { workspace = true, optional = true }
 
 [lints]
 workspace = true

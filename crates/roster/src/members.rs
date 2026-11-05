@@ -39,10 +39,15 @@
 //! index hit is checked against the leaf it names. What fails a check is not
 //! answered, and the store is told, so that whoever keeps it stops believing it.
 
+use crate::prelude::*;
+use crate::sync::Arc;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
 use std::sync::Mutex;
+
+#[cfg(not(feature = "std"))]
+use refused::Mutex;
 
 use crate::batch::BatchEntry;
 use crate::id::{DeviceId, KeyId, OperationId};
@@ -68,6 +73,15 @@ pub trait MemberStore: merkle::NodeSource {
 
     /// The devices the store's index says are assigned `address`.
     fn address_holders(&self, address: [u8; 4]) -> Vec<DeviceId>;
+
+    /// Up to `count` of the claims the store's address index holds, in
+    /// address and then device order, from `from` on: what finding the
+    /// lowest address free reads, a page at a time.
+    fn address_claims_from(
+        &self,
+        from: ([u8; 4], DeviceId),
+        count: usize,
+    ) -> Vec<([u8; 4], DeviceId)>;
 
     /// The devices the store's index says answer to `name`, given in ASCII
     /// lower case.
@@ -139,6 +153,15 @@ pub trait LayerStore: merkle::NodeSink {
     /// The addresses its entries assign, each once, in order.
     fn addresses(&self, batch: &OperationId) -> Vec<[u8; 4]>;
 
+    /// Up to `count` of the claims its address index holds for batch
+    /// `batch`, in address and then device order, from `from` on.
+    fn address_claims_from(
+        &self,
+        batch: &OperationId,
+        from: ([u8; 4], DeviceId),
+        count: usize,
+    ) -> Vec<([u8; 4], DeviceId)>;
+
     /// The devices its name index says answer to `name`, in ASCII lower case.
     fn name_holders(&self, batch: &OperationId, name: &str) -> Vec<DeviceId>;
 
@@ -200,10 +223,6 @@ fn built_index(
     }
     index
 }
-
-/// How many leaves a layer lays in a stored tree before spilling the paths it
-/// made to the store: the most of a tree held in memory while laying one.
-const SPILL_EVERY: usize = 4_096;
 
 /// How many trees a layer remembers having been laid over: the one the kept
 /// state rests on, the one at the root, and those the states a derivation
@@ -340,8 +359,7 @@ impl Layer {
         entries_root: merkle::Hash,
         count: usize,
     ) -> Self {
-        let source: Arc<dyn merkle::NodeSource> = store.clone();
-        let entries = merkle::Tree::stored(entries_root, source);
+        let entries = merkle::Tree::stored(entries_root, merkle::source_of(Arc::clone(&store)));
         Self::with_held(batch, mode, groups, Held::Stored { store, entries, count })
     }
 
@@ -440,9 +458,24 @@ impl Layer {
     /// The devices it admits, each with its entry, in device order. From a
     /// store, a page at a time, each entry checked.
     pub fn devices(&self) -> impl Iterator<Item = (DeviceId, BatchEntry)> + Send + '_ {
-        let mut slot = 0_usize;
+        self.devices_after(None)
+    }
+
+    /// The devices it admits after `from`, in device order, as
+    /// [`Self::devices`] gives them: a page of a listing, with no pass over
+    /// those before.
+    pub fn devices_after(
+        &self,
+        from: Option<DeviceId>,
+    ) -> impl Iterator<Item = (DeviceId, BatchEntry)> + Send + '_ {
+        let mut slot = match (&self.held, from) {
+            (Held::Memory { devices, .. }, Some(from)) => {
+                devices.partition_point(|(device, _)| *device <= from)
+            }
+            _ => 0_usize,
+        };
         let mut page: alloc::vec::IntoIter<(DeviceId, BatchEntry)> = Vec::new().into_iter();
-        let mut after: Option<DeviceId> = None;
+        let mut after: Option<DeviceId> = from;
         let mut finished = false;
         core::iter::from_fn(move || match &self.held {
             Held::Memory { entries, devices, .. } => {
@@ -478,6 +511,61 @@ impl Layer {
                 page = next.into_iter();
             },
         })
+    }
+
+    /// Every device the layer admits with its entry, in device order, as
+    /// [`Self::devices`] gives them: for a whole pass over the batch.
+    ///
+    /// A stored layer's entries are read in order and checked **together**:
+    /// the entries tree they make, each entry naming the device it is kept
+    /// under, must have the root the batch's signed header names. One entry
+    /// altered, missing or added changes that root, so the check is the one
+    /// each entry's own proof makes, for the whole batch at once, without
+    /// reading a path of the tree for every entry (`scalable-membership` 16.7).
+    /// Where the root is not that, the entries are read and checked one at a
+    /// time, as `devices` does: the altered ones hidden, and the store told.
+    #[must_use]
+    pub fn all_devices(&self) -> Vec<(DeviceId, BatchEntry)> {
+        let Held::Stored { store, entries, count } = &self.held else {
+            return self.devices().collect();
+        };
+        let mut read: Vec<(DeviceId, BatchEntry)> = Vec::with_capacity(*count);
+        let mut after: Option<DeviceId> = None;
+        loop {
+            let next = store.entries_after(&self.batch, after.as_ref(), PAGE);
+            let finished = next.len() < PAGE;
+            let first_too_low =
+                next.first().is_some_and(|(first, _)| after.is_some_and(|last| *first <= last));
+            let unordered =
+                next.windows(2).any(|pair| matches!(pair, [one, two] if one.0 >= two.0));
+            if first_too_low || unordered {
+                return self.devices().collect();
+            }
+            after = next.last().map(|(device, _)| *device).or(after);
+            read.extend(next);
+            if finished || read.len() > *count {
+                break;
+            }
+        }
+        let mut leaves: Vec<(merkle::Hash, merkle::Hash)> = Vec::with_capacity(read.len());
+        for (device, entry) in &read {
+            if !entry.device_id().is_ok_and(|named| named == *device) {
+                return self.devices().collect();
+            }
+            leaves.push((BatchEntry::position(device), entry.value_hash()));
+        }
+        leaves.sort_unstable_by_key(|(position, _)| *position);
+        let mut builder = merkle::Builder::new(|_, _| {});
+        for (position, value) in leaves {
+            if !builder.push(position, value) {
+                return self.devices().collect();
+            }
+        }
+        if read.len() == *count && builder.finish() == entries.root() {
+            read
+        } else {
+            self.devices().collect()
+        }
     }
 
     /// The entry admitting `device`.
@@ -528,6 +616,24 @@ impl Layer {
             store.tampered();
         }
         holds
+    }
+
+    /// Every claim its entries make on an address, in address and then device
+    /// order: from its indexes as they stand, a stored layer's a page at a
+    /// time, not checked against the entries (`Members::lowest_unclaimed`).
+    fn claims(&self) -> Box<dyn Iterator<Item = ([u8; 4], DeviceId)> + Send + '_> {
+        match &self.held {
+            Held::Memory { devices, addresses, .. } => {
+                Box::new(addresses.iter().filter_map(|(address, slot)| {
+                    devices.get(*slot as usize).map(|(device, _)| (*address, *device))
+                }))
+            }
+            Held::Stored { store, .. } => {
+                let store = Arc::clone(store);
+                let batch = self.batch;
+                Box::new(paged(move |from| store.address_claims_from(&batch, from, CLAIMS_PAGE)))
+            }
+        }
     }
 
     /// The devices whose entry assigns `address`, in device order.
@@ -701,21 +807,24 @@ impl Layer {
         let mut laid = tree.clone();
         let store = self.store().cloned();
         if let Some(store) = &store {
-            laid.spill_to(Arc::clone(store) as Arc<dyn merkle::NodeSink>);
+            laid.spill_to(merkle::sink_of(Arc::clone(store)));
         }
-        let mut since_spill = 0_usize;
-        for (device, entry) in self.devices() {
-            if left_out.contains(&device) {
-                continue;
-            }
-            let leaf = self.leaf_of(device, &entry);
-            laid.insert(DeviceLeaf::position(&device), leaf.value_hash());
-            since_spill = since_spill.saturating_add(1);
-            if store.is_some() && since_spill >= SPILL_EVERY {
-                laid.spill();
-                since_spill = 0;
-            }
-        }
+        // In position order, in one pass: each node of the tree beneath read
+        // once for the whole batch, where a leaf at a time read its path back
+        // from the store for every board, fifty minutes a million
+        // (`scalable-membership` 16.7). The leaves are the batch's, bounded as
+        // a batch is.
+        let mut leaves: Vec<(merkle::Hash, merkle::Hash)> = self
+            .all_devices()
+            .into_iter()
+            .filter(|(device, _)| !left_out.contains(device))
+            .map(|(device, entry)| {
+                (DeviceLeaf::position(&device), self.leaf_of(device, &entry).value_hash())
+            })
+            .collect();
+        leaves.sort_unstable_by_key(|(position, _)| *position);
+        laid.insert_sorted(&leaves);
+        drop(leaves);
         if store.is_some() {
             laid.spill();
         }
@@ -727,6 +836,112 @@ impl Layer {
         }
         laid
     }
+}
+
+/// The least claim a source has not yet given, and which source: the heap
+/// that merges the sources' claims in order holds these.
+type Head = core::cmp::Reverse<(([u8; 4], DeviceId), usize)>;
+
+/// The lock over what a [`Layer`] and [`Members`] cache, without `std`. A
+/// microcontroller member keeps no member set, so it keeps no cache either:
+/// every lock is refused, as a poisoned one is, and what it would have held is
+/// worked out again.
+#[cfg(not(feature = "std"))]
+mod refused {
+    use core::convert::Infallible;
+    use core::marker::PhantomData;
+    use core::ops::{Deref, DerefMut};
+
+    /// Holds nothing, and lets nobody in.
+    pub(crate) struct Mutex<T>(PhantomData<T>);
+
+    /// What a lock that is never given would give.
+    pub(crate) struct Guard<T>(Infallible, PhantomData<T>);
+
+    impl<T> Mutex<T> {
+        /// Drops `value`: there is nowhere to keep it.
+        pub(crate) fn new(value: T) -> Self {
+            drop(value);
+            Self(PhantomData)
+        }
+
+        /// Always refused.
+        pub(crate) fn lock(&self) -> Result<Guard<T>, ()> {
+            Err(())
+        }
+    }
+
+    impl<T> Default for Mutex<T> {
+        fn default() -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<T> Deref for Guard<T> {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            match self.0 {}
+        }
+    }
+
+    impl<T> DerefMut for Guard<T> {
+        fn deref_mut(&mut self) -> &mut T {
+            match self.0 {}
+        }
+    }
+}
+
+/// How many claims on addresses a store is read for at a time.
+const CLAIMS_PAGE: usize = 1024;
+
+/// The claims `page` gives from a point on, read on as each page is used up:
+/// in order, each once, and stopping where a store answers out of order.
+fn paged(
+    mut page: impl FnMut(([u8; 4], DeviceId)) -> Vec<([u8; 4], DeviceId)> + Send,
+) -> impl Iterator<Item = ([u8; 4], DeviceId)> + Send {
+    let mut from = Some(([0_u8; 4], DeviceId::from_bytes([0; 32])));
+    let mut held: alloc::vec::IntoIter<([u8; 4], DeviceId)> = Vec::new().into_iter();
+    let mut last: Option<([u8; 4], DeviceId)> = None;
+    core::iter::from_fn(move || {
+        loop {
+            if let Some(claim) = held.next() {
+                if last.is_some_and(|before| claim <= before) {
+                    // Out of order would loop: what is read so far stands.
+                    from = None;
+                    held = Vec::new().into_iter();
+                    return None;
+                }
+                last = Some(claim);
+                return Some(claim);
+            }
+            let at = from?;
+            let next = page(at);
+            from = match next.last() {
+                Some((address, device)) if next.len() >= CLAIMS_PAGE => after(*address, *device),
+                _ => None,
+            };
+            if next.is_empty() {
+                return None;
+            }
+            held = next.into_iter();
+        }
+    })
+}
+
+/// The claim just after this one in address and then device order.
+fn after(address: [u8; 4], device: DeviceId) -> Option<([u8; 4], DeviceId)> {
+    let mut bytes = *device.as_bytes();
+    for byte in bytes.iter_mut().rev() {
+        if *byte == u8::MAX {
+            *byte = 0;
+        } else {
+            *byte = byte.saturating_add(1);
+            return Some((address, DeviceId::from_bytes(bytes)));
+        }
+    }
+    let next = u32::from_be_bytes(address).checked_add(1)?;
+    Some((next.to_be_bytes(), DeviceId::from_bytes([0; 32])))
 }
 
 /// Two names in ASCII lower case order, without lowering either.
@@ -754,8 +969,15 @@ impl Laid {
     }
 
     fn iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + Send + '_ {
+        self.iter_after(None)
+    }
+
+    fn iter_after(
+        &self,
+        from: Option<DeviceId>,
+    ) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + Send + '_ {
         self.layer
-            .devices()
+            .devices_after(from)
             .filter(|(device, _)| !self.left_out.contains(device))
             .map(|(device, entry)| (device, self.layer.leaf_of(device, &entry)))
     }
@@ -844,10 +1066,9 @@ impl Members {
     /// does not, a signed root or the machine's own checkpoint.
     #[must_use]
     pub fn stored(store: Arc<dyn MemberStore>, root: merkle::Hash) -> Self {
-        let source: Arc<dyn merkle::NodeSource> = store.clone();
         Self {
             len: store.count(),
-            tree: merkle::Tree::stored(root, source),
+            tree: merkle::Tree::stored(root, merkle::source_of(Arc::clone(&store))),
             base: Base::Kept(store),
             layers: Vec::new(),
             leaves: BTreeMap::new(),
@@ -967,8 +1188,19 @@ impl Members {
 
     /// The members with their ids, by id: the base and the changes merged.
     pub fn iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
-        let mut base = self.lower_iter().peekable();
-        let mut over = self.leaves.iter().peekable();
+        self.iter_after(None)
+    }
+
+    /// The members after `from`, by id, as [`Self::iter`] gives them: a page
+    /// of a listing begins where the last ended, with no pass over those
+    /// before, in memory, in a store or in a batch alike.
+    pub fn iter_after(
+        &self,
+        from: Option<DeviceId>,
+    ) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
+        let mut base = self.lower_iter(from).peekable();
+        let lower = from.map_or(core::ops::Bound::Unbounded, core::ops::Bound::Excluded);
+        let mut over = self.leaves.range((lower, core::ops::Bound::Unbounded)).peekable();
         core::iter::from_fn(move || {
             loop {
                 let take_over = match (base.peek(), over.peek()) {
@@ -993,19 +1225,22 @@ impl Members {
         })
     }
 
-    /// The base's leaves and the layers', merged by id: what the changes are
-    /// laid over. Where two answer for one id, which derivation never makes,
-    /// the later layer does.
-    fn lower_iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
+    /// The base's leaves and the layers' after `from`, merged by id: what the
+    /// changes are laid over. Where two answer for one id, which derivation
+    /// never makes, the later layer does.
+    fn lower_iter(
+        &self,
+        from: Option<DeviceId>,
+    ) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
         let mut sources: Vec<Source<'_>> = Vec::with_capacity(self.layers.len().saturating_add(1));
         sources.push(
-            (alloc::boxed::Box::new(self.base_iter())
+            (alloc::boxed::Box::new(self.base_iter_after(from))
                 as alloc::boxed::Box<dyn Iterator<Item = _> + Send>)
                 .peekable(),
         );
         for laid in &self.layers {
             sources.push(
-                (alloc::boxed::Box::new(laid.iter())
+                (alloc::boxed::Box::new(laid.iter_after(from))
                     as alloc::boxed::Box<dyn Iterator<Item = _> + Send>)
                     .peekable(),
             );
@@ -1028,12 +1263,21 @@ impl Members {
     /// The base's leaves by id, checked where the base is a store. A device
     /// among the changes is passed over unchecked: the changes answer for it.
     fn base_iter(&self) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
+        self.base_iter_after(None)
+    }
+
+    /// The base's leaves after `from`, as [`Self::base_iter`] gives them.
+    fn base_iter_after(
+        &self,
+        from: Option<DeviceId>,
+    ) -> impl Iterator<Item = (DeviceId, Arc<DeviceLeaf>)> + '_ {
+        let lower = from.map_or(core::ops::Bound::Unbounded, core::ops::Bound::Excluded);
         let mut memory = match &self.base {
-            Base::Memory(shared) => Some(shared.leaves.iter()),
+            Base::Memory(shared) => Some(shared.leaves.range((lower, core::ops::Bound::Unbounded))),
             Base::Kept(_) => None,
         };
         let mut page: alloc::vec::IntoIter<DeviceLeaf> = Vec::new().into_iter();
-        let mut after: Option<DeviceId> = None;
+        let mut after: Option<DeviceId> = from;
         let mut finished = false;
         core::iter::from_fn(move || {
             if let Some(memory) = memory.as_mut() {
@@ -1212,6 +1456,107 @@ impl Members {
         )
     }
 
+    /// The first of the lowest `count` consecutive addresses from 1 to `last`
+    /// that no member is claimed to hold, read as [`Self::holding_address`]
+    /// reads one: the base's claims and each layer's, but the devices a layer
+    /// leaves out, then the changes, which take a claim away or add one.
+    ///
+    /// Every index read once, in address order, a page at a time, rather than
+    /// asked once for each address: a million devices holding consecutive
+    /// addresses cost a pass, where asking took minutes (`scalable-membership`
+    /// 16.7). A claim a store's index makes is not checked against its leaf
+    /// here, as `holding_address` checks it. What that check stops is a store
+    /// claiming an address that is free, which here only skips it; a store
+    /// hiding a holder is believed by both, the index being the only place an
+    /// address is looked up by.
+    #[must_use]
+    pub fn lowest_unclaimed(&self, last: u32, count: u32) -> Option<u32> {
+        let count = count.max(1);
+        let mut start = 1_u32;
+        for address in self.claimed() {
+            let address = u32::from_be_bytes(address);
+            if address < start {
+                continue;
+            }
+            if address.saturating_sub(start) >= count {
+                break;
+            }
+            start = address.checked_add(1)?;
+        }
+        let end = start.checked_add(count.saturating_sub(1))?;
+        (end <= last).then_some(start)
+    }
+
+    /// Every address some member is claimed to hold, each once, ascending.
+    fn claimed(&self) -> impl Iterator<Item = [u8; 4]> + '_ {
+        let mut sources: Vec<Box<dyn Iterator<Item = ([u8; 4], DeviceId)> + '_>> = Vec::new();
+        match &self.base {
+            Base::Memory(shared) => sources.push(Box::new(shared.addresses.iter().copied())),
+            Base::Kept(store) => {
+                let store = Arc::clone(store);
+                sources.push(Box::new(paged(move |from| {
+                    store.address_claims_from(from, CLAIMS_PAGE)
+                })));
+            }
+        }
+        for laid in &self.layers {
+            let left_out = Arc::clone(&laid.left_out);
+            sources.push(Box::new(
+                laid.layer.claims().filter(move |(_, device)| !left_out.contains(device)),
+            ));
+        }
+        let mut heads: alloc::collections::BinaryHeap<Head> = alloc::collections::BinaryHeap::new();
+        for (index, source) in sources.iter_mut().enumerate() {
+            if let Some(claim) = source.next() {
+                heads.push(core::cmp::Reverse((claim, index)));
+            }
+        }
+        let changes = &self.addresses;
+        let mut last: Option<[u8; 4]> = None;
+        let mut changed = changes.iter().peekable();
+        core::iter::from_fn(move || {
+            loop {
+                // The next address any source or change names.
+                let below = heads.peek().map(|core::cmp::Reverse(((address, _), _))| *address);
+                let changed_at = changed.peek().map(|((address, _), _)| *address);
+                let address = match (below, changed_at) {
+                    (None, None) => return None,
+                    (Some(one), None) | (None, Some(one)) => one,
+                    (Some(one), Some(two)) => one.min(two),
+                };
+                // Who the sources say, at this address, and what changed.
+                let mut claimants: Vec<DeviceId> = Vec::new();
+                while let Some(core::cmp::Reverse(((held, device), index))) = heads.peek().copied()
+                {
+                    if held != address {
+                        break;
+                    }
+                    heads.pop();
+                    claimants.push(device);
+                    if let Some(next) = sources.get_mut(index).and_then(Iterator::next) {
+                        heads.push(core::cmp::Reverse((next, index)));
+                    }
+                }
+                let mut added = false;
+                while let Some(((held, device), holds)) = changed.peek().copied() {
+                    if *held != address {
+                        break;
+                    }
+                    changed.next();
+                    if *holds {
+                        added = true;
+                    } else {
+                        claimants.retain(|claimant| claimant != device);
+                    }
+                }
+                if (added || !claimants.is_empty()) && last != Some(address) {
+                    last = Some(address);
+                    return Some(address);
+                }
+            }
+        })
+    }
+
     /// The members assigned `address`, by id. In a derived state there is at
     /// most one.
     #[must_use]
@@ -1359,6 +1704,45 @@ impl Members {
         found
             .into_iter()
             .filter(|device| self.get(device).is_some_and(|leaf| leaf.settings.mode == Mode::Full))
+            .collect()
+    }
+
+    /// The admins, by id: few in any network, and found without reading every
+    /// member. A batch admits members only, so the layers hold none; the
+    /// base's are asked of an index of its admins, built once the first time;
+    /// the changes are looked at. Every one is held to its leaf saying admin.
+    #[must_use]
+    pub fn admins(&self) -> Vec<DeviceId> {
+        const ADMIN: [u8; 4] = [1, 0, 0, 0];
+        let mut found: BTreeSet<DeviceId> = BTreeSet::new();
+        match &self.base {
+            Base::Memory(shared) => found.extend(
+                shared
+                    .leaves
+                    .iter()
+                    .filter(|(_, leaf)| leaf.record.role == Role::Admin)
+                    .map(|(device, _)| *device),
+            ),
+            Base::Kept(store) => {
+                let tag = *b"peerfectly admin members, base 1";
+                let held = store.derived_holders(&tag, ADMIN).unwrap_or_else(|| {
+                    let rows: Vec<([u8; 4], DeviceId)> = self
+                        .base_iter()
+                        .filter(|(_, leaf)| leaf.record.role == Role::Admin)
+                        .map(|(device, _)| (ADMIN, device))
+                        .collect();
+                    store.put_derived(&tag, &rows);
+                    rows.into_iter().map(|(_, device)| device).collect()
+                });
+                found.extend(held);
+            }
+        }
+        found.extend(
+            self.leaves.iter().filter(|(_, changed)| changed.is_some()).map(|(device, _)| *device),
+        );
+        found
+            .into_iter()
+            .filter(|device| self.get(device).is_some_and(|leaf| leaf.record.role == Role::Admin))
             .collect()
     }
 

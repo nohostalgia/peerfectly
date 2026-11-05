@@ -275,6 +275,44 @@ pub(crate) fn shown_of(roster: &Roster, device: &roster::id::DeviceId) -> Vec<u8
         .map_or_else(Vec::new, |shown| shown.to_bytes())
 }
 
+/// What a board provisioned before its admission starts from, as `roster`
+/// holds it: the root, the parameters under it with the root of the devices'
+/// tree beside them, and the evidence of the network's anchors that are full
+/// members (`scalable-membership` 15.4). `None` where it holds no root.
+#[must_use]
+pub fn provisioning(roster: &Roster) -> Option<crate::control::Provisioning> {
+    let held = roster.snapshot()?;
+    let copied;
+    let state = match roster.held_state() {
+        Some(state) => state,
+        None => {
+            copied = roster.state_for_root(&held.body().root)?.1;
+            &copied
+        }
+    };
+    let anchors = state
+        .params
+        .anchors
+        .iter()
+        .filter(|anchor| {
+            state
+                .devices
+                .get(anchor)
+                .is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Full)
+        })
+        .map(|anchor| evidence_of(roster, anchor))
+        .filter(|evidence| !evidence.is_empty())
+        .map(hex::encode)
+        .collect();
+    Some(crate::control::Provisioning {
+        root: hex::encode(held.to_bytes()),
+        devices_root: hex::encode(state.devices.root()),
+        params: hex::encode(state.params.to_bytes()),
+        relay: state.params.relay.clone()?,
+        anchors,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {

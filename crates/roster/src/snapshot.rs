@@ -51,6 +51,7 @@ use crate::leaf::DeviceLeaf;
 use crate::limits;
 use crate::membership::MembershipProof;
 use crate::merkle::Hash;
+use crate::prelude::*;
 use crate::sign::{PublicKey, Signer};
 use crate::state::RosterState;
 

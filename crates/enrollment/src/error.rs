@@ -70,6 +70,7 @@ pub enum Error {
     ///
     /// Carries the custody reason whole, because one of them — a person declining
     /// the prompt — is an ordinary outcome and must reach the interface as one.
+    #[cfg(feature = "std")]
     NotProved(identity::Error),
 }
 
@@ -112,6 +113,7 @@ impl fmt::Display for Error {
             Self::TooManyAttempts { limit } => {
                 write!(f, "this wait has already entertained {limit} attempts, and has ended")
             }
+            #[cfg(feature = "std")]
             Self::NotProved(cause) => {
                 write!(f, "this device's proof that it holds its key was not signed: {cause}")
             }

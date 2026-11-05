@@ -25,6 +25,10 @@
 //!   anybody else: it names keys whose private halves they do not hold, for one
 //!   invite only.
 
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use roster::cbor::{Reader, Writer};
 use roster::sign::{PublicKey, Signer};
 
@@ -89,6 +93,7 @@ impl Possession {
     /// # Errors
     ///
     /// When the channel material is empty.
+    #[cfg(feature = "std")]
     pub fn request(
         signing: &PublicKey,
         channel: &[u8],
@@ -107,6 +112,7 @@ impl Possession {
     /// # Errors
     ///
     /// When the channel material is empty, or the identity's key does not sign.
+    #[cfg(feature = "std")]
     pub fn prove_detached(identity: &identity::NodeIdentity, channel: &[u8]) -> Result<Self> {
         let request = Self::request(&identity.signing_key().public_key(), channel)?;
         let signature = identity.sign_request(&request).map_err(Error::NotProved)?;

@@ -63,6 +63,7 @@ pub enum Error {
     Roster(roster::Error),
 
     /// The transport failed, or the session ended.
+    #[cfg(feature = "std")]
     Transport(transport::Error),
 
     /// A light member offered or sent operations, which it does not exchange.
@@ -105,7 +106,10 @@ impl Error {
     /// the session open, by design — see the crate documentation.
     #[must_use]
     pub fn is_session_over(&self) -> bool {
-        matches!(self, Self::Transport(inner) if inner.is_closed())
+        #[cfg(feature = "std")]
+        return matches!(self, Self::Transport(inner) if inner.is_closed());
+        #[cfg(not(feature = "std"))]
+        false
     }
 }
 
@@ -115,6 +119,7 @@ impl From<roster::Error> for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<transport::Error> for Error {
     fn from(value: transport::Error) -> Self {
         Self::Transport(value)
@@ -135,6 +140,7 @@ impl fmt::Display for Error {
                 write!(f, "message declares {declared} entries but only {available} can follow")
             }
             Self::Roster(reason) => write!(f, "the roster refused it: {reason}"),
+            #[cfg(feature = "std")]
             Self::Transport(reason) => write!(f, "the session: {reason}"),
             Self::FromLightMember { peer } => {
                 write!(f, "{peer:?} is a light member, and exchanges roots, not operations")

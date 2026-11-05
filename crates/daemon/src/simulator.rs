@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use identity::NodeIdentity;
+use light_node::engine::{Engine, LOOKUP_PATIENCE_MS, Output};
 use roster::batch::{BatchEntry, BatchHeader, pieces_of};
 use roster::id::{DeviceId, NetworkId, OperationId};
 use roster::leaf::Mode;
@@ -49,46 +50,27 @@ enum At {
 enum Carried {
     /// A roster-sync message, as the daemon sends it on the roster channel.
     Roster(Vec<u8>),
-    /// A light member asking for the roots after the one it holds.
-    RootsAfter([u8; 32]),
-    /// The roots asked for.
-    Roots(Vec<u8>),
-    /// A light member asking for its own leaf and proof again.
-    Renew,
-    /// The evidence asked for.
-    Evidence(Vec<u8>),
+    /// A lookup message, as the daemon sends it on the lookup channel: a light
+    /// member's engine asking (roots after its own, its footing, its proof
+    /// again), or a full member answering.
+    Lookup(Vec<u8>),
     /// What one side shows the other as a session opens: its compact
     /// evidence, in `OPEN` or `ACCEPT`.
     Shown(Vec<u8>),
     /// A light member that cannot place the root it was shown, as `BEHIND`.
     Behind([u8; 32]),
-    /// A light member asking what it stands on, after taking a root, with the
-    /// digest of the footing it last took.
-    Footing(Option<[u8; 32]>),
-    /// What it stands on, as a footing answer carries it.
-    Footed(Vec<u8>),
+    /// The roots `BEHIND` asked for, as `ROOTS`.
+    Roots(Vec<u8>),
 }
 
 impl Carried {
-    /// What it costs on the wire, near enough: its payload, and the lookup
-    /// message's framing where it is one.
+    /// What it costs on the wire, near enough: its payload, and the frame's
+    /// framing where it is one of the transport's.
     fn bytes(&self) -> u64 {
         let length = match self {
-            Self::Roster(bytes)
-            | Self::Roots(bytes)
-            | Self::Evidence(bytes)
-            | Self::Footed(bytes) => bytes.len(),
+            Self::Roster(bytes) | Self::Lookup(bytes) | Self::Roots(bytes) => bytes.len(),
             Self::Shown(bytes) => bytes.len().saturating_add(10),
-            Self::RootsAfter(_) => 32 + 6,
-            Self::Footing(held) => {
-                if held.is_some() {
-                    64 + 6
-                } else {
-                    32 + 6
-                }
-            }
             Self::Behind(_) => 32 + 9,
-            Self::Renew => 16 + 6,
         };
         u64::try_from(length).unwrap_or(u64::MAX)
     }
@@ -113,15 +95,14 @@ struct Full {
 }
 
 struct Light {
-    member: LightMember,
+    /// Its member and upkeep, run by the engine the daemon runs.
+    engine: Engine,
     online: bool,
     /// The full members it keeps in touch with.
     kept: Vec<usize>,
     /// Whether its sessions with them are open: from when it comes online
     /// until it goes off.
     in_session: bool,
-    /// The digest of the footing it last took.
-    footing: Option<[u8; 32]>,
     renewed: u64,
     sent: u64,
     received: u64,
@@ -159,6 +140,32 @@ impl core::fmt::Display for Phase {
     }
 }
 
+/// What a full member answers a lookup question, as `Node::answer_lookup`:
+/// the footing, the roots after one, or a member's evidence.
+fn full_answers(full: &Full, question: &[u8]) -> Option<Vec<u8>> {
+    let Some(crate::lookup::Message::Request { id, query }) =
+        crate::lookup::Message::decode(question)
+    else {
+        return None;
+    };
+    let roster = full.syncer.roster();
+    let evidence = match &query {
+        crate::lookup::Query::Footing(asker, held) => {
+            crate::lookup::footing_of(roster, asker, held.as_ref(), &|_| true)
+        }
+        crate::lookup::Query::RootsAfter(since) => crate::lookup::encode_roots_within(
+            &roster.roots_after(since),
+            crate::lookup::MAX_ROOTS_ANSWER,
+        ),
+        other => roster
+            .state()
+            .ok()
+            .and_then(|state| crate::lookup::resolve(&state, other))
+            .map_or_else(Vec::new, |device| crate::snapshots::evidence_of(roster, &device)),
+    };
+    Some(crate::lookup::Message::Answer { id, evidence }.encode())
+}
+
 /// A network of full and light members.
 pub(crate) struct Simulation {
     founder: Arc<NodeIdentity>,
@@ -168,6 +175,9 @@ pub(crate) struct Simulation {
     light_index: BTreeMap<DeviceId, usize>,
     queue: Vec<Envelope>,
     clock: u64,
+    /// The light members' engines' clock, in milliseconds: a hop a tenth of a
+    /// second, so a question whose answer was lost is given up within fifty.
+    now: u64,
 }
 
 /// How many full members a light member keeps in touch with, as
@@ -259,6 +269,7 @@ impl Simulation {
             light_index: BTreeMap::new(),
             queue: Vec::new(),
             clock,
+            now: 0,
         };
         simulation.choose_neighbours();
         simulation
@@ -322,8 +333,24 @@ impl Simulation {
         // last is held, as an admin admits a fleet larger than one batch.
         let most = usize::try_from(roster::limits::MAX_BATCH_ENTRIES).unwrap_or(usize::MAX);
         let mut out = Vec::new();
-        for lot in entries.chunks(most) {
-            let header = BatchHeader::for_entries(lot, Mode::Light, Vec::new(), None, "sim")
+        for chunk in entries.chunks(most) {
+            // Each lot given the lowest run of the block free, in device order,
+            // as an admin's daemon gives one (`batches::prepared`).
+            let mut lot = chunk.to_vec();
+            lot.sort_by_key(|entry| entry.device_id().ok());
+            let count = u32::try_from(lot.len()).expect("a batch's size");
+            let first = self
+                .fulls
+                .first()
+                .and_then(|founder| founder.syncer.roster().state().ok())
+                .and_then(|state| state.free_offsets(count))
+                .expect("room in the block");
+            let run = roster::batch::OffsetRun::new(first, count).expect("a run");
+            for (entry, offset) in lot.iter_mut().zip(run.offsets()) {
+                entry.ipv4 = Some(offset);
+            }
+            let lot = lot.as_slice();
+            let header = BatchHeader::for_entries(lot, Mode::Light, Vec::new(), Some(run), "sim")
                 .expect("a header");
             let (batch, header) = self.founder_signs(OperationBody::AdmitBatch(header));
             let pieces = pieces_of(&batch, lot).expect("pieces");
@@ -379,17 +406,17 @@ impl Simulation {
         }
         for (board, member, kept) in lights {
             let at = self.lights.len();
+            let engine = Engine::new(member);
             for full in &kept {
                 if let Some(full) = self.fulls.get_mut(*full) {
                     full.serves.push(at);
                 }
             }
             self.lights.push(Light {
-                member,
+                engine,
                 online: true,
                 kept,
                 in_session: false,
-                footing: None,
                 renewed: 0,
                 sent: 0,
                 received: 0,
@@ -432,14 +459,11 @@ impl Simulation {
     /// pushed on its sessions. The revoked one is out, its sessions closed.
     pub(crate) fn revoke_and_rename(&mut self, revoked: usize, renamed: usize) -> Phase {
         let device = |at: usize, lights: &[Light]| {
-            lights.get(at).map(|light| light.member.device()).expect("a light member")
+            lights.get(at).map(|light| light.engine.member().device()).expect("a light member")
         };
         let gone = device(revoked, &self.lights);
         let changed = device(renamed, &self.lights);
-        if let Some(light) = self.lights.get_mut(revoked) {
-            light.online = false;
-            light.in_session = false;
-        }
+        self.switch_off(&[revoked]);
         let before = self.counters();
         let mut signed = Vec::new();
         for body in [
@@ -468,8 +492,11 @@ impl Simulation {
     /// runs until every full member holds it, and every light member online
     /// the root.
     pub(crate) fn rename(&mut self, renamed: usize) -> Phase {
-        let device =
-            self.lights.get(renamed).map(|light| light.member.device()).expect("a light member");
+        let device = self
+            .lights
+            .get(renamed)
+            .map(|light| light.engine.member().device())
+            .expect("a light member");
         let before = self.counters();
         self.clock = self.clock.saturating_add(1);
         let (id, bytes) = self.founder_signs(OperationBody::Rename {
@@ -491,10 +518,16 @@ impl Simulation {
     /// Takes light members offline, their sessions gone, so roots published
     /// meanwhile do not reach them.
     pub(crate) fn switch_off(&mut self, lights: &[usize]) {
+        let ids: Vec<DeviceId> = self.fulls.iter().map(|full| full.id).collect();
         for at in lights {
             if let Some(light) = self.lights.get_mut(*at) {
                 light.online = false;
                 light.in_session = false;
+                for full in &light.kept {
+                    if let Some(id) = ids.get(*full) {
+                        light.engine.session_closed(id);
+                    }
+                }
             }
         }
     }
@@ -502,10 +535,14 @@ impl Simulation {
     /// Brings light members back: they meet their full members at the next
     /// [`Self::hour`].
     pub(crate) fn switch_on(&mut self, lights: &[usize]) {
+        // Off long enough for whatever it asked to be given up.
+        self.now = self.now.saturating_add(LOOKUP_PATIENCE_MS);
         for at in lights {
             if let Some(light) = self.lights.get_mut(*at) {
                 light.online = true;
+                light.engine.tick(self.now);
             }
+            self.carry_out(*at);
         }
     }
 
@@ -527,17 +564,13 @@ impl Simulation {
                 continue;
             }
             light.in_session = true;
-            let own = light.member.shown();
+            let own = light.engine.member().shown();
             // The first full member met after a start is asked what the light
-            // member stands on, as `Node::serving` asks it (`footing_due`).
-            if light.footing.is_none()
-                && let Some(first) = light.kept.first()
-            {
-                self.queue.push(Envelope {
-                    from: At::Light(at),
-                    to: At::Full(*first),
-                    carried: Carried::Footing(None),
-                });
+            // member stands on, as `Node::serving` tells the engine.
+            for full in &light.kept {
+                if let Some(id) = self.fulls.get(*full).map(|full| full.id) {
+                    light.engine.session_opened(id, self.now);
+                }
             }
             for full in light.kept.clone() {
                 self.queue.push(Envelope {
@@ -552,6 +585,7 @@ impl Simulation {
                     carried: Carried::Shown(theirs),
                 });
             }
+            self.carry_out(at);
         }
         let ticks = self.run_until(Self::lights_hold_the_root);
         self.phase_since(&before, ticks)
@@ -560,7 +594,7 @@ impl Simulation {
     /// Whether every light member online holds the founder's root.
     fn lights_hold_the_root(&self) -> bool {
         let root = self.founder_roster().snapshot().map(|held| held.body().root);
-        self.lights.iter().all(|light| !light.online || light.member.current() == root)
+        self.lights.iter().all(|light| !light.online || light.engine.member().current() == root)
     }
 
     /// What a light member keeps, as it writes it: its memory, near enough.
@@ -568,7 +602,7 @@ impl Simulation {
         let sizes: Vec<u64> = self
             .lights
             .iter()
-            .map(|light| u64::try_from(light.member.to_bytes().len()).unwrap_or(u64::MAX))
+            .map(|light| u64::try_from(light.engine.member().to_bytes().len()).unwrap_or(u64::MAX))
             .collect();
         spread_of(&sizes)
     }
@@ -582,7 +616,7 @@ impl Simulation {
     pub(crate) fn light_roots(&self) -> BTreeMap<Option<[u8; 32]>, usize> {
         let mut counted = BTreeMap::new();
         for light in &self.lights {
-            let held = counted.entry(light.member.current()).or_insert(0_usize);
+            let held = counted.entry(light.engine.member().current()).or_insert(0_usize);
             *held = held.saturating_add(1);
         }
         counted
@@ -617,7 +651,7 @@ impl Simulation {
         let Some(full) = self.fulls.get(from) else { return };
         let peer = match to {
             At::Full(other) => self.fulls.get(other).map(|other| other.id),
-            At::Light(light) => self.lights.get(light).map(|light| light.member.device()),
+            At::Light(light) => self.lights.get(light).map(|light| light.engine.member().device()),
         };
         let Some(peer) = peer else { return };
         if let Some(shaped) = full.syncer.for_peer(&peer, message.clone()) {
@@ -636,9 +670,22 @@ impl Simulation {
         let mut reached = done(self).then_some(0);
         while !self.queue.is_empty() {
             ticks = ticks.saturating_add(1);
+            self.now = self.now.saturating_add(100);
             let now: Vec<Envelope> = std::mem::take(&mut self.queue);
             for envelope in now {
                 self.deliver(envelope);
+            }
+            // What an engine gave up on, past its deadline.
+            for at in 0..self.lights.len() {
+                let late = self.lights.get(at).is_some_and(|light| {
+                    light.online && light.engine.next_deadline().is_some_and(|due| due <= self.now)
+                });
+                if late {
+                    if let Some(light) = self.lights.get_mut(at) {
+                        light.engine.tick(self.now);
+                    }
+                    self.carry_out(at);
+                }
             }
             if reached.is_none() && done(self) {
                 reached = Some(ticks);
@@ -659,29 +706,15 @@ impl Simulation {
         self.count(to, bytes, false);
         match (to, carried) {
             (At::Full(at), Carried::Roster(payload)) => self.full_receives(at, from, &payload),
-            (At::Full(at), Carried::RootsAfter(since)) => {
-                let roots = self
-                    .fulls
-                    .get(at)
-                    .map(|full| full.syncer.roster().roots_after(&since))
-                    .unwrap_or_default();
-                let answer = crate::lookup::encode_roots(&roots);
-                self.queue.push(Envelope { from: to, to: from, carried: Carried::Roots(answer) });
-            }
-            (At::Full(at), Carried::Renew) => {
-                let At::Light(light) = from else { return };
-                let device = self.lights.get(light).map(|light| light.member.device());
-                let evidence = match (self.fulls.get(at), device) {
-                    (Some(full), Some(device)) => {
-                        crate::snapshots::evidence_of(full.syncer.roster(), &device)
-                    }
-                    _ => Vec::new(),
-                };
-                self.queue.push(Envelope {
-                    from: to,
-                    to: from,
-                    carried: Carried::Evidence(evidence),
-                });
+            (At::Full(at), Carried::Lookup(question)) => {
+                let answer = self.fulls.get(at).and_then(|full| full_answers(full, &question));
+                if let Some(answer) = answer {
+                    self.queue.push(Envelope {
+                        from: to,
+                        to: from,
+                        carried: Carried::Lookup(answer),
+                    });
+                }
             }
             (At::Full(at), Carried::Behind(since)) => {
                 // As `Node::roots_source` answers it: within one frame.
@@ -696,32 +729,15 @@ impl Simulation {
                 );
                 self.queue.push(Envelope { from: to, to: from, carried: Carried::Roots(answer) });
             }
-            (At::Full(at), Carried::Footing(held)) => {
-                let At::Light(light) = from else { return };
-                let device = self.lights.get(light).map(|light| light.member.device());
-                let footing = match (self.fulls.get(at), device) {
-                    (Some(full), Some(device)) => crate::lookup::footing_of(
-                        full.syncer.roster(),
-                        &device,
-                        held.as_ref(),
-                        &|_| true,
-                    ),
-                    _ => Vec::new(),
-                };
-                self.queue.push(Envelope { from: to, to: from, carried: Carried::Footed(footing) });
-            }
             (At::Light(at), carried) => self.light_receives(at, from, carried),
-            (
-                At::Full(_),
-                Carried::Roots(_) | Carried::Evidence(_) | Carried::Shown(_) | Carried::Footed(_),
-            ) => {}
+            (At::Full(_), Carried::Shown(_) | Carried::Roots(_)) => {}
         }
     }
 
     fn full_receives(&mut self, at: usize, from: At, payload: &[u8]) {
         let peer = match from {
             At::Full(other) => self.fulls.get(other).map(|other| other.id),
-            At::Light(light) => self.lights.get(light).map(|light| light.member.device()),
+            At::Light(light) => self.lights.get(light).map(|light| light.engine.member().device()),
         };
         let (Some(peer), Some(full)) = (peer, self.fulls.get_mut(at)) else { return };
         let reception = full.syncer.receive(peer, payload);
@@ -733,78 +749,78 @@ impl Simulation {
         }
     }
 
+    /// What a light member receives, given to its engine as the daemon gives
+    /// it; then what the engine asks, carried out.
     fn light_receives(&mut self, at: usize, from: At, carried: Carried) {
+        let At::Full(full) = from else { return };
+        let Some(peer) = self.fulls.get(full).map(|full| full.id) else { return };
+        let now = self.now;
         let Some(light) = self.lights.get_mut(at) else { return };
-        let mut asks = Vec::new();
         match carried {
             Carried::Roster(payload) => {
                 let Ok(Message::Snapshot(root)) = Message::decode(&payload) else { return };
-                match light.member.offer_root(&root) {
-                    Ok(roster::light::RootOutcome::NeedsChain) => {
-                        if let Some(current) = light.member.current() {
-                            asks.push(Carried::RootsAfter(current));
-                        }
-                    }
-                    // As `Node::received_light`: on taking a root, what it stands
-                    // on is asked of the one who pushed it, and the proof renewed
-                    // when the root named it. Asked once: the same root from its
-                    // other anchors is taken already.
-                    Ok(
-                        roster::light::RootOutcome::Adopted
-                        | roster::light::RootOutcome::Switched
-                        | roster::light::RootOutcome::KeptAside,
-                    ) => {
-                        asks.push(Carried::Footing(light.footing));
-                        if light.member.needs_renewal() {
-                            asks.push(Carried::Renew);
-                        }
-                    }
-                    _ => {}
-                }
+                light.engine.root_pushed(peer, &root, now);
             }
+            Carried::Lookup(answer) => light.engine.lookup(peer, &answer, now),
             Carried::Shown(shown) => {
                 // As the light member's transport judges it as a session opens:
                 // believed against a root it remembers, or the chain asked.
-                let Ok(shown) = roster::membership::Shown::from_bytes(&shown) else { return };
-                if light.member.believes_shown(&shown) {
+                let Ok(compact) = roster::membership::Shown::from_bytes(&shown) else { return };
+                if light.engine.judge(&compact) {
                     return;
                 }
-                if let Some(current) = light.member.behind(&shown.against) {
-                    asks.push(Carried::Behind(current));
+                if let Some(current) = light.engine.behind(&shown) {
+                    self.queue.push(Envelope {
+                        from: At::Light(at),
+                        to: from,
+                        carried: Carried::Behind(current),
+                    });
                 }
+                return;
             }
-            Carried::Roots(answer) => {
-                let chain = crate::lookup::decode_roots(&answer).unwrap_or_default();
-                if light.member.take_chain(&chain) {
-                    asks.push(Carried::Footing(light.footing));
-                    if light.member.needs_renewal() {
-                        asks.push(Carried::Renew);
+            Carried::Roots(roots) => {
+                let shown = self
+                    .fulls
+                    .get(full)
+                    .map(|full| crate::snapshots::shown_of(full.syncer.roster(), &full.id))
+                    .unwrap_or_default();
+                let Some(light) = self.lights.get_mut(at) else { return };
+                let _taken = light.engine.take_roots(&shown, &roots, now);
+            }
+            Carried::Behind(_) => return,
+        }
+        self.carry_out(at);
+    }
+
+    /// Carries out what light member `at`'s engine asks: its questions sent to
+    /// the full members it names, its renewals counted.
+    fn carry_out(&mut self, at: usize) {
+        loop {
+            let Some(output) = self.lights.get_mut(at).and_then(|light| light.engine.poll_output())
+            else {
+                return;
+            };
+            match output {
+                Output::Send { peer, body, .. } => {
+                    if let Some(full) = self.fulls.iter().position(|full| full.id == peer) {
+                        self.queue.push(Envelope {
+                            from: At::Light(at),
+                            to: At::Full(full),
+                            carried: Carried::Lookup(body),
+                        });
                     }
                 }
-            }
-            Carried::Evidence(bytes) => {
-                let renewed = roster::membership::Evidence::from_bytes(&bytes)
-                    .ok()
-                    .is_some_and(|evidence| light.member.renew(evidence).is_ok());
-                if renewed {
-                    light.renewed = light.renewed.saturating_add(1);
+                Output::Renewed => {
+                    if let Some(light) = self.lights.get_mut(at) {
+                        light.renewed = light.renewed.saturating_add(1);
+                    }
                 }
+                Output::Keep
+                | Output::Reconsider
+                | Output::StateChanged
+                | Output::WakeAt(_)
+                | Output::Found { .. } => {}
             }
-            Carried::Footed(answer) => {
-                // As `Node::take_footing_from`: its own digest back is nothing
-                // new; a footing is taken, and its digest kept.
-                if light.footing.is_some_and(|held| answer == held) {
-                    return;
-                }
-                if let Some(footing) = crate::lookup::Footing::decode(&answer) {
-                    let _taken = crate::lookup::take_footing(&mut light.member, &footing);
-                    light.footing = Some(footing.digest());
-                }
-            }
-            Carried::RootsAfter(_) | Carried::Renew | Carried::Behind(_) | Carried::Footing(_) => {}
-        }
-        for carried in asks {
-            self.queue.push(Envelope { from: At::Light(at), to: from, carried });
         }
     }
 

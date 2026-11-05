@@ -205,9 +205,13 @@ pub trait Transport: Send + Sync {
 }
 
 /// The roots a node holding a roster took after the one named, as the bytes
-/// [`CatchingUp::take`] reads, no more than one answer holds.
+/// [`CatchingUp::take`] reads, in no more than the bytes given: what the
+/// asking peer takes in one answer.
 pub type RootsAfter = std::sync::Arc<
-    dyn Fn([u8; 32]) -> core::pin::Pin<Box<dyn core::future::Future<Output = Vec<u8>> + Send>>
+    dyn Fn(
+            [u8; 32],
+            usize,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Vec<u8>> + Send>>
         + Send
         + Sync,
 >;

@@ -81,6 +81,15 @@ impl MemberStore for Kept {
         addresses.keys().filter(|(held, _)| *held == address).map(|(_, device)| *device).collect()
     }
 
+    fn address_claims_from(
+        &self,
+        from: ([u8; 4], DeviceId),
+        count: usize,
+    ) -> Vec<([u8; 4], DeviceId)> {
+        let addresses = self.addresses.lock().unwrap();
+        addresses.range(from..).take(count).map(|(claim, ())| *claim).collect()
+    }
+
     fn name_holders(&self, name: &str) -> Vec<DeviceId> {
         let leaves = self.leaves.lock().unwrap();
         leaves
@@ -129,11 +138,16 @@ impl Kept {
 
 /// The leaf of fixture device `seed`, with an address when `address` is set.
 fn leaf(seed: u8, address: Option<u8>) -> DeviceLeaf {
-    let record = device(seed, &format!("d{seed}"), Role::Member, false)
+    leaf_as(seed, address, Role::Member)
+}
+
+/// The leaf of fixture device `seed` in `role`.
+fn leaf_as(seed: u8, address: Option<u8>, role: Role) -> DeviceLeaf {
+    let record = device(seed, &format!("d{seed}"), role, false)
         .into_record(OperationId::from_bytes([seed; 32]))
         .unwrap();
     let settings =
-        DeviceSettings::new(Mode::Full, Vec::new(), address.map(|last| [100, 70, 0, last]), None)
+        DeviceSettings::new(Mode::Full, Vec::new(), address.map(|last| [0, 0, 0, last]), None)
             .unwrap();
     DeviceLeaf { record, settings }
 }
@@ -144,7 +158,8 @@ fn fixture(seeds: &[u8]) -> Vec<DeviceLeaf> {
         .iter()
         .map(|seed| {
             let seed = (seed % 99).saturating_add(1);
-            leaf(seed, (seed % 3 == 0).then_some(seed))
+            let role = if seed % 7 == 0 { Role::Admin } else { Role::Member };
+            leaf_as(seed, (seed % 3 == 0).then_some(seed), role)
         })
         .collect();
     leaves.sort_by_key(|leaf| leaf.record.id);
@@ -161,8 +176,30 @@ fn transport_key(leaf: &DeviceLeaf) -> KeyId {
         .unwrap()
 }
 
+/// The lowest `count` offsets from 1 to `last` no member holds, each asked of
+/// the index on its own: what [`Members::lowest_unclaimed`] reads in one pass.
+fn lowest_by_lookup(members: &Members, last: u32, count: u32) -> Option<u32> {
+    let mut run = 0_u32;
+    for offset in 1..=last {
+        if members.holding_address(offset.to_be_bytes()).is_empty() {
+            run = run.saturating_add(1);
+            if run == count {
+                return Some(offset.saturating_add(1).saturating_sub(count));
+            }
+        } else {
+            run = 0;
+        }
+    }
+    None
+}
+
 /// The same devices in memory and over a store answer the same.
 fn assert_same(memory: &Members, stored: &Members) {
+    for count in [1_u32, 2, 3, 7] {
+        let expected = lowest_by_lookup(memory, 120, count);
+        assert_eq!(memory.lowest_unclaimed(120, count), expected, "in memory, {count}");
+        assert_eq!(stored.lowest_unclaimed(120, count), expected, "over a store, {count}");
+    }
     assert_eq!(stored.len(), memory.len());
     assert_eq!(stored.root(), memory.root());
     let in_memory: Vec<DeviceLeaf> = memory.leaves();
@@ -183,13 +220,31 @@ fn assert_same(memory: &Members, stored: &Members) {
         assert_eq!(named(stored), vec![device], "found by name, case aside");
         assert_eq!(named(memory), vec![device]);
     }
+    // A page begins after any member, or none, as the whole listing goes on.
+    let ids: Vec<DeviceId> = in_memory.iter().map(|leaf| leaf.record.id).collect();
+    for (at, from) in core::iter::once(None).chain(ids.iter().copied().map(Some)).enumerate() {
+        let rest = ids.get(at..).unwrap_or_default();
+        let after = |members: &Members| -> Vec<DeviceId> {
+            members.iter_after(from).map(|(device, _)| device).collect()
+        };
+        assert_eq!(after(memory), rest, "in memory, after {at}");
+        assert_eq!(after(stored), rest, "over a store, after {at}");
+    }
+    // The admins, from an index, are those a pass over every member finds.
+    let admins: Vec<DeviceId> = in_memory
+        .iter()
+        .filter(|leaf| leaf.record.role == Role::Admin)
+        .map(|leaf| leaf.record.id)
+        .collect();
+    assert_eq!(memory.admins(), admins, "in memory");
+    assert_eq!(stored.admins(), admins, "over a store");
 }
 
 proptest! {
     #[test]
     fn devices_over_a_store_answer_and_change_as_in_memory(
         base in proptest::collection::vec(any::<u8>(), 0..60),
-        changes in proptest::collection::vec((0u8..3, any::<u8>()), 0..30),
+        changes in proptest::collection::vec((0u8..4, any::<u8>()), 0..30),
     ) {
         let leaves = fixture(&base);
         let (kept, root) = Kept::of(&leaves);
@@ -199,7 +254,8 @@ proptest! {
 
         for (act, seed) in changes {
             let seed = (seed % 99).saturating_add(1);
-            let changed = leaf(seed, (act == 2).then_some(seed));
+            let role = if act == 3 { Role::Admin } else { Role::Member };
+            let changed = leaf_as(seed, (act == 2).then_some(seed), role);
             let device = changed.record.id;
             match act {
                 0 => {

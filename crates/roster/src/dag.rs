@@ -21,7 +21,8 @@
 //! because the alternative to detecting it is looping forever on input someone
 //! else supplied.
 
-use std::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
+use crate::prelude::*;
 
 use crate::error::{Error, Result};
 use crate::id::{DeviceId, KeyId, NetworkId, OperationId};
@@ -119,13 +120,13 @@ impl BitSet {
 /// them every time it resolves a state, and working out a device's id checks
 /// every one of its keys: done there, two thousand boards cost a daemon minutes
 /// of start-up (found in the testbed, 18.1).
-type HeldBatch = alloc::sync::Arc<crate::members::Layer>;
+type HeldBatch = crate::sync::Arc<crate::members::Layer>;
 
 /// Where a graph keeps the layers of its whole batches: in memory, or in a
 /// store, which a full member of a fleet gives it so that a million boards
 /// are not held in memory.
 #[derive(Clone, Default)]
-struct LayersIn(Option<alloc::sync::Arc<dyn crate::members::LayerStore>>);
+struct LayersIn(Option<crate::sync::Arc<dyn crate::members::LayerStore>>);
 
 impl core::fmt::Debug for LayersIn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -217,8 +218,7 @@ impl Dag {
     /// part in a cycle — the two are distinguished, because they mean very
     /// different things about the sender.
     pub fn from_operations(operations: Vec<VerifiedOperation>) -> Result<Self> {
-        let present: std::collections::HashSet<OperationId> =
-            operations.iter().map(VerifiedOperation::id).collect();
+        let present: HashSet<OperationId> = operations.iter().map(VerifiedOperation::id).collect();
 
         let mut dag = Self::new();
         let mut remaining = operations;
@@ -442,7 +442,7 @@ impl Dag {
                     id,
                     header.mode,
                     header.groups.clone(),
-                    alloc::sync::Arc::clone(store),
+                    crate::sync::Arc::clone(store),
                     header.entries,
                     entries.len(),
                 )
@@ -450,24 +450,24 @@ impl Dag {
             None => crate::members::Layer::new(id, header.mode, header.groups.clone(), entries),
         };
         self.insert(operation)?;
-        self.batch_entries.insert(id, alloc::sync::Arc::new(layer));
+        self.batch_entries.insert(id, crate::sync::Arc::new(layer));
         Ok(())
     }
 
     /// Keeps the layers of the batches that become whole from here on in
     /// `store`, rather than in memory.
-    pub fn keep_layers_in(&mut self, store: alloc::sync::Arc<dyn crate::members::LayerStore>) {
+    pub fn keep_layers_in(&mut self, store: crate::sync::Arc<dyn crate::members::LayerStore>) {
         self.layers_in = LayersIn(Some(store));
     }
 
     /// The layers of the whole batches this graph holds.
-    pub fn layers(&self) -> impl Iterator<Item = &alloc::sync::Arc<crate::members::Layer>> {
+    pub fn layers(&self) -> impl Iterator<Item = &crate::sync::Arc<crate::members::Layer>> {
         self.batch_entries.values()
     }
 
     /// Where the layers of whole batches are kept, if not in memory.
     #[must_use]
-    pub fn layer_store(&self) -> Option<&alloc::sync::Arc<dyn crate::members::LayerStore>> {
+    pub fn layer_store(&self) -> Option<&crate::sync::Arc<dyn crate::members::LayerStore>> {
         self.layers_in.0.as_ref()
     }
 
@@ -477,7 +477,7 @@ impl Dag {
     pub fn batch_layer(
         &self,
         batch: &OperationId,
-    ) -> Option<&alloc::sync::Arc<crate::members::Layer>> {
+    ) -> Option<&crate::sync::Arc<crate::members::Layer>> {
         self.batch_entries.get(batch)
     }
 
@@ -642,7 +642,7 @@ impl Dag {
         // forward from an earlier compaction, plus any fork this one would
         // discard.
         rebuilt.kept_evidence = core::mem::take(&mut self.kept_evidence);
-        let surviving: std::collections::HashSet<usize> = keep.iter().copied().collect();
+        let surviving: HashSet<usize> = keep.iter().copied().collect();
         for fork in self.forks() {
             if surviving.contains(&fork.first) && surviving.contains(&fork.second) {
                 continue;

@@ -36,22 +36,29 @@ pub(crate) struct Membership {
 }
 
 /// Every device this roster names, and every key it knows the owner of.
+///
+/// The members are asked as a device is named, through the state's indexes:
+/// a report names a page of them, the accused and the revoked, and a copy of
+/// every member's name and keys per report would be the roster's size at a
+/// million (`scalable-membership` 16.6). What is held is what the valid
+/// operations admitted, which the graph's window bounds.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Directory {
-    /// The name each device goes by: its current name if it is a member, and the
-    /// name it was admitted under otherwise.
+    /// The members, asked first: the name a member goes by now, and its keys.
+    members: roster::members::Members,
+    /// The name each device was admitted under, for those no longer members.
     names: BTreeMap<DeviceId, String>,
-    /// The device each key belongs to.
+    /// The device each key admitted belongs to.
     owners: BTreeMap<KeyId, DeviceId>,
 }
 
 impl Directory {
     /// Builds the directory from the derived state and the valid operations held.
     ///
-    /// Admissions first, in the order held, keeping the first for a device — a
-    /// roster keeps the first admission of a device id for good. Then the current
-    /// members overwrite with the names they go by now, which also covers members
-    /// whose admission a snapshot discarded.
+    /// Admissions, in the order held, keeping the first for a device — a
+    /// roster keeps the first admission of a device id for good. The current
+    /// members answer before them, with the names they go by now, which also
+    /// covers members whose admission a snapshot discarded.
     ///
     /// **Valid operations only.** The graph holds everything that verified,
     /// including operations the roster's rules then disregarded. An admission any
@@ -70,12 +77,7 @@ impl Directory {
             directory.admit(spec);
         }
 
-        for record in state.devices.values() {
-            directory.names.insert(record.id, record.name.clone());
-            for key in &record.keys {
-                directory.owners.insert(KeyId::of_public_key(&key.value), record.id);
-            }
-        }
+        directory.members = state.devices.clone();
         directory
     }
 
@@ -90,7 +92,8 @@ impl Directory {
 
     /// A device, named as well as this roster can.
     pub(crate) fn named(&self, device: &DeviceId) -> Named {
-        Named::new(device, self.names.get(device).cloned())
+        let current = self.members.get(device).map(|leaf| leaf.record.name.clone());
+        Named::new(device, current.or_else(|| self.names.get(device).cloned()))
     }
 
     /// The device behind a key.
@@ -99,7 +102,11 @@ impl Directory {
     /// is the digest of its identifying signing key, which is the key that signs,
     /// so the same bytes name the device.
     pub(crate) fn owner(&self, key: &KeyId) -> DeviceId {
-        self.owners.get(key).copied().unwrap_or_else(|| DeviceId::from_bytes(*key.as_bytes()))
+        self.members
+            .holding(key, None)
+            .map(|leaf| leaf.record.id)
+            .or_else(|| self.owners.get(key).copied())
+            .unwrap_or_else(|| DeviceId::from_bytes(*key.as_bytes()))
     }
 
     /// What an operation does, with every device in it named.

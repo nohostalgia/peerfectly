@@ -79,7 +79,10 @@ fn entry(n: u32) -> BatchEntry {
     .map(|(tag, purpose)| KeyEntry::new(Algorithm::Ed25519, purpose, hash(tag)).unwrap())
     .collect();
     keys.sort_by_key(KeyEntry::order_key);
-    BatchEntry { keys, name: format!("board-{n}"), serial: n.to_be_bytes().to_vec(), ipv4: None }
+    // Each its offset in the network's block, after the founder's: a fleet's
+    // boards hold consecutive addresses.
+    let ipv4 = Some(n.saturating_add(2).to_be_bytes());
+    BatchEntry { keys, name: format!("board-{n}"), serial: n.to_be_bytes().to_vec(), ipv4 }
 }
 
 /// The founder's device, from its signer.
@@ -167,8 +170,10 @@ fn a_full_member_holds_nothing_per_board_with_its_layers_on_disk() {
         let lot: Vec<BatchEntry> = (admitted..admitted.saturating_add(count))
             .map(|n| entry(u32::try_from(n).unwrap()))
             .collect();
+        let first = u32::try_from(admitted).unwrap().saturating_add(2).to_be_bytes();
+        let run = roster::batch::OffsetRun::new(first, u32::try_from(count).unwrap()).unwrap();
         let header =
-            BatchHeader::for_entries(&lot, Mode::Light, Vec::new(), None, "fleet").unwrap();
+            BatchHeader::for_entries(&lot, Mode::Light, Vec::new(), Some(run), "fleet").unwrap();
         let (batch, bytes) = sign(&roster, OperationBody::AdmitBatch(header), network);
         let _ = roster.offer_bytes(&bytes);
         for piece in pieces_of(&batch, &lot).unwrap() {
@@ -178,6 +183,15 @@ fn a_full_member_holds_nothing_per_board_with_its_layers_on_disk() {
     }
     let held = roster.state().unwrap();
     assert_eq!(held.devices.len(), devices.saturating_add(1), "every board admitted");
+    // The next device admitted is given the lowest offset free: past every
+    // board's, which an admission asks the index for one at a time.
+    let asked = std::time::Instant::now();
+    let next = held.free_offsets(1).map(u32::from_be_bytes);
+    println!(
+        "the lowest offset free, past {devices} boards: {next:?}, found in {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(next, u32::try_from(devices).ok().map(|boards| boards.saturating_add(2)));
     drop(held);
     report("the roster, every board admitted, layers on disk", live().saturating_sub(start));
     report("  at its peak while admitting", peak().saturating_sub(start));
