@@ -100,6 +100,26 @@ pub trait Transport: Send + Sync {
     /// its caller. Every implementation that keeps its own copy must override it.
     async fn update_state(&self, _state: RosterState) {}
 
+    /// Hands the transport what this device shows a peer as a session opens:
+    /// its leaf, the proof of it and the hash of the root they rest on, as the
+    /// bytes of a `roster::membership::Shown`. Empty when it holds no root.
+    ///
+    /// A peer holding no roster judges this device by it alone; a peer holding
+    /// one judges by its state and may ignore it. Replaces what was said
+    /// before. The default ignores it, which is right for a transport whose
+    /// peers all hold a roster.
+    fn update_evidence(&self, _evidence: Vec<u8>) {}
+
+    /// Judges every open session again, for a transport whose peers were
+    /// judged by their evidence: called when what the caller believes changed —
+    /// a new root, or an invalidation naming a peer — so that a peer no longer
+    /// shown a member is cut off then, not at its next session. Its session is
+    /// closed as a loss of membership.
+    ///
+    /// The default does nothing, which is right for a transport that judges
+    /// peers by state: [`Self::update_state`] is its reconsideration.
+    fn reconsider(&self) {}
+
     /// Says which blocks of addresses are served by tunnels the caller runs.
     ///
     /// A transport that finds its own caller's tunnel among the machine's
@@ -164,7 +184,59 @@ pub trait Transport: Send + Sync {
     async fn path_to(&self, _peer: &DeviceId) -> Option<Path> {
         None
     }
+
+    /// Hands a node holding a roster what to answer a peer that cannot place
+    /// the root this node rests on: the roots taken after the one the peer
+    /// names, as `roots` gives them.
+    ///
+    /// The default ignores it, which is right for a transport whose peers all
+    /// hold a roster.
+    fn serve_roots(&self, _roots: RootsAfter) {}
+
+    /// Hands a node holding no roster how to catch up while a session opens,
+    /// when the root a peer's evidence rests on is one it cannot place.
+    ///
+    /// Without it such a peer is refused, and a member that missed roots —
+    /// off while two were published, or following another admin's branch —
+    /// refuses every member that holds them, for good: found in the testbed
+    /// (18.1). The default ignores it, which is right for a transport whose
+    /// peers all hold a roster.
+    fn catch_up_by(&self, _catching: CatchingUp) {}
 }
+
+/// The roots a node holding a roster took after the one named, as the bytes
+/// [`CatchingUp::take`] reads, in no more than the bytes given: what the
+/// asking peer takes in one answer.
+pub type RootsAfter = std::sync::Arc<
+    dyn Fn(
+            [u8; 32],
+            usize,
+        ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Vec<u8>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How a node holding no roster catches up while a session opens.
+///
+/// Nothing a peer sends is believed for being sent: every root taken is
+/// verified against the one before it, and the peer's evidence is judged
+/// again only afterwards.
+#[derive(Clone)]
+pub struct CatchingUp {
+    /// For evidence resting on a root this node cannot place, the root to
+    /// ask after: its own current one. `None` where the root is placed, or
+    /// the evidence is not worth asking about.
+    pub behind: Behind,
+    /// Takes the roots a peer sent, for the evidence it showed. Whether
+    /// anything was taken.
+    pub take: TakeRoots,
+}
+
+/// [`CatchingUp::behind`].
+pub type Behind = std::sync::Arc<dyn Fn(&[u8]) -> Option<[u8; 32]> + Send + Sync>;
+
+/// [`CatchingUp::take`].
+pub type TakeRoots = std::sync::Arc<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 
 /// How a session's bytes travel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

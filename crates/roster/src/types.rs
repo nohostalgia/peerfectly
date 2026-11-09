@@ -38,6 +38,7 @@ use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::id::{DeviceId, KeyId, NetworkId, OperationId};
 use crate::limits;
+use crate::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -56,14 +57,110 @@ pub const DEVICE_RECORD_SCHEMA: &[&str] =
     &["id", "keys", "name", "role", "founder", "added_by", "capabilities"];
 /// Field names of the network parameters, in canonical order.
 ///
-/// `ipv4` and `leaving` may be absent: see [`NETWORK_PARAMS_OPTIONAL`].
-pub const NETWORK_PARAMS_SCHEMA: &[&str] =
-    &["ula", "ipv4", "relay", "suffix", "leaving", "snapshot_window"];
+/// `ipv4`, `policy`, `anchors`, `leaving` and `excluded` may be absent: see
+/// [`NETWORK_PARAMS_OPTIONAL`].
+pub const NETWORK_PARAMS_SCHEMA: &[&str] = &[
+    "ula",
+    "ipv4",
+    "relay",
+    "policy",
+    "suffix",
+    "anchors",
+    "leaving",
+    "excluded",
+    "snapshot_window",
+];
 /// The keys of the network parameters that may be absent.
 ///
 /// Each is left out when absent rather than written empty, so that parameters
 /// without it encode exactly as they did before it existed.
-pub const NETWORK_PARAMS_OPTIONAL: &[&str] = &["ipv4", "leaving"];
+pub const NETWORK_PARAMS_OPTIONAL: &[&str] =
+    &["ipv4", "policy", "anchors", "leaving", "excluded", "snapshot_window"];
+
+/// A block of IPv4 addresses an admin excluded from a network's route, on
+/// every device: a hole, as a local interface makes one
+/// (`scalable-membership` 19.7). From `/10` to one address, with no host bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Excluded {
+    address: [u8; 4],
+    prefix_len: u8,
+}
+
+impl Excluded {
+    /// How many excluded blocks a network's parameters hold at most.
+    pub const MAX: usize = 64;
+
+    /// Builds one, refusing a length outside `/10` to `/32` or host bits set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidValue`] naming the rule.
+    pub fn new(address: [u8; 4], prefix_len: u8) -> Result<Self> {
+        if !(Ipv4Range::MIN_PREFIX_LEN..=32).contains(&prefix_len) {
+            return Err(Error::InvalidValue("excluded block prefix length"));
+        }
+        if u32::from_be_bytes(address) & !mask(prefix_len) != 0 {
+            return Err(Error::InvalidValue("excluded block has host bits set"));
+        }
+        Ok(Self { address, prefix_len })
+    }
+
+    /// Its first address.
+    #[must_use]
+    pub const fn address(&self) -> [u8; 4] {
+        self.address
+    }
+
+    /// Its prefix length.
+    #[must_use]
+    pub const fn prefix_len(&self) -> u8 {
+        self.prefix_len
+    }
+
+    /// The five encoded bytes.
+    #[must_use]
+    pub const fn to_bytes(&self) -> [u8; IPV4_RANGE_LEN] {
+        let [a, b, c, d] = self.address;
+        [a, b, c, d, self.prefix_len]
+    }
+
+    /// Reads the five encoded bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], and on a wrong length.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let [a, b, c, d, len] = bytes else {
+            return Err(Error::InvalidValue("excluded block length"));
+        };
+        Self::new([*a, *b, *c, *d], *len)
+    }
+}
+
+impl core::fmt::Display for Excluded {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [a, b, c, d] = self.address;
+        write!(f, "{a}.{b}.{c}.{d}/{}", self.prefix_len)
+    }
+}
+
+impl core::str::FromStr for Excluded {
+    type Err = Error;
+
+    /// `a.b.c.d/len`, or `a.b.c.d` for one address.
+    fn from_str(text: &str) -> Result<Self> {
+        let (address, prefix_len) = match text.trim().split_once('/') {
+            Some((address, len)) => (
+                address,
+                len.parse::<u8>().map_err(|_| Error::InvalidValue("excluded block syntax"))?,
+            ),
+            None => (text.trim(), 32),
+        };
+        let address: core::net::Ipv4Addr =
+            address.parse().map_err(|_| Error::InvalidValue("excluded block syntax"))?;
+        Self::new(address.octets(), prefix_len)
+    }
+}
 /// Field names of a relay being left, in canonical order.
 pub const LEAVING_SCHEMA: &[&str] = &["relay", "until"];
 /// Field names of a `create_network` body, in canonical order.
@@ -247,6 +344,10 @@ pub enum OperationType {
     Rename,
     /// Changes the network parameters.
     SetNetwork,
+    /// Changes a device's settings: mode, groups, assigned address, relay.
+    SetDevice,
+    /// Admits many devices at once: the header of a batch.
+    AdmitBatch,
 }
 
 impl OperationType {
@@ -259,6 +360,8 @@ impl OperationType {
         Self::Demote,
         Self::Rename,
         Self::SetNetwork,
+        Self::SetDevice,
+        Self::AdmitBatch,
     ];
 
     /// The wire name.
@@ -272,6 +375,8 @@ impl OperationType {
             Self::Demote => "demote",
             Self::Rename => "rename",
             Self::SetNetwork => "set_network",
+            Self::SetDevice => "set_device",
+            Self::AdmitBatch => "admit_batch",
         }
     }
 
@@ -285,6 +390,8 @@ impl OperationType {
             "demote" => Ok(Self::Demote),
             "rename" => Ok(Self::Rename),
             "set_network" => Ok(Self::SetNetwork),
+            "set_device" => Ok(Self::SetDevice),
+            "admit_batch" => Ok(Self::AdmitBatch),
             _ => Err(Error::UnknownOperationType),
         }
     }
@@ -528,7 +635,7 @@ impl DeviceSpec {
 }
 
 /// Reads a device's key list.
-fn decode_keys(reader: &mut Reader<'_>) -> Result<Vec<KeyEntry>> {
+pub(crate) fn decode_keys(reader: &mut Reader<'_>) -> Result<Vec<KeyEntry>> {
     let count = reader.array(limits::MAX_KEYS_PER_DEVICE, "keys per device")?;
     let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
@@ -657,7 +764,8 @@ pub const IPV4_RANGE_BLOCKS: [([u8; 4], u8); 5] = [
     ([198, 18, 0, 0], 15),
 ];
 
-/// The IPv4 range a network's devices derive their addresses in.
+/// The IPv4 block a network's devices hold their addresses in: each the base
+/// plus its offset (`leaf::Ipv4Offset`).
 ///
 /// Canonical by construction: no host bits, a prefix length from
 /// [`Self::MIN_PREFIX_LEN`] to [`Self::MAX_PREFIX_LEN`], inside one of
@@ -670,12 +778,11 @@ pub struct Ipv4Range {
 }
 
 impl Ipv4Range {
-    /// The widest range allowed. Wider would swallow whole private blocks a
-    /// home or office network is likely to be using.
-    pub const MIN_PREFIX_LEN: u8 = 8;
-    /// The narrowest range allowed: sixteen addresses, fourteen of them
-    /// assignable. Narrower holds too few devices for the derivation to find
-    /// room.
+    /// The widest range allowed: some four million hosts, a fleet's. Wider
+    /// would swallow whole private blocks a home or office network is likely
+    /// to be using.
+    pub const MIN_PREFIX_LEN: u8 = 10;
+    /// The narrowest range allowed: sixteen addresses, fourteen of them hosts.
     pub const MAX_PREFIX_LEN: u8 = 28;
     /// The range of a network whose parameters carry none.
     pub const DEFAULT: Self = Self { address: [100, 64, 0, 0], prefix_len: 10 };
@@ -727,6 +834,35 @@ impl Ipv4Range {
         u32::from_be_bytes(address) & mask(self.prefix_len) == u32::from_be_bytes(self.address)
     }
 
+    /// The address at `offset` in the range, where it is one of its hosts:
+    /// neither its first address nor its last, and inside it.
+    #[must_use]
+    pub fn address_at(&self, offset: [u8; 4]) -> Option<[u8; 4]> {
+        let offset = u32::from_be_bytes(offset);
+        let size = u32::try_from(self.size()).unwrap_or(u32::MAX);
+        if offset == 0 || offset >= size.saturating_sub(1) {
+            return None;
+        }
+        Some(u32::from_be_bytes(self.address).checked_add(offset)?.to_be_bytes())
+    }
+
+    /// The offset of `address` in the range, where it is one of its hosts.
+    #[must_use]
+    pub fn offset_of(&self, address: [u8; 4]) -> Option<[u8; 4]> {
+        if !self.contains(address) {
+            return None;
+        }
+        let offset = u32::from_be_bytes(address).checked_sub(u32::from_be_bytes(self.address))?;
+        let offset = offset.to_be_bytes();
+        self.address_at(offset).map(|_| offset)
+    }
+
+    /// How many hosts it holds: every address but its first and its last.
+    #[must_use]
+    pub fn hosts(&self) -> u64 {
+        self.size().saturating_sub(2)
+    }
+
     /// The five encoded bytes.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; IPV4_RANGE_LEN] {
@@ -768,7 +904,7 @@ impl core::str::FromStr for Ipv4Range {
     fn from_str(text: &str) -> Result<Self> {
         let (address, prefix_len) =
             text.split_once('/').ok_or(Error::InvalidValue("ipv4 range syntax"))?;
-        let address: std::net::Ipv4Addr =
+        let address: core::net::Ipv4Addr =
             address.parse().map_err(|_| Error::InvalidValue("ipv4 range syntax"))?;
         let prefix_len: u8 =
             prefix_len.parse().map_err(|_| Error::InvalidValue("ipv4 range syntax"))?;
@@ -843,6 +979,20 @@ pub struct NetworkParams {
     pub leaving: Option<Leaving>,
     /// Snapshot validity window, in seconds.
     pub snapshot_window: u64,
+    /// The network's anchors: always-on full members light members turn to.
+    ///
+    /// Sorted, without repeats. Empty at founding, and it may stay so. Carried
+    /// only as a parameter leaf (see [`crate::parameters`]).
+    pub anchors: Vec<DeviceId>,
+    /// The access policy: which group may open sessions to which.
+    ///
+    /// Sorted, without repeats. Empty is no policy: every member may reach every
+    /// member. Carried only as a parameter leaf.
+    pub policy: Vec<crate::parameters::Rule>,
+    /// The blocks excluded from the network's IPv4 route on every device.
+    ///
+    /// Sorted, without repeats. Empty is none, a network's ordinary state.
+    pub excluded: Vec<Excluded>,
 }
 
 impl NetworkParams {
@@ -883,7 +1033,17 @@ impl NetworkParams {
             }
             _ => {}
         }
-        Ok(Self { ula, ipv4: None, relay, suffix, leaving: None, snapshot_window })
+        Ok(Self {
+            ula,
+            ipv4: None,
+            relay,
+            suffix,
+            leaving: None,
+            snapshot_window,
+            anchors: Vec::new(),
+            policy: Vec::new(),
+            excluded: Vec::new(),
+        })
     }
 
     /// Chooses the IPv4 range. The range was checked when it was built.
@@ -917,7 +1077,13 @@ impl NetworkParams {
     /// As [`Self::leaving`], and when the new relay is outside its bound.
     pub fn moving_to(&self, relay: impl Into<String>, issued: u64) -> Result<Self> {
         let relay = relay.into();
-        let window_ms = self.snapshot_window.saturating_mul(1_000);
+        // One freshness window; a network with none moves over the window a
+        // network is founded with by default.
+        let window = match self.snapshot_window {
+            0 => limits::DEFAULT_SNAPSHOT_WINDOW,
+            seconds => seconds,
+        };
+        let window_ms = window.saturating_mul(1_000);
         let leaving = self
             .relay
             .clone()
@@ -926,6 +1092,9 @@ impl NetworkParams {
         let mut moved =
             Self::with_relay(self.ula.clone(), Some(relay), &*self.suffix, self.snapshot_window)?;
         moved.ipv4 = self.ipv4;
+        moved.anchors.clone_from(&self.anchors);
+        moved.policy.clone_from(&self.policy);
+        moved.excluded.clone_from(&self.excluded);
         match leaving {
             Some(leaving) => moved.leaving(leaving),
             None => Ok(moved),
@@ -952,7 +1121,48 @@ impl NetworkParams {
             self.snapshot_window,
         )?;
         moved.ipv4 = self.ipv4;
+        moved.anchors.clone_from(&self.anchors);
+        moved.policy.clone_from(&self.policy);
+        moved.excluded.clone_from(&self.excluded);
         Ok(moved)
+    }
+
+    /// The same parameters with `anchors` as the anchor list, in place of the
+    /// one held. Empty is no anchors, which is a network's ordinary state.
+    ///
+    /// # Errors
+    ///
+    /// When there are more than the list holds, or one is named twice.
+    pub fn with_anchors(&self, anchors: Vec<DeviceId>) -> Result<Self> {
+        let mut changed = self.clone();
+        changed.anchors = if anchors.is_empty() {
+            anchors
+        } else {
+            match crate::parameters::Parameter::anchors(anchors)? {
+                crate::parameters::Parameter::Anchors(sorted) => sorted,
+                _ => Vec::new(),
+            }
+        };
+        Ok(changed)
+    }
+
+    /// The same parameters with `excluded` as the blocks excluded from the
+    /// network's route, in place of those held. Empty is none.
+    ///
+    /// # Errors
+    ///
+    /// When there are more than [`Excluded::MAX`], or one is named twice.
+    pub fn with_excluded(&self, excluded: Vec<Excluded>) -> Result<Self> {
+        let mut changed = self.clone();
+        changed.excluded = if excluded.is_empty() {
+            excluded
+        } else {
+            match crate::parameters::Parameter::excluded(excluded)? {
+                crate::parameters::Parameter::Excluded(sorted) => sorted,
+                _ => Vec::new(),
+            }
+        };
+        Ok(changed)
     }
 
     /// The relay being left, while the transition has not ended at `now`
@@ -992,15 +1202,39 @@ impl NetworkParams {
         Ok(self)
     }
 
+    /// The parameters' canonical bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        self.encode(&mut writer);
+        writer.finish()
+    }
+
+    /// Reads parameters from their canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not canonical parameters.
+    pub fn from_bytes(input: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(input);
+        let params = Self::decode(&mut reader)?;
+        reader.finish()?;
+        Ok(params)
+    }
+
     /// Writes the parameters.
     ///
     /// The relay is an array of nothing or of one value, so absence has exactly
     /// one encoding. The IPv4 range is instead left out when absent, so that
     /// parameters without one encode exactly as they did before it existed.
     pub(crate) fn encode(&self, writer: &mut Writer) {
-        let present = 4_u64
+        let present = 3_u64
+            .saturating_add(u64::from(self.snapshot_window != 0))
             .saturating_add(u64::from(self.ipv4.is_some()))
-            .saturating_add(u64::from(self.leaving.is_some()));
+            .saturating_add(u64::from(!self.policy.is_empty()))
+            .saturating_add(u64::from(!self.anchors.is_empty()))
+            .saturating_add(u64::from(self.leaving.is_some()))
+            .saturating_add(u64::from(!self.excluded.is_empty()));
         writer.map(present);
         writer.key("ula").bytes(&self.ula);
         if let Some(range) = &self.ipv4 {
@@ -1016,13 +1250,28 @@ impl NetworkParams {
                 writer.array(0);
             }
         }
+        if !self.policy.is_empty() {
+            writer.key("policy");
+            crate::parameters::write_policy(writer, &self.policy);
+        }
         writer.key("suffix").str(&self.suffix);
+        if !self.anchors.is_empty() {
+            writer.key("anchors");
+            crate::parameters::write_anchors(writer, &self.anchors);
+        }
         if let Some(leaving) = &self.leaving {
             writer.key("leaving").map(2);
             writer.key("relay").str(&leaving.relay);
             writer.key("until").u64(leaving.until);
         }
-        writer.key("snapshot_window").u64(self.snapshot_window);
+        if !self.excluded.is_empty() {
+            writer.key("excluded");
+            crate::parameters::write_excluded(writer, &self.excluded);
+        }
+        // No window is the key left out: a network that never reads as stale.
+        if self.snapshot_window != 0 {
+            writer.key("snapshot_window").u64(self.snapshot_window);
+        }
     }
 
     /// Reads the parameters.
@@ -1046,7 +1295,28 @@ impl NetworkParams {
                 _ => Some(value.str(limits::MAX_RELAY_LEN, "relay address length")?.to_owned()),
             }
         };
+        // Left out when empty, and refused when written empty: one spelling.
+        let policy = match map.optional_key("policy")? {
+            Some(value) => {
+                let rules = crate::parameters::read_policy(value)?;
+                if rules.is_empty() {
+                    return Err(Error::NonCanonical);
+                }
+                rules
+            }
+            None => Vec::new(),
+        };
         let suffix = map.key("suffix")?.str(limits::MAX_SUFFIX_LEN, "suffix length")?.to_owned();
+        let anchors = match map.optional_key("anchors")? {
+            Some(value) => {
+                let anchors = crate::parameters::read_anchors(value)?;
+                if anchors.is_empty() {
+                    return Err(Error::NonCanonical);
+                }
+                anchors
+            }
+            None => Vec::new(),
+        };
         // One key holding both, so a relay being left without an end, or an end
         // without a relay, is not something the encoding can say at all.
         let leaving = match map.optional_key("leaving")? {
@@ -1062,10 +1332,30 @@ impl NetworkParams {
             }
             None => None,
         };
-        let snapshot_window = map.key("snapshot_window")?.u64()?;
+        let excluded = match map.optional_key("excluded")? {
+            Some(value) => {
+                let excluded = crate::parameters::read_excluded(value)?;
+                if excluded.is_empty() {
+                    return Err(Error::NonCanonical);
+                }
+                excluded
+            }
+            None => Vec::new(),
+        };
+        let snapshot_window = match map.optional_key("snapshot_window")? {
+            // Absence has one spelling: the key left out, never written as zero.
+            Some(value) => match value.u64()? {
+                0 => return Err(Error::NonCanonical),
+                seconds => seconds,
+            },
+            None => 0,
+        };
         map.finish()?;
 
-        let params = Self::with_relay(ula, relay, suffix, snapshot_window)?;
+        let mut params = Self::with_relay(ula, relay, suffix, snapshot_window)?;
+        params.anchors = anchors;
+        params.policy = policy;
+        params.excluded = excluded;
         let params = match ipv4 {
             Some(range) => params.in_ipv4_range(range),
             None => params,
@@ -1124,6 +1414,15 @@ pub enum OperationBody {
     },
     /// Replaces the network parameters.
     SetNetwork(NetworkParams),
+    /// Changes a device's settings, each field on its own.
+    SetDevice {
+        /// The device whose settings change.
+        device: DeviceId,
+        /// What changes.
+        change: crate::leaf::SettingsChange,
+    },
+    /// Admits the devices a batch's entries name.
+    AdmitBatch(crate::batch::BatchHeader),
 }
 
 impl OperationBody {
@@ -1138,6 +1437,8 @@ impl OperationBody {
             Self::Demote { .. } => OperationType::Demote,
             Self::Rename { .. } => OperationType::Rename,
             Self::SetNetwork(_) => OperationType::SetNetwork,
+            Self::SetDevice { .. } => OperationType::SetDevice,
+            Self::AdmitBatch(_) => OperationType::AdmitBatch,
         }
     }
 
@@ -1184,6 +1485,8 @@ impl OperationBody {
                 device.encode(writer);
             }
             Self::SetNetwork(params) => params.encode(writer),
+            Self::SetDevice { device, change } => change.encode(device, writer),
+            Self::AdmitBatch(header) => header.encode(writer),
         }
     }
 
@@ -1248,6 +1551,13 @@ impl OperationBody {
                 Self::Rename { device, name }
             }
             OperationType::SetNetwork => Self::SetNetwork(NetworkParams::decode(&mut reader)?),
+            OperationType::SetDevice => {
+                let (device, change) = crate::leaf::SettingsChange::decode(&mut reader)?;
+                Self::SetDevice { device, change }
+            }
+            OperationType::AdmitBatch => {
+                Self::AdmitBatch(crate::batch::BatchHeader::decode(&mut reader)?)
+            }
         };
         reader.finish()?;
         Ok(body)
@@ -1527,6 +1837,28 @@ mod tests {
         assert_eq!(Err(Error::MissingField), decoded, "an end is not optional inside the group");
     }
 
+    /// No freshness window is the key left out, and a window written as zero is
+    /// a second spelling of it, refused.
+    #[test]
+    fn no_window_is_the_key_left_out_and_zero_is_refused() {
+        let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 0)
+            .expect("well-formed");
+        let mut writer = cbor::Writer::new();
+        params.encode(&mut writer);
+        let bytes = writer.finish();
+        assert!(!bytes.windows(15).any(|window| window == b"snapshot_window"));
+        assert_eq!(NetworkParams::decode(&mut cbor::Reader::new(&bytes)), Ok(params));
+
+        let mut writer = cbor::Writer::new();
+        writer.map(4);
+        writer.key("ula").bytes(&[0xfd, 0, 0, 0, 0, 0, 0, 0]);
+        writer.key("relay").array(0);
+        writer.key("suffix").str("casa.internal");
+        writer.key("snapshot_window").u64(0);
+        let zero = writer.finish();
+        assert_eq!(NetworkParams::decode(&mut cbor::Reader::new(&zero)), Err(Error::NonCanonical));
+    }
+
     /// The end is the rule: past it, the relay being left is not in use, with
     /// nothing signed to say so.
     #[test]
@@ -1597,7 +1929,7 @@ mod tests {
 
     #[test]
     fn the_operation_type_set_is_closed() {
-        assert_eq!(OperationType::ALL.len(), 7);
+        assert_eq!(OperationType::ALL.len(), 9);
         assert_eq!(OperationType::parse("delegate"), Err(Error::UnknownOperationType));
         assert_eq!(OperationType::parse(""), Err(Error::UnknownOperationType));
     }
@@ -1816,23 +2148,23 @@ mod tests {
             other => unreachable!("{text} must be refused, got {other:?}"),
         };
         assert_eq!(refused("10.42.0.1/16"), "ipv4 range has host bits set");
-        assert_eq!(refused("10.0.0.0/7"), "ipv4 range prefix length");
+        assert_eq!(refused("10.0.0.0/9"), "ipv4 range prefix length");
         assert_eq!(refused("10.0.0.0/29"), "ipv4 range prefix length");
         for text in [
             "8.8.8.0/24",
-            "127.0.0.0/8",
+            "127.0.0.0/10",
             "169.254.0.0/16",
-            "240.0.0.0/8",
-            "0.0.0.0/8",
-            "11.0.0.0/8",
+            "240.0.0.0/10",
+            "0.0.0.0/10",
+            "11.0.0.0/10",
         ] {
             assert_eq!(refused(text), "ipv4 range outside the private blocks", "{text}");
         }
-        // Wider than `/8` is refused on its length before its place.
+        // Wider than `/10` is refused on its length before its place.
         for text in ["224.0.0.0/4", "240.0.0.0/4"] {
             assert!(refused(text).starts_with("ipv4 range"), "{text}");
         }
-        assert_eq!(refused("100.0.0.0/9"), "ipv4 range outside the private blocks");
+        assert_eq!(refused("100.0.0.0/10"), "ipv4 range outside the private blocks");
         assert_eq!(refused("172.0.0.0/12"), "ipv4 range outside the private blocks");
         assert_eq!(refused("10.0.0.0"), "ipv4 range syntax");
     }
@@ -1840,6 +2172,7 @@ mod tests {
     #[test]
     fn every_allowed_block_and_the_bounds_are_accepted() {
         for (block, prefix_len) in IPV4_RANGE_BLOCKS {
+            let prefix_len = prefix_len.max(Ipv4Range::MIN_PREFIX_LEN);
             let range = Ipv4Range::new(block, prefix_len).unwrap_or_else(|_| unreachable!());
             assert_eq!(range.to_string().parse::<Ipv4Range>(), Ok(range));
         }

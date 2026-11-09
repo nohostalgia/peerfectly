@@ -89,6 +89,16 @@ jobs:
       # kernel, a TPM and root are `#[ignore]`d: the Docker testbed runs them.
       - run: cargo clippy --workspace --exclude windows-daemon --all-targets --locked -- -D warnings
       - run: cargo test --workspace --exclude windows-daemon --locked
+      # What a microcontroller member is built from, `no_std` + `alloc`: on the
+      # ESP32-C6's instruction set, the C3's (no atomics) and a Cortex-M4's.
+      - run: rustup target add riscv32imac-unknown-none-elf riscv32imc-unknown-none-elf thumbv7em-none-eabihf
+      - run: |
+          # A chip without atomics: the firmware tells portable-atomic how; here,
+          # as esp-hal does for the ESP32-C3, that the chip has one core.
+          RUSTFLAGS="--cfg portable_atomic_unsafe_assume_single_core" cargo clippy -p roster -p enrollment -p tunnel -p light-node -p roster-sync --no-default-features --target riscv32imc-unknown-none-elf --locked -- -D warnings
+          for target in riscv32imac-unknown-none-elf thumbv7em-none-eabihf; do
+            cargo clippy -p roster -p enrollment -p tunnel -p light-node -p roster-sync --no-default-features --target "$target" --locked -- -D warnings
+          done
 
   # Licences, RustSec advisories and sources, against `deny.toml`.
   deny:

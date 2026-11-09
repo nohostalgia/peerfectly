@@ -210,7 +210,13 @@ async fn read_context(
             ContextEvent::Closed { peer, .. } | ContextEvent::ChannelReset { peer, .. } => {
                 end(&routes, &peer);
             }
-            ContextEvent::Datagram { .. } | ContextEvent::PathChanged { .. } => {}
+            // An exchange is over within seconds, well inside a session's keys;
+            // a session that goes idle meanwhile reopens with the next message.
+            // No context here takes data in a first contact.
+            ContextEvent::Datagram { .. }
+            | ContextEvent::PathChanged { .. }
+            | ContextEvent::Idle { .. }
+            | ContextEvent::EarlyDatagram { .. } => {}
         }
     }
 }
@@ -246,22 +252,37 @@ pub struct Waiting {
 }
 
 impl Waiting {
-    /// Starts a node at the relay a person named, under this device's transport
-    /// key, open to anyone in the enrolment context.
+    /// Starts a node at an invite's relay, under the rendezvous identity the
+    /// invite's secret derives: the key the inviting admin dials, used once and
+    /// telling the relay nothing else.
     ///
     /// # Errors
     ///
-    /// When the transport key is not ed25519, the relay is not `key@host:port`,
-    /// or the node cannot start.
-    pub async fn listen(identity: &NodeIdentity, relay: &str) -> Result<Self> {
+    /// When the relay is not `key@host:port`, or the node cannot start.
+    pub async fn at_rendezvous(seed: &[u8; 32], relay: &str) -> Result<Self> {
+        let own = Identity::from_ed25519_seed(seed)
+            .map_err(|cause| BuildError::Start(cause.to_string()))?;
+        let endpoint = Endpoint::start(own, Some(relay), Access::Everyone, true).await?;
+        Ok(Self { endpoint, relay: relay.to_owned() })
+    }
+
+    /// Starts a node at a network's relay under a joining device's own
+    /// transport key: where a member that holds its admission dials it, when
+    /// the device does not yet know it was admitted.
+    ///
+    /// The device has no roster and no running node yet, so nothing else is
+    /// registered under the key. It stops before the device's own node starts.
+    ///
+    /// # Errors
+    ///
+    /// When the key is not ed25519, the relay is not `key@host:port`, or the
+    /// node cannot start.
+    pub async fn under_own_key(identity: &NodeIdentity, relay: &str) -> Result<Self> {
         let key = identity.transport_key();
         if key.algorithm() != Algorithm::Ed25519 {
             return Err(BuildError::NotEd25519 { algorithm: key.algorithm() });
         }
-        let own = Identity::from_ed25519_seed(key.material().expose())
-            .map_err(|cause| BuildError::Start(cause.to_string()))?;
-        let endpoint = Endpoint::start(own, Some(relay), Access::Everyone, true).await?;
-        Ok(Self { endpoint, relay: relay.to_owned() })
+        Self::at_rendezvous(key.material().expose(), relay).await
     }
 
     /// Waits until the relay has this node, so a peer can reach it.
@@ -270,13 +291,13 @@ impl Waiting {
         let _ = online.wait_for(|online| *online).await;
     }
 
-    /// The relay this node registered at, for the payload to carry.
+    /// The relay this node registered at.
     #[must_use]
     pub fn relay(&self) -> &str {
         &self.relay
     }
 
-    /// This device's transport key.
+    /// The key this node waits under: the rendezvous key.
     #[must_use]
     pub fn transport_key(&self) -> PublicKey {
         self.endpoint.own()
@@ -331,18 +352,14 @@ pub struct Admitting {
 impl Admitting {
     /// Starts a node that will only ever dial.
     ///
-    /// `identity` and `state` are taken for the shape the daemon calls: the
-    /// admitting node runs under a key of its own (see the module), and its
-    /// relay is the one [`Admitting::reach`] is given, which the daemon has
-    /// already checked is one this network uses.
+    /// The admitting node runs under a key of its own (see the module), and
+    /// its relay is the one [`Admitting::reach`] is given: the network's, which
+    /// the daemon read from its own roster or its own invite.
     ///
     /// # Errors
     ///
     /// When the generator fails, or the node cannot start.
-    pub async fn dialling(
-        _identity: &NodeIdentity,
-        _state: &roster::state::RosterState,
-    ) -> Result<Self> {
+    pub async fn dialling() -> Result<Self> {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).map_err(|cause| BuildError::Start(cause.to_string()))?;
         let own = Identity::from_ed25519_seed(&seed)
@@ -403,6 +420,19 @@ impl Admitting {
     pub async fn close(self) {
         drop(self);
     }
+}
+
+/// The key a device waiting at the rendezvous `seed` derives is reached at:
+/// what the inviting admin dials.
+///
+/// # Errors
+///
+/// When the seed makes no key.
+pub fn rendezvous_key(seed: &[u8; 32]) -> Result<PublicKey> {
+    let own =
+        Identity::from_ed25519_seed(seed).map_err(|cause| BuildError::Start(cause.to_string()))?;
+    PublicKey::new(Algorithm::Ed25519, own.address().as_bytes().to_vec())
+        .map_err(|cause| BuildError::Start(cause.to_string()))
 }
 
 /// The session's channel binding with `peer`.

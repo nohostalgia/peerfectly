@@ -237,6 +237,31 @@ fn a_deeply_backdated_operation_is_refused_at_ingest() {
     );
 }
 
+/// Anchored at its shallowest parent: naming the frontier's head beside an
+/// old parent does not make it recent. Judged at the deepest, it was taken by
+/// a node holding the old parent and held for ever by one that had compacted
+/// it away, the two deriving different states (`tests/layers.rs`).
+#[test]
+fn an_old_parent_beside_a_recent_one_is_stale() {
+    let mut history = deep_history(12);
+    history.op(
+        "straddling",
+        1,
+        &["anchor", "d11"],
+        OperationBody::AddDevice(device(4, "printer", Role::Member, false)),
+    );
+    let mut roster = Roster::with_staleness_depth(4);
+    for entry in history.entries() {
+        if entry.label == "backdated" || entry.label == "straddling" {
+            continue;
+        }
+        roster.offer_bytes(&entry.bytes);
+    }
+
+    let outcome = roster.offer_bytes(&history.bytes("straddling"));
+    assert_eq!(outcome.refusal(), Some(&Error::StaleOperation));
+}
+
 #[test]
 fn an_operation_from_a_recently_offline_device_is_admitted() {
     let history = deep_history(3);

@@ -25,7 +25,7 @@
 
 use core::fmt;
 
-use crate::control::{Contact, Network, Peer, Report, Signed, shown};
+use crate::control::{Contact, Network, Peer, Report, Revoked, Signed, shown};
 use crate::drawing::Block;
 
 impl Report {
@@ -45,6 +45,15 @@ impl Report {
         Address { report: self, network }
     }
 
+    /// Where each network's devices go on past the report's first page: its
+    /// label and the cursor to ask the next with, for those that do.
+    #[must_use]
+    pub fn peers_continuing(&self, network: Option<&str>) -> Vec<(String, String)> {
+        self.covered(network)
+            .filter_map(|held| held.peers_after.clone().map(|after| (held.label.clone(), after)))
+            .collect()
+    }
+
     /// The networks this report covers, narrowed to one when a name is given.
     fn covered<'a>(&'a self, network: Option<&'a str>) -> impl Iterator<Item = &'a Network> {
         self.networks.iter().filter(move |held| match network {
@@ -61,6 +70,51 @@ pub struct Peers<'a> {
     report: &'a Report,
     /// The network asked about, if one was named.
     network: Option<&'a str>,
+}
+
+/// A page of a network's devices after the report's first, as `peers` draws
+/// each.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerRows<'a>(pub &'a [Peer]);
+
+impl fmt::Display for PeerRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for peer in self.0 {
+            writeln!(f)?;
+            write!(f, "{}", entry_for(peer))?;
+        }
+        Ok(())
+    }
+}
+
+/// A page of the devices a network holds as revoked, as `revoked` draws it:
+/// each with every revocation of it, and the revoker's clock presented as the
+/// revoker's claim, never as when it happened.
+#[derive(Debug, Clone, Copy)]
+pub struct RevokedRows<'a>(pub &'a [Revoked]);
+
+impl fmt::Display for RevokedRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for revoked in self.0 {
+            writeln!(f)?;
+            writeln!(f, "  {} — {}", revoked.device, revoked.last_contact)?;
+            for revocation in &revoked.revocations {
+                let clock = match revocation.signer_clock {
+                    Signed::At { time } => {
+                        format!("the revoking device's clock said {}", crate::drawing::when(time))
+                    }
+                    _ => "the revoking device recorded no time".to_owned(),
+                };
+                writeln!(
+                    f,
+                    "    by {}: \"{}\" ({clock})",
+                    revocation.by,
+                    shown(&revocation.reason)
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// This device's own address, as `address` draws it.
@@ -121,6 +175,17 @@ impl fmt::Display for Report {
             block.plain(
                 "Nothing about them is shown here, and nothing you ask can reach them. Whoever they belong to can use them, and an administrator can take one over.",
             );
+            write!(f, "{block}")?;
+        }
+
+        // What waits on this person refuses the next founding, join or invite:
+        // said here, so a refused person can see what it is and cancel it.
+        if let Some(waiting) = &self.waiting_on {
+            writeln!(f)?;
+            let mut block = Block::headed("waiting on you".to_owned());
+            block.note(waiting.clone());
+            block.plain("Nothing else starts until it is finished or cancelled.");
+            block.plain("  to cancel it:  peerfectly cancel");
             write!(f, "{block}")?;
         }
 
@@ -261,13 +326,18 @@ fn entry_for(peer: &Peer) -> Block {
 /// device is counted when the roster names it, and is not when it does not —
 /// which is the state a device is in between joining and being admitted.
 fn counted(network: &Network) -> String {
-    let others = network.peers.len();
+    // All of them, where the report lists a page: a daemon before pages
+    // listed every one and counted none.
+    let others = network.peer_count.max(network.peers.len());
     let devices = others.saturating_add(usize::from(network.name.is_some()));
     let word = if devices == 1 { "device" } else { "devices" };
-    if network.revoked.is_empty() {
-        format!("{devices} {word}")
-    } else {
-        format!("{devices} {word}, {} revoked", network.revoked.len())
+    // Counted, not listed: they only grow, and are a command of their own.
+    match network.revoked_count {
+        0 => format!("{devices} {word}"),
+        revoked => format!(
+            "{devices} {word} · {revoked} revoked: peerfectly revoked {}",
+            shown(&network.label)
+        ),
     }
 }
 
@@ -286,12 +356,16 @@ fn infrastructure(network: &Network) -> String {
     // **Said, because whoever runs the old relay needs to read it.** Switched
     // off before the end, it strands every device that has not come back yet —
     // and nothing else on this screen would tell them it is still in use.
-    match &network.relay_leaving {
+    let line = match &network.relay_leaving {
         Some(leaving) => format!(
             "{line}; moving from {} — everybody stays there until {}, so keep it running until then",
             shown(&leaving.relay),
             crate::drawing::when(leaving.until)
         ),
+        None => line,
+    };
+    match &network.ipv4_block {
+        Some(block) => format!("{line}; IPv4 block {block}"),
         None => line,
     }
 }
@@ -348,80 +422,15 @@ fn warnings(network: &Network, block: &mut Block) {
         );
     }
 
-    if network.has_unpropagated_work() {
+    // Perhaps hours after the command that issued the invite ended: where there
+    // is no tray, this is where the person hears of it.
+    if let Some(name) = &network.arrived {
         block.blank();
-        block.note("waiting: signed operations have not reached every device");
-        for waiting in &network.waiting {
-            match waiting.signed_here {
-                Signed::At { time } => block.plain(format!(
-                    "  {} — signed here at {}",
-                    waiting.does,
-                    crate::drawing::when(time)
-                )),
-                _ => block.plain(format!("  {} — signed here, no time recorded", waiting.does)),
-            }
-            for owed in &waiting.owed {
-                if owed.connected {
-                    block.plain(format!(
-                        "    {} — connected, and has not said it holds it",
-                        owed.device
-                    ));
-                } else {
-                    block.plain(format!(
-                        "    {} — not in contact; {}",
-                        owed.device, owed.last_contact
-                    ));
-                }
-            }
-        }
-        if network.waiting_unlisted > 0 {
-            block.plain(format!(
-                "  and {} more operations waiting, not listed here. No revocation is among them.",
-                network.waiting_unlisted
-            ));
-        }
-
-        // The remedy, chosen from what is actually true. A number with no remedy
-        // trains a person to ignore the number; a remedy that does not apply to
-        // their situation trains them faster.
-        //
-        // Two conditions and not two branches of one: a network can hold both a
-        // device that has not appeared and one that is here and has not taken
-        // the operation, and each of those has an answer of its own.
-        let owed = || network.waiting.iter().flat_map(|waiting| waiting.owed.iter());
-        if owed().any(|device| !device.connected) {
-            block.plain(
-                "Leave the tunnel up. A device is sent these the moment it is in contact, by \
-                 this device or by any other member that already holds them.",
-            );
-        }
-        if owed().any(|device| device.connected) {
-            block.plain(
-                "A device that stays connected without saying it holds them has not taken \
-                 them. Until it does, it still admits anything these operations revoke.",
-            );
-        }
-    }
-
-    if !network.revoked.is_empty() {
-        block.blank();
-        block.plain("revoked — the revocations this device holds:");
-        for revoked in &network.revoked {
-            block.plain(format!("  {} — {}", revoked.device, revoked.last_contact));
-            for revocation in &revoked.revocations {
-                let clock = match revocation.signer_clock {
-                    Signed::At { time } => {
-                        format!("the revoking device's clock said {}", crate::drawing::when(time))
-                    }
-                    _ => "the revoking device recorded no time".to_owned(),
-                };
-                block.plain(format!(
-                    "    by {}: \"{}\" ({clock})",
-                    revocation.by,
-                    shown(&revocation.reason)
-                ));
-            }
-        }
+        block.note(format!(
+            "the device invited as {} has arrived, and is waiting at the code",
+            shown(name)
+        ));
+        block.plain("  to compare the code and admit it:  peerfectly resume");
     }
 
     // One line, the latest and only while recent. The history is the service's
@@ -487,13 +496,18 @@ mod tests {
             custody: crate::control::Custody::HeldHere,
             owner_taken: false,
             confirmation: None,
+            arrived: None,
+            anchors: Vec::new(),
             relay: Some("https://relay.example:443".to_owned()),
             relay_leaving: None,
+            ipv4_block: Some("100.64.0.0/10".to_owned()),
             accused: Vec::new(),
             peers,
-            revoked: Vec::new(),
-            waiting: Vec::new(),
-            waiting_unlisted: 0,
+            peer_count: 0,
+            reachable_count: 0,
+            peers_after: None,
+            full_members: Vec::new(),
+            revoked_count: 0,
             problem: None,
         }
     }
@@ -517,6 +531,31 @@ mod tests {
         assert!(!infrastructure(&moving).contains("old.example"), "nothing, after the end");
     }
 
+    /// **An invited device that arrived after its command ended is told in
+    /// `status`**, with the command that comes back to it.
+    #[test]
+    fn status_says_an_invited_device_has_arrived() {
+        let mut report = two_networks();
+        assert!(!report.to_string().contains("has arrived"));
+        if let Some(casa) = report.networks.first_mut() {
+            casa.arrived = Some("tv".to_owned());
+        }
+        let drawn = report.to_string();
+        assert!(drawn.contains("invited as tv has arrived"), "{drawn}");
+        assert!(drawn.contains("peerfectly resume"), "{drawn}");
+    }
+
+    /// **What waits on this person is said, with how to cancel it.**
+    #[test]
+    fn status_says_what_waits_and_how_to_cancel_it() {
+        let mut report = two_networks();
+        assert!(!report.to_string().contains("waiting on you"));
+        report.waiting_on = Some("the founding of `prova`, waiting for its relay's key".to_owned());
+        let drawn = report.to_string();
+        assert!(drawn.contains("the founding of `prova`"), "{drawn}");
+        assert!(drawn.contains("peerfectly cancel"), "{drawn}");
+    }
+
     fn two_networks() -> Report {
         Report {
             networks: vec![
@@ -529,6 +568,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -552,6 +592,7 @@ mod tests {
             "100.64.0.1",
             "2 devices",
             "relay https://relay.example:443 (trusted by its key)",
+            "IPv4 block 100.64.0.0/10",
         ] {
             assert!(said(&drawn).contains(expected), "status says `{expected}`: {drawn}");
         }
@@ -695,6 +736,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -712,6 +754,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
@@ -737,6 +780,7 @@ mod tests {
                 unusable: Vec::new(),
                 note: None,
                 admin_refusal: None,
+                waiting_on: None,
                 elsewhere: 0,
                 may_stop_the_daemon: true,
                 could_stop_the_daemon: false,
@@ -757,6 +801,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,

@@ -11,14 +11,13 @@
 //! month with one peer up, and between 2.8 and 11 GB with one switched off
 //! (`crates/linux-daemon/VERIFICATION.md`, step 32). The sixty-second sync, which
 //! dialled every member and offered it everything, and the five-second
-//! announcements were most of it. [`Schedule::sync`], [`Schedule::announce`],
-//! [`Schedule::press_longest`] and [`Schedule::idle`] are set from that
-//! measurement, and say so where they are defined.
+//! announcements were most of it. [`Schedule::sync`], [`Schedule::announce`]
+//! and [`Schedule::idle`] are set from that measurement, and say so where they
+//! are defined.
 //!
-//! The others are still argued rather than measured: `endpoint_cache` and
-//! `press`. If one of them is still unchanged after the daemon has run on a
-//! real machine for a week, that is a sign nobody looked — not a sign it was
-//! right.
+//! `endpoint_cache` is still argued rather than measured. If it is still
+//! unchanged after the daemon has run on a real machine for a week, that is a
+//! sign nobody looked — not a sign it was right.
 
 use core::time::Duration;
 
@@ -53,36 +52,18 @@ pub struct Schedule {
     /// a missing one leaves the first session to the relay.
     pub endpoint_cache: Duration,
 
-    /// How soon to try a member that is owed something this device signed.
-    ///
-    /// An idle network and a network carrying a revocation nobody has yet
-    /// received were paced identically: both dialled on [`Self::sync`]. That is
-    /// the wrong economy at both ends — a minute of exposure when a revoked
-    /// device's peer comes back a moment after the revocation is signed, and a
-    /// minute is also far too often to keep dialling a laptop that has been
-    /// switched off for a week.
-    ///
-    /// So this is where pressing *starts*, and [`Pressing`] widens it back toward
-    /// [`Self::sync`] as attempts go unanswered. Short, because the attempts most
-    /// likely to be answered are the ones just after the event.
-    pub press: Duration,
-    /// The longest pressing ever waits.
-    ///
-    /// Pressing used to widen only to the ordinary tick, a minute, and stay
-    /// there: a device switched off for a week was dialled every minute for the
-    /// week, and each attempt retried a handshake on every path it knew for half
-    /// a minute. Six hours is a few attempts a day for a device that is simply
-    /// away, while one that comes back soon after the operation is still found
-    /// within seconds.
-    pub press_longest: Duration,
     /// How long a session may carry nothing before it is closed.
     ///
     /// A session is opened by the first packet that needs it, so a closed one
     /// costs the next packet a reopening: a handshake of a few kilobytes and a
-    /// pause of tens to hundreds of milliseconds. An open one costs the
-    /// keep-alives that hold its path open, for as long as it stays open. Ten minutes keeps a session through the ordinary pauses of
-    /// someone working — reading a page, thinking between commands — and closes it
-    /// once they have stopped.
+    /// pause of tens to hundreds of milliseconds. An open one costs nothing on
+    /// the wire — convesso sends no keep-alive for a session, and forgets one
+    /// whose keys expired — only what the daemon holds for it. Ten minutes keeps
+    /// a session through the ordinary pauses of someone working — reading a
+    /// page, thinking between commands — and closes it once they have stopped.
+    ///
+    /// Not a session with a light member: that one stays open, the way a new
+    /// root reaches the light member (`node::held_open`).
     pub idle: Duration,
 }
 
@@ -94,65 +75,8 @@ impl Schedule {
             sync: Duration::from_secs(60 * 60),
             announce: Duration::from_secs(60),
             endpoint_cache: Duration::from_secs(24 * 60 * 60),
-            press: Duration::from_secs(2),
-            press_longest: Duration::from_secs(6 * 60 * 60),
             idle: Duration::from_secs(10 * 60),
         }
-    }
-}
-
-/// Decides how long to wait before pressing a member that is owed something.
-///
-/// Pure, and separate from the loop that sleeps: the interesting half is the
-/// decision, and a decision made inside a `sleep` can only be tested by waiting
-/// for it.
-///
-/// The rule is that urgency decays. The attempts most likely to be answered are
-/// the ones immediately after an operation is signed — a device that is going to
-/// come back usually comes back soon — so pressing starts short and doubles until
-/// it reaches [`Schedule::press_longest`], six hours. A device that has been off
-/// for a week is then tried a few times a day, rather than every two seconds — or
-/// every minute — for a week.
-///
-/// It starts short again when the amount owed **grows**, because that is a new
-/// event rather than a continuation of the old wait. A person who revokes a
-/// second device should not have that revocation paced by how long the first one
-/// has been waiting.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pressing {
-    /// What the next press will wait.
-    interval: Duration,
-    /// How much was owed when this was last asked.
-    owed: usize,
-}
-
-impl Pressing {
-    /// Nothing pressed yet.
-    #[must_use]
-    pub const fn new(start: Duration) -> Self {
-        Self { interval: start, owed: 0 }
-    }
-
-    /// How long to wait, given how much is currently owed.
-    ///
-    /// `owed` is the number of (operation, device) pairs outstanding toward
-    /// members with no open session — the work pressing exists to finish. With
-    /// nothing owed the answer is the ordinary tick, and the next press starts
-    /// short again.
-    pub fn next(&mut self, owed: usize, schedule: &Schedule) -> Duration {
-        if owed == 0 {
-            *self = Self::new(schedule.press);
-            return schedule.sync;
-        }
-
-        if owed > self.owed {
-            self.interval = schedule.press;
-        }
-        self.owed = owed;
-
-        let waiting = self.interval.min(schedule.press_longest);
-        self.interval = self.interval.saturating_mul(2).min(schedule.press_longest);
-        waiting
     }
 }
 
@@ -408,72 +332,5 @@ mod tests {
     fn a_cached_endpoint_survives_an_overnight_gap() {
         // §2.6b's restore path depends on the cache being warm in the morning.
         assert!(Schedule::provisional().endpoint_cache >= Duration::from_secs(12 * 60 * 60));
-    }
-
-    /// Urgency is the point: a revocation must not be paced like an idle
-    /// network.
-    #[test]
-    fn pressing_starts_sooner_than_the_ordinary_tick() {
-        let schedule = Schedule::provisional();
-        let mut pressing = Pressing::new(schedule.press);
-        assert!(
-            pressing.next(1, &schedule) < schedule.sync,
-            "the first attempt after signing comes sooner than the idle tick"
-        );
-    }
-
-    /// And decays, so a device that has been switched off for a week is not
-    /// dialled every two seconds — or every minute — for a week.
-    #[test]
-    fn pressing_widens_to_hours() {
-        let schedule = Schedule::provisional();
-        let mut pressing = Pressing::new(schedule.press);
-
-        let mut previous = pressing.next(1, &schedule);
-        let mut widened = false;
-        for _ in 0..30u32 {
-            let waiting = pressing.next(1, &schedule);
-            assert!(waiting >= previous, "the interval never narrows while the wait continues");
-            assert!(waiting <= schedule.press_longest, "and never exceeds six hours");
-            widened |= waiting > previous;
-            previous = waiting;
-        }
-        assert!(widened, "it widens rather than repeating");
-        assert!(previous > Duration::from_secs(60), "past a minute");
-        assert_eq!(previous, schedule.press_longest, "settling at six hours");
-    }
-
-    /// A second revocation is a new event, not a continuation of the first
-    /// one's wait.
-    #[test]
-    fn something_newly_owed_starts_short_again() {
-        let schedule = Schedule::provisional();
-        let mut pressing = Pressing::new(schedule.press);
-
-        for _ in 0..10u32 {
-            pressing.next(1, &schedule);
-        }
-        assert_eq!(
-            pressing.next(2, &schedule),
-            schedule.press,
-            "more owed than before resets the urgency"
-        );
-    }
-
-    /// Nothing owed is not a wait at all.
-    #[test]
-    fn nothing_owed_falls_back_to_the_ordinary_tick() {
-        let schedule = Schedule::provisional();
-        let mut pressing = Pressing::new(schedule.press);
-
-        for _ in 0..10u32 {
-            pressing.next(1, &schedule);
-        }
-        assert_eq!(pressing.next(0, &schedule), schedule.sync);
-        assert_eq!(
-            pressing.next(1, &schedule),
-            schedule.press,
-            "and the next thing owed is pressed from the start"
-        );
     }
 }

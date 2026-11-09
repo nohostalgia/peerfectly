@@ -5,159 +5,144 @@ is the roster's canonical CBOR under the same narrowed rules: definite lengths,
 minimal integer widths, length-first map key ordering, every field exactly once,
 no trailing bytes, and **rejection rather than repair**.
 
-## 1. The joining payload
+## 0. The invite
+
+What an admin hands a device so that it can join. It opens a door, once: the
+device waits at a rendezvous key derived from the invite's secret, and the admin
+that issued it dials that key. Nobody else knows where the device waits.
 
 ```text
-Joining = {
-  "alg":    tstr,   ; the signing key's algorithm: "ed25519" or "p256"
-  "name":   tstr,   ; the name the device proposes for itself
-  "sign":   bstr,   ; the signing key, from which the device id is derived
-  "relay":  tstr,   ; where the device is waiting to be reached
-  "trans":  bstr,   ; the transport key, which a session authenticates
-  "attest": bstr    ; the attestation key, which will date the device's roster
+Invite = {
+  "net":    bstr .size 32,   ; the network id: the only network the device accepts
+  "block":  bstr .size 5,    ; the network's IPv4 block: its base, then its prefix length
+  "relay":  tstr,            ; the network's relay, key@host:port
+  "secret": bstr .size 16    ; random
 }
 ```
 
-Key order is length-first, so the three-byte key comes first, then the two
-four-byte keys ordered by their bytes (`name` before `sign`), then the two
-five-byte ones (`relay` before `trans`), and the six-byte `attest` last.
-Alphabetical order would put `alg`, `attest`, `name`, `relay`, `sign`, `trans`
-and produce bytes a conforming decoder refuses.
+Roster's canonical encoding: length-first keys, every field exactly once, no
+trailing bytes. The relay is 1 to 128 bytes. An invite carries **no** name,
+role, mode or groups: those stay in the admin's local record of the invite,
+with its expiry and whether it was used, and never enter the roster.
 
-`alg` covers the **signing** key only. Neither the transport key's algorithm nor
-the attestation key's is carried: §2.3 fixes device transport keys as ed25519 and
-the binding refuses anything else when it binds an endpoint, and an attestation
-key is ed25519 for a reason of its own — it is never held in an enclave, because
-a key in one is a key that asks a person. A field for either would be a second
-place to state one thing.
+The block is the network's IPv4 block when the invite was issued, `/10` to `/28`
+inside the private blocks. It is there so the joining device can say, before it
+asks, where the network's addresses would coincide with its other networks or the
+subnets it is on. Nothing signs it: an invite that lied about it misleads only
+that warning, and the block a member holds is the one its roster says.
 
-`attest` is here because the device record the admission signs must carry an
-attestation key, and the admitting side has nowhere else to learn it from. The
-joining device cannot attest to anything until it is admitted; what this field
-does is let the record be complete at the moment it is created, since none of the
-roster's operations adds a key to a device that already exists.
+The text form is `peerfectly-invite-v2:` followed by the bytes in lowercase
+hexadecimal; surrounding whitespace is ignored. A scannable code carries the
+text.
 
-`name` and `relay` are refused when empty. Absence is not one of the things this
-format can say, and a device asking for the empty name is not the same request
-as a device asking for nothing.
+The rendezvous identity's seed is
+`BLAKE3-derive("peerfectly invite rendezvous v1", network id || secret)`: an
+ed25519 seed, bound to the network as well as the secret, so one secret cannot
+meet in two networks.
 
-**What is deliberately absent**: a role, a founder flag, capabilities, an expiry,
-and any secret. A joining device says who it is and asks for a name. What it is
-permitted to be is decided by the admin that admits it, and a field here for any
-of that would be a field somebody eventually honours.
+## 2. No confirmation code
 
-### The text form
+There is none. Enrolment is asynchronous: the joining device's request is kept by
+the admitting side until a person approves it, and nobody compares two screens.
+A short code compared remotely is a second bearer secret, sent the way the
+invite was, and over `Noise_IKpsk2` the responder chooses its ephemeral after
+the initiator's, so whoever holds the invite could search ephemerals until two
+codes matched. In person, the admin compares the fingerprint of the joining
+device's signing key, which is derived from the key and cannot be ground.
 
-```text
-peerfectly-join-v1:<lowercase hex of the canonical bytes>
-```
-
-The prefix is the version. A later format changes it, so an older reader refuses
-new bytes instead of misreading them. Surrounding whitespace is ignored on
-reading, because a person copying out of a terminal picks some up.
-
-The scannable form carries **the same bytes**. It is a rendering, not a second
-format, and a test asserts the two round-trip to one payload.
-
-## 2. The confirmation code
-
-Six decimal digits, leading zeros kept, derived as:
+## 3. The proofs of possession
 
 ```text
-code = decimal( first 8 bytes, big-endian, of
-                blake3-derive-key( "peerfectly enrolment confirmation code v1",
-                                     len||joining-signing-key
-                                  || len||joining-transport-key
-                                  || len||joining-attestation-key
-                                  || len||admitting-transport-key
-                                  || len||channel )
-              ) mod 1 000 000
+request   = blake3-derive-key( "peerfectly join request v1",
+                               network id || rendezvous key || transport key || attestation key )
+challenge(m) = blake3-derive-key( "peerfectly enrolment possession v1", m )
+proof     = sign( challenge(request) ) with the device's SIGNING key
+tproof    = sign( challenge(channel) ) with the device's TRANSPORT key
 ```
 
-Every length is a four-byte big-endian prefix: without it two different sets of
-fields could concatenate to the same input, and two different exchanges could
-produce one code.
+`network id` and `rendezvous key` are the invite's: the network it names and the
+key its secret derives (§0). The keys are their 32 raw bytes. Both proofs are
+verified against the keys the introduction presents.
 
-The joining device's **attestation** key is covered although nothing establishes
-possession of it, unlike the signing key — proven by the possession proof — and
-the transport key, proven by the channel. The code is not only a proof of
-possession: it is what makes the admitting side's signature cover what both
-people compared. That key goes into the device record, so a code that left it out
-would allow a payload substituted in flight to name an attestation key of the
-attacker's choosing while showing the same six digits.
+The channel of an invite authenticates only the rendezvous key the invite's
+secret derives, which says nothing about the device's own keys. The signing key
+is where a device's identity comes from, and the transport key is what its
+sessions will be authenticated by. Without these proofs an introduction could
+pair one device's signing key with another's transport key, and because a roster
+keeps the **first** admission of a device id and ignores later ones, that binding
+could never be corrected.
 
-The two roles are fixed and different, so there is no order to agree on. The
-joining device contributes **both** of its keys — its signing key is established
-by the proof of possession below, its transport key by the channel. The admitting
-device contributes only its transport key, because that is all the joining device
-can know about it: the channel authenticates transport keys, and the admitting
-device's signing key is in the roster that has not arrived yet. Asserting it over
-the wire and mixing it in would look like a binding and be none — an impostor
-would assert its own and compute the same code. What exposes an impostor is that
-its channel is a different channel.
+`proof` covers the join's **request** rather than a channel because it is made
+once, when the person runs the join: the signing key may be one only a person can
+unlock, and the exchanges of a join happen whenever the daemons meet, with nobody
+there. It names the other two keys and the invite, so it cannot be moved to
+another device's keys or another invite; a copy of it is worth nothing to anybody
+else, who holds none of those keys. `tproof` covers each channel, since the
+transport key answers without a person.
 
-**`channel` is required and must not be empty.** It is material exported from the
-established channel, and it is what makes six digits safe. Every key above is
-public — the payload is on a screen, the admin's keys are in a roster everyone
-holds — so a derivation over keys alone could be computed in advance by anyone
-who had seen the payload, and then matched by generating key pairs until one
-produced the same six digits. That search is over a space of one million.
-Channel material defeats it because the value being matched does not exist until
-the channel does.
-
-## 3. The proof of possession
-
-```text
-challenge = blake3-derive-key( "peerfectly enrolment possession v1", channel )
-proof     = sign( challenge ) with the device's SIGNING key
-```
-
-Verified against the signing key the payload carries.
-
-The channel authenticates the transport key — the admitting side dials it, and
-nobody else can answer. It says nothing about the signing key, which is where a
-device's identity comes from. Without this proof a payload could pair one
-device's signing key with another's transport key, and because a roster keeps the
-**first** admission of a device id and ignores later ones, that binding could
-never be corrected.
-
-The two derivation contexts are distinct, and neither is used anywhere else in
-the system. A signature made for another purpose cannot serve as this proof, and
-this proof cannot serve elsewhere.
+The derivation contexts are distinct, and none is used anywhere else in the
+system. A signature made for another purpose cannot serve as these proofs, and
+these proofs cannot serve elsewhere.
 
 ## 3b. The exchange, and what is said when
 
-Four messages, in one order. Each side knows which it expects, and one arriving
+Every exchange is opened by the admitting side — the admin that issued the invite,
+or a full member bringing an admission — and the joining device answers. It has
+one of two shapes. Each side knows which messages it expects, and one arriving
 out of turn ends the exchange rather than being acted on.
 
 ```text
-joiner -> admin   hello     { kind, proof }
-                  (the admin shows the code it computed; its person is asked
-                   whether the device being enrolled says the code was accepted)
-joiner -> admin   accepted  { kind }
+joiner -> admin   introduce { alg, kind, name, sign, proof, trans, attest, tproof, conflicts }
+
+then, before a person has approved the request:
+admin  -> joiner  received  { kind }                         (the exchange ends)
+
+or, once a person has approved it:
+admin  -> joiner  base      { kind, root, pieces }           (zero or more)
+admin  -> joiner  batch     { kind, pieces }                 (zero or more)
 admin  -> joiner  admit     { kind, roster, snapshot? }
 joiner -> admin   outcome   { kind, taken }
 ```
+
+A device opens with `introduce`: it presents all three of its keys and proves
+two — `proof` and `tproof` of §3. `alg` covers the signing key only: transport
+and attestation keys are ed25519. Both proofs SHALL be checked before the request
+is kept. `conflicts` is an array of at most 16 text strings of at most 200 bytes,
+each saying in the device's words where the invite's block coincides with its
+other networks or the subnets it is on; the admin's daemon keeps them with the
+request for the person approving it, and decides nothing by them. `name` is the
+name it proposes; the admin's record of the invite decides
+the name, role, mode, groups and address it is admitted with, and an admission
+whose record chose any of the last four is followed, in the same delivery, by the
+`set_device` that sets them.
+
+`received` carries **nothing but its kind**, and proves nothing: whoever holds the
+invite can send it. It tells the joining device that its request is kept and that
+waiting on is the next thing. A delivery comes later, in another exchange, from the
+admin or from any full member holding the admission, at the rendezvous or at the
+joining device's own transport key.
+
+Where the admitting side's roster was compacted, its operations no longer reach
+the genesis, and `admit` alone derives nothing. The admitting side then sends,
+before it, the state its roster rests on: `root` is the signed root beneath the
+window, `pieces` are the state's pieces as roster-sync's state transfer cuts
+them (at most 64 KiB each, at most 14 to a message, so that a part fits one
+message beside the root). Every `base` carries the same root. The joiner
+gathers the pieces and believes the state only once every one is in, it makes
+the root, and the root's signature checks against its author in that state; it
+then rests on it and takes the operations of `admit` that follow the root's
+heads. A base that does not hold is refused like a roster that does not admit
+the device: nothing is written, and `outcome` says `taken: false`.
+
+`batch` carries pieces of the batches among the operations to come, at most 120
+to a message, each as large as an operation may be. A batch's operation is only
+its header; the joiner offers each batch its pieces as soon as it holds the
+header, and takes into the graph whatever was signed after it once it is whole.
 
 Every message travels in the same envelope, `{ body, kind }`, where `body` is the
 embedded canonical encoding of the map above and `kind` repeats its name. An
 envelope whose `kind` disagrees with its body is refused: a reader that trusted
 the label over the contents is a reader that can be talked into the wrong branch.
-
-`accepted` carries **nothing but its kind**. Both sides derived the same code
-from the channel, so a field repeating it would be a second source for one fact;
-and sending back the digits a person typed would put them on the channel, which
-is precisely what an attacker who dialled the waiting device first controls.
-
-What it carries is *when*. The joining side sends it once a person has entered
-the code the admitting side displayed and it matched. Until it arrives, the
-admitting side does not know whether anyone compared anything — and signing
-before it would deliver the whole roster, and an admission for that device, to a
-machine whose person has confirmed nothing.
-
-An implementation SHALL NOT sign before reading `accepted`, SHALL read it under
-the exchange's own deadline, and SHALL refuse one that arrives before `hello`,
-twice, or in place of `outcome`.
 
 `admit` carries the network's current **snapshot** beside the roster, where the
 admitting side holds one. The field is optional and absence has one spelling: the
@@ -177,30 +162,27 @@ and never because of who sent it.
 
 A snapshot that does not check SHALL be dropped **without refusing the roster**.
 The operations prove the membership; the snapshot only dates it, and it is
-allowed to be missing altogether. A joiner that discarded a membership its person
-had just confirmed on two screens, over a field that need not have been sent,
-would be trading the thing it came for against the thing it could do without. An
-admitting side that sends none, and one whose snapshot does not check, leave the
-joiner in the same place: a member, with nothing yet to measure freshness from,
-and told so.
+allowed to be missing altogether. An admitting side that sends none, and one
+whose snapshot does not check, leave the joiner in the same place: a member, with
+nothing yet to measure freshness from, and told so.
 
 ## 4. Bounds
 
 | | |
 |---|---|
-| Joining payload, encoded | 512 bytes |
 | Proposed name | 64 bytes (the roster's own) |
 | Relay address | 128 bytes (the roster's own) |
 | One exchange message | 1 MiB |
-| A wait | 600 seconds |
-| One exchange within a wait | 60 seconds |
-| Attempts within a wait | 10 |
-| Confirmation code | 6 digits |
+| State pieces in one `base` | 14 |
+| Batch pieces in one `batch` | 120 |
+| `base` or `batch` messages in one exchange | 4096 each |
+| One exchange | 60 seconds |
 
 A declared length is checked against its bound **before** any buffer is reserved,
 so a peer cannot make a device allocate merely by claiming a large size.
 
-The last three are security parameters rather than sizes. The payload is public,
-so anyone who has seen one can open an exchange with the device that produced it:
-the per-exchange deadline stops one silent peer occupying the only slot, and the
-attempt cap is what keeps six digits out of reach of guessing.
+The exchange's deadline is a security parameter rather than a size. An invite is
+a bearer token, so anyone who has read one can open an exchange with the device
+waiting behind it: the deadline stops one silent peer occupying the only slot.
+A join has no deadline of its own: it ends when it is admitted, rejected,
+withdrawn or cancelled, and the exchanges it answers are paced rather than counted.

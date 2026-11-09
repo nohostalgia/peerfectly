@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use identity::NodeIdentity;
-use roster::id::{DeviceId, OperationId};
+use roster::id::DeviceId;
 use roster::state::RosterState;
 use roster_sync::Syncer;
 use tokio::sync::{Mutex, watch};
@@ -50,7 +50,6 @@ use transport::session::{Session, Transport};
 use tunnel::Ipv4Holdings;
 
 use crate::channel::{Channel, frame, unframe};
-use crate::confirmations::{Confirmations, Confirmed};
 use crate::contacts::{ContactRecord, LastContacts};
 use crate::gateway::{Departure, Gateway};
 use crate::router::Router;
@@ -111,26 +110,10 @@ impl Fault {
     }
 }
 
-/// A device that has not confirmed holding everything authored here.
-///
-/// Named rather than counted. "Two operations are outstanding" tells a person
-/// that something is wrong and nothing about what to do; "the laptop has not got
-/// the revocation" tells them which machine is still admitting the device they
-/// expelled. It also survives a dishonest member: one that claims to hold what
-/// it discards removes its own row from this list and nobody else's.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Lagging {
-    /// The device, as the roster names it.
-    pub name: String,
-    /// How many operations authored here it has not confirmed holding.
-    pub operations: usize,
-    /// Whether a session with it is open right now.
-    ///
-    /// The difference between "wait for it to appear" and "it is here and has
-    /// not taken this", which are not the same situation and do not have the
-    /// same remedy.
-    pub connected: bool,
-}
+/// A light member and its upkeep, as `light_node::engine` runs them: shared
+/// by the node and the transport's judging, which only ever lock it briefly
+/// and never across an await.
+type Light = Arc<std::sync::Mutex<light_node::engine::Engine>>;
 
 /// The assembled node.
 pub struct Node {
@@ -170,17 +153,23 @@ pub struct Node {
     /// admitted or revoked while up changes them without a restart. Sent only
     /// from `enforce_roster`, and only when the holdings actually changed.
     holdings: watch::Sender<Arc<Ipv4Holdings>>,
+    /// The state the holdings and the router were last made to follow: what
+    /// the next change is measured from, so that a change costs what changed.
+    enforced: Mutex<Option<RosterState>>,
+    /// This device's neighbour choices, and the state they are of: followed
+    /// through a roster's changes rather than read from every member again.
+    choices: std::sync::Mutex<Option<(RosterState, crate::neighbours::Choices)>>,
     /// The peers withheld on this device, and why, as the service last decided.
     ///
     /// Decided outside the node, because it depends on this device's other
     /// networks and interfaces; kept here, because the resolver and the report
     /// already read the node. Empty while down: nothing is routed, so nothing is
     /// withheld from a route.
-    withheld: std::sync::Mutex<Arc<BTreeMap<DeviceId, crate::conflicts::Conflict>>>,
+    withheld: std::sync::Mutex<Arc<Vec<crate::conflicts::Hole>>>,
     /// Live sessions, by the device they belong to.
     sessions: Mutex<BTreeMap<DeviceId, Arc<dyn Session>>>,
-    /// Which way each live session was opened, by the same key.
-    openings: std::sync::Mutex<BTreeMap<DeviceId, Opening>>,
+    /// Which way each live session was opened, and when, by the same key.
+    openings: std::sync::Mutex<BTreeMap<DeviceId, (Opening, tokio::time::Instant)>>,
     /// Dials in flight, by the peer's transport key, each with where its
     /// outcome will be told. A second caller waits for that outcome rather than
     /// dialling again: two dials to one peer at once opened two sessions in
@@ -199,23 +188,37 @@ pub struct Node {
     called: String,
     /// The operation log the roster is rebuilt from.
     log: Log,
+    /// What this device holds where it is a light member here: in place of a
+    /// roster, whose syncer then stays empty.
+    light: std::sync::RwLock<Option<Light>>,
+    /// Set when this node changed mode — full to light or light to full — so
+    /// the service builds it again from what it now keeps.
+    switched: std::sync::atomic::AtomicBool,
+    /// Set while a light member that became full fetches the state it rests on.
+    becoming_full: std::sync::atomic::AtomicBool,
+    /// Wakes the light member's upkeep, to carry out what its engine asks.
+    upkeep: Arc<tokio::sync::Notify>,
+    /// Held while what a light member's engine asks is carried out, so that
+    /// its outputs are acted on in the order it gave them.
+    driving: Mutex<()>,
+    /// When this node was built: the light member's engine counts time from
+    /// it.
+    born: tokio::time::Instant,
+    /// Held while the log is written: appended to, or rewritten after a
+    /// compaction, so that a rewrite never drops an operation appended while it
+    /// was being made.
+    log_guard: Mutex<()>,
+    /// What keeps this network's checkpoint current, once the service has set
+    /// one. Absent in a node nobody carries.
+    keeper: std::sync::OnceLock<Arc<crate::checkpoint::Keeper>>,
+    /// The store this network's base is kept in, once a base is: opened by
+    /// this node and held while it lives, since a store is opened by one owner
+    /// at a time.
+    base: std::sync::Mutex<Option<Arc<member_store::Store>>>,
+    /// Whether a base that failed a check has been reported.
+    base_told: std::sync::atomic::AtomicBool,
     /// The intervals this node runs on.
     schedule: Schedule,
-    /// Which devices have been observed to hold which operations.
-    ///
-    /// §2.6c: with the network down the daemon reaches no infrastructure, so an
-    /// administrative act taken then has nowhere to go yet. What matters is not
-    /// that it waits — the CRDT is built for that — but that nobody is told it
-    /// arrived. A person who has revoked a device and been shown nothing thinks
-    /// the revocation has taken effect.
-    ///
-    /// So the question is answered from evidence rather than from a queue: an
-    /// operation authored here is outstanding toward every member whose own offer
-    /// has never named it. There is no list to lose across a restart, and no
-    /// event that empties it without a peer having said anything.
-    confirmed: Mutex<Confirmed>,
-    /// Where that record is kept between runs.
-    confirmations: Confirmations,
     /// The last minute each device spoke on a session with this one.
     ///
     /// Written from two places — a session opening, and roster traffic arriving
@@ -292,20 +295,6 @@ impl Node {
         log: Log,
         schedule: Schedule,
     ) -> Self {
-        let confirmations = Confirmations::beside(log.path());
-
-        // A record that cannot be read is treated as an empty one, which reports
-        // every operation authored here as outstanding toward every member. The
-        // two failure directions are not symmetrical: over-reporting costs a
-        // person a look at a device that is already fine, and under-reporting
-        // costs them a revocation they believe is in force and is not. The
-        // failure is recorded rather than swallowed, so the over-reporting has a
-        // stated reason next to it.
-        let (confirmed, failure) = match confirmations.load() {
-            Ok(confirmed) => (confirmed, None),
-            Err(cause) => (Confirmed::default(), Some(cause.to_string())),
-        };
-
         // Losing this one misleads nobody: every device reads as having no
         // contact recorded, which is what this device now knows.
         let contact_record = ContactRecord::beside(log.path());
@@ -331,28 +320,35 @@ impl Node {
             .and_then(|directory| directory.file_name())
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
 
-        // Each is logged; the last is kept as the latest.
-        let mut latest = None;
-        for cause in failure.into_iter().chain(lost.map(|cause| cause.to_string())) {
+        // Logged, and kept as the latest.
+        let latest = lost.map(|cause| {
+            let cause = cause.to_string();
             tracing::warn!(
                 network = %called,
                 subsystem = "state",
                 cause = %crate::logging::scrubbed(&cause),
                 "fault"
             );
-            latest = Some(Fault { subsystem: "state".to_owned(), cause, at: SystemTime::now() });
-        }
+            Fault { subsystem: "state".to_owned(), cause, at: SystemTime::now() }
+        });
 
         // The holdings the roster already implies, so the gateway and router
         // agree with it from the start rather than from the first change.
-        let holdings = syncer
-            .roster()
-            .state()
-            .map_or_else(|_| Ipv4Holdings::default(), |state| Ipv4Holdings::of_state(&state));
+        // A roster that derives nothing yet holds no addresses: not a failure
+        // to record, the state of a network still being joined.
+        #[allow(
+            clippy::manual_ok_err,
+            reason = "spelled out: a test here forbids the form that swallows failures"
+        )]
+        let initial = match syncer.roster().state() {
+            Ok(state) => Some(state),
+            Err(_) => None,
+        };
+        let holdings = initial.as_ref().map_or_else(Ipv4Holdings::default, Ipv4Holdings::of_state);
         let mut router = router;
         router.set_holdings(holdings.clone());
-        if let Ok(state) = syncer.roster().state() {
-            router.set_members(others(&state, &identity.device_id()));
+        if let Some(state) = &initial {
+            router.follow_state(state, &identity.device_id());
         }
         gateway.set_holdings(holdings.clone());
 
@@ -365,7 +361,9 @@ impl Node {
             gateway,
             router: Mutex::new(router),
             holdings: watch::Sender::new(Arc::new(holdings)),
-            withheld: std::sync::Mutex::new(Arc::new(BTreeMap::new())),
+            enforced: Mutex::new(initial),
+            choices: std::sync::Mutex::new(None),
+            withheld: std::sync::Mutex::new(Arc::new(Vec::new())),
             sessions: Mutex::new(BTreeMap::new()),
             openings: std::sync::Mutex::new(BTreeMap::new()),
             dialling: std::sync::Mutex::new(BTreeMap::new()),
@@ -374,9 +372,17 @@ impl Node {
             event: Mutex::new(None),
             called,
             log,
+            light: std::sync::RwLock::new(None),
+            switched: std::sync::atomic::AtomicBool::new(false),
+            becoming_full: std::sync::atomic::AtomicBool::new(false),
+            upkeep: Arc::new(tokio::sync::Notify::new()),
+            driving: Mutex::new(()),
+            born: tokio::time::Instant::now(),
+            log_guard: Mutex::new(()),
+            keeper: std::sync::OnceLock::new(),
+            base: std::sync::Mutex::new(None),
+            base_told: std::sync::atomic::AtomicBool::new(false),
             schedule,
-            confirmed: Mutex::new(confirmed),
-            confirmations,
             contacts: Mutex::new(contacts),
             contact_record,
             in_neighbours: Mutex::new(in_neighbours),
@@ -394,6 +400,13 @@ impl Node {
 
     /// How many times it tries again before giving up on this attempt.
     pub const NEWCOMER_ATTEMPTS: usize = 3;
+
+    /// How long a peer that had no room waits before trying again: it is
+    /// there, and one of its sessions falls quiet within seconds.
+    pub const BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// How many times a peer that had no room is tried again, in one attempt.
+    pub const BUSY_ATTEMPTS: usize = 8;
 
     /// The least time between two catch-ups caused by refusals.
     pub const CATCH_UP_AT_MOST: std::time::Duration = std::time::Duration::from_secs(60);
@@ -430,7 +443,8 @@ impl Node {
         }
     }
 
-    /// Closes every session that has carried nothing for `idle`.
+    /// Closes every session that has carried nothing for `idle`, but those
+    /// [`held_open`] keeps.
     ///
     /// Not a fault and not recorded: it is the ordinary end of a session nothing
     /// is using, and the next packet that needs one opens it again.
@@ -446,6 +460,20 @@ impl Node {
                     .collect()
             },
         );
+        if held_open(self.is_light(), false) {
+            return;
+        }
+        let stale: Vec<DeviceId> = {
+            let syncer = self.syncer.lock().await;
+            let roster = syncer.roster();
+            stale
+                .into_iter()
+                .filter(|peer| {
+                    let peer_light = roster.mode_of(peer) == Some(roster::leaf::Mode::Light);
+                    !held_open(false, peer_light)
+                })
+                .collect()
+        };
         for peer in stale {
             tracing::info!(network = %self.called, ?peer, "closing a session nothing used");
             let session = self.sessions.lock().await.get(&peer).map(Arc::clone);
@@ -492,7 +520,42 @@ impl Node {
         // So that, with other admins in the network, this device's own
         // attestations do not keep its own roster fresh.
         roster.set_own_device(identity.device_id());
+        // The batches' layers on disk, emptied and filled again as the log is
+        // replayed: a fleet's boards are not held in memory, and nothing the
+        // file held before this start is relied on (`member_store::Layers`).
+        // Where it cannot be opened, the layers stay in memory.
+        if let Some(paths) = log.path().parent().map(crate::state::Paths::under)
+            && let Ok(layers) = crate::state::open_layers(&paths)
+            && layers.clear().is_ok()
+        {
+            roster.keep_layers_in(layers);
+        }
         let held = log.read()?;
+        // A log that was compacted rests on a base: the root beneath its window
+        // and the state that root commits to. Only the operations that follow
+        // the base's heads are offered; the rest of the log, where a rewrite
+        // was cut short, is what the base already covers.
+        let paths = log.path().parent().map(crate::state::Paths::under);
+        let store = paths
+            .as_ref()
+            .filter(|paths| paths.base_snapshot().exists())
+            .map(crate::state::open_base_store)
+            .transpose()?;
+        let held = match (&paths, &store) {
+            (Some(paths), Some(store)) => match resting_on_base(&mut roster, paths, store, held) {
+                Ok(after) => after,
+                // A base that does not check out holds nothing to rest on, and
+                // a log beneath a base derives nothing without one: said as
+                // what it is.
+                Err(_) => {
+                    return Err(crate::error::Error::State {
+                        path: paths.base_store(),
+                        cause: CHANGED_OUTSIDE.to_owned(),
+                    });
+                }
+            },
+            _ => held,
+        };
         // Why the first operation this build refuses was refused. A log written
         // by a build whose rules were looser — before network suffixes and
         // prefixes were bounded, say — reads as a device that holds a network
@@ -504,6 +567,14 @@ impl Node {
             let admission = roster.offer_bytes(operation);
             if let (None, Some(reason)) = (&refusal, admission.refusal()) {
                 refusal = Some(reason.to_string());
+            }
+        }
+        // The pieces of the batches among them, now that their headers are
+        // held: a batch takes effect only once they are all in, so the state
+        // a snapshot below is checked against needs them first.
+        if let Some(paths) = log.path().parent().map(crate::state::Paths::under) {
+            for piece in crate::state::Log::at(paths.pieces()).read()? {
+                let _taken = roster.offer_piece(&piece);
             }
         }
 
@@ -546,14 +617,641 @@ impl Node {
         // No adapter and no transport are made here. Both are things a person has
         // to ask for, and both talk to something the moment they exist. `up`
         // makes them; `down` drops them.
-        Ok(Some(Arc::new(Self::new(
+        let node = Self::new(
             identity,
             Syncer::new(roster),
             Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(prefix, own))),
             crate::router::Router::new(prefix),
             log,
             crate::schedule::Schedule::provisional(),
-        ))))
+        );
+        if let Ok(mut held) = node.base.lock() {
+            *held = store;
+        }
+        Ok(Some(Arc::new(node)))
+    }
+
+    /// A node for a network this device is a light member of: it holds no
+    /// roster, and runs on the light member kept beside its identity.
+    ///
+    /// `None` where no light member is kept there.
+    ///
+    /// # Errors
+    ///
+    /// When the parameters the member holds are unusable.
+    pub fn from_light(
+        identity: Arc<NodeIdentity>,
+        paths: &crate::state::Paths,
+    ) -> crate::Result<Option<Arc<Self>>> {
+        let Some(member) = crate::state::read_light(paths) else { return Ok(None) };
+        let state = member.state();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula)?;
+        let own = identity.device_id();
+        let node = Self::new(
+            identity,
+            Syncer::new(roster::roster::Roster::new()),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(prefix, own))),
+            crate::router::Router::new(prefix),
+            // Never written: a light member holds no operations.
+            Log::at(paths.roster()),
+            crate::schedule::Schedule::provisional(),
+        );
+        node.set_light(Some(Arc::new(std::sync::Mutex::new(light_node::engine::Engine::new(
+            member,
+        )))));
+        Ok(Some(Arc::new(node)))
+    }
+
+    /// Keeps this network's checkpoint current from now on.
+    pub fn keep_with(&self, keeper: Arc<crate::checkpoint::Keeper>) {
+        let _already = self.keeper.set(keeper);
+    }
+
+    /// What keeps this network's checkpoint, if anything does.
+    #[must_use]
+    pub fn keeper(&self) -> Option<&Arc<crate::checkpoint::Keeper>> {
+        self.keeper.get()
+    }
+
+    /// The root the roster's base rests on, where it was compacted.
+    pub async fn base_root(&self) -> Option<crate::checkpoint::Hash> {
+        let syncer = self.syncer.lock().await;
+        syncer.roster().dag().base_snapshot().map(|snapshot| snapshot.body().root)
+    }
+
+    /// Reads a node nobody else holds yet: `None` while something else does.
+    ///
+    /// For checking a node just assembled against its checkpoint, where
+    /// nothing else can be holding it and the caller cannot wait.
+    pub fn with_roster_now<T>(&self, read: impl FnOnce(&roster::roster::Roster) -> T) -> Option<T> {
+        self.syncer.try_lock().ok().map(|syncer| read(syncer.roster()))
+    }
+
+    /// The store this network's base is kept in, opened the first time a base
+    /// is written and kept open from then on.
+    fn base_store(&self) -> Option<Arc<member_store::Store>> {
+        let mut held = self.base.lock().ok()?;
+        if let Some(store) = held.as_ref() {
+            return Some(Arc::clone(store));
+        }
+        let store = crate::state::open_base_store(&self.paths()?).ok()?;
+        *held = Some(Arc::clone(&store));
+        Some(store)
+    }
+
+    /// Whether the store this network's base is kept in answered something
+    /// that did not check out: it was changed by someone other than this
+    /// daemon, and nothing it holds is to be believed.
+    #[must_use]
+    pub fn base_tampered(&self) -> bool {
+        self.base
+            .lock()
+            .ok()
+            .and_then(|held| held.as_ref().map(|store| store.tampered()))
+            .unwrap_or(false)
+    }
+
+    /// Whether the base store failed a check, recording it the first time it
+    /// is seen.
+    pub async fn base_tampered_told(&self) -> bool {
+        if !self.base_tampered() {
+            return false;
+        }
+        if !self.base_told.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.record(
+                Severity::Problem,
+                "state",
+                "the store this network's base is kept in was changed outside this daemon:                  what it holds is not believed, and joining the network again fetches it                  from peers",
+            )
+            .await;
+        }
+        true
+    }
+
+    /// The base this roster rests on: the root beneath its window and the
+    /// state it commits to.
+    pub async fn base(
+        &self,
+    ) -> Option<(roster::snapshot::SignedSnapshot, roster::state::RosterState)> {
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        Some((dag.base_snapshot()?.clone(), dag.base_state()?.clone()))
+    }
+
+    /// Writes `state` as the base, and rests the roster on what the store then
+    /// holds rather than on the copy in memory.
+    fn write_base_and_rest(
+        &self,
+        paths: &crate::state::Paths,
+        snapshot: &roster::snapshot::SignedSnapshot,
+        state: &roster::state::RosterState,
+    ) -> crate::Result<Option<roster::state::RosterState>> {
+        let store = self.base_store().ok_or_else(|| crate::error::Error::State {
+            path: paths.base_store(),
+            cause: "the base store would not open".to_owned(),
+        })?;
+        crate::state::write_base(paths, &store, snapshot, state)?;
+        Ok(store.state().ok().flatten().filter(|stored| stored.root() == state.root()))
+    }
+
+    /// Whether the roster holds `operation`.
+    pub async fn holds_operation(&self, operation: &roster::id::OperationId) -> bool {
+        self.syncer.lock().await.roster().dag().contains(operation)
+    }
+
+    /// When `operation` was signed, in milliseconds since the epoch on its
+    /// author's clock, where it admits one device and the roster still holds
+    /// it. Not for a batch: its boards reach the network themselves, and
+    /// nobody dials them (found in the testbed, 18.1: two thousand boards
+    /// dialled at once kept a daemon's every thread busy).
+    pub async fn admitted_alone_at(&self, operation: &roster::id::OperationId) -> Option<u64> {
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        dag.position(operation)
+            .and_then(|index| dag.operation(index))
+            .filter(|held| matches!(held.core().body, roster::types::OperationBody::AddDevice(_)))
+            .map(|held| held.core().ts)
+    }
+
+    /// The devices admitted alone, each by an `add_device` the roster still
+    /// holds signed at `since` or after, in milliseconds since the epoch on its
+    /// author's clock: the newcomers there may be, read from the operations
+    /// held rather than from every member. Not a batch's boards (as
+    /// [`Self::admitted_alone_at`]).
+    pub async fn admitted_alone_since(
+        &self,
+        since: u64,
+    ) -> Vec<(DeviceId, roster::id::OperationId)> {
+        let syncer = self.syncer.lock().await;
+        syncer
+            .roster()
+            .dag()
+            .operations()
+            .iter()
+            .filter(|operation| operation.core().ts >= since)
+            .filter_map(|operation| match &operation.core().body {
+                roster::types::OperationBody::AddDevice(spec) => {
+                    spec.device_id().ok().map(|device| (device, operation.id()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The neighbours this device could choose in `state`: which new members
+    /// it brings the network to.
+    pub(crate) fn choices(&self, state: &RosterState) -> Option<crate::neighbours::Choices> {
+        self.choices_in(state)
+    }
+
+    /// The network a light member's node belongs to.
+    #[must_use]
+    pub fn light_network(&self) -> Option<roster::id::NetworkId> {
+        self.light().and_then(|light| light.lock().ok().map(|light| light.member().network()))
+    }
+
+    /// Names a base about to be written in the checkpoint first. Whether the
+    /// write may go ahead: a base the checkpoint does not name would keep the
+    /// network from being carried at the next start.
+    fn before_writing_base(&self, root: crate::checkpoint::Hash) -> bool {
+        self.keeper.get().is_none_or(|keeper| keeper.allow_base(Some(root)).is_ok())
+    }
+
+    /// The same, for what a light member keeps.
+    fn before_writing_light(&self, member: &roster::member::LightMember) -> bool {
+        let hash = crate::checkpoint::light_hash(member);
+        self.keeper.get().is_none_or(|keeper| keeper.allow_light(hash).is_ok())
+    }
+
+    /// Says a write named beforehand has landed.
+    fn landed(&self) {
+        if let Some(keeper) = self.keeper.get() {
+            keeper.landed();
+        }
+    }
+
+    /// The same, for what a light member keeps: and that it is what the
+    /// checkpoint vouches for from now on, whatever the file is made to hold.
+    fn light_landed(&self, member: &roster::member::LightMember) {
+        if let Some(keeper) = self.keeper.get() {
+            keeper.holds_light(crate::checkpoint::light_hash(member));
+            keeper.landed();
+        }
+    }
+
+    /// The light member this node runs on, if it is one now.
+    fn light(&self) -> Option<Light> {
+        self.light.read().map_or(None, |held| held.clone())
+    }
+
+    /// A copy of the light member this node runs on, if it is one now.
+    fn light_member(&self) -> Option<roster::member::LightMember> {
+        self.light().and_then(|light| light.lock().ok().map(|light| light.member().clone()))
+    }
+
+    /// Milliseconds since this node was built: the light member's engine's
+    /// clock.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Gives the light member's engine something that happened, and carries
+    /// out what it asks in return. Nothing where this node is not light.
+    async fn tell_light(&self, event: impl FnOnce(&mut light_node::engine::Engine, u64)) {
+        let Some(light) = self.light() else { return };
+        let now = self.now_ms();
+        if let Ok(mut engine) = light.lock() {
+            event(&mut engine, now);
+        }
+        self.drive_light().await;
+    }
+
+    /// Carries out what the light member's engine asks, in its order: sends
+    /// its questions, keeps the member before acting on what follows, judges
+    /// the sessions again, follows the state.
+    async fn drive_light(&self) {
+        let _driving = self.driving.lock().await;
+        loop {
+            let Some(light) = self.light() else { return };
+            let next = light.lock().ok().and_then(|mut engine| engine.poll_output());
+            let Some(output) = next else { return };
+            match output {
+                light_node::engine::Output::Send { peer, channel, body } => {
+                    self.send_to(peer, channel, &body).await;
+                }
+                light_node::engine::Output::Keep => {
+                    if let Some(member) = self.light_member() {
+                        self.keep_light(&member).await;
+                    }
+                }
+                light_node::engine::Output::Renewed => {
+                    self.refresh_evidence().await;
+                    // Its leaf may now say it is full.
+                    let _asked = self.begin_full().await;
+                }
+                light_node::engine::Output::Reconsider => {
+                    let transport = self.transport.lock().await.clone();
+                    if let Some(transport) = transport {
+                        transport.reconsider();
+                    }
+                }
+                light_node::engine::Output::StateChanged => self.enforce_roster().await,
+                // The upkeep sleeps until the earliest deadline anyway, and
+                // nothing here asks the engine to find a member.
+                light_node::engine::Output::WakeAt(_)
+                | light_node::engine::Output::Found { .. } => {}
+            }
+        }
+    }
+
+    /// Makes this node a light member's, or a full member's.
+    fn set_light(&self, member: Option<Light>) {
+        if let Ok(mut held) = self.light.write() {
+            *held = member;
+        }
+    }
+
+    /// Whether this node changed mode since it was built: the service then
+    /// builds it again, from what it now keeps.
+    #[must_use]
+    pub fn mode_switched(&self) -> bool {
+        self.switched.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Becomes a light member, where the root this node holds says it is one:
+    /// its leaf, its proof and that root are kept as a light member, and the
+    /// roster and everything beside it is dropped.
+    ///
+    /// Returns whether it switched.
+    async fn become_light_if_named(&self) -> bool {
+        let me = self.identity.device_id();
+        let recent = self.seen_lately().await;
+        let member = {
+            let syncer = self.syncer.lock().await;
+            let roster = syncer.roster();
+            let Some(evidence) = roster.evidence_for(&me) else { return false };
+            if evidence.leaf.settings.mode != roster::leaf::Mode::Light {
+                return false;
+            }
+            let Ok(state) = roster.state() else { return false };
+            let Ok(mut member) = roster::member::LightMember::new(
+                evidence,
+                state.params,
+                roster::member::DEFAULT_BUDGET,
+            ) else {
+                return false;
+            };
+            // A way out besides the admin that admitted it, chosen while the
+            // whole roster is still here to choose from.
+            for evidence in crate::lookup::handed_evidence(roster, &me, &|device| recent(device)) {
+                let _kept = member.learn(&evidence);
+            }
+            member
+        };
+        let Some(paths) = self.paths() else { return false };
+        if !self.before_writing_light(&member) {
+            self.record(
+                Severity::Problem,
+                "state",
+                "the checkpoint could not name the light member",
+            )
+            .await;
+            return false;
+        }
+        if let Err(cause) = crate::state::write_light(&paths, &member) {
+            self.record(Severity::Problem, "state", cause).await;
+            return false;
+        }
+        self.light_landed(&member);
+        {
+            let _guard = self.log_guard.lock().await;
+            if let Ok(mut held) = self.base.lock() {
+                *held = None;
+            }
+            // The layers too, where nothing holds them open any more; one still
+            // open is emptied at the next start anyway.
+            for kept in [
+                paths.roster(),
+                paths.pieces(),
+                paths.base_snapshot(),
+                paths.base_store(),
+                paths.layers(),
+            ] {
+                let _removed = std::fs::remove_file(kept);
+            }
+        }
+        self.set_light(Some(Arc::new(std::sync::Mutex::new(light_node::engine::Engine::new(
+            member,
+        )))));
+        self.switched.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Starts becoming a full member, where this light member's own leaf says
+    /// it is one: it asks its contact for the state behind its root, through
+    /// the syncer, which rests on it once it is whole and checked. Returns the
+    /// message sent, for a caller that carries it itself.
+    async fn begin_full(&self) -> Option<roster_sync::message::Message> {
+        let member = self.light_member()?;
+        let (evidence, contact) = (member.evidence(), member.contact());
+        let shown = roster::membership::Evidence::from_bytes(&evidence).ok()?;
+        if shown.leaf.settings.mode != roster::leaf::Mode::Full {
+            return None;
+        }
+        self.becoming_full.store(true, std::sync::atomic::Ordering::SeqCst);
+        let root = roster_sync::message::Message::Snapshot(shown.root).encode();
+        let reception = self.syncer.lock().await.receive(contact, &root);
+        let request = reception
+            .replies
+            .into_iter()
+            .find(|reply| matches!(reply, roster_sync::message::Message::StateRequest(_)))?;
+        self.send_to(contact, Channel::Roster, &request.encode()).await;
+        Some(request)
+    }
+
+    /// Finishes becoming a full member once the state is whole and kept: the
+    /// light member is dropped, and the service builds the node again.
+    async fn finish_full(&self) {
+        if !self.becoming_full.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Some(paths) = self.paths() {
+            let _removed = std::fs::remove_file(paths.light());
+        }
+        self.set_light(None);
+        self.switched.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// What this device shows of its membership without the root, as bytes: for
+    /// an announcement. Empty where it holds no root.
+    pub async fn shown(&self) -> Vec<u8> {
+        if let Some(light) = self.light() {
+            return light.lock().map_or_else(|_| Vec::new(), |light| light.member().shown());
+        }
+        crate::snapshots::shown_of(self.syncer.lock().await.roster(), &self.identity.device_id())
+    }
+
+    /// Learns a member from what it showed in an announcement signed with
+    /// `key`, as a light member does: the leaf must name that key for the
+    /// transport purpose, and its proof hold against a root this member
+    /// remembers. Whether it was learned.
+    pub async fn learn_shown(&self, key: &roster::sign::PublicKey, shown: &[u8]) -> bool {
+        let Some(member) = self.light() else { return false };
+        let Ok(compact) = roster::membership::Shown::from_bytes(shown) else { return false };
+        let names_key = compact.leaf.record.keys.iter().any(|entry| {
+            entry.purpose == roster::types::KeyPurpose::Transport && entry.value == key.as_bytes()
+        });
+        if !names_key {
+            return false;
+        }
+        let kept = member.lock().ok().and_then(|mut light| {
+            light.member_mut().learn_shown(shown).ok()?;
+            Some(light.member().clone())
+        });
+        let Some(kept) = kept else { return false };
+        self.keep_light(&kept).await;
+        self.enforce_roster().await;
+        true
+    }
+
+    /// Whether this node is a light member's.
+    #[must_use]
+    pub fn is_light(&self) -> bool {
+        self.light().is_some()
+    }
+
+    /// What a light member's transport starts with: the compact evidence it
+    /// shows, and how it judges the compact evidence its peers show. `None`
+    /// for a full member.
+    ///
+    /// A peer is believed against a root this member remembers, and nothing
+    /// else: a root it does not is caught up to first, as the session opens
+    /// ([`Self::catching_up`]). It used to be shown with the evidence, and a
+    /// root one step ahead adopted here; it was most of what opening a session
+    /// cost, for a root the member nearly always held already
+    /// (`daemon::simulator`).
+    #[must_use]
+    pub fn light_binding(&self) -> Option<(Vec<u8>, transport_convesso::node::Judge)> {
+        let light = self.light()?;
+        let shown = light.lock().ok()?.member().shown();
+        let judging = Arc::clone(&light);
+        let judge: transport_convesso::node::Judge =
+            Arc::new(move |shown| judging.lock().is_ok_and(|light| light.judge(shown)));
+        Some((shown, judge))
+    }
+
+    /// How a light member catches up while a session opens, on a root its
+    /// peer's evidence rests on that it knows nothing of: it asks that peer
+    /// for the roots after its own, takes them, and judges the evidence again.
+    /// `None` for a full member.
+    ///
+    /// Without it, a member that missed roots refused every member holding
+    /// them, and had nobody left to ask (testbed, 18.1).
+    #[must_use]
+    pub fn catching_up(&self) -> Option<transport::session::CatchingUp> {
+        let light = self.light()?;
+        let asking = Arc::clone(&light);
+        let behind: transport::session::Behind =
+            Arc::new(move |shown: &[u8]| asking.lock().ok()?.behind(shown));
+        let upkeep = Arc::clone(&self.upkeep);
+        let born = self.born;
+        let take: transport::session::TakeRoots = Arc::new(move |shown: &[u8], roots: &[u8]| {
+            let now = u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let taken = light.lock().is_ok_and(|mut light| light.take_roots(shown, roots, now));
+            if taken {
+                // Kept, and what it stands on asked, by the upkeep.
+                upkeep.notify_one();
+            }
+            taken
+        });
+        Some(transport::session::CatchingUp { behind, take })
+    }
+
+    /// Reads the roster, as a full member holds it: `None` for a light node,
+    /// which holds none.
+    pub async fn read_roster<T>(
+        &self,
+        read: impl FnOnce(&roster::roster::Roster) -> T,
+    ) -> Option<T> {
+        if self.is_light() {
+            return None;
+        }
+        Some(read(self.syncer.lock().await.roster()))
+    }
+
+    /// What a full member answers a light member that cannot place its root:
+    /// the roots it took after the one named, as many as the room its answer
+    /// has, which is what the asking peer takes.
+    pub fn roots_source(self: &Arc<Self>) -> transport::session::RootsAfter {
+        let node = Arc::downgrade(self);
+        Arc::new(move |since: [u8; 32], room: usize| {
+            let node = node.clone();
+            Box::pin(async move {
+                let Some(node) = node.upgrade() else { return Vec::new() };
+                let roots = node.syncer.lock().await.roster().roots_after(&since);
+                crate::lookup::encode_roots_within(&roots, room)
+            })
+        })
+    }
+
+    /// Takes roster traffic as a light member does: roots, and nothing else.
+    ///
+    /// An adopted root is kept, and every open session judged again under it,
+    /// so a peer it revokes is cut off now (`light_node::engine`).
+    async fn received_light(&self, peer: DeviceId, body: &[u8]) {
+        let Ok(roster_sync::message::Message::Snapshot(bytes)) =
+            roster_sync::message::Message::decode(body)
+        else {
+            return;
+        };
+        self.tell_light(|engine, now| engine.root_pushed(peer, &bytes, now)).await;
+    }
+
+    /// Answers a lookup, as a full member: the evidence of the member asked
+    /// for, against the root this node holds, or nothing.
+    pub async fn answer_lookup(&self, query: &crate::lookup::Query) -> Vec<u8> {
+        if self.is_light() {
+            return Vec::new();
+        }
+        if let crate::lookup::Query::Footing(asker, held) = query {
+            let recent = self.seen_lately().await;
+            let syncer = self.syncer.lock().await;
+            return crate::lookup::footing_of(syncer.roster(), asker, held.as_ref(), &|device| {
+                recent(device)
+            });
+        }
+        let syncer = self.syncer.lock().await;
+        if let crate::lookup::Query::RootsAfter(since) = query {
+            // Within what every peer takes: a microcontroller asks this too.
+            return crate::lookup::encode_roots_within(
+                &syncer.roster().roots_after(since),
+                crate::lookup::MAX_ROOTS_ANSWER,
+            );
+        }
+        let Ok(state) = syncer.roster().state() else { return Vec::new() };
+        crate::lookup::resolve(&state, query)
+            .map_or_else(Vec::new, |device| crate::snapshots::evidence_of(syncer.roster(), &device))
+    }
+
+    /// Lookup traffic from a peer: a question to answer, or, for a light
+    /// member, an answer its engine awaits.
+    async fn received_lookup(&self, peer: DeviceId, body: &[u8]) {
+        if self.is_light() {
+            self.tell_light(|engine, now| engine.lookup(peer, body, now)).await;
+            return;
+        }
+        if let Some(crate::lookup::Message::Request { id, query }) =
+            crate::lookup::Message::decode(body)
+        {
+            let evidence = self.answer_lookup(&query).await;
+            let answer = crate::lookup::Message::Answer { id, evidence };
+            self.send_to(peer, Channel::Lookup, &answer.encode()).await;
+        }
+    }
+
+    /// Which devices this one was in contact with lately, or is: what a full
+    /// member hands a light member first.
+    async fn seen_lately(&self) -> impl Fn(&DeviceId) -> bool + use<> {
+        let me = self.identity.device_id();
+        let now = crate::clock::minute_now();
+        let contacts = self.contacts.lock().await.clone();
+        move |device: &DeviceId| {
+            *device == me
+                || contacts.minute(device).is_some_and(|minute| {
+                    now.saturating_sub(minute) <= crate::limits::HANDED_SEEN_WITHIN_MINUTES
+                })
+        }
+    }
+
+    /// How many lookups, renewals and chain requests this node ever asked.
+    #[must_use]
+    pub fn asked(&self) -> u32 {
+        self.light().and_then(|light| light.lock().ok().map(|light| light.asked())).unwrap_or(0)
+    }
+
+    /// Keeps a light member beside the identity.
+    async fn keep_light(&self, member: &roster::member::LightMember) {
+        let Some(paths) = self.paths() else { return };
+        if !self.before_writing_light(member) {
+            self.record(
+                Severity::Problem,
+                "state",
+                "the checkpoint could not name the light member",
+            )
+            .await;
+            return;
+        }
+        match crate::state::write_light(&paths, member) {
+            Ok(()) => self.light_landed(member),
+            Err(cause) => self.record(Severity::Problem, "state", cause).await,
+        }
+    }
+
+    /// A light member's upkeep, for as long as the node runs: it carries out
+    /// what its engine asks, and tells it the time when a question it asked
+    /// is due. The engine renews its proof and fetches roots it missed when,
+    /// and only when, an event says it owes them — a root naming it, a root it
+    /// could not place, a peer telling it so, a start after a gap. Never on a
+    /// clock: a quiet network costs nothing.
+    pub async fn keep_up_forever(self: Arc<Self>) {
+        // A start: the proof may have aged while this device was off.
+        self.tell_light(|engine, now| engine.start(now)).await;
+        loop {
+            let Some(light) = self.light() else { return };
+            let due = light.lock().ok().and_then(|engine| engine.next_deadline());
+            let due =
+                due.and_then(|due| self.born.checked_add(std::time::Duration::from_millis(due)));
+            match due {
+                Some(at) => {
+                    tokio::select! {
+                        () = self.upkeep.notified() => {}
+                        () = tokio::time::sleep_until(at) => {}
+                    }
+                }
+                None => self.upkeep.notified().await,
+            }
+            self.tell_light(|engine, now| engine.tick(now)).await;
+        }
     }
 
     /// This device's own identity.
@@ -586,16 +1284,17 @@ impl Node {
         crate::wire::Ipv4View { holdings: self.current_ipv4_holdings(), withheld: self.withheld() }
     }
 
-    /// The peers withheld on this device, and why.
+    /// The holes in this network's block on this device: a peer whose address
+    /// falls in one is withheld here, and why.
     #[must_use]
-    pub fn withheld(&self) -> Arc<BTreeMap<DeviceId, crate::conflicts::Conflict>> {
+    pub fn withheld(&self) -> Arc<Vec<crate::conflicts::Hole>> {
         self.withheld
             .lock()
             .map_or_else(|poisoned| Arc::clone(poisoned.get_ref()), |held| Arc::clone(&held))
     }
 
-    /// Records which peers are withheld on this device.
-    pub fn set_withheld(&self, withheld: BTreeMap<DeviceId, crate::conflicts::Conflict>) {
+    /// Records the holes in this network's block on this device.
+    pub fn set_withheld(&self, withheld: Vec<crate::conflicts::Hole>) {
         let withheld = Arc::new(withheld);
         match self.withheld.lock() {
             Ok(mut held) => *held = withheld,
@@ -615,6 +1314,14 @@ impl Node {
     /// Takes a started transport, which is what makes the node reachable.
     pub async fn started(&self, transport: Arc<dyn Transport>) {
         *self.transport.lock().await = Some(transport);
+        // The root it holds may already say it is light: a device invited as
+        // light is delivered the root over its own admission, and nothing
+        // arrives after to make it look again. Left full, it was answered with
+        // roots it could not derive and never sent the operations behind them,
+        // so it stayed behind for good — found in the testbed (18.1).
+        if !self.is_light() {
+            let _switched = self.become_light_if_named().await;
+        }
     }
 
     /// Puts a new transport in place of the running one, without the tunnel
@@ -673,6 +1380,22 @@ impl Node {
         self.syncer.lock().await.roster().heads()
     }
 
+    /// Where an urgent act against `target` — a revocation — should hang, and
+    /// what of the target's it would void.
+    ///
+    /// The clock picks parents here and orders nothing: it says only which
+    /// batches are recent enough that a peer may still be fetching their
+    /// pieces, and a revocation naming one would wait there with it.
+    pub async fn urgent_anchor(&self, target: &DeviceId) -> roster::roster::UrgentAnchor {
+        self.syncer.lock().await.roster().urgent_anchor(target, crate::clock::now_ms())
+    }
+
+    /// How many operations the roster's graph holds: the recent window, once
+    /// it has compacted, rather than the whole history.
+    pub async fn held_operations(&self) -> usize {
+        self.syncer.lock().await.roster().dag().len()
+    }
+
     /// Where the roster stands now: its heads, and the snapshot it holds.
     ///
     /// Taken when a batch is prepared and compared when its signatures come
@@ -684,7 +1407,7 @@ impl Node {
         let roster = syncer.roster();
         crate::signing::Moment {
             heads: roster.heads(),
-            snapshot: roster.snapshot().map(|held| held.body().seq),
+            snapshot: roster.snapshot().map(|held| held.body().generation),
         }
     }
 
@@ -782,6 +1505,12 @@ impl Node {
     /// When the roster cannot derive a state, which means the operations held do
     /// not describe a network.
     pub async fn state(&self) -> roster::Result<RosterState> {
+        if let Some(light) = &self.light() {
+            return light
+                .lock()
+                .map(|light| light.member().state())
+                .map_err(|_| roster::Error::InvalidValue("the light member is unreadable"));
+        }
         self.syncer.lock().await.roster().state()
     }
 
@@ -820,6 +1549,63 @@ impl Node {
         self.log.path().parent().map(crate::state::Paths::under)
     }
 
+    /// Tells the transport what this device shows a peer as a session opens:
+    /// its leaf, and its proof against the root it holds with that root's
+    /// hash. A light peer, holding no roster, judges this device by that
+    /// alone, and catches up to a root it does not know.
+    async fn refresh_evidence(&self) {
+        let evidence = match &self.light() {
+            Some(light) => light.lock().map_or_else(|_| Vec::new(), |light| light.member().shown()),
+            None => crate::snapshots::shown_of(
+                self.syncer.lock().await.roster(),
+                &self.identity.device_id(),
+            ),
+        };
+        let transport = self.transport.lock().await.clone();
+        if let Some(transport) = transport {
+            transport.update_evidence(evidence);
+        }
+    }
+
+    /// Appends batch pieces to the pieces log, under the log's guard.
+    async fn keep_pieces(&self, pieces: &[Vec<u8>]) -> crate::Result<()> {
+        let Some(paths) = self.paths() else { return Ok(()) };
+        let log = crate::state::Log::at(paths.pieces());
+        let _guard = self.log_guard.lock().await;
+        for piece in pieces {
+            log.append(piece)?;
+        }
+        Ok(())
+    }
+
+    /// Admits the pieces of a batch authored here, and spreads them.
+    ///
+    /// Its header first, through [`Self::admit_without_activating`]: a piece is
+    /// taken only once its header is held. Kept before they are spread, as an
+    /// operation is.
+    ///
+    /// # Errors
+    ///
+    /// When the roster refuses a piece, or the pieces cannot be kept.
+    pub async fn admit_pieces(&self, pieces: &[Vec<u8>]) -> crate::Result<()> {
+        self.keep_pieces(pieces).await?;
+        let messages = self
+            .syncer
+            .lock()
+            .await
+            .admit_local_pieces(pieces)
+            .map_err(|cause| crate::Error::Refused { cause: cause.to_string() })?;
+        let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
+        for message in messages {
+            for peer in &peers {
+                self.send_roster(*peer, message.clone()).await;
+            }
+        }
+        self.spread_soon();
+        self.enforce_roster().await;
+        Ok(())
+    }
+
     /// Signs a fresh snapshot where this device administers the network and the
     /// one it holds is old enough to be worth replacing.
     ///
@@ -831,16 +1617,103 @@ impl Node {
     /// Silent when there is nothing to do, which is the ordinary case: a member's
     /// daemon reaches the first check and stops, without touching a key.
     pub(crate) async fn attest_unattended(&self) {
-        // On a phone the signing key lives in the keystore, and every signature
-        // asks for the lock. A daemon that reached for it on a timer would raise
-        // a prompt out of nowhere, repeatedly, for something a person did not ask
-        // for — a worse product than a roster that is a few days older than it
-        // could be. So an admin whose key is held elsewhere attests only where a
-        // person is already there: at founding, and after an admin act.
-        if self.identity.signing_key().custodian().is_some() {
+        // A root is signed with the attestation key, which asks nobody, so the
+        // recurring pass may publish one wherever an act it did not see coming —
+        // one that arrived from another admin's branch — left the state moved.
+        self.attest_now().await;
+        // Roots from other admins arrive through sync; whatever window they
+        // close is compacted here.
+        self.compact_and_keep().await;
+    }
+
+    /// Compacts beneath the newest root the roster may compact against, and
+    /// keeps the result: the base it now rests on, and a log that no longer
+    /// carries what the base covers.
+    ///
+    /// The base is written first, so a log without the operations beneath it
+    /// is never left without it. The log is rewritten from what is on disk,
+    /// minus exactly what compaction discarded, under the log's guard: an
+    /// operation appended while this ran, admitted or not yet, stays.
+    pub(crate) async fn compact_and_keep(&self) {
+        let Some(paths) = self.paths() else { return };
+        let (discarded, snapshot, state, batches) = {
+            let mut syncer = self.syncer.lock().await;
+            let roster = syncer.roster_mut();
+            let before: std::collections::BTreeSet<roster::id::OperationId> =
+                roster.dag().operations().iter().map(roster::sign::VerifiedOperation::id).collect();
+            if !matches!(roster.compact(), Ok(discarded) if discarded > 0) {
+                return;
+            }
+            let after: std::collections::BTreeSet<roster::id::OperationId> =
+                roster.dag().operations().iter().map(roster::sign::VerifiedOperation::id).collect();
+            let dag = roster.dag();
+            let (Some(snapshot), Some(state)) = (dag.base_snapshot(), dag.base_state()) else {
+                return;
+            };
+            let discarded: std::collections::BTreeSet<roster::id::OperationId> =
+                before.difference(&after).copied().collect();
+            // The batches whose pieces are still worth keeping: those still in
+            // the window, whole or waiting. One beneath the base is in its state.
+            let batches: std::collections::BTreeSet<roster::id::OperationId> = roster
+                .whole_batches()
+                .into_iter()
+                .chain(roster.waiting_headers().into_iter().map(|(batch, _)| batch))
+                .collect();
+            (discarded, snapshot.clone(), state.clone(), batches)
+        };
+
+        let _guard = self.log_guard.lock().await;
+        if !self.before_writing_base(snapshot.body().root) {
+            self.record(Severity::Problem, "state", "the checkpoint could not name the new base")
+                .await;
             return;
         }
-        self.attest_now().await;
+        match self.write_base_and_rest(&paths, &snapshot, &state) {
+            Ok(stored) => {
+                if let Some(stored) = stored {
+                    let _rested = self.syncer.lock().await.roster_mut().replace_base_state(stored);
+                }
+            }
+            Err(cause) => {
+                self.record(Severity::Problem, "state", cause).await;
+                return;
+            }
+        }
+        let kept = match self.log.read() {
+            Ok(held) => held
+                .into_iter()
+                .filter(|bytes| {
+                    roster::sign::RawOperation::decode(bytes)
+                        .map_or(true, |raw| !discarded.contains(&raw.id()))
+                })
+                .collect::<Vec<_>>(),
+            Err(cause) => {
+                self.record(Severity::Problem, "state", cause).await;
+                return;
+            }
+        };
+        if let Err(cause) = self.log.rewrite(&kept) {
+            self.record(Severity::Problem, "state", cause).await;
+        }
+        // The new base is in place: the one it replaced may leave the checkpoint.
+        self.landed();
+        let pieces = crate::state::Log::at(paths.pieces());
+        let kept = match pieces.read() {
+            Ok(held) => held
+                .into_iter()
+                .filter(|piece| {
+                    roster::batch::BatchPiece::batch_of(piece)
+                        .is_ok_and(|batch| batches.contains(&batch))
+                })
+                .collect::<Vec<_>>(),
+            Err(cause) => {
+                self.record(Severity::Problem, "state", cause).await;
+                return;
+            }
+        };
+        if let Err(cause) = pieces.rewrite(&kept) {
+            self.record(Severity::Problem, "state", cause).await;
+        }
     }
 
     /// Dates this node's roster and tells every session, where it is an admin.
@@ -915,7 +1788,7 @@ impl Node {
         let message = roster_sync::message::Message::Attestation(bytes);
         let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
         for peer in peers {
-            self.send_to(peer, Channel::Roster, &message.encode()).await;
+            self.send_roster(peer, message.clone()).await;
         }
         // An admin on a phone gives it to its neighbours, and they relay it: it
         // never has to meet every member.
@@ -953,60 +1826,26 @@ impl Node {
         }
     }
 
-    /// The snapshot a batch should end with, once `cores` are in — when one will
-    /// be owed and this node cannot sign it itself.
+    /// Publishes the root of this node's state, where it is an admin and the
+    /// state has moved since the root it holds.
     ///
-    /// `None` when the snapshot held will still describe the roster closely
-    /// enough, when the act leaves this device no admin, or when the key signs
-    /// here — in which case [`Self::attest_now`] signs one as the act lands, and
-    /// there is nothing to ask for.
-    ///
-    /// Built over a preview, so it is prepared **with** the operations rather
-    /// than after them: the whole act is shown to a person, and signed, at once.
-    pub async fn snapshot_after(
-        &self,
-        cores: &[roster::types::OperationCore],
-    ) -> Option<identity::detached::SigningRequest> {
-        if self.identity.signing_key().answers_here() {
-            return None;
-        }
-        let syncer = self.syncer.lock().await;
-        let body = crate::snapshots::after(
-            syncer.roster(),
-            cores,
-            &self.identity,
-            crate::state::wall_seconds(),
-        )
-        .ok()??;
-        Some(identity::detached::prepare_snapshot(&body, &self.identity.signing_key().public_key()))
-    }
-
-    /// The same, where a person is present and has just signed something.
-    ///
-    /// The one path that may ask a custodian for a signature: founding, and the
-    /// moments after an admission or a revocation, where the prompt arrives while
-    /// a person is looking at the screen that caused it.
+    /// Called right after an act takes effect here, and on the recurring pass.
+    /// Signed with the attestation key, which asks nobody: a root carries no
+    /// decision of its own, and every full member checks it by deriving. Sent to
+    /// every open session at once, so a light member hears of a revocation as
+    /// soon as the admin's daemon does.
     pub(crate) async fn attest_now(&self) {
-        let now = crate::state::wall_seconds();
-        // A key this process cannot reach cannot sign here at all, and recording
-        // that as a fault every time would put a fault line where a requirement
-        // belongs. The asking happens where an answer has somewhere to come back
-        // to; see `snapshot_after`.
-        if !self.identity.signing_key().answers_here() {
-            return;
-        }
         let signed = {
             let syncer = self.syncer.lock().await;
-            if !crate::snapshots::due(syncer.roster(), &self.identity, now) {
+            if !crate::snapshots::owed(syncer.roster(), &self.identity) {
                 return;
             }
             crate::snapshots::sign_over_heads(syncer.roster(), &self.identity)
         };
         let bytes = match signed {
             Ok(bytes) => bytes,
-            // A person declining the lock is an ordinary outcome, and the next
-            // pass asks again. Recorded so that a network that never gets one has
-            // a reason a person can read.
+            // Recorded so that a network that never gets one has a reason a
+            // person can read.
             Err(cause) => {
                 self.record(Severity::Event, "snapshot", cause).await;
                 return;
@@ -1022,7 +1861,16 @@ impl Node {
             return;
         }
         self.keep_snapshot(&bytes).await;
+        self.refresh_evidence().await;
         self.reconsider_carrying().await;
+        self.compact_and_keep().await;
+
+        let message = roster_sync::message::Message::Snapshot(bytes);
+        let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
+        for peer in peers {
+            self.send_roster(peer, message.clone()).await;
+        }
+        self.spread_soon();
     }
 
     /// Works out what this device will carry, and keeps it for the packet path.
@@ -1114,18 +1962,26 @@ impl Node {
             // not the same session on both sides: each closed the one the other
             // kept, and both were left with none (`convesso-reach` 9.2). Between
             // opposite directions, both keep the one the lower id dialled.
+            //
+            // Only while two dials can still be crossing. A peer with the higher
+            // id dials only when it holds no session with this device, so a dial
+            // from it past that window means it lost the one held here, whose
+            // close never arrived: kept, every dial it made was closed in favour
+            // of a session it no longer had, and nothing it pushed got through
+            // until this device restarted (found in the testbed, 18.1, between an
+            // admin and its anchor).
             let held = self.openings.lock().ok().and_then(|openings| openings.get(&peer).copied());
-            if sessions.contains_key(&peer)
-                && held.is_some_and(|held| held != opening)
-                && !self.keeps(opening, &peer)
-            {
+            let crossing = held.is_some_and(|(held, at)| {
+                held != opening && at.elapsed() < crate::limits::CROSSING_DIALS
+            });
+            if sessions.contains_key(&peer) && crossing && !self.keeps(opening, &peer) {
                 drop(sessions);
                 let _closing = session.close().await;
                 return None;
             }
             let replaced = sessions.insert(peer, Arc::clone(&session));
             if let Ok(mut openings) = self.openings.lock() {
-                openings.insert(peer, opening);
+                openings.insert(peer, (opening, tokio::time::Instant::now()));
             }
             replaced
         };
@@ -1187,7 +2043,23 @@ impl Node {
         let Some(paths) = self.paths() else { return };
         let Some((bytes, _at)) = crate::state::read_attestation(&paths) else { return };
         let message = roster_sync::message::Message::Attestation(bytes);
-        self.send_to(peer, Channel::Roster, &message.encode()).await;
+        self.send_roster(peer, message).await;
+    }
+
+    /// Sends a roster message to a peer, as that peer is to receive it.
+    ///
+    /// Every roster send goes through here, so a light member is never sent
+    /// an operation, a piece or an offer of them, whichever path produced it;
+    /// see [`roster_sync::Syncer::for_peer`].
+    async fn send_roster(&self, peer: DeviceId, message: roster_sync::message::Message) {
+        // A light member offers nothing: full members push roots to it.
+        if self.is_light() {
+            return;
+        }
+        let shaped = self.syncer.lock().await.for_peer(&peer, message);
+        if let Some(message) = shaped {
+            self.send_to(peer, Channel::Roster, &message.encode()).await;
+        }
     }
 
     /// Records that a device spoke on an authenticated session, now.
@@ -1243,17 +2115,11 @@ impl Node {
         let (greeting, neighbour) = {
             let syncer = self.syncer.lock().await;
             let neighbour = syncer.roster().state().is_ok_and(|state| {
-                let members = crate::neighbours::members_of(&state);
-                crate::neighbours::claim_holds(
-                    &state.network,
-                    &self.identity.device_id(),
-                    &peer,
-                    &members,
-                )
+                self.choices_in(&state).is_some_and(|choices| choices.could_choose(&peer))
             });
-            (syncer.greeting().encode(), neighbour)
+            (syncer.greeting(), neighbour)
         };
-        self.send_to(peer, Channel::Roster, &greeting).await;
+        self.send_roster(peer, greeting).await;
         // Where this device could have chosen the peer, it says so, so that the
         // peer pushes to it too. The peer checks the same rule before believing it.
         if neighbour {
@@ -1285,6 +2151,11 @@ impl Node {
         // sides greet on contact by design.
         let greeter = Arc::clone(&self);
         tokio::spawn(async move { greeter.greet(peer).await });
+
+        // A light member asks the first member it meets after starting what it
+        // stands on: the parameters may have moved while it was off. Asked by
+        // the upkeep, never here, where the answer would wait behind this.
+        self.tell_light(|engine, now| engine.session_opened(peer, now)).await;
 
         // Packets are read beside payloads, never in the same `select!`: a payload
         // receive reads a length and then a body, and dropping it half-way would
@@ -1375,10 +2246,58 @@ impl Node {
     /// answered and are not yet due to be tried again.
     async fn chosen_neighbours(&self) -> Vec<DeviceId> {
         let Ok(state) = self.state().await else { return Vec::new() };
-        let members = crate::neighbours::members_of(&state);
-        let me = self.identity.device_id();
-        let Some(mine) = members.iter().find(|member| member.device == me).copied() else {
-            return Vec::new();
+        // A light member chooses no neighbours: it keeps in touch with its
+        // anchors it knows and, failing them, the admin whose root it holds.
+        if let Some(member) = self.light_member() {
+            let anchors: Vec<DeviceId> =
+                crate::seeking::anchors_for(&member.device(), &member.params().anchors)
+                    .into_iter()
+                    .filter(|anchor| state.devices.contains_key(anchor))
+                    .collect();
+            let kept = member.known_fulls();
+            let order = crate::seeking::first_start_order(
+                &anchors,
+                Some(member.contact()),
+                &kept,
+                &[],
+                &[],
+            );
+            return order.into_iter().filter(|device| *device != member.device()).take(2).collect();
+        }
+        let Some(choices) = self.choices_in(&state) else {
+            // Light by its own state and not yet by a root it holds — invited as
+            // light, say, and up a moment after the root that makes it so went
+            // out. It chooses no neighbours as a light member would, and keeps
+            // in touch with the full members it would be handed, so that the
+            // root reaches it.
+            let me = self.identity.device_id();
+            let light = state
+                .devices
+                .get(&me)
+                .is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Light);
+            if !light {
+                return Vec::new();
+            }
+            let recent = self.seen_lately().await;
+            let full = |device: &DeviceId| {
+                state
+                    .devices
+                    .get(device)
+                    .is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Full)
+            };
+            let anchors: Vec<DeviceId> =
+                state.params.anchors.iter().filter(|anchor| full(anchor)).copied().collect();
+            let fulls: Vec<DeviceId> = if anchors.is_empty() {
+                state
+                    .devices
+                    .iter()
+                    .filter(|(_, leaf)| leaf.settings.mode == roster::leaf::Mode::Full)
+                    .map(|(device, _)| device)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return crate::seeking::handed(&me, &anchors, &fulls, &|device| recent(device));
         };
         let now = tokio::time::Instant::now();
         let resting: BTreeSet<DeviceId> = self.unanswered.lock().map_or_else(
@@ -1391,9 +2310,22 @@ impl Node {
                     .collect()
             },
         );
-        crate::neighbours::choose(&state.network, &mine, &members, &|device| {
-            resting.contains(device)
-        })
+        choices.choose(&state, &|device| resting.contains(device))
+    }
+
+    /// This device's neighbour choices in `state`: those kept, followed to it.
+    /// `None` where this device is not a full member there.
+    fn choices_in(&self, state: &RosterState) -> Option<crate::neighbours::Choices> {
+        let mut kept = self.choices.lock().ok()?;
+        let next = match kept.as_ref() {
+            Some((previous, choices)) if previous.root() == state.root() => {
+                return Some(choices.clone());
+            }
+            Some((previous, choices)) => choices.updated(previous, state),
+            None => crate::neighbours::Choices::of(state, &self.identity.device_id()),
+        };
+        *kept = next.clone().map(|choices| (state.clone(), choices));
+        next
     }
 
     /// Tries the members this device holds no session with, because a person
@@ -1416,7 +2348,7 @@ impl Node {
             {
                 continue;
             }
-            if let Some(key) = transport_key_of(record) {
+            if let Some(key) = transport_key_of(&record) {
                 keys.push((record.id, key));
             }
         }
@@ -1501,7 +2433,8 @@ impl Node {
             if self.has_session(&device).await || state.revoked.contains(&device) {
                 continue;
             }
-            let Some(key) = state.devices.get(&device).and_then(transport_key_of) else {
+            let Some(key) = state.devices.get(&device).and_then(|leaf| transport_key_of(&leaf))
+            else {
                 continue;
             };
             // The session greets on opening, and says it comes from a neighbour.
@@ -1531,34 +2464,22 @@ impl Node {
         entry.until = now.checked_add(entry.interval).unwrap_or(now);
         entry.interval = entry.interval.saturating_mul(2).min(LONGEST);
     }
+}
 
-    /// Opens a session with every roster peer matching `wanted` that has none.
-    async fn dial(self: &Arc<Self>, wanted: &(dyn Fn(&DeviceId) -> bool + Sync)) {
-        let Ok(state) = self.state().await else { return };
-        let me = self.identity.device_id();
-
-        for record in state.devices.values() {
-            if record.id == me || !wanted(&record.id) || self.has_session(&record.id).await {
-                continue;
-            }
-
-            let Some(key) = transport_key_of(record) else {
-                self.record(
-                    Severity::Event,
-                    "roster",
-                    format!("{:?} declares no transport key", record.id),
-                )
-                .await;
-                continue;
-            };
-            if let Err(cause) = self.connect(&key).await {
-                // Unreachable right now is the ordinary state of a device that is
-                // switched off. Recorded, and tried again on the next tick.
-                self.record(Severity::Event, "transport", format!("{}: {cause}", record.name))
-                    .await;
-            }
-        }
-    }
+/// Whether a session between this device and a peer stays open however long
+/// it carries nothing: where either is a light member.
+///
+/// A session nothing uses costs nothing on the wire: convesso lets its keys
+/// expire and forgets it, and this binding's session outlives that, reopened
+/// by the next frame either side sends. Kept open, it is how a light member
+/// hears of a new root the moment a full member takes it, pushed as anything
+/// new is; closed, it heard only when it next came asking, once an hour,
+/// which cost every light member a session opened and evidence shown both ways
+/// each hour, whether the network had changed or not (`daemon::simulator`).
+/// Between full members nothing changes: they are pushed to as neighbours.
+#[must_use]
+pub(crate) const fn held_open(this_light: bool, peer_light: bool) -> bool {
+    this_light || peer_light
 }
 
 /// Dials in flight, by the peer's transport key, each with where its outcome
@@ -1634,38 +2555,7 @@ fn udp_source_port(packet: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([high, low]))
 }
 
-/// Every member but this device, as the router needs them.
-fn others(state: &roster::state::RosterState, me: &DeviceId) -> Vec<DeviceId> {
-    state
-        .devices
-        .keys()
-        .filter(|device| *device != me && !state.revoked.contains(device))
-        .copied()
-        .collect()
-}
-
 /// A device's transport key, as the roster declares it.
-/// The operations `me` signed, as the roster holds them.
-///
-/// Propagation is only this device's business for what this device authored. An
-/// operation somebody else signed and this node merely relayed is their concern to
-/// be told about, and counting it here would report a person's own network back
-/// at them as a backlog.
-fn authored_by<'a>(
-    roster: &'a roster::roster::Roster,
-    state: &RosterState,
-    me: &DeviceId,
-) -> Vec<&'a roster::sign::VerifiedOperation> {
-    roster
-        .dag()
-        .operations()
-        .iter()
-        .filter(|operation| {
-            state.device_for_key(&operation.core().author).is_some_and(|record| record.id == *me)
-        })
-        .collect()
-}
-
 fn transport_key_of(record: &roster::types::DeviceRecord) -> Option<roster::sign::PublicKey> {
     let entry =
         record.keys.iter().find(|entry| entry.purpose == roster::types::KeyPurpose::Transport)?;
@@ -1713,16 +2603,27 @@ impl Node {
         if let Some(transport) = transport {
             transport.update_state(state.clone()).await;
         }
+        self.refresh_evidence().await;
+        if !self.is_light() && self.become_light_if_named().await {
+            return;
+        }
 
         // Addresses follow membership in the same place. A device admitted
         // since the tunnel came up becomes routable at its IPv4 address now, and
         // a device revoked stops being so, rather than at the next restart.
-        let holdings = Ipv4Holdings::of_state(&state);
+        // Held until the holdings are sent: what the next change is measured
+        // from and what the holdings say must be the same state's.
+        let mut enforced = self.enforced.lock().await;
+        let previous = enforced.replace(state.clone());
+        let holdings = match &previous {
+            Some(previous) => self.holdings.borrow().updated(previous, &state),
+            None => Ipv4Holdings::of_state(&state),
+        };
         self.gateway.set_holdings(holdings.clone());
         {
             let mut router = self.router.lock().await;
             router.set_holdings(holdings.clone());
-            router.set_members(others(&state, &self.identity.device_id()));
+            router.follow_state(&state, &self.identity.device_id());
         }
         self.holdings.send_if_modified(|current| {
             if **current == holdings {
@@ -1732,6 +2633,10 @@ impl Node {
                 true
             }
         });
+        drop(enforced);
+        if let Some(previous) = &previous {
+            self.tell_lost_offsets(previous, &state).await;
+        }
 
         self.forget_departed(&state).await;
         self.reconsider_carrying().await;
@@ -1776,25 +2681,27 @@ impl Node {
         }
     }
 
+    /// Tells an admin of each device that lost its IPv4 offset to another
+    /// given it at the same time (`admitting::lost_offsets`).
+    async fn tell_lost_offsets(&self, previous: &RosterState, state: &RosterState) {
+        let me = self.identity.device_id();
+        for said in crate::admitting::lost_offsets(previous, state, &me) {
+            self.record(Severity::Event, "ipv4", said).await;
+        }
+    }
+
     /// Drops what is kept about devices that are no longer there to keep it for.
-    ///
-    /// Confirmations for devices that have left. Not a tidy-up for its own sake:
-    /// an operation cannot be outstanding toward somebody who is no longer a
-    /// member, so keeping their pairs would grow the record against devices that
-    /// no longer exist and report against them too.
     ///
     /// Last contact is kept for revoked devices as well as members. When a stolen
     /// laptop last spoke to this device is exactly what a person wants to know,
     /// and it cannot change once the device is revoked: its session is closed
     /// here and refused afterwards.
     async fn forget_departed(&self, state: &RosterState) {
-        let members: BTreeSet<DeviceId> = state.devices.keys().copied().collect();
-        if self.confirmed.lock().await.retain_members(&members) {
-            self.persist_confirmations().await;
-        }
-
-        let kept: BTreeSet<DeviceId> = members.union(&state.revoked).copied().collect();
-        let changed = self.contacts.lock().await.retain(&kept);
+        // Asked of the state for each device held, rather than by listing every
+        // member: what is held is what this device spoke to, a few at most.
+        let member = |device: &DeviceId| state.devices.contains_key(device);
+        let kept = |device: &DeviceId| member(device) || state.revoked.contains(device);
+        let changed = self.contacts.lock().await.retain(kept);
         if changed {
             self.save_contacts().await;
         }
@@ -1817,6 +2724,11 @@ impl Node {
 
     /// Forgets the session held with a device, whichever one it is.
     pub async fn closed(&self, peer: &DeviceId) {
+        if let Some(light) = self.light()
+            && let Ok(mut engine) = light.lock()
+        {
+            engine.session_closed(peer);
+        }
         self.router.lock().await.closed(peer);
         self.sessions.lock().await.remove(peer);
         if let Ok(mut openings) = self.openings.lock() {
@@ -1839,6 +2751,12 @@ impl Node {
     /// sessions and this is false for everyone, which is the truth.
     pub async fn has_session(&self, peer: &DeviceId) -> bool {
         self.sessions.lock().await.contains_key(peer)
+    }
+
+    /// The devices this node has a session with now: few, whatever the
+    /// network's size.
+    pub async fn session_peers(&self) -> Vec<DeviceId> {
+        self.sessions.lock().await.keys().copied().collect()
     }
 
     /// Whether the session with `peer` is direct or through the relay, as the
@@ -1872,6 +2790,7 @@ impl Node {
         match channel {
             Channel::Roster => self.received_roster(peer, body).await,
             Channel::Neighbour => self.received_neighbour_claim(peer).await,
+            Channel::Lookup => self.received_lookup(peer, body).await,
         }
     }
 
@@ -1895,13 +2814,7 @@ impl Node {
         let holds = {
             let syncer = self.syncer.lock().await;
             syncer.roster().state().is_ok_and(|state| {
-                let members = crate::neighbours::members_of(&state);
-                crate::neighbours::claim_holds(
-                    &state.network,
-                    &peer,
-                    &self.identity.device_id(),
-                    &members,
-                )
+                crate::neighbours::claim_holds_in(&state, &peer, &self.identity.device_id())
             })
         };
         if !holds {
@@ -1934,6 +2847,10 @@ impl Node {
         // taken per packet would be paid on the path that carries everything.
         self.note_contact(peer).await;
 
+        if self.is_light() && !self.becoming_full.load(std::sync::atomic::Ordering::SeqCst) {
+            self.received_light(peer, body).await;
+            return;
+        }
         let reception = self.syncer.lock().await.receive(peer, body);
 
         // Persist exactly what was admitted, as it arrived. Deriving the bytes
@@ -1947,10 +2864,50 @@ impl Node {
         // revocation, closed the session it revoked, and forgot it at the next
         // restart. And this node's own operations were appended again on every
         // reconciliation, without bound.
+        let based = reception.base.is_some();
+        // A base obtained from a peer, before the heads it rests on are logged:
+        // replayed, the log rests on it, as on one this node compacted to.
+        if let Some((snapshot, state)) = &reception.base
+            && let Some(paths) = self.paths()
+        {
+            let written = if self.before_writing_base(snapshot.body().root) {
+                let _guard = self.log_guard.lock().await;
+                self.write_base_and_rest(&paths, snapshot, state)
+            } else {
+                Err(crate::error::Error::State {
+                    path: paths.base_store(),
+                    cause: "the checkpoint could not name the base".to_owned(),
+                })
+            };
+            match written {
+                Ok(stored) => {
+                    self.landed();
+                    if let Some(stored) = stored {
+                        let _rested =
+                            self.syncer.lock().await.roster_mut().replace_base_state(stored);
+                    }
+                }
+                Err(cause) => self.record(Severity::Problem, "state", cause).await,
+            }
+        }
         for operation in &reception.accepted {
-            if let Err(cause) = self.log.append(operation) {
+            let appended = {
+                let _guard = self.log_guard.lock().await;
+                self.log.append(operation)
+            };
+            if let Err(cause) = appended {
                 self.record(Severity::Problem, "state", cause).await;
             }
+        }
+        if based {
+            self.finish_full().await;
+        }
+        // And the batch pieces taken, beside the log: a batch's entries live
+        // in them, and a restart without them would leave its header waiting.
+        if !reception.pieces.is_empty()
+            && let Err(cause) = self.keep_pieces(&reception.pieces).await
+        {
+            self.record(Severity::Problem, "state", cause).await;
         }
 
         // A snapshot is not an operation, so the loop above never sees one: it is
@@ -1979,18 +2936,15 @@ impl Node {
             .await;
         }
 
-        // The peer said, in its own offer, what it holds. That statement is the
-        // only thing that makes an operation authored here stop being outstanding
-        // toward it.
-        if let Some(held) = reception.held {
-            self.record_confirmations(held).await;
-        }
-
         for message in reception.replies {
-            self.send_to(peer, Channel::Roster, &message.encode()).await;
+            self.send_roster(peer, message).await;
         }
         if let Some(forward) = reception.forward {
-            self.send_to_others(peer, Channel::Roster, &forward.encode()).await;
+            let others: Vec<DeviceId> =
+                self.sessions.lock().await.keys().copied().filter(|other| *other != peer).collect();
+            for other in others {
+                self.send_roster(other, forward.clone()).await;
+            }
             self.spread_soon();
         }
 
@@ -2130,11 +3084,9 @@ impl Node {
     async fn open_for_waiting(self: Arc<Self>, device: DeviceId) {
         let key = {
             let syncer = self.syncer.lock().await;
-            syncer
-                .roster()
-                .state()
-                .ok()
-                .and_then(|state| state.devices.get(&device).and_then(transport_key_of))
+            syncer.roster().state().ok().and_then(|state| {
+                state.devices.get(&device).and_then(|leaf| transport_key_of(&leaf))
+            })
         };
         let outcome = match key {
             Some(key) => self.connect(&key).await,
@@ -2143,7 +3095,11 @@ impl Node {
             }),
         };
         if let Err(cause) = outcome {
-            self.rest_after_failure(device);
+            // A peer with no room is there: the next packet tries again,
+            // rather than wait as for a device that is not.
+            if !matches!(cause, crate::Error::Busy { .. }) {
+                self.rest_after_failure(device);
+            }
             let dropped = self.waiting.lock().await.remove(&device);
             let count =
                 dropped.map_or(0, |queue| queue.packets.len().saturating_add(queue.dropped));
@@ -2237,7 +3193,10 @@ impl Node {
         // Written before it is spread. An operation a peer has and this node
         // forgets at the next restart is worse than one that was refused: it
         // takes effect, disappears, and nobody is told.
-        self.log.append(bytes)?;
+        {
+            let _guard = self.log_guard.lock().await;
+            self.log.append(bytes)?;
+        }
 
         let forward = self
             .syncer
@@ -2252,9 +3211,8 @@ impl Node {
             // like one it did; what settles it is that peer's own offer naming
             // the operation, which the recurring reconciliation will fetch.
             let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
-            let encoded = message.encode();
             for peer in peers {
-                self.send_to(peer, Channel::Roster, &encoded).await;
+                self.send_roster(peer, message.clone()).await;
             }
             // And the neighbours with no session, which is every operation and
             // not only a revocation: one is rare, so pushing it costs something
@@ -2274,98 +3232,6 @@ impl Node {
         Ok(())
     }
 
-    /// Which members have not confirmed holding what was authored here.
-    ///
-    /// The thing a person most needs to see and is least likely to ask for. It is
-    /// derived rather than stored: the log says what this device authored, the
-    /// roster says who the members are, and the confirmation record says which of
-    /// them has said, in its own offer, that it holds each one. Nothing here can
-    /// be emptied by an event that is not a peer speaking.
-    pub async fn outstanding(&self) -> Vec<Lagging> {
-        self.lagging().await.into_iter().map(|(_, device)| device).collect()
-    }
-
-    /// How much is owed to members this node holds no session with.
-    ///
-    /// The work pressing exists to finish, as a single number, because that is
-    /// what [`crate::schedule::Pressing`] paces against. Members already
-    /// connected are excluded: a session is open, the recurring reconciliation
-    /// will carry it, and dialling would achieve nothing.
-    pub async fn owed(&self) -> usize {
-        self.lagging()
-            .await
-            .iter()
-            .filter(|(_, device)| !device.connected)
-            .fold(0usize, |total, (_, device)| total.saturating_add(device.operations))
-    }
-
-    /// Members with no open session that are owed something signed here.
-    pub async fn pressed(&self) -> Vec<DeviceId> {
-        self.lagging()
-            .await
-            .into_iter()
-            .filter_map(|(id, device)| (!device.connected).then_some(id))
-            .collect()
-    }
-
-    /// Opens a session with each of the given devices, if one is not open.
-    ///
-    /// Scoped deliberately: a member that has confirmed everything this device
-    /// signed is not contacted for it, so the cost of pressing is bounded by
-    /// what is actually being waited for rather than by the size of the network.
-    pub async fn press(self: &Arc<Self>) {
-        let wanted: BTreeSet<DeviceId> = self.pressed().await.into_iter().collect();
-        if wanted.is_empty() {
-            return;
-        }
-        self.dial(&|device| wanted.contains(device)).await;
-    }
-
-    /// Every member, with what it has not confirmed and whether it is connected.
-    async fn lagging(&self) -> Vec<(DeviceId, Lagging)> {
-        let me = self.identity.device_id();
-
-        // Confirmations and sessions first, then the roster, held while counting.
-        // Nothing anywhere holds the roster while waiting for either of these, so
-        // taking them in this order cannot deadlock — and the roster's operations
-        // are read where they are rather than copied, on a tick that runs every
-        // few seconds while anything is owed.
-        let confirmed = self.confirmed.lock().await;
-        let connected: BTreeSet<DeviceId> = self.sessions.lock().await.keys().copied().collect();
-        let syncer = self.syncer.lock().await;
-        let roster = syncer.roster();
-        let Ok(state) = roster.state() else { return Vec::new() };
-        let mine: Vec<&roster::sign::VerifiedOperation> = authored_by(roster, &state, &me);
-        if mine.is_empty() {
-            return Vec::new();
-        }
-
-        let mut lagging = Vec::new();
-        for record in state.devices.values() {
-            if record.id == me {
-                continue;
-            }
-            // The same rule the report uses, so pressing and the report cannot
-            // disagree about who an operation is owed to.
-            let missing = mine
-                .iter()
-                .filter(|operation| crate::describing::owed_to(operation, &record.id))
-                .filter(|operation| !confirmed.holds(&record.id, &operation.id()))
-                .count();
-            if missing > 0 {
-                lagging.push((
-                    record.id,
-                    Lagging {
-                        name: record.name.clone(),
-                        operations: missing,
-                        connected: connected.contains(&record.id),
-                    },
-                ));
-            }
-        }
-        lagging
-    }
-
     /// Everything the report says about membership, gathered in one pass.
     ///
     /// Built while the roster is borrowed, not from a copy of it. On a desktop a
@@ -2376,98 +3242,32 @@ impl Node {
     /// The small things are read first and the roster held last, and nothing
     /// awaits while it is held.
     pub(crate) async fn membership(&self, state: &RosterState) -> crate::describing::Membership {
-        let me = self.identity.device_id();
-        let confirmed = self.confirmed.lock().await;
-        let connected: BTreeSet<DeviceId> = self.sessions.lock().await.keys().copied().collect();
         let contacts = self.contacts.lock().await.clone();
 
         let syncer = self.syncer.lock().await;
         let roster = syncer.roster();
-        let dag = roster.dag();
-
-        // What the roster counts, not everything that verified. The graph keeps
-        // operations its rules disregarded, and a name or a reason from one of
-        // those is a claim the roster itself refused.
-        let valid: Vec<&roster::sign::VerifiedOperation> = roster::state::derive_with_verdicts(dag)
-            .map_or_else(
-                |_| Vec::new(),
-                |(_, verdicts)| {
-                    dag.operations()
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, _)| verdicts.is_valid(*index))
-                        .map(|(_, operation)| operation)
-                        .collect()
-                },
-            );
+        let valid = valid_operations(roster.dag());
         let directory = crate::describing::Directory::of(state, &valid);
         let accused = crate::describing::accused(&directory, roster);
-        let revoked = crate::describing::revoked(&directory, state, &valid, &contacts);
-        let authored = authored_by(roster, state, &me);
-        let (waiting, waiting_unlisted) = crate::describing::waiting(
-            &directory, state, &authored, &me, &confirmed, &connected, &contacts,
-        );
         drop(syncer);
 
-        crate::describing::Membership {
-            directory,
-            revoked,
-            accused,
-            waiting,
-            waiting_unlisted,
-            contacts,
-        }
+        crate::describing::Membership { directory, accused, contacts }
     }
 
-    /// Records what a peer's own offer said it holds.
-    ///
-    /// Monotone by construction — see `confirmations` — and written through to
-    /// disk only when something was new, so an idle pair of nodes re-offering
-    /// every minute does not rewrite the file every minute.
-    async fn record_confirmations(&self, held: roster_sync::Held) {
-        let ids = self.confirmable(&held).await;
-        if ids.is_empty() {
-            return;
-        }
-
-        let changed = self.confirmed.lock().await.confirm(held.peer, ids);
-        if changed {
-            self.persist_confirmations().await;
-        }
-    }
-
-    /// The subset of a peer's claim that may be believed.
-    ///
-    /// A device may not confirm the operation that revokes it. It is the one
-    /// party with a motive to claim a revocation is delivered, and the report
-    /// this feeds is what a person reads before deciding a stolen laptop is dealt
-    /// with. Its session is in fact closed by `enforce_roster` before it could
-    /// offer anything — but that is the order of two blocks in one function, and
-    /// this should not rest on it.
-    async fn confirmable(&self, held: &roster_sync::Held) -> Vec<OperationId> {
+    /// A page of the devices `state` holds as revoked, after `after` (`None`:
+    /// the first), and where the next begins while more remain. Apart from
+    /// [`Self::membership`]: revocations only grow, and a report counts them
+    /// rather than listing them.
+    pub(crate) async fn revoked_page(
+        &self,
+        state: &RosterState,
+        after: Option<DeviceId>,
+    ) -> (Vec<crate::control::Revoked>, Option<String>) {
+        let contacts = self.contacts.lock().await.clone();
         let syncer = self.syncer.lock().await;
-        held.ids
-            .iter()
-            .filter(|id| {
-                !syncer.roster().dag().operations().iter().any(|operation| {
-                    operation.id() == **id
-                        && matches!(
-                            operation.body(),
-                            roster::types::OperationBody::RevokeDevice { device, .. }
-                                if *device == held.peer
-                        )
-                })
-            })
-            .copied()
-            .collect()
-    }
-
-    /// Writes the confirmation record, recording a failure rather than raising it.
-    async fn persist_confirmations(&self) {
-        let confirmed = self.confirmed.lock().await.clone();
-        if let Err(cause) = self.confirmations.save(&confirmed) {
-            self.record(Severity::Problem, "state", cause).await;
-        }
+        let valid = valid_operations(syncer.roster().dag());
+        let directory = crate::describing::Directory::of(state, &valid);
+        crate::describing::revoked(&directory, state, &valid, &contacts, after)
     }
 
     /// Sends this node's digest to every open session.
@@ -2476,10 +3276,10 @@ impl Node {
     /// for hours still notice a revocation made elsewhere, at the cost of a few
     /// dozen bytes each way when they already agree.
     pub async fn offer_to_everyone(&self) {
-        let offer = self.syncer.lock().await.greeting().encode();
+        let offer = self.syncer.lock().await.greeting();
         let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
         for peer in peers {
-            self.send_to(peer, Channel::Roster, &offer).await;
+            self.send_roster(peer, offer.clone()).await;
         }
     }
 
@@ -2524,15 +3324,6 @@ impl Node {
                 }
             }
             Err(cause) => self.record(Severity::Event, "session", cause).await,
-        }
-    }
-
-    /// Sends to every peer but one.
-    async fn send_to_others(&self, except: DeviceId, channel: Channel, payload: &[u8]) {
-        let peers: Vec<DeviceId> =
-            self.sessions.lock().await.keys().copied().filter(|peer| *peer != except).collect();
-        for peer in peers {
-            self.send_to(peer, channel, payload).await;
         }
     }
 
@@ -2594,15 +3385,25 @@ impl Node {
         // the other side is the one behind. A device this side does not know
         // either is a stranger to both, and insisting would only delay saying so.
         let known = self.state().await.is_ok_and(|state| {
-            state.devices.values().any(|record| {
-                transport_key_of(record).is_some_and(|key| key.key_id() == peer.key_id())
-                    && !state.revoked.contains(&record.id)
-            })
+            state
+                .device_for_key_of_purpose(&peer.key_id(), roster::types::KeyPurpose::Transport)
+                .is_some_and(|record| !state.revoked.contains(&record.id))
         });
         let mut attempt = 0usize;
+        let mut busy = 0usize;
         loop {
             let transport = self.transport.lock().await.clone().ok_or(crate::Error::NotUp)?;
             match transport.connect(peer).await {
+                // A board holds a handful of sessions: one of them makes room
+                // as soon as it falls quiet. Tried again shortly, rather than
+                // rested on as a device that is not there.
+                Err(transport::Error::PeerBusy) if busy < Self::BUSY_ATTEMPTS => {
+                    busy = busy.saturating_add(1);
+                    tokio::time::sleep(Self::BUSY_RETRY).await;
+                }
+                Err(busy @ transport::Error::PeerBusy) => {
+                    return Err(crate::Error::Busy { cause: busy.to_string() });
+                }
                 Ok(session) => {
                     if let Some(session) = self.opened(session, Opening::Dialled).await {
                         tokio::spawn(Arc::clone(self).serving(session));
@@ -2615,6 +3416,18 @@ impl Node {
                     // It may be this side that is behind, about the peer.
                     if matches!(refusal, transport::Error::NotAMember) {
                         self.catch_up();
+                        // A light member refused as a stranger: the peer does not
+                        // believe its proof any more, which is the peer asking
+                        // it to renew.
+                        // Told, and left to the upkeep: this dial may be one the
+                        // upkeep itself is making, which would wait on itself.
+                        if let Some(light) = self.light() {
+                            let now = self.now_ms();
+                            if let Ok(mut engine) = light.lock() {
+                                engine.refused_as_a_stranger(now);
+                            }
+                            self.upkeep.notify_one();
+                        }
                     }
                     attempt = attempt.saturating_add(1);
                     tokio::time::sleep(Self::NEWCOMER_RETRY).await;
@@ -2640,6 +3453,23 @@ impl Node {
         tokio::spawn(Arc::clone(self).serve(session, Opening::Accepted));
         Ok(())
     }
+}
+
+/// The operations the roster counts, not everything that verified. The graph
+/// keeps operations its rules disregarded, and a name or a reason from one of
+/// those is a claim the roster itself refused.
+fn valid_operations(dag: &roster::dag::Dag) -> Vec<&roster::sign::VerifiedOperation> {
+    roster::state::derive_with_verdicts(dag).map_or_else(
+        |_| Vec::new(),
+        |(_, verdicts)| {
+            dag.operations()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| verdicts.is_valid(*index))
+                .map(|(_, operation)| operation)
+                .collect()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2777,7 +3607,6 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod borrowing {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use identity::NodeIdentity;
@@ -2789,7 +3618,6 @@ mod borrowing {
     use tunnel::{Prefix, Tunnel as Rules};
 
     use super::Node;
-    use crate::confirmations::Confirmed;
     use crate::contacts::LastContacts;
     use crate::gateway::Gateway;
     use crate::router::Router;
@@ -2886,21 +3714,10 @@ mod borrowing {
             .map(|(_, operation)| operation.clone())
             .collect();
         let valid: Vec<&VerifiedOperation> = valid.iter().collect();
-        let mine: Vec<VerifiedOperation> = roster.dag().operations().to_vec();
-        let mine: Vec<&VerifiedOperation> = mine.iter().collect();
         let directory = crate::describing::Directory::of(&state, &valid);
         let expected_accused = crate::describing::accused(&directory, &roster);
-        let expected_revoked =
-            crate::describing::revoked(&directory, &state, &valid, &LastContacts::default());
-        let expected_waiting = crate::describing::waiting(
-            &directory,
-            &state,
-            &mine,
-            &founder.device_id(),
-            &Confirmed::default(),
-            &BTreeSet::new(),
-            &LastContacts::default(),
-        );
+        let (expected_revoked, _) =
+            crate::describing::revoked(&directory, &state, &valid, &LastContacts::default(), None);
 
         // The node, in place.
         let scratch = tempfile::tempdir().unwrap();
@@ -2916,8 +3733,8 @@ mod borrowing {
         let membership = node.membership(&state).await;
 
         assert_eq!(membership.accused, expected_accused);
-        assert_eq!(membership.revoked, expected_revoked);
-        assert_eq!((membership.waiting, membership.waiting_unlisted), expected_waiting);
+        let (revoked, _) = node.revoked_page(&state, None).await;
+        assert_eq!(revoked, expected_revoked);
         assert!(
             expected_revoked.len() >= 10,
             "the fixture really does revoke: {}",
@@ -2925,14 +3742,15 @@ mod borrowing {
         );
     }
 
-    /// The node's own sources copy no operation to build the report or to pace.
+    /// The node's own sources copy no operation to build the report.
     #[test]
-    fn no_operation_is_copied_to_report_or_to_pace() {
+    fn no_operation_is_copied_to_build_the_report() {
         let code = crate::code_of(include_str!("node.rs"));
-        for function in ["pub(crate) async fn membership(", "async fn lagging("] {
+        for function in ["pub(crate) async fn membership("] {
             let (_, rest) = code.split_once(function).unwrap();
             let body = rest.split("\nasync fn ").next().unwrap_or(rest);
             let body = body.split("\npub(crate) async fn ").next().unwrap_or(body);
+            let body = body.split("\npub async fn ").next().unwrap_or(body);
             for copy in [".cloned()", ".to_vec()", "to_owned()", "::from("] {
                 assert!(!body.contains(copy), "`{function}` copies with `{copy}`");
             }
@@ -3212,5 +4030,748 @@ impl Node {
     /// Whether `device` is rested as a neighbour that did not answer.
     pub(crate) fn resting_as_a_neighbour(&self, device: &DeviceId) -> bool {
         self.unanswered.lock().is_ok_and(|unanswered| unanswered.contains_key(device))
+    }
+}
+
+/// Rests `roster` on the base kept beside the log, where there is one, and
+/// returns the operations still to offer: those that follow the base's heads.
+///
+/// Where there is no base, or it does not check out, the roster is left empty
+/// and the whole log is returned, to be replayed as it always was.
+/// What a base that does not check out is said to be.
+pub const CHANGED_OUTSIDE: &str = "the base store does not check out against its signed root: it was changed outside      this daemon";
+
+/// Up to how many devices a base store is checked whole before the log rests
+/// on it: a few seconds at most.
+const CHECKED_BEFORE_RESTING: usize = 50_000;
+
+fn resting_on_base(
+    roster: &mut roster::roster::Roster,
+    paths: &crate::state::Paths,
+    store: &Arc<member_store::Store>,
+    held: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, Vec<Vec<u8>>> {
+    let Some((snapshot, state)) = crate::state::read_base(paths, store) else { return Err(held) };
+    let Ok(raw) = roster::snapshot::RawSnapshot::decode(&snapshot) else { return Err(held) };
+    // Checked whole: against the root it holds, which `rest_on` then holds to
+    // the signed one. Before anything rests on it, where that is quick; in the
+    // background otherwise, a million devices taking minutes — meanwhile every
+    // leaf read is checked against the signed root as it is read, so what the
+    // store could do is hide a device, never add one. A store failing either
+    // says so through `Node::base_tampered`.
+    if roster::members::MemberStore::count(&**store) <= CHECKED_BEFORE_RESTING {
+        if store.verify(&state.devices.root()).is_err() {
+            return Err(held);
+        }
+    } else {
+        let checking = Arc::clone(store);
+        let _checker = std::thread::Builder::new()
+            .name("base check".to_owned())
+            .spawn(move || checking.verify_held());
+    }
+    let heads: std::collections::BTreeSet<roster::id::OperationId> =
+        raw.body().heads.iter().copied().collect();
+    let decoded: Vec<(Vec<u8>, roster::id::OperationId, Vec<roster::id::OperationId>)> = held
+        .iter()
+        .filter_map(|bytes| {
+            let operation = roster::sign::RawOperation::decode(bytes).ok()?;
+            Some((bytes.clone(), operation.id(), operation.core().parents.clone()))
+        })
+        .collect();
+    let head_bytes: Vec<Vec<u8>> = decoded
+        .iter()
+        .filter(|(_, id, _)| heads.contains(id))
+        .map(|(bytes, _, _)| bytes.clone())
+        .collect();
+    // The root it is checked against is the signed one: a store holding a
+    // whole other state, consistent with itself, stops here.
+    if roster.rest_on(&snapshot, state, &head_bytes).is_err() {
+        return Err(held);
+    }
+    // In the log's order, which is the order they were admitted: an operation
+    // follows the base when every parent is a head or follows it.
+    let mut known = heads;
+    let mut after = Vec::new();
+    for (bytes, id, parents) in decoded {
+        if known.contains(&id) {
+            continue;
+        }
+        if parents.iter().all(|parent| known.contains(parent)) {
+            known.insert(id);
+            after.push(bytes);
+        }
+    }
+    Ok(after)
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
+mod batches {
+    use std::sync::Arc;
+
+    use identity::NodeIdentity;
+    use roster::batch::{BatchEntry, BatchHeader, pieces_of};
+    use roster::id::NetworkId;
+    use roster::leaf::Mode;
+    use roster::sign::sign_operation;
+    use roster::types::{NetworkParams, OperationBody, OperationCore, Role};
+
+    use super::Node;
+    use crate::state::{Log, Paths};
+
+    /// A network founded by `founder`, its genesis written to `paths`.
+    fn founded(founder: &NodeIdentity, paths: &Paths) -> NetworkId {
+        let params =
+            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                .unwrap();
+        let genesis = OperationCore::new(
+            1,
+            founder.signing_key().algorithm(),
+            OperationBody::CreateNetwork {
+                device: founder.device_spec("founder", Role::Admin, true, vec![]).unwrap(),
+                params,
+            },
+            vec![],
+            founder.signing_key().key_id(),
+            NetworkId::from_bytes([0; 32]),
+        )
+        .unwrap();
+        Log::at(paths.roster())
+            .append(&sign_operation(&genesis, founder.signer()).unwrap())
+            .unwrap();
+        NetworkId::from_bytes(*genesis.id().as_bytes())
+    }
+
+    fn started(founder: &Arc<NodeIdentity>, paths: &Paths) -> Arc<Node> {
+        Node::from_log(Arc::clone(founder), Log::at(paths.roster()), None, None, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A batch admitted here is whole again after a restart: its pieces were
+    /// kept beside the log, and replayed once the header was.
+    #[tokio::test]
+    async fn a_batch_survives_a_restart() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let network = founded(&founder, &paths);
+        let node = started(&founder, &paths);
+
+        let entries: Vec<BatchEntry> = (0..150)
+            .map(|index| {
+                let board = NodeIdentity::generate().unwrap();
+                let spec = board.device_spec("board", Role::Member, false, vec![]).unwrap();
+                BatchEntry {
+                    keys: spec.keys,
+                    name: format!("board-{index}"),
+                    serial: Vec::new(),
+                    ipv4: None,
+                }
+            })
+            .collect();
+        let header =
+            BatchHeader::for_entries(&entries, Mode::Light, Vec::new(), None, "lot").unwrap();
+        let core = OperationCore::new(
+            crate::clock::signing_time(),
+            founder.signing_key().algorithm(),
+            OperationBody::AdmitBatch(header),
+            node.heads().await,
+            founder.signing_key().key_id(),
+            network,
+        )
+        .unwrap();
+        let batch = core.id();
+        node.admit_without_activating(&sign_operation(&core, founder.signer()).unwrap())
+            .await
+            .unwrap();
+        node.admit_pieces(&pieces_of(&batch, &entries).unwrap()).await.unwrap();
+        assert_eq!(node.state().await.unwrap().devices.len(), 151);
+
+        drop(node);
+        let restarted = started(&founder, &paths);
+        assert_eq!(restarted.state().await.unwrap().devices.len(), 151, "whole after a restart");
+        assert!(Log::at(paths.pieces()).read().unwrap().len() > 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
+mod light {
+    use std::sync::Arc;
+
+    use identity::NodeIdentity;
+    use roster::id::NetworkId;
+    use roster::member::{DEFAULT_BUDGET, LightMember};
+    use roster::roster::Roster;
+    use roster::sign::sign_operation;
+    use roster::types::{NetworkParams, OperationBody, OperationCore, Role};
+
+    use super::Node;
+    use crate::state::Paths;
+
+    /// A founder's roster of the founder and `member`, with a root over it.
+    fn founded(founder: &NodeIdentity, member: &NodeIdentity) -> (Roster, NetworkId) {
+        let params =
+            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                .unwrap();
+        let sign = |body, parents, network| {
+            let core = OperationCore::new(
+                1,
+                founder.signing_key().algorithm(),
+                body,
+                parents,
+                founder.signing_key().key_id(),
+                network,
+            )
+            .unwrap();
+            (core.id(), sign_operation(&core, founder.signer()).unwrap())
+        };
+        let (genesis, genesis_bytes) = sign(
+            OperationBody::CreateNetwork {
+                device: founder.device_spec("nas", Role::Admin, true, vec![]).unwrap(),
+                params,
+            },
+            vec![],
+            NetworkId::from_bytes([0; 32]),
+        );
+        let network = NetworkId::from_bytes(*genesis.as_bytes());
+        let (_, added) = sign(
+            OperationBody::AddDevice(
+                member.device_spec("sensor", Role::Member, false, vec![]).unwrap(),
+            ),
+            vec![genesis],
+            network,
+        );
+        let mut roster = Roster::new();
+        assert!(roster.offer_bytes(&genesis_bytes).is_accepted());
+        assert!(roster.offer_bytes(&added).is_accepted());
+        let root = crate::snapshots::sign_over_heads(&roster, founder).unwrap();
+        assert!(roster.offer_snapshot(&root).is_accepted());
+        (roster, network)
+    }
+
+    /// A full member on the root the light member holds is believed by its
+    /// compact evidence. One that took the next root is not believed on its
+    /// word, since only the root's hash is shown: the light member catches up
+    /// from the chain, and then believes it.
+    #[tokio::test]
+    async fn a_peer_on_a_root_not_held_is_believed_once_caught_up() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (mut roster, network) = founded(&founder, &sensor);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().expect("a light member");
+        let (_, judge) = node.light_binding().unwrap();
+        let catching = node.catching_up().expect("a light member catches up");
+        let held = member.current().unwrap();
+
+        let admit = |roster: &mut Roster, name: &str, ts: u64| {
+            let device = NodeIdentity::generate().unwrap();
+            let core = OperationCore::new(
+                ts,
+                founder.signing_key().algorithm(),
+                OperationBody::AddDevice(
+                    device.device_spec(name, Role::Member, false, vec![]).unwrap(),
+                ),
+                roster.heads(),
+                founder.signing_key().key_id(),
+                network,
+            )
+            .unwrap();
+            assert!(
+                roster.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted()
+            );
+            let root = crate::snapshots::sign_over_heads(roster, &founder).unwrap();
+            assert!(roster.offer_snapshot(&root).is_accepted());
+        };
+        let shown =
+            |roster: &Roster| roster.evidence_for(&founder.device_id()).unwrap().shown().unwrap();
+
+        assert!(judge(&shown(&roster)), "on the root it holds, believed");
+
+        admit(&mut roster, "tv", 2);
+        let next = shown(&roster);
+        assert!(!judge(&next), "on the next root, not taken on a peer's word");
+        assert_eq!((catching.behind)(&next.to_bytes()), Some(held), "it asks after its own");
+        let answer = crate::lookup::encode_roots_within(
+            &roster.roots_after(&held),
+            transport_convesso::frame::MAX_ROOTS,
+        );
+        assert!((catching.take)(&next.to_bytes(), &answer), "the chain is taken");
+        assert!(judge(&next), "and the peer believed");
+        assert_eq!(node.light().unwrap().lock().unwrap().member().current(), Some(next.against));
+    }
+
+    /// Two roots behind, a light member asks the peer for the roots after its
+    /// own as the session opens, takes them, and believes the peer: what the
+    /// testbed found missing (18.1), where a member that missed roots refused
+    /// every member holding them.
+    #[tokio::test]
+    async fn a_member_two_roots_behind_catches_up_from_the_peer() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (mut roster, network) = founded(&founder, &sensor);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().expect("a light member");
+        let (_, judge) = node.light_binding().unwrap();
+        let catching = node.catching_up().expect("a light member catches up");
+        let held = member.current().unwrap();
+
+        for (name, ts) in [("tv", 2), ("radio", 3)] {
+            let device = NodeIdentity::generate().unwrap();
+            let core = OperationCore::new(
+                ts,
+                founder.signing_key().algorithm(),
+                OperationBody::AddDevice(
+                    device.device_spec(name, Role::Member, false, vec![]).unwrap(),
+                ),
+                roster.heads(),
+                founder.signing_key().key_id(),
+                network,
+            )
+            .unwrap();
+            assert!(
+                roster.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted()
+            );
+            let root = crate::snapshots::sign_over_heads(&roster, &founder).unwrap();
+            assert!(roster.offer_snapshot(&root).is_accepted());
+        }
+        let far = roster.evidence_for(&founder.device_id()).unwrap().shown().unwrap();
+        let shown = far.to_bytes();
+
+        assert!(!judge(&far), "not placed, not believed");
+        assert_eq!((catching.behind)(&shown), Some(held), "it asks after the root it holds");
+
+        // What a full member answers, as `Node::roots_source` builds it.
+        let answer = crate::lookup::encode_roots_within(
+            &roster.roots_after(&held),
+            transport_convesso::frame::MAX_ROOTS,
+        );
+        assert!((catching.take)(&shown, &answer), "the chain is taken");
+        assert!(judge(&far), "and the peer believed");
+        assert_eq!((catching.behind)(&shown), None, "nothing more to ask");
+        assert_eq!(node.light().unwrap().lock().unwrap().member().current(), Some(far.against));
+        assert!(
+            !(catching.take)(&shown, b"not roots"),
+            "nothing is taken from bytes that are not roots"
+        );
+    }
+
+    /// What a light member keeps, changed behind the running daemon, is not
+    /// what the next checkpoint vouches for; what the daemon writes after is.
+    #[tokio::test]
+    async fn a_light_member_planted_while_the_daemon_runs_is_not_vouched_for() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (roster, _) = founded(&founder, &sensor);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path().join("casa"));
+        paths.create().unwrap();
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().expect("a light member");
+        let (machine, _) = crate::checkpoint::SoftwareKey::at(scratch.path()).unwrap();
+        let keeper =
+            Arc::new(crate::checkpoint::Keeper::new(Arc::new(machine), paths.clone(), None));
+        let started = crate::checkpoint::file_hash(&paths.light()).unwrap();
+        // As the service does at start, once the file was checked.
+        keeper.holds_light(started);
+        node.keep_with(Arc::clone(&keeper));
+        let vouched = || {
+            let (machine, _) = crate::checkpoint::SoftwareKey::at(scratch.path()).unwrap();
+            crate::checkpoint::read(&paths, &machine).unwrap().unwrap()
+        };
+
+        std::fs::write(paths.light(), b"planted").unwrap();
+        let planted = crate::checkpoint::file_hash(&paths.light()).unwrap();
+        let values = crate::checkpoint::Values::of(&node, &paths, "casa").await.unwrap();
+        keeper.keep(values, true).unwrap();
+        assert!(!vouched().allows_light(&planted), "the planted file is not named");
+        assert!(vouched().allows_light(&started), "what the daemon holds is");
+
+        // A root taken is written by the daemon, and that is what is named.
+        let mut later = roster;
+        let extra = NodeIdentity::generate().unwrap();
+        let core = OperationCore::new(
+            2,
+            founder.signing_key().algorithm(),
+            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, false, vec![]).unwrap()),
+            later.heads(),
+            founder.signing_key().key_id(),
+            later.state().unwrap().network,
+        )
+        .unwrap();
+        assert!(later.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted());
+        let second = crate::snapshots::sign_over_heads(&later, &founder).unwrap();
+        let message = roster_sync::message::Message::Snapshot(second).encode();
+        node.received_roster(founder.device_id(), &message).await;
+        let written = crate::checkpoint::file_hash(&paths.light()).unwrap();
+        assert_ne!(written, planted, "the daemon wrote over it");
+        let values = crate::checkpoint::Values::of(&node, &paths, "casa").await.unwrap();
+        keeper.keep(values, true).unwrap();
+        assert!(vouched().allows_light(&written), "what it wrote is named");
+        assert!(!vouched().allows_light(&started), "and what it replaced is gone");
+    }
+
+    #[tokio::test]
+    async fn a_light_daemon_runs_with_no_roster_file() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (roster, _) = founded(&founder, &sensor);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().expect("a light member");
+        assert!(node.is_light());
+        let state = node.state().await.unwrap();
+        assert!(state.devices.contains_key(&sensor.device_id()), "it knows itself");
+        assert!(node.light_binding().is_some(), "and what to show and judge by");
+
+        // A root arriving from a full member is taken, and kept beside the
+        // identity; no roster is ever written.
+        let mut later = roster;
+        let extra = NodeIdentity::generate().unwrap();
+        let heads = later.heads();
+        let core = OperationCore::new(
+            2,
+            founder.signing_key().algorithm(),
+            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, false, vec![]).unwrap()),
+            heads,
+            founder.signing_key().key_id(),
+            later.state().unwrap().network,
+        )
+        .unwrap();
+        assert!(later.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted());
+        let second = crate::snapshots::sign_over_heads(&later, &founder).unwrap();
+        let before = std::fs::read(paths.light()).unwrap();
+        let taken = roster::snapshot::RawSnapshot::decode(&second).unwrap().body().root;
+        let message = roster_sync::message::Message::Snapshot(second).encode();
+        node.received_roster(founder.device_id(), &message).await;
+
+        assert_ne!(std::fs::read(paths.light()).unwrap(), before, "the new root is kept");
+        assert!(!paths.roster().exists(), "and there is no roster file");
+        let restarted = Node::from_light(sensor, &paths).unwrap().unwrap();
+        assert_eq!(
+            restarted.light().unwrap().lock().unwrap().member().current(),
+            Some(taken),
+            "restarted, it holds the root it took"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_node_answers_a_lookup_with_evidence_a_light_member_believes() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let sensor = NodeIdentity::generate().unwrap();
+        let (roster, _) = founded(&founder, &sensor);
+        let mut member = LightMember::new(
+            roster.evidence_for(&founder.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        let state = roster.state().unwrap();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let full = Node::new(
+            Arc::clone(&founder),
+            roster_sync::Syncer::new(roster),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(
+                prefix,
+                founder.device_id(),
+            ))),
+            crate::router::Router::new(prefix),
+            crate::state::Log::at(scratch.path().join("roster.log")),
+            crate::schedule::Schedule::provisional(),
+        );
+
+        let query = crate::lookup::Query::Name("sensor".to_owned());
+        let evidence = full.answer_lookup(&query).await;
+        assert_eq!(
+            crate::lookup::take_answer(&mut member, &query, &evidence),
+            Ok(sensor.device_id())
+        );
+        let nobody = crate::lookup::Query::Name("nobody".to_owned());
+        assert!(full.answer_lookup(&nobody).await.is_empty(), "nothing known is said as nothing");
+    }
+
+    /// A light member's upkeep owes nothing on a clock: a month with no root
+    /// published and nothing asked of it, and it asks nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_network_costs_a_light_member_nothing_for_a_month() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (roster, _) = founded(&founder, &sensor);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().unwrap();
+        let upkeep = tokio::spawn(Arc::clone(&node).keep_up_forever());
+
+        for _ in 0..30 {
+            tokio::time::advance(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(node.asked(), 0, "nothing renewed, nothing fetched, in a month");
+
+        // A root naming the member is what makes it renew.
+        let mut later = roster;
+        let rename = OperationCore::new(
+            3,
+            founder.signing_key().algorithm(),
+            OperationBody::Rename { device: sensor.device_id(), name: "probe".into() },
+            later.heads(),
+            founder.signing_key().key_id(),
+            later.state().unwrap().network,
+        )
+        .unwrap();
+        assert!(
+            later.offer_bytes(&sign_operation(&rename, founder.signer()).unwrap()).is_accepted()
+        );
+        let named = crate::snapshots::sign_over_heads(&later, &founder).unwrap();
+        node.received_roster(
+            founder.device_id(),
+            &roster_sync::message::Message::Snapshot(named).encode(),
+        )
+        .await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(node.asked() > 0, "named in a delta, it asks for a renewed proof");
+        upkeep.abort();
+    }
+
+    /// Sets a device's mode, signed by the founder, over the roster's heads.
+    fn set_mode(
+        roster: &mut Roster,
+        founder: &NodeIdentity,
+        device: roster::id::DeviceId,
+        mode: roster::leaf::Mode,
+        ts: u64,
+    ) {
+        let core = OperationCore::new(
+            ts,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device,
+                change: roster::leaf::SettingsChange {
+                    mode: Some(mode),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            roster.heads(),
+            founder.signing_key().key_id(),
+            roster.state().unwrap().network,
+        )
+        .unwrap();
+        assert!(
+            roster.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted()
+        );
+        let root = crate::snapshots::sign_over_heads(roster, founder).unwrap();
+        assert!(roster.offer_snapshot(&root).is_accepted());
+    }
+
+    #[tokio::test]
+    async fn a_full_member_made_light_drops_its_roster_and_keeps_its_leaf() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (mut roster, _) = founded(&founder, &sensor);
+        set_mode(&mut roster, &founder, sensor.device_id(), roster::leaf::Mode::Light, 5);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let log = crate::state::Log::at(paths.roster());
+        for bytes in roster.retained_operations() {
+            log.append(&bytes).unwrap();
+        }
+        let state = roster.state().unwrap();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula).unwrap();
+        let node = Node::new(
+            Arc::clone(&sensor),
+            roster_sync::Syncer::new(roster),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(prefix, sensor.device_id()))),
+            crate::router::Router::new(prefix),
+            log,
+            crate::schedule::Schedule::provisional(),
+        );
+        assert!(!node.is_light());
+
+        node.enforce_roster().await;
+
+        assert!(node.is_light() && node.mode_switched());
+        assert!(!paths.roster().exists(), "the roster is dropped");
+        assert!(paths.light().exists(), "and the light member kept");
+        assert!(node.state().await.unwrap().devices.contains_key(&sensor.device_id()));
+    }
+
+    /// A member its state already makes light, and no root it holds yet,
+    /// keeps in touch with full members until that root reaches it.
+    #[tokio::test]
+    async fn a_member_light_by_its_state_alone_keeps_in_touch_with_full_members() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (mut roster, network) = founded(&founder, &sensor);
+        // Made light by an operation, with no root over it.
+        let core = OperationCore::new(
+            5,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device: sensor.device_id(),
+                change: roster::leaf::SettingsChange {
+                    mode: Some(roster::leaf::Mode::Light),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            roster.heads(),
+            founder.signing_key().key_id(),
+            network,
+        )
+        .unwrap();
+        assert!(
+            roster.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted()
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let log = crate::state::Log::at(paths.roster());
+        let state = roster.state().unwrap();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula).unwrap();
+        let node = Node::new(
+            Arc::clone(&sensor),
+            roster_sync::Syncer::new(roster),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(prefix, sensor.device_id()))),
+            crate::router::Router::new(prefix),
+            log,
+            crate::schedule::Schedule::provisional(),
+        );
+        assert!(!node.is_light(), "no root makes it light yet");
+        assert_eq!(node.chosen_neighbours().await, vec![founder.device_id()]);
+    }
+
+    /// Made light, a member keeps a way out besides the admin that admitted
+    /// it: full members chosen from the roster it still held.
+    #[tokio::test]
+    async fn a_member_made_light_keeps_full_members_besides_its_admitter() {
+        let founder = NodeIdentity::generate().unwrap();
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let laptop = NodeIdentity::generate().unwrap();
+        let (mut roster, network) = founded(&founder, &sensor);
+        let core = OperationCore::new(
+            3,
+            founder.signing_key().algorithm(),
+            OperationBody::AddDevice(
+                laptop.device_spec("laptop", Role::Member, false, vec![]).unwrap(),
+            ),
+            roster.heads(),
+            founder.signing_key().key_id(),
+            network,
+        )
+        .unwrap();
+        assert!(
+            roster.offer_bytes(&sign_operation(&core, founder.signer()).unwrap()).is_accepted()
+        );
+        set_mode(&mut roster, &founder, sensor.device_id(), roster::leaf::Mode::Light, 5);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let log = crate::state::Log::at(paths.roster());
+        for bytes in roster.retained_operations() {
+            log.append(&bytes).unwrap();
+        }
+        let state = roster.state().unwrap();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula).unwrap();
+        let node = Node::new(
+            Arc::clone(&sensor),
+            roster_sync::Syncer::new(roster),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(prefix, sensor.device_id()))),
+            crate::router::Router::new(prefix),
+            log,
+            crate::schedule::Schedule::provisional(),
+        );
+
+        node.enforce_roster().await;
+
+        assert!(node.is_light());
+        let member = node.light().unwrap();
+        let kept = member.lock().unwrap().member().known_fulls();
+        assert_eq!(kept, vec![laptop.device_id()], "the laptop, besides the admin");
+        assert!(node.chosen_neighbours().await.contains(&laptop.device_id()), "and turns to it");
+    }
+
+    #[tokio::test]
+    async fn a_light_member_made_full_rests_on_the_state_it_fetched() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let sensor = Arc::new(NodeIdentity::generate().unwrap());
+        let (mut roster, _) = founded(&founder, &sensor);
+        set_mode(&mut roster, &founder, sensor.device_id(), roster::leaf::Mode::Light, 5);
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = Paths::under(scratch.path());
+        let member = LightMember::new(
+            roster.evidence_for(&sensor.device_id()).unwrap(),
+            roster.state().unwrap().params,
+            DEFAULT_BUDGET,
+        )
+        .unwrap();
+        crate::state::write_light(&paths, &member).unwrap();
+        let node = Node::from_light(Arc::clone(&sensor), &paths).unwrap().unwrap();
+
+        // The admin makes it full; the root says so, and its proof is renewed.
+        set_mode(&mut roster, &founder, sensor.device_id(), roster::leaf::Mode::Full, 6);
+        let latest = roster.snapshot().unwrap().to_bytes();
+        {
+            let held = node.light().unwrap();
+            let mut held = held.lock().unwrap();
+            held.member_mut().offer_root(&latest).unwrap();
+            held.member_mut().renew(roster.evidence_for(&sensor.device_id()).unwrap()).unwrap();
+        }
+        let request = node.begin_full().await.expect("it asks for the state");
+
+        // The full member answers; the light member rests on what it is given.
+        let mut full = roster_sync::Syncer::new(roster);
+        let answers = full.receive(sensor.device_id(), &request.encode()).replies;
+        assert!(!answers.is_empty());
+        for answer in answers {
+            node.received_roster(founder.device_id(), &answer.encode()).await;
+        }
+
+        assert!(!node.is_light() && node.mode_switched(), "it is full now");
+        assert!(!paths.light().exists(), "the light member is dropped");
+        assert!(paths.base_store().exists(), "and the state it rests on kept");
+        assert_eq!(
+            node.state().await.unwrap().root(),
+            full.roster().snapshot().unwrap().body().root,
+            "it holds the state the root commits to"
+        );
     }
 }

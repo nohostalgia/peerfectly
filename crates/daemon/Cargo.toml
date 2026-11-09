@@ -9,6 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 roster = { path = "../roster" }
+# A light member's protocol, which this daemon runs where it is one.
+light-node = { path = "../light-node" }
+# A full member's base on disk, believed through its root.
+member-store = { path = "../member-store" }
 # The enrolment format and its rules: the joining payload, the confirmation code,
 # the proof of possession, and what a delivered roster must prove. Portable, so
 # a phone reuses it unchanged — the sockets and the terminal are this crate's.
@@ -20,7 +24,9 @@ transport-convesso = { path = "../transport-convesso" }
 roster-sync = { path = "../roster-sync" }
 local-discovery = { path = "../local-discovery" }
 tunnel = { path = "../tunnel" }
-blake3.workspace = true
+blake3 = { workspace = true, features = ["std"] }
+# A new network's IPv4 block, drawn at random among the free ones.
+getrandom.workspace = true
 async-trait.workspace = true
 # `io-util`: the control channel's framing reads and writes lines on a stream.
 tokio = { workspace = true, features = ["io-util", "net"] }
@@ -80,6 +86,8 @@ convesso-core = { workspace = true, features = ["alloc", "ed25519-seed"] }
 # supposed to return.
 rcgen = "0.14"
 tempfile.workspace = true
+# The kept neighbour choices held to the rule over generated memberships.
+proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "test-util"] }
 
 [lints]

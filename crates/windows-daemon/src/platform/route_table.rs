@@ -32,9 +32,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2,
     DeleteUnicastIpAddressEntry, FreeMibTable, GetIpForwardTable2, GetIpInterfaceEntry,
-    InitializeIpForwardEntry, InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry,
-    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
-    SetIpInterfaceEntry,
+    GetUnicastIpAddressEntry, InitializeIpForwardEntry, InitializeIpInterfaceEntry,
+    InitializeUnicastIpAddressEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    MIB_UNICASTIPADDRESS_ROW, SetIpInterfaceEntry,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred};
 
@@ -72,8 +72,8 @@ fn row_for(route: &Route) -> MIB_IPFORWARD_ROW2 {
             row.NextHop.si_family = AF_INET6;
             row.NextHop.Ipv6.sin6_family = AF_INET6;
         }
-        Destination::Host(address) => {
-            // A `/32` for one peer, on-link the same way.
+        Destination::Ipv4(address, _) => {
+            // A network's block or a part of it, on-link the same way.
             row.DestinationPrefix.Prefix.si_family = AF_INET;
             row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
             row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = in_addr(address);
@@ -93,21 +93,23 @@ fn in_addr(address: Ipv4Addr) -> u32 {
 /// Reads a row back into the crate's own type, if it is one we could have made.
 ///
 /// A row this daemon could have written is an IPv6 prefix of whole bytes or an
-/// IPv4 `/32`. Anything else is not this daemon's.
+/// IPv4 block of `/10` to `/32`: a network's, or a part of it around a hole.
+/// Anything else is not this daemon's.
 fn route_from(row: &MIB_IPFORWARD_ROW2) -> Option<Route> {
     // SAFETY: reading `si_family` from the union is what the API defines as the
     // way to learn which arm is populated; every arm begins with it.
     let family = unsafe { row.DestinationPrefix.Prefix.si_family };
     if family == AF_INET {
-        if row.DestinationPrefix.PrefixLength != 32 {
-            // Never a range: this daemon writes one address per peer, and a
-            // wider IPv4 route cannot have come from here.
+        let prefix_len = row.DestinationPrefix.PrefixLength;
+        if !(roster::types::Ipv4Range::MIN_PREFIX_LEN..=32).contains(&prefix_len) {
+            // Wider than any network's block: not from here.
             return None;
         }
         // SAFETY: `si_family` said IPv4, so the `Ipv4` arm is the populated one.
         let raw = unsafe { row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr };
-        return Some(Route::host(
+        return Some(Route::ipv4(
             Ipv4Addr::from(raw.to_ne_bytes()),
+            prefix_len,
             Interface::new(row.InterfaceIndex),
         ));
     }
@@ -305,24 +307,46 @@ pub fn weigh_ipv4_interface(interface: Interface) -> Result<()> {
 ///
 /// When Windows refuses, most often for want of Administrator.
 pub fn assign_address(interface: Interface, address: IpAddr) -> Result<()> {
-    let row = address_row(interface, address);
-    // SAFETY: `row` is a fully initialised value of the expected type, borrowed
-    // for the duration of the call only.
-    let status = unsafe { CreateUnicastIpAddressEntry(&raw const row) };
-
     // ERROR_OBJECT_ALREADY_EXISTS. Asking for an address the adapter already has
     // is the outcome wanted, and failing here would make a retry after a partial
     // bring-up impossible.
     const ALREADY: u32 = 5_010;
+    let create = || {
+        let row = address_row(interface, address);
+        // SAFETY: `row` is a fully initialised value of the expected type,
+        // borrowed for the duration of the call only.
+        unsafe { CreateUnicastIpAddressEntry(&raw const row) }
+    };
+    let refused = |status: u32| Error::BringUp {
+        step: Step::CreatingAdapter,
+        cause: format!("the adapter would not take the address {address}: error {status}"),
+        left: Vec::new(),
+    };
 
-    if status == NO_ERROR || status == ALREADY {
-        Ok(())
-    } else {
-        Err(Error::BringUp {
+    let first = create();
+    if first != NO_ERROR && first != ALREADY {
+        return Err(refused(first));
+    }
+    // Taken, as Windows says; and held, as the table says. The two parted on
+    // a person's PC (2026-11-02): after the block's route was split around a
+    // hole and joined again, the address was answered "already there" and was
+    // in no table, so nothing reached it. What is left of it is taken away,
+    // and it is made again.
+    if holds_address(interface, address) != Some(false) {
+        return Ok(());
+    }
+    let _cleared = remove_address(interface, address);
+    let second = create();
+    match holds_address(interface, address) {
+        Some(false) => Err(Error::BringUp {
             step: Step::CreatingAdapter,
-            cause: format!("the adapter would not take the address {address}: error {status}"),
+            cause: format!(
+                "the adapter answered {first}, then {second}, for the address {address}, and holds                  it in no table"
+            ),
             left: Vec::new(),
-        })
+        }),
+        _ if second == NO_ERROR || second == ALREADY => Ok(()),
+        _ => Err(refused(second)),
     }
 }
 
@@ -349,6 +373,22 @@ pub fn remove_address(interface: Interface, address: IpAddr) -> Result<()> {
             cause: format!("the adapter would not drop the address {address}: error {status}"),
             left: Vec::new(),
         })
+    }
+}
+
+/// Whether the interface holds `address` now: `None` where the table could
+/// not be asked.
+pub fn holds_address(interface: Interface, address: IpAddr) -> Option<bool> {
+    let mut row = address_row(interface, address);
+    // SAFETY: `row` names the address by interface and value, which is all the
+    // call reads; it fills in the rest.
+    let status = unsafe { GetUnicastIpAddressEntry(&raw mut row) };
+    // ERROR_NOT_FOUND: the address is not on the interface.
+    const NOT_FOUND: u32 = 1_168;
+    match status {
+        NO_ERROR => Some(true),
+        NOT_FOUND => Some(false),
+        _ => None,
     }
 }
 
@@ -486,12 +526,26 @@ mod tests {
         assert_eq!(route_from(&row_for(&host())), Some(host()));
     }
 
-    /// An IPv4 route wider than one address is not this daemon's: it writes a
-    /// `/32` per peer and never a range.
+    /// The table says which addresses an interface holds: the loopback holds
+    /// `127.0.0.1`, and no interface holds an address nobody gave it.
     #[test]
-    fn an_ipv4_range_row_is_not_claimed() {
-        let mut row = row_for(&host());
-        row.DestinationPrefix.PrefixLength = 10;
+    fn the_table_says_whether_an_address_is_held() {
+        let loopback = Interface::new(1);
+        assert_eq!(holds_address(loopback, IpAddr::V4(Ipv4Addr::LOCALHOST)), Some(true));
+        assert_eq!(
+            holds_address(loopback, IpAddr::V4(Ipv4Addr::new(10, 255, 255, 254))),
+            Some(false)
+        );
+    }
+
+    /// A network's block is this daemon's, and so is a part of it; an IPv4
+    /// route wider than any block is not, nor an IPv4 default route.
+    #[test]
+    fn an_ipv4_block_row_is_claimed_and_a_wider_one_is_not() {
+        let block = Route::ipv4(Ipv4Addr::new(100, 64, 0, 0), 10, Interface::new(7));
+        assert_eq!(route_from(&row_for(&block)), Some(block));
+        let mut row = row_for(&block);
+        row.DestinationPrefix.PrefixLength = 9;
         assert_eq!(route_from(&row), None);
         row.DestinationPrefix.PrefixLength = 0;
         assert_eq!(route_from(&row), None, "and never an IPv4 default route");

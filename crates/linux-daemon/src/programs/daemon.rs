@@ -53,7 +53,8 @@ pub fn main() -> ExitCode {
         }
     };
 
-    let service = match runtime.block_on(start()) {
+    let headless = std::env::args().any(|word| word == crate::HEADLESS);
+    let service = match runtime.block_on(start(headless)) {
         Ok(service) => service,
         Err(cause) => {
             tracing::error!(%cause, "could not start");
@@ -64,7 +65,11 @@ pub fn main() -> ExitCode {
     let stopping = Arc::new(AtomicBool::new(false));
     runtime.spawn(serve_commands(Arc::clone(&service), Arc::clone(&stopping)));
     runtime.spawn(Arc::clone(&service).reconcile_forever());
-    tracing::info!("running");
+    if headless {
+        tracing::info!("running headless: an anchor, with no packet interface");
+    } else {
+        tracing::info!("running");
+    }
 
     runtime.block_on(wait(&service, &stopping));
 
@@ -130,8 +135,9 @@ fn may_run_from_here() -> bool {
 }
 
 /// Assembles the service, writes the firewall table, and brings back what was
-/// left on.
-async fn start() -> daemon::Result<Arc<daemon::Service>> {
+/// left on. Headless, as an anchor: no packet interface, no resolver and no
+/// firewall table, and every network carried all the same.
+async fn start(headless: bool) -> daemon::Result<Arc<daemon::Service>> {
     use daemon::connectivity::Convesso;
     use daemon::lifecycle::Lifecycle;
     use daemon::resolving::sockets::Sockets;
@@ -140,6 +146,23 @@ async fn start() -> daemon::Result<Arc<daemon::Service>> {
     let home = crate::home::home_for_this_machine()?;
     home.create()?;
     let keys = crate::custody::keys::LinuxKeys::open(home.root())?;
+
+    if headless {
+        let service = Arc::new(Service::over_with_keys(
+            home,
+            Lifecycle::new(Arc::new(daemon::machine::Headless) as Arc<dyn Machine>),
+            Arc::new(Convesso) as Arc<dyn Connectivity>,
+            Arc::new(daemon::resolving::Nowhere) as Arc<dyn Resolving>,
+            Arc::new(keys),
+        )?);
+        match service.resume().await {
+            Ok(true) => tracing::info!("the networks left on are on again"),
+            Ok(false) => {}
+            Err(cause) => tracing::warn!(%cause, "a network left on would not come up"),
+        }
+        return Ok(service);
+    }
+
     let firewall = crate::firewall::Nftables::under(home.root());
 
     let service = Arc::new(
@@ -236,7 +259,7 @@ mod tests {
             .join("\n");
         for speaking in [
             "ConvessoTransport::bind",
-            "Waiting::listen",
+            "Waiting::at_rendezvous",
             "Tun::open",
             "connectivity.start",
             "Multicast::",
@@ -246,8 +269,13 @@ mod tests {
                 "`{speaking}` in the startup path would reach something"
             );
         }
+        // On the path with a firewall: headless, an anchor has no table and
+        // resumes at once, by design.
+        let with_a_firewall =
+            code.split_once("let firewall =").map(|(_, rest)| rest).unwrap_or_default();
+        let ensured = with_a_firewall.find("firewall.ensure()");
         assert!(
-            code.find("firewall.ensure()") < code.find("service.resume()"),
+            ensured.is_some() && ensured < with_a_firewall.find("service.resume()"),
             "the table before anything comes up"
         );
     }

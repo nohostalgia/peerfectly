@@ -208,6 +208,12 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
@@ -315,7 +321,7 @@ version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ca26ef0159422fb77631dc9d17b102f253b876fe1586b03b803e63a309b4ee2"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "cairo-sys-rs",
  "glib",
  "libc",
@@ -422,12 +428,14 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "daemon",
  "identity",
+ "light-node",
  "roster",
+ "serialport",
  "tokio",
 ]
 
@@ -462,7 +470,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 [[package]]
 name = "convesso-core"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -476,7 +484,7 @@ dependencies = [
 [[package]]
 name = "convesso-relay"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
 dependencies = [
  "convesso-core",
 ]
@@ -484,7 +492,7 @@ dependencies = [
 [[package]]
 name = "convesso-stream"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
 dependencies = [
  "convesso-core",
 ]
@@ -492,7 +500,7 @@ dependencies = [
 [[package]]
 name = "convesso-tokio"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=d9d7e6f71398a3a0ac36cf35d035b35744748615#d9d7e6f71398a3a0ac36cf35d035b35744748615"
+source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
 dependencies = [
  "convesso-core",
  "convesso-relay",
@@ -505,6 +513,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -566,9 +584,9 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "9c035cb64cba03dad2fb921f3e218785e8cf9a41790da5eb3a1400f62fa2be11"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -593,9 +611,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
 dependencies = [
  "cmov",
  "subtle",
@@ -631,18 +649,22 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "blake3",
  "chrono",
  "convesso-core",
  "enrollment",
+ "getrandom 0.4.3",
  "hex",
  "hickory-proto",
  "identity",
+ "light-node",
  "local-discovery",
+ "member-store",
  "netdev",
+ "proptest",
  "qrcode",
  "rcgen",
  "roster",
@@ -737,7 +759,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "block2",
  "libc",
  "objc2",
@@ -839,9 +861,10 @@ dependencies = [
 
 [[package]]
 name = "enrollment"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "blake3",
+ "getrandom 0.4.3",
  "identity",
  "roster",
 ]
@@ -1136,7 +1159,7 @@ version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "futures-channel",
  "futures-core",
  "futures-executor",
@@ -1427,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1504,6 +1527,16 @@ dependencies = [
  "tokio",
  "widestring",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "io-kit-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617ee6cf8e3f66f3b4ea67a4058564628cde41901316e19f559e14c7c72c5e7b"
+dependencies = [
+ "core-foundation-sys",
+ "mach2",
 ]
 
 [[package]]
@@ -1609,7 +1642,7 @@ version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fbe853b403ae61a04233030ae8a79d94975281ed9770a1f9e246732b534b28d"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "serde",
 ]
 
@@ -1679,8 +1712,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "light-node"
+version = "0.5.0"
+dependencies = [
+ "blake3",
+ "identity",
+ "roster",
+ "roster-sync",
+ "transport-wire",
+ "tunnel",
+]
+
+[[package]]
 name = "linux-daemon"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "cli",
@@ -1717,7 +1762,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "local-discovery"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1742,6 +1787,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3d25b0e0b648a86960ac23b7ad4abb9717601dec6f66c165f5b037f3f03065f"
 
 [[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mbox"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1749,6 +1803,16 @@ checksum = "26d142aeadbc4e8c679fc6d93fbe7efe1c021fa7d80629e615915b519e3bc6de"
 dependencies = [
  "libc",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "member-store"
+version = "0.5.0"
+dependencies = [
+ "blake3",
+ "redb",
+ "roster",
+ "tempfile",
 ]
 
 [[package]]
@@ -1871,7 +1935,7 @@ version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59d48ffc8b73a506e1ff0878528c72668f2bfbc3d875b6be890a96be5d0d5576"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "libc",
  "log",
  "netlink-packet-core",
@@ -1887,6 +1951,17 @@ dependencies = [
  "bytes",
  "libc",
  "log",
+]
+
+[[package]]
+name = "nix"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "598beaf3cc6fdd9a5dfb1630c2800c7acd31df7aaf0f565796fba2b53ca1af1b"
+dependencies = [
+ "bitflags 1.3.2",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -1959,7 +2034,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
@@ -1971,7 +2046,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "block2",
  "dispatch2",
  "libc",
@@ -1984,7 +2059,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "objc2-core-foundation",
 ]
 
@@ -2000,7 +2075,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "block2",
  "objc2",
  "objc2-core-foundation",
@@ -2012,7 +2087,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "objc2-core-foundation",
 ]
 
@@ -2208,7 +2283,7 @@ version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "crc32fast",
  "fdeflate",
  "flate2",
@@ -2230,6 +2305,15 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "potential_utf"
@@ -2337,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "programs"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "linux-daemon",
  "windows-daemon",
@@ -2351,7 +2435,7 @@ checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
 dependencies = [
  "bit-set",
  "bit-vec 0.10.1",
- "bitflags",
+ "bitflags 2.13.1",
  "chacha20",
  "core_detect",
  "num-traits",
@@ -2446,6 +2530,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
+name = "redb"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_users"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2487,7 +2580,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-server"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "convesso-tokio",
  "daemon",
@@ -2526,13 +2619,14 @@ dependencies = [
 
 [[package]]
 name = "roster"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
  "hex",
  "minicbor",
  "p256",
+ "portable-atomic-util",
  "proptest",
  "serde_json",
  "signature",
@@ -2540,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "roster-sync"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "identity",
@@ -2574,7 +2668,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -2641,6 +2735,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sec1"
@@ -2741,6 +2841,24 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct",
  "serde",
+]
+
+[[package]]
+name = "serialport"
+version = "4.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba5f8f29aa20853c4e3e85a33ec580eb66be1f057142e77a333834a318bacf2"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "core-foundation",
+ "core-foundation-sys",
+ "io-kit-sys",
+ "mach2",
+ "nix",
+ "scopeguard",
+ "unescaper",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3037,9 +3155,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.54.0"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -3200,27 +3318,30 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "identity",
  "proptest",
  "roster",
  "tokio",
+ "transport-wire",
 ]
 
 [[package]]
 name = "transport-convesso"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "convesso-core",
  "convesso-relay",
  "convesso-stream",
  "convesso-tokio",
+ "curve25519-dalek",
  "getrandom 0.4.3",
  "hex",
  "identity",
+ "light-node",
  "proptest",
  "rcgen",
  "roster",
@@ -3228,6 +3349,15 @@ dependencies = [
  "tracing",
  "transport",
  "transport-convesso",
+ "transport-wire",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "transport-wire"
+version = "0.5.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
@@ -3286,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "tunnel"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3308,6 +3438,15 @@ name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
+name = "unescaper"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7285e83a80ce76f5e7bce79fa41f68d78ba62d1003cf27bf748ab24413808cf4"
+dependencies = [
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "unicode-ident"
@@ -3504,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "windows-daemon"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3595,7 +3734,7 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "widestring",
  "windows-sys 0.61.2",
 ]

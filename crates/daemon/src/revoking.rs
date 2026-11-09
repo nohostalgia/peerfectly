@@ -21,10 +21,13 @@
 //! disagreed would be the daemon deciding membership, which
 //! [`crate::lib`](crate) says it must never do.
 
+use std::sync::Arc;
+
 use identity::NodeIdentity;
 use roster::id::DeviceId;
+use roster::leaf::DeviceLeaf;
 use roster::state::RosterState;
-use roster::types::{DeviceRecord, OperationBody, OperationCore};
+use roster::types::{OperationBody, OperationCore};
 
 use crate::control::{Target, read_short_id, short_id, shown};
 
@@ -111,20 +114,13 @@ fn asked_for(target: &Target) -> String {
 ///
 /// When no member matches, when more than one does, or when an id is not all
 /// sixteen digits or names a device already revoked.
-pub(crate) fn find<'a>(
-    state: &'a RosterState,
+pub(crate) fn find(
+    state: &RosterState,
     target: &Target,
     choose: &str,
-) -> Result<&'a DeviceRecord, String> {
-    let (matches, asked): (Vec<&DeviceRecord>, String) = match target {
-        Target::Name(name) => (
-            state
-                .devices
-                .values()
-                .filter(|record| record.name.eq_ignore_ascii_case(name))
-                .collect(),
-            format!("{name:?}"),
-        ),
+) -> Result<Arc<DeviceLeaf>, String> {
+    let (matches, asked): (Vec<Arc<DeviceLeaf>>, String) = match target {
+        Target::Name(name) => (state.devices.named(name), format!("{name:?}")),
         Target::Id(typed) => {
             let Some(id) = read_short_id(typed) else {
                 return Err(format!(
@@ -132,7 +128,7 @@ pub(crate) fn find<'a>(
                      shows it: xxxx-xxxx-xxxx-xxxx. Part of one is not accepted."
                 ));
             };
-            let found: Vec<&DeviceRecord> =
+            let found: Vec<Arc<DeviceLeaf>> =
                 state.devices.values().filter(|record| short_id(&record.id) == id).collect();
             if found.is_empty() && state.revoked.iter().any(|device| short_id(device) == id) {
                 return Err(format!(
@@ -146,7 +142,7 @@ pub(crate) fn find<'a>(
 
     match matches.as_slice() {
         [] => Err(format!("no device in this network answers to {asked}")),
-        [one] => Ok(*one),
+        [one] => Ok(Arc::clone(one)),
         several => {
             let listed = several
                 .iter()
@@ -351,7 +347,8 @@ mod tests {
 
     /// A second member with the given name and id, beside the fixture's.
     fn with_member(state: &mut RosterState, id: DeviceId, name: &str) {
-        let mut record = state.devices.values().next().expect("the fixture has members").clone();
+        let mut record =
+            state.devices.values().next().expect("the fixture has members").record.clone();
         record.id = id;
         record.name = name.to_owned();
         state.devices.insert(id, record);

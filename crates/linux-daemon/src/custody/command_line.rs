@@ -111,6 +111,10 @@ fn opened(bytes: &[u8], passphrase: &[u8]) -> Result<identity::PrivateKey, Strin
 }
 
 impl cli::Custody for LinuxCustody {
+    fn may_sign(&self) -> Result<(), String> {
+        Self::as_root()
+    }
+
     fn make_key(&self, wanted: &KeyWanted) -> Result<MadeKey, String> {
         Self::as_root()?;
         let tpm = self.tpm.clone();

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use convesso_core::handshake::DialError;
+use convesso_core::handshake::{DialError, RefusalCode};
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::paths::PathKind;
 use convesso_tokio::entropy::OsEntropy;
@@ -23,10 +23,10 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use transport::error::{Error, Result as SessionResult};
 use transport::limits;
-use transport::session::{Path, Session, Transport};
+use transport::session::{CatchingUp, Path, RootsAfter, Session, Transport};
 
 use crate::error::{BuildError, Result};
-use crate::frame::{Frame, MAX_MESSAGE, Reason, SessionId, Stream, VERSION};
+use crate::frame::{Frame, MAX_MESSAGE, OWN, Reason, SessionId, Stream, VERSION};
 use crate::members::{Gate, Members};
 use crate::session::{DATAGRAM_ROOM, Live, SessionHandle};
 
@@ -39,6 +39,15 @@ pub const CONTEXT: &[u8] = b"peerfectly/transport";
 
 /// The close code sent to convesso when a peer stops being a member.
 const CLOSE_MEMBERSHIP: u16 = 0x0101;
+/// How long before the sender of a session this node does not hold is told so
+/// again, while it goes on sending.
+const TELL_AGAIN: Duration = Duration::from_secs(2);
+/// convesso's close code for a peer whose open was refused, and which holds no
+/// other session here.
+const CLOSE_REFUSED: u16 = 0x0102;
+/// How long a refused peer's session is kept for the refusal to reach it:
+/// less than any dialler rests before it tries again.
+const REFUSED_GRACE: Duration = Duration::from_secs(5);
 
 /// How long after a change of network convesso is told: long enough for
 /// several changes the system reports together (Wi-Fi gone, then mobile data
@@ -60,6 +69,18 @@ const AGAIN: [Duration; 3] =
 /// for the session protocol's own answer.
 const DIAL_PATIENCE: Duration = Duration::from_secs(20);
 
+/// How long a node holding no roster waits for the roots it asked for while a
+/// session opens, within the dialler's own patience.
+const CATCH_UP_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The most opens held while their roots are asked for. Beyond it an open
+/// that would be held is refused, as it was before anything was held.
+const MAX_HELD_OPENS: usize = 64;
+
+/// The most sessions remembered as answered with roots, before the record
+/// starts again.
+const MAX_ANSWERED: usize = 4096;
+
 /// What one peer's messages may hold before its sender waits: two of the
 /// largest, each at its cost.
 const MESSAGE_BUDGET: usize = 2 * (MAX_MESSAGE + ELEMENT_COST);
@@ -68,13 +89,30 @@ const MESSAGE_BUDGET: usize = 2 * (MAX_MESSAGE + ELEMENT_COST);
 /// packet queue, in datagrams of the largest size.
 const DATAGRAM_BUDGET: usize = limits::PACKET_QUEUE * (DATAGRAM_ROOM + ELEMENT_COST);
 
+/// Whether a light node believes a peer's compact evidence: its proof holds
+/// against a root the node remembers, and the leaf is still the device's word
+/// as far as the node knows.
+pub type Judge = Arc<dyn Fn(&roster::membership::Shown) -> bool + Send + Sync>;
+
 /// What a dial is told.
 enum Answer {
-    /// The far end took the session.
-    Accepted,
+    /// The far end took the session, showing this evidence.
+    Accepted(Vec<u8>),
     /// It was refused, or could not be made.
     Refused(Error),
 }
+
+/// An open from a peer, held while the roots its evidence rests on are asked
+/// for.
+struct HeldOpen {
+    peer: PeerId,
+    version: u8,
+    evidence: Vec<u8>,
+    since: tokio::time::Instant,
+}
+
+/// A dial of this node waiting for its roots: whom it asked, and where they go.
+type CatchUp = (PeerId, oneshot::Sender<Vec<u8>>);
 
 /// A dial waiting for its answer.
 struct Dial {
@@ -97,12 +135,80 @@ enum Out {
     Close(PeerId, u16),
 }
 
+/// What the access policy is decided from, kept beside the sessions so the
+/// handshake, which cannot wait, reads it at once.
+#[derive(Default)]
+struct Policy {
+    /// The network's rules; none lets everyone reach everyone.
+    rules: Vec<roster::parameters::Rule>,
+    /// This device's own groups.
+    own: Vec<roster::leaf::Group>,
+    /// Every member's groups, for a node holding a roster.
+    groups: HashMap<DeviceId, Vec<roster::leaf::Group>>,
+}
+
+impl Policy {
+    /// What a roster state says.
+    fn of_state(state: &RosterState, own: &DeviceId) -> Self {
+        Self {
+            rules: state.params.policy.clone(),
+            own: state.settings_of(own).groups,
+            groups: state
+                .devices
+                .iter()
+                .map(|(device, leaf)| (device, leaf.settings.groups.clone()))
+                .collect(),
+        }
+    }
+
+    /// Whether `initiator`, with `shown` as its leaf where this node holds no
+    /// roster, may open a session to this device.
+    fn allows(&self, initiator: &DeviceId, shown: &[u8]) -> bool {
+        if self.rules.is_empty() {
+            return true;
+        }
+        let groups = match self.groups.get(initiator) {
+            Some(groups) => groups.clone(),
+            None => roster::membership::Shown::from_bytes(shown)
+                .map(|shown| shown.leaf.settings.groups)
+                .unwrap_or_default(),
+        };
+        roster::parameters::allows(&self.rules, &groups, &self.own)
+    }
+}
+
 /// What the transport and its tasks share.
 struct Shared {
     node: Node,
     context: Context,
+    /// What each peer takes, and what it is sending in parts.
+    wire: Arc<crate::wire::Wire>,
     members: Arc<RwLock<Members>>,
     state: Mutex<RosterState>,
+    /// What this node shows a peer as a session opens; empty for nothing.
+    evidence: std::sync::Mutex<Vec<u8>>,
+    /// For a node holding no roster: how it judges the root a peer's evidence
+    /// rests on. `None` for a node that judges peers by its state.
+    judge: Option<Judge>,
+    /// For a node holding no roster: how it catches up on a root it cannot
+    /// place, while a session opens.
+    catching: std::sync::RwLock<Option<CatchingUp>>,
+    /// For a node holding a roster: the roots it answers that with.
+    roots: std::sync::RwLock<Option<RootsAfter>>,
+    /// Dials of this node waiting for the roots they asked for, by session.
+    catch_ups: std::sync::Mutex<HashMap<SessionId, CatchUp>>,
+    /// Opens held while their roots are asked for, by session.
+    held_opens: std::sync::Mutex<HashMap<SessionId, HeldOpen>>,
+    /// When each peer was last refused, until its session is closed.
+    refusals: std::sync::Mutex<HashMap<PeerId, tokio::time::Instant>>,
+    /// Sessions already answered with roots: once each.
+    answered: std::sync::Mutex<HashSet<SessionId>>,
+    /// Sessions this node does not hold whose sender was told so, and when.
+    unknown: std::sync::Mutex<HashMap<SessionId, tokio::time::Instant>>,
+    /// The access policy, and the groups it is decided over.
+    policy: std::sync::RwLock<Policy>,
+    /// This device.
+    own: DeviceId,
     sessions: std::sync::Mutex<HashMap<SessionId, Arc<Live>>>,
     accepted_from: std::sync::Mutex<HashMap<PeerId, SessionId>>,
     dials: std::sync::Mutex<HashMap<SessionId, Dial>>,
@@ -208,7 +314,36 @@ impl ConvessoTransport {
     /// When the transport key is not ed25519, the relay's pinned key is not
     /// one, or the node cannot start.
     pub async fn bind(identity: &NodeIdentity, state: RosterState) -> Result<Self> {
-        Self::bind_with(identity, state, None).await
+        Self::bind_with(identity, state, None, None).await
+    }
+
+    /// Starts a node for a device holding no roster: a light member.
+    ///
+    /// It knows its network and the parameters it uses, shows `evidence` — its
+    /// compact evidence — and judges every peer by what that peer shows: its
+    /// leaf must name the key the handshake authenticated, and `judge` must
+    /// believe its proof against a root the node remembers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bind`].
+    pub async fn bind_light(
+        identity: &NodeIdentity,
+        network: roster::id::NetworkId,
+        params: roster::types::NetworkParams,
+        evidence: Vec<u8>,
+        judge: Judge,
+    ) -> Result<Self> {
+        let state = RosterState::from_parts(
+            network,
+            params,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeMap::new(),
+        );
+        let transport = Self::bind_with(identity, state, None, Some(judge)).await?;
+        transport.update_evidence(evidence);
+        Ok(transport)
     }
 
     /// [`Self::bind`], with convesso resolving the relay's host through
@@ -224,13 +359,14 @@ impl ConvessoTransport {
         state: RosterState,
         resolver: convesso_tokio::Resolver,
     ) -> Result<Self> {
-        Self::bind_with(identity, state, Some(resolver)).await
+        Self::bind_with(identity, state, Some(resolver), None).await
     }
 
     async fn bind_with(
         identity: &NodeIdentity,
         state: RosterState,
         resolver: Option<convesso_tokio::Resolver>,
+        judge: Option<Judge>,
     ) -> Result<Self> {
         let key = identity.transport_key();
         if key.algorithm() != Algorithm::Ed25519 {
@@ -251,7 +387,7 @@ impl ConvessoTransport {
 
         let members = Arc::new(RwLock::new(Members::from_state(&state)));
         let options = ContextOptions {
-            access: Access::Admit(Box::new(Gate(Arc::clone(&members)))),
+            access: Access::Admit(Box::new(Gate(Arc::clone(&members), judge.is_some()))),
             delivery: Delivery::PerPeer { messages: MESSAGE_BUDGET, datagrams: DATAGRAM_BUDGET },
             ..ContextOptions::default()
         };
@@ -278,8 +414,20 @@ impl ConvessoTransport {
         let shared = Arc::new(Shared {
             node,
             context,
+            wire: Arc::default(),
             members,
             state: Mutex::new(state.clone()),
+            evidence: std::sync::Mutex::new(Vec::new()),
+            policy: std::sync::RwLock::new(Policy::of_state(&state, &identity.device_id())),
+            own: identity.device_id(),
+            judge,
+            catching: std::sync::RwLock::new(None),
+            roots: std::sync::RwLock::new(None),
+            catch_ups: std::sync::Mutex::new(HashMap::new()),
+            held_opens: std::sync::Mutex::new(HashMap::new()),
+            refusals: std::sync::Mutex::new(HashMap::new()),
+            answered: std::sync::Mutex::new(HashSet::new()),
+            unknown: std::sync::Mutex::new(HashMap::new()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             accepted_from: std::sync::Mutex::new(HashMap::new()),
             dials: std::sync::Mutex::new(HashMap::new()),
@@ -297,7 +445,7 @@ impl ConvessoTransport {
         let tasks = vec![
             tokio::spawn(read_node_events(Arc::clone(&shared), node_events)),
             tokio::spawn(read_context_events(Arc::clone(&shared), context_events)),
-            tokio::spawn(send_queued(shared.context.clone(), queued)),
+            tokio::spawn(send_queued(shared.context.clone(), Arc::clone(&shared.wire), queued)),
         ];
         Ok(Self { shared, accepted: Mutex::new(accepted), tasks })
     }
@@ -339,7 +487,7 @@ impl ConvessoTransport {
             |sessions| {
                 sessions
                     .values()
-                    .filter(|live| live.device == *device && live.closure().is_none())
+                    .filter(|live| live.device() == *device && live.closure().is_none())
                     .cloned()
                     .collect()
             },
@@ -360,7 +508,11 @@ impl Transport for ConvessoTransport {
         // Decided now, acted on once the far end has answered. A dialler that
         // refused before sending anything would leave the far end's `accept`
         // waiting for ever; this one dials, and closes what it opened (design D3).
-        let verdict = {
+        let verdict = if shared.judge.is_some() {
+            // Nothing to decide by yet: the far end's evidence comes back with
+            // its answer. Provisionally the device its key is; confirmed below.
+            Ok(DeviceId::from_bytes(*peer.key_id().as_bytes()))
+        } else {
             let state = shared.state.lock().await;
             transport::auth::authorize(&state, &peer.key_id())
         };
@@ -376,7 +528,8 @@ impl Transport for ConvessoTransport {
         // Registered before the far end can answer, so nothing it sends right
         // after taking the session is dropped for want of somewhere to go.
         let live = verdict.as_ref().ok().map(|device| {
-            let live = Live::new(id, *device, address, shared.context.clone());
+            let live =
+                Live::new(id, *device, address, shared.context.clone(), Arc::clone(&shared.wire));
             if let Ok(mut sessions) = shared.sessions.lock() {
                 sessions.insert(id, Arc::clone(&live));
             }
@@ -391,14 +544,29 @@ impl Transport for ConvessoTransport {
             }
         };
 
-        let open = Frame::Open { version: VERSION, id }.encode();
-        if let Err(cause) = shared.context.send_message(address, open).await {
+        let open =
+            Frame::Open { version: VERSION, id, limits: OWN, evidence: own_evidence(shared) }
+                .encode();
+        if let Err(cause) = send_framed(shared, address, open).await {
             forget();
             return Err(Error::PeerUnreachable { cause: Some(cause.to_string()) });
         }
 
         let outcome = match tokio::time::timeout(DIAL_PATIENCE, answered).await {
-            Ok(Ok(Answer::Accepted)) => Ok(()),
+            Ok(Ok(Answer::Accepted(evidence))) => {
+                match judged_catching_up(shared, peer, address, id, &evidence).await {
+                    // A light node learns here who it reached.
+                    Some(Ok(device)) => {
+                        if let Some(live) = &live {
+                            live.set_device(device);
+                            live.set_evidence(evidence);
+                        }
+                        Ok(())
+                    }
+                    Some(Err(error)) => Err(error),
+                    None => Ok(()),
+                }
+            }
             Ok(Ok(Answer::Refused(error))) => Err(error),
             Ok(Err(_)) => Err(Error::PeerUnreachable {
                 cause: Some("the node stopped while dialling".to_owned()),
@@ -409,6 +577,10 @@ impl Transport for ConvessoTransport {
         };
         if let Err(error) = outcome {
             forget();
+            if error.is_membership_refusal() {
+                let close = Frame::Close { id, reason: reason_of(&error) }.encode();
+                let _ = shared.outbound.send(Out::Message(address, close));
+            }
             return Err(error);
         }
         match (verdict, live) {
@@ -455,15 +627,99 @@ impl Transport for ConvessoTransport {
         }
     }
 
+    fn serve_roots(&self, roots: RootsAfter) {
+        if let Ok(mut held) = self.shared.roots.write() {
+            *held = Some(roots);
+        }
+    }
+
+    fn catch_up_by(&self, catching: CatchingUp) {
+        if let Ok(mut held) = self.shared.catching.write() {
+            *held = Some(catching);
+        }
+    }
+
+    fn update_evidence(&self, evidence: Vec<u8>) {
+        // A node holding no roster knows its own groups from its own leaf.
+        if self.shared.judge.is_some()
+            && let Ok(shown) = roster::membership::Shown::from_bytes(&evidence)
+            && let Ok(mut policy) = self.shared.policy.write()
+        {
+            policy.own = shown.leaf.settings.groups;
+        }
+        if let Ok(mut held) = self.shared.evidence.lock() {
+            *held = evidence;
+        }
+    }
+
+    fn reconsider(&self) {
+        let shared = &self.shared;
+        let Some(judge) = shared.judge.as_ref() else { return };
+        let Ok(sessions) = shared.sessions.lock() else { return };
+        for live in sessions.values().filter(|live| live.closure().is_none()) {
+            let Ok(key) = PublicKey::new(Algorithm::Ed25519, live.address.as_bytes().to_vec())
+            else {
+                continue;
+            };
+            let shown = live.evidence();
+            let holds = transport::auth::authenticate_by_shown(&shown, &key.key_id(), &|shown| {
+                judge(shown)
+            });
+            if holds.ok() != Some(live.device()) {
+                live.shut(Error::ClosedOnMembershipLoss);
+                let close = Frame::Close { id: live.id, reason: Reason::MembershipLost };
+                let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
+            } else if live.inbound() && !allowed(shared, &live.device(), &shown) {
+                live.shut(Error::NotAllowed);
+                let close = Frame::Close { id: live.id, reason: Reason::NotAllowed };
+                let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
+            }
+        }
+    }
+
     async fn update_state(&self, state: RosterState) {
         let shared = &self.shared;
+        if shared.judge.is_some() {
+            // A node holding no roster is handed the parameters it uses: the
+            // policy among them. Its peers are judged by their evidence.
+            if let Ok(mut policy) = shared.policy.write() {
+                policy.rules = state.params.policy.clone();
+            }
+            *shared.state.lock().await = state;
+            self.reconsider();
+            return;
+        }
+        if let Ok(mut policy) = shared.policy.write() {
+            *policy = Policy::of_state(&state, &shared.own);
+        }
         if let Ok(mut members) = shared.members.write() {
             *members = Members::from_state(&state);
         }
         let mut leaving = HashSet::new();
         if let Ok(mut sessions) = shared.sessions.lock() {
             for live in sessions.values() {
-                if live.closure().is_none() && !transport::auth::is_member(&state, &live.device) {
+                // Still a member is not enough: a device whose transport key
+                // changed is not the key this session authenticated.
+                let still = shared
+                    .members
+                    .read()
+                    .is_ok_and(|members| members.member(&live.peer) == Some(live.device()));
+                if live.closure().is_none()
+                    && live.inbound()
+                    && transport::auth::is_member(&state, &live.device())
+                    && still
+                    && !allowed(shared, &live.device(), &live.evidence())
+                {
+                    // A changed policy closes what it no longer allows.
+                    live.shut(Error::NotAllowed);
+                    let close = Frame::Close { id: live.id, reason: Reason::NotAllowed };
+                    let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
+                    leaving.insert(live.peer);
+                    continue;
+                }
+                if live.closure().is_none()
+                    && (!transport::auth::is_member(&state, &live.device()) || !still)
+                {
                     live.shut(Error::ClosedOnMembershipLoss);
                     let close = Frame::Close { id: live.id, reason: Reason::MembershipLost };
                     let _ = shared.outbound.send(Out::Message(live.address, close.encode()));
@@ -590,31 +846,61 @@ fn schedule_move_end(shared: &Arc<Shared>, params: &NetworkParams) {
     }
 }
 
-/// Starts a reader for every member that has none, and stops those of
-/// devices that are no longer members.
+/// Stops the readers of devices that are no longer members, and of those
+/// that ended.
+///
+/// A reader is started when a session with a peer has keys
+/// ([`ContextEvent::Connected`]) or this node dials it, and ended when the
+/// session has none left ([`ContextEvent::Idle`]): not one for every member.
+/// An open reader keeps convesso from forgetting its peer's channel, and one
+/// for every member was a task and a channel per member, for good, on every
+/// full member of a network of a hundred thousand.
 fn ensure_readers(shared: &Arc<Shared>) {
-    let own = shared.node.address().peer_id();
-    let members: Vec<Address> =
-        shared.members.read().map(|members| members.others(&own)).unwrap_or_default();
-    let keep: HashSet<PeerId> = members.iter().map(Address::peer_id).collect();
+    // A node holding no roster judges by evidence, and knows no members to
+    // keep readers to: it keeps those its sessions started.
+    if shared.judge.is_some() {
+        return;
+    }
+    // Asked of each reader's peer, not of every member: a reader is kept for
+    // a peer the roster still names.
+    let Ok(members) = shared.members.read() else { return };
     if let Ok(mut readers) = shared.readers.lock() {
         readers.retain(|peer, reader| {
-            let kept = keep.contains(peer) && !reader.is_finished();
+            let kept = members.member(peer).is_some() && !reader.is_finished();
             if !kept {
                 reader.abort();
             }
             kept
         });
     }
-    for address in members {
-        ensure_reader(shared, address);
+}
+
+/// Ends `peer`'s reader once its session has no keys, so that convesso may
+/// forget its channel: a message either side sends next opens a new session,
+/// and its [`ContextEvent::Connected`] a new reader.
+///
+/// Asked first whether the session is still without keys: a reader dropped
+/// while the peer has opened a new one would reset the channel that new
+/// session carries. Dropped while there is none, it tells the peer nothing.
+async fn end_reader_if_idle(shared: Arc<Shared>, peer: PeerId) {
+    if !matches!(shared.context.is_live(peer).await, Ok(false)) {
+        return;
+    }
+    if let Ok(mut readers) = shared.readers.lock()
+        && let Some(reader) = readers.remove(&peer)
+    {
+        reader.abort();
     }
 }
 
 /// Starts a reader for `address` if it has none running.
 fn ensure_reader(shared: &Arc<Shared>, address: Address) {
+    ensure_reader_of(shared, address.peer_id());
+}
+
+/// Starts a reader for `peer` if it has none running.
+fn ensure_reader_of(shared: &Arc<Shared>, peer: PeerId) {
     let Ok(mut readers) = shared.readers.lock() else { return };
-    let peer = address.peer_id();
     if readers.get(&peer).is_some_and(|reader| !reader.is_finished()) {
         return;
     }
@@ -670,6 +956,7 @@ const fn reason_of(error: &Error) -> Reason {
         Error::Revoked => Reason::Revoked,
         Error::IncompatibleVersion => Reason::Version,
         Error::ClosedOnMembershipLoss => Reason::MembershipLost,
+        Error::NotAllowed => Reason::NotAllowed,
         _ => Reason::Ordinary,
     }
 }
@@ -680,6 +967,7 @@ const fn refusal_of(reason: Reason) -> Error {
         Reason::NotAMember => Error::NotAMember,
         Reason::Revoked => Error::Revoked,
         Reason::Version => Error::IncompatibleVersion,
+        Reason::NotAllowed => Error::NotAllowed,
         Reason::Ordinary | Reason::MembershipLost | Reason::Unknown(_) => Error::ClosedByPeer,
     }
 }
@@ -687,6 +975,13 @@ const fn refusal_of(reason: Reason) -> Error {
 /// A failed dial, as the interface says it.
 fn dial_failed(error: &DialError) -> Error {
     match error {
+        // convesso's own codes for a peer with no room now: its handshakes or
+        // its sessions are all taken, or it sheds load.
+        DialError::Refused(code)
+            if *code == RefusalCode::CAPACITY_EXHAUSTED || *code == RefusalCode::BUSY =>
+        {
+            Error::PeerBusy
+        }
         DialError::Refused(code) => crate::members::refusal(code.get())
             .unwrap_or_else(|| Error::PeerUnreachable { cause: Some(error.to_string()) }),
         DialError::UnsupportedVersion(_) => Error::IncompatibleVersion,
@@ -720,15 +1015,49 @@ fn refresh_addresses(shared: &Arc<Shared>) {
     });
 }
 
-/// Sends what the readers and the transport queued, in order.
-async fn send_queued(context: Context, mut queued: mpsc::UnboundedReceiver<Out>) {
+/// Sends what the readers and the transport queued, in order: each frame cut
+/// to what its peer takes.
+async fn send_queued(
+    context: Context,
+    wire: Arc<crate::wire::Wire>,
+    mut queued: mpsc::UnboundedReceiver<Out>,
+) {
     while let Some(out) = queued.recv().await {
-        let _ = match out {
-            Out::Message(address, bytes) => context.send_message(address, bytes).await,
-            Out::Reply(peer, bytes) => context.send_message_to_peer(peer, bytes).await,
-            Out::Close(peer, code) => context.close(peer, code).await,
-        };
+        match out {
+            Out::Message(address, bytes) => {
+                let _sending = wire.sending(&address.peer_id()).await;
+                for piece in wire.messages(&address.peer_id(), bytes) {
+                    if context.send_message(address, piece).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Out::Reply(peer, bytes) => {
+                let _sending = wire.sending(&peer).await;
+                for piece in wire.messages(&peer, bytes) {
+                    if context.send_message_to_peer(peer, piece).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Out::Close(peer, code) => {
+                let _ = context.close(peer, code).await;
+            }
+        }
     }
+}
+
+/// Sends one frame to `address` now, cut to what its peer takes.
+async fn send_framed(
+    shared: &Shared,
+    address: Address,
+    frame: Vec<u8>,
+) -> core::result::Result<(), convesso_tokio::NodeError> {
+    let _sending = shared.wire.sending(&address.peer_id()).await;
+    for piece in shared.wire.messages(&address.peer_id(), frame) {
+        shared.context.send_message(address, piece).await?;
+    }
+    Ok(())
 }
 
 /// Reads the node's own events: the relay's availability, the addresses it
@@ -788,7 +1117,22 @@ async fn read_context_events(shared: Arc<Shared>, mut events: ContextEvents) {
             ContextEvent::ChannelReset { peer, reason } => {
                 lose_peer(&shared, &peer, &reset(&reason));
             }
-            ContextEvent::Connected { .. } | ContextEvent::PathChanged { .. } => {}
+            // Whoever connects is read: convesso grants a peer's channel only
+            // the room of its receiver, so a peer with none would have its open
+            // held back unread and its dial time out. Whether it is let into a
+            // session is decided by what it opens with.
+            ContextEvent::Connected { peer } => ensure_reader_of(&shared, peer),
+            // A convesso session with no keys left ends no session of this
+            // binding: the next frame either side sends opens a new convesso
+            // session, and the session carries on (`Live` outlives it). Its
+            // reader ends, asked aside: the question goes to the node that
+            // sends these events.
+            ContextEvent::Idle { peer } => {
+                tokio::spawn(end_reader_if_idle(Arc::clone(&shared), peer));
+            }
+            // No context of this binding takes data in a first contact: it
+            // would be unconfirmed, and could be replayed.
+            ContextEvent::PathChanged { .. } | ContextEvent::EarlyDatagram { .. } => {}
         }
     }
 }
@@ -801,6 +1145,7 @@ fn session_of(shared: &Shared, id: SessionId, peer: &PeerId) -> Option<Arc<Live>
 
 /// Ends every session with `peer`, and every dial to it.
 fn lose_peer(shared: &Shared, peer: &PeerId, dial_error: &Error) {
+    shared.wire.forget(peer);
     if let Ok(sessions) = shared.sessions.lock() {
         for live in sessions.values().filter(|live| live.peer == *peer) {
             live.shut(Error::ClosedByPeer);
@@ -838,7 +1183,7 @@ fn answer_dial(shared: &Shared, id: SessionId, peer: &PeerId, answer: Answer) {
         Some(dial) => dial.answer.send(answer).err(),
         None => Some(answer),
     };
-    if matches!(unwanted, Some(Answer::Accepted)) {
+    if matches!(unwanted, Some(Answer::Accepted(_))) {
         if let Ok(mut sessions) = shared.sessions.lock() {
             sessions.remove(&id);
         }
@@ -847,21 +1192,253 @@ fn answer_dial(shared: &Shared, id: SessionId, peer: &PeerId, answer: Answer) {
     }
 }
 
-/// A peer opens a session with this node.
-fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
-    let refuse = |reason: Reason| {
-        let _ = shared.outbound.send(Out::Reply(peer, Frame::Refuse { id, reason }.encode()));
+/// Whether the access policy lets `initiator` open a session to this device.
+fn allowed(shared: &Shared, initiator: &DeviceId, shown: &[u8]) -> bool {
+    shared.policy.read().is_ok_and(|policy| policy.allows(initiator, shown))
+}
+
+/// This node's evidence, as it stands.
+fn own_evidence(shared: &Shared) -> Vec<u8> {
+    shared.evidence.lock().map(|held| held.clone()).unwrap_or_default()
+}
+
+/// The device a peer's evidence shows it to be, for a node holding no roster;
+/// `None` for one that judges by its state.
+///
+/// The leaf must name, for the transport purpose, the very key the handshake
+/// authenticated: a valid proof of another device's leaf shows nothing about
+/// this peer.
+fn judged(
+    shared: &Shared,
+    peer: &PublicKey,
+    evidence: &[u8],
+) -> Option<core::result::Result<DeviceId, Error>> {
+    let judge = shared.judge.as_ref()?;
+    Some(transport::auth::authenticate_by_shown(evidence, &peer.key_id(), &|shown| judge(shown)))
+}
+
+/// [`judged`], for the evidence a dialled peer answered with: where it rests on
+/// a root this node cannot place, the roots after its own are asked for on
+/// the session, taken, and the evidence judged again.
+async fn judged_catching_up(
+    shared: &Shared,
+    peer: &PublicKey,
+    address: Address,
+    id: SessionId,
+    evidence: &[u8],
+) -> Option<core::result::Result<DeviceId, Error>> {
+    let first = judged(shared, peer, evidence);
+    if !matches!(first, Some(Err(_))) {
+        return first;
+    }
+    let Some(catching) = shared.catching.read().ok().and_then(|held| held.clone()) else {
+        return first;
     };
+    let Some(root) = (catching.behind)(evidence) else { return first };
+    let (tell, told) = oneshot::channel();
+    if let Ok(mut waiting) = shared.catch_ups.lock() {
+        waiting.insert(id, (address.peer_id(), tell));
+    }
+    let behind = Frame::Behind { id, root }.encode();
+    let asked = send_framed(shared, address, behind).await.is_ok();
+    let roots = if asked { tokio::time::timeout(CATCH_UP_PATIENCE, told).await.ok() } else { None };
+    if let Ok(mut waiting) = shared.catch_ups.lock() {
+        waiting.remove(&id);
+    }
+    match roots {
+        Some(Ok(roots)) if (catching.take)(evidence, &roots) => judged(shared, peer, evidence),
+        _ => first,
+    }
+}
+
+/// Holds an open whose evidence rests on a root this node cannot place, and
+/// asks the dialler for the roots after its own. Whether it was held: where
+/// not, it is refused as any other.
+fn held_for_roots(
+    shared: &Shared,
+    peer: PeerId,
+    version: u8,
+    id: SessionId,
+    evidence: &[u8],
+) -> bool {
+    let Some(catching) = shared.catching.read().ok().and_then(|held| held.clone()) else {
+        return false;
+    };
+    let Some(root) = (catching.behind)(evidence) else { return false };
+    let Ok(mut held) = shared.held_opens.lock() else { return false };
+    // An open nobody answered for is let go once its dialler has given up.
+    held.retain(|_, open| open.since.elapsed() < DIAL_PATIENCE);
+    if held.len() >= MAX_HELD_OPENS || held.contains_key(&id) {
+        return false;
+    }
+    held.insert(
+        id,
+        HeldOpen { peer, version, evidence: evidence.to_vec(), since: tokio::time::Instant::now() },
+    );
+    drop(held);
+    let behind = Frame::Behind { id, root }.encode();
+    let _ = shared.outbound.send(Out::Reply(peer, behind));
+    true
+}
+
+/// Answers a peer that cannot place this node's root, with the roots after
+/// its own: once per session, and only for a session, or a dial, this node
+/// has with that peer.
+fn answer_behind(shared: &Shared, peer: PeerId, id: SessionId, root: [u8; 32]) {
+    let Some(source) = shared.roots.read().ok().and_then(|held| held.clone()) else { return };
+    let ours = session_of(shared, id, &peer).is_some()
+        || shared
+            .dials
+            .lock()
+            .is_ok_and(|dials| dials.get(&id).is_some_and(|dial| dial.peer == peer));
+    if !ours {
+        return;
+    }
+    let first = shared.answered.lock().is_ok_and(|mut answered| {
+        if answered.len() >= MAX_ANSWERED {
+            answered.clear();
+        }
+        answered.insert(id)
+    });
+    if !first {
+        return;
+    }
+    let outbound = shared.outbound.clone();
+    // As many as the peer puts back together in one frame.
+    let room = crate::frame::MAX_ROOTS
+        .min(shared.wire.limits(&peer).frame_len().saturating_sub(crate::frame::PAYLOAD_HEADER));
+    tokio::spawn(async move {
+        let roots = source(root, room).await;
+        // Whole roots fitting one frame are the source's to choose: cut here,
+        // the last would be half a root, and the rest unreadable with it.
+        if roots.len() <= room {
+            let _ = outbound.send(Out::Reply(peer, Frame::Roots { id, roots }.encode()));
+        }
+    });
+}
+
+/// Roots that arrived for a dial or an open waiting on them; anything else is
+/// dropped.
+fn roots_arrived(shared: &Arc<Shared>, peer: PeerId, id: SessionId, roots: Vec<u8>) {
+    let waiting = shared.catch_ups.lock().ok().and_then(|mut waiting| {
+        if waiting.get(&id).is_some_and(|(from, _)| *from == peer) {
+            waiting.remove(&id)
+        } else {
+            None
+        }
+    });
+    if let Some((_, tell)) = waiting {
+        let _ = tell.send(roots);
+        return;
+    }
+    let held = shared.held_opens.lock().ok().and_then(|mut held| {
+        if held.get(&id).is_some_and(|open| open.peer == peer) { held.remove(&id) } else { None }
+    });
+    let Some(open) = held else { return };
+    let taken = shared
+        .catching
+        .read()
+        .ok()
+        .and_then(|held| held.clone())
+        .is_some_and(|catching| (catching.take)(&open.evidence, &roots));
+    if taken {
+        opened(shared, peer, open.version, id, &open.evidence, false);
+    } else {
+        refused(shared, peer, id, Reason::NotAMember);
+    }
+}
+
+/// The transport key behind an authenticated convesso peer, read from the
+/// evidence it shows: the one of its leaf's transport keys that is this peer.
+fn key_shown_by(peer: &PeerId, evidence: &[u8]) -> Option<(PublicKey, Address)> {
+    let shown = roster::membership::Shown::from_bytes(evidence).ok()?;
+    shown.leaf.record.keys.iter().find_map(|entry| {
+        if entry.purpose != roster::types::KeyPurpose::Transport || entry.alg != Algorithm::Ed25519
+        {
+            return None;
+        }
+        let bytes = <[u8; 32]>::try_from(entry.value.as_slice()).ok()?;
+        let address = Address::parse(bytes).ok()?;
+        (address.peer_id() == *peer)
+            .then(|| {
+                PublicKey::new(Algorithm::Ed25519, bytes.to_vec()).ok().map(|key| (key, address))
+            })
+            .flatten()
+    })
+}
+
+/// Refuses `peer`'s open `id`, and where this node will not talk to it, closes
+/// convesso's session with it once the refusal has had time to reach it, if
+/// nothing else has been said to it since, nor anything opened with it.
+///
+/// A peer this node will not talk to keeps no session keys here: it passed the
+/// handshake (another version, groups that do not allow it, a revocation since,
+/// or a node holding no roster, which admits every handshake), and left open,
+/// the session would outlive the refusal on this side alone. Closed at once,
+/// the close overtakes the refusal, and the peer is told nothing. A member
+/// refused for want of room keeps its session, and opens again on it.
+fn refused(shared: &Arc<Shared>, peer: PeerId, id: SessionId, reason: Reason) {
+    let _ = shared.outbound.send(Out::Reply(peer, Frame::Refuse { id, reason }.encode()));
+    if reason == Reason::Ordinary {
+        return;
+    }
+    let at = tokio::time::Instant::now();
+    let Ok(mut refusals) = shared.refusals.lock() else { return };
+    refusals.insert(peer, at);
+    drop(refusals);
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        tokio::time::sleep(REFUSED_GRACE).await;
+        // A later refusal closes in its own time.
+        let latest = shared.refusals.lock().is_ok_and(|mut refusals| {
+            let latest = refusals.get(&peer) == Some(&at);
+            if latest {
+                refusals.remove(&peer);
+            }
+            latest
+        });
+        if latest && !speaks_to(&shared, &peer) {
+            let _ = shared.outbound.send(Out::Close(peer, CLOSE_REFUSED));
+        }
+    });
+}
+
+/// A peer opens a session with this node.
+///
+/// Where this node holds no roster and cannot place the root the evidence
+/// rests on, the open is held while the roots are asked for, unless
+/// `may_catch_up` is false: once they are taken, it is judged again here.
+fn opened(
+    shared: &Arc<Shared>,
+    peer: PeerId,
+    version: u8,
+    id: SessionId,
+    evidence: &[u8],
+    may_catch_up: bool,
+) {
+    let refuse = |reason: Reason| refused(shared, peer, id, reason);
     if version != VERSION {
         refuse(Reason::Version);
         return;
     }
-    let entry =
-        shared.members.read().ok().map(|members| (members.verdict(&peer), members.address(&peer)));
+    let entry = if shared.judge.is_some() {
+        // No roster to look the key up in: the evidence names the key, and must
+        // name the one the handshake authenticated.
+        Some(match key_shown_by(&peer, evidence) {
+            Some((key, address)) => {
+                (judged(shared, &key, evidence).unwrap_or(Err(Error::NotAMember)), Some(address))
+            }
+            None => (Err(Error::NotAMember), None),
+        })
+    } else {
+        shared.members.read().ok().map(|members| (members.verdict(&peer), members.address(&peer)))
+    };
     let (device, address) = match entry {
         Some((Ok(device), Some(address))) => (device, address),
         Some((Err(error), _)) => {
-            refuse(reason_of(&error));
+            if !(may_catch_up && held_for_roots(shared, peer, version, id, evidence)) {
+                refuse(reason_of(&error));
+            }
             return;
         }
         _ => {
@@ -874,7 +1451,15 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
         // A repeated `OPEN`: the first one is the session.
         return;
     }
-    let live = Live::new(id, device, address, shared.context.clone());
+    // The receiver's check, once, as the session opens: the initiator's groups
+    // from the leaf it verified, against this device's own.
+    if !allowed(shared, &device, evidence) {
+        refuse(Reason::NotAllowed);
+        return;
+    }
+    let live = Live::new(id, device, address, shared.context.clone(), Arc::clone(&shared.wire));
+    live.set_evidence(evidence.to_vec());
+    live.set_inbound();
     sessions.insert(id, Arc::clone(&live));
     let replaced = shared.accepted_from.lock().ok().and_then(|mut from| from.insert(peer, id));
     if let Some(older) = replaced.and_then(|older| sessions.get(&older).cloned()) {
@@ -895,14 +1480,35 @@ fn opened(shared: &Shared, peer: PeerId, version: u8, id: SessionId) {
         refuse(Reason::Ordinary);
         return;
     }
-    let _ = shared.outbound.send(Out::Reply(peer, Frame::Accept { id }.encode()));
+    let accept = Frame::Accept { id, limits: OWN, evidence: own_evidence(shared) };
+    let _ = shared.outbound.send(Out::Reply(peer, accept.encode()));
 }
 
 /// A reliable message from `peer`.
-async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
-    match Frame::decode(data) {
-        Some(Frame::Open { version, id }) => opened(shared, peer, version, id),
-        Some(Frame::Accept { id }) => answer_dial(shared, id, &peer, Answer::Accepted),
+async fn on_message(shared: &Arc<Shared>, peer: PeerId, data: &[u8]) {
+    // A part waits for the rest of its frame. From a peer this node does not
+    // yet speak to, nothing larger than an opening: a node holding no roster
+    // admits every handshake, and a stranger would make it hold frames' worth
+    // of memory for nothing.
+    let largest = if speaks_to(shared, &peer) {
+        crate::frame::OWN.frame_len()
+    } else {
+        transport_wire::parts::MAX_OPENING
+    };
+    let Some(data) = shared.wire.join(peer, data, largest) else { return };
+    match Frame::decode(&data) {
+        Some(Frame::Open { version, id, limits, evidence }) => {
+            if version == VERSION {
+                shared.wire.heard(peer, limits);
+            }
+            opened(shared, peer, version, id, &evidence, true);
+        }
+        Some(Frame::Behind { id, root }) => answer_behind(shared, peer, id, root),
+        Some(Frame::Roots { id, roots }) => roots_arrived(shared, peer, id, roots),
+        Some(Frame::Accept { id, limits, evidence }) => {
+            shared.wire.heard(peer, limits);
+            answer_dial(shared, id, &peer, Answer::Accepted(evidence));
+        }
         Some(Frame::Refuse { id, reason }) => {
             answer_dial(shared, id, &peer, Answer::Refused(refusal_of(reason)));
         }
@@ -911,22 +1517,58 @@ async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
                 live.shut(Error::ClosedByPeer);
             }
         }
-        Some(Frame::Payload { id, bytes }) => {
-            if let Some(live) = session_of(shared, id, &peer) {
-                live.deliver_payload(bytes).await;
-            }
-        }
+        Some(Frame::Payload { id, bytes }) => match session_of(shared, id, &peer) {
+            Some(live) => live.deliver_payload(bytes).await,
+            None => unknown_session(shared, peer, id),
+        },
         // A packet sent as a message is not one: ignored.
         Some(Frame::Packet { .. }) | None => {}
     }
 }
 
+/// Whether this node speaks to `peer`: a session with it, a dial to it, or
+/// its open held while roots are asked for.
+fn speaks_to(shared: &Shared, peer: &PeerId) -> bool {
+    shared.sessions.lock().is_ok_and(|sessions| sessions.values().any(|live| live.peer == *peer))
+        || shared.dials.lock().is_ok_and(|dials| dials.values().any(|dial| dial.peer == *peer))
+        || shared.held_opens.lock().is_ok_and(|held| held.values().any(|open| open.peer == *peer))
+}
+
 /// A datagram from `peer`.
 fn on_datagram(shared: &Shared, peer: PeerId, data: &[u8]) {
-    if let Some(Frame::Packet { id, fragment }) = Frame::decode(data)
-        && let Some(live) = session_of(shared, id, &peer)
-    {
-        live.deliver_fragment(&fragment);
+    if let Some(Frame::Packet { id, fragment }) = Frame::decode(data) {
+        match session_of(shared, id, &peer) {
+            Some(live) => live.deliver_fragment(&fragment),
+            None => unknown_session(shared, peer, id),
+        }
+    }
+}
+
+/// A frame for a session this node does not hold: one it closed, or one it
+/// lost by restarting. The sender is told, and told again every
+/// [`TELL_AGAIN`] while it goes on sending, so that it ends the session rather
+/// than carry on into nothing: told once, the close could be lost as convesso
+/// opened the session again.
+///
+/// convesso tells a restart only when a message was cut half way: a peer that
+/// restarted between messages takes the next one as a new start, silently. A
+/// node that kept a session with it would otherwise send into it until that
+/// session closed on its own, which, held open, is never.
+fn unknown_session(shared: &Shared, peer: PeerId, id: SessionId) {
+    let now = tokio::time::Instant::now();
+    let due = shared.unknown.lock().is_ok_and(|mut told| {
+        if told.len() >= MAX_ANSWERED && !told.contains_key(&id) {
+            told.clear();
+        }
+        let due = told.get(&id).is_none_or(|at| now.duration_since(*at) >= TELL_AGAIN);
+        if due {
+            told.insert(id, now);
+        }
+        due
+    });
+    if due {
+        let close = Frame::Close { id, reason: Reason::Ordinary }.encode();
+        let _ = shared.outbound.send(Out::Reply(peer, close));
     }
 }
 
@@ -953,6 +1595,12 @@ mod tests {
         assert_eq!(dial_failed(&refused(NOT_A_MEMBER)), Error::NotAMember);
         assert_eq!(dial_failed(&refused(REVOKED)), Error::Revoked);
         assert!(matches!(dial_failed(&refused(0x0200)), Error::PeerUnreachable { .. }));
+        // A peer with no room is there, and is tried again soon.
+        assert_eq!(
+            dial_failed(&DialError::Refused(RefusalCode::CAPACITY_EXHAUSTED)),
+            Error::PeerBusy
+        );
+        assert_eq!(dial_failed(&DialError::Refused(RefusalCode::BUSY)), Error::PeerBusy);
         assert!(matches!(dial_failed(&DialError::NoResponse), Error::PeerUnreachable { .. }));
 
         // The same refusal, reaching a reader as a reset before the dial's own

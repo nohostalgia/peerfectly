@@ -49,7 +49,10 @@ use roster::state::RosterState;
 /// to attest to, or when signing is declined or fails.
 pub fn sign_over_heads(roster: &Roster, identity: &NodeIdentity) -> Result<Vec<u8>, String> {
     let body = body_over_heads(roster, identity)?;
-    identity.sign_snapshot(&body).map_err(|cause| cause.to_string())
+    // The attestation key: a root carries no decision of its own, and every full
+    // member checks it by deriving, so signing one asks nobody.
+    roster::snapshot::sign_snapshot(&body, identity.attestation_key().signer())
+        .map_err(|cause| cause.to_string())
 }
 
 /// The snapshot this node would sign, up to but not including its signature.
@@ -92,77 +95,52 @@ pub fn body_over_heads(roster: &Roster, identity: &NodeIdentity) -> Result<Snaps
     // The heads cover everything, so the state they imply is the state this node
     // already derived. Deriving it again over a rebuilt graph would be the same
     // answer reached the long way.
-    let body = Snapshot::new(
-        next_sequence(roster),
-        state.to_bytes(),
-        heads,
-        depths,
-        identity.signing_key().key_id(),
-        state.network,
-    )
-    .map_err(|cause| cause.to_string())?;
-
-    Ok(body)
+    following(roster, &state, heads, depths, identity)?.ok_or_else(|| {
+        "this device was not an admin in the root this network holds, so it cannot sign the \
+         next one; an admin of that root will"
+            .to_owned()
+    })
 }
 
-/// The snapshot a batch should end with, if the network will be owed one once
-/// `cores` are in.
+/// The root of `state` that follows the one `roster` holds.
 ///
-/// Built over [`Roster::preview`], so the operations it covers have not been
-/// signed yet: the whole act — operations and snapshot — is prepared first, shown
-/// to a person together, and signed together. The body is ordinary; the roster
-/// that is later offered it derives the covered state from operations it has
-/// verified, and a body that disagreed would be refused rather than trusted.
-///
-/// `None` when no snapshot is due, including when the act leaves this device no
-/// admin.
+/// `None` when this device was not an admin in the root it would follow: its
+/// signer proof is made in that root's state, which is what a member holding
+/// only that root can check, so a device promoted since signs from the root
+/// after.
 ///
 /// # Errors
 ///
-/// When the operations cannot be previewed over this roster.
-pub fn after(
+/// When the root held was never verified here, so its state is not known and
+/// nothing can be proved in it, or when the body is not well formed.
+fn following(
     roster: &Roster,
-    cores: &[roster::types::OperationCore],
+    state: &roster::state::RosterState,
+    heads: Vec<roster::id::OperationId>,
+    depths: Vec<u64>,
     identity: &NodeIdentity,
-    now: u64,
 ) -> Result<Option<Snapshot>, String> {
-    let preview = roster.preview(cores).map_err(|cause| cause.to_string())?;
-    if !due_over(roster, &preview.state, identity, now) {
-        return Ok(None);
-    }
-    body_over_preview(roster, preview, identity).map(Some)
-}
-
-/// A snapshot body over a preview of operations not yet signed.
-///
-/// The same body [`body_over_heads`] would build once those operations were in:
-/// the sequence follows what `roster` holds, and the state, heads and depths are
-/// the preview's.
-///
-/// # Errors
-///
-/// When the preview has no heads, or the body is not one the roster would take.
-pub fn body_over_preview(
-    roster: &Roster,
-    preview: roster::roster::Preview,
-    identity: &NodeIdentity,
-) -> Result<Snapshot, String> {
-    if !preview.state.is_admin(&identity.device_id()) {
-        return Err(
-            "this device is not an admin of that network, so it attests to nothing".to_owned()
-        );
-    }
-    if preview.heads.is_empty() {
-        return Err("that roster has no heads, so there is nothing to attest to".to_owned());
-    }
-    Snapshot::new(
-        next_sequence(roster),
-        preview.state.to_bytes(),
-        preview.heads,
-        preview.depths,
-        identity.signing_key().key_id(),
-        preview.state.network,
+    let previous = match roster.snapshot() {
+        None => None,
+        Some(held) => {
+            let Some(held_state) = roster.snapshot_state() else {
+                return Err("this device has not verified the root this network holds, so it \
+                            cannot prove itself in it"
+                    .to_owned());
+            };
+            if !held_state.is_admin(&identity.device_id()) {
+                return Ok(None);
+            }
+            Some((held.body(), held_state))
+        }
+    };
+    roster::snapshot::Snapshot::over(
+        state,
+        roster::snapshot::Covering { heads, depths },
+        identity.attestation_key().public_key().key_id(),
+        previous,
     )
+    .map(Some)
     .map_err(|cause| cause.to_string())
 }
 
@@ -265,58 +243,81 @@ pub fn admins_of(state: &RosterState) -> std::collections::BTreeSet<DeviceId> {
         .collect()
 }
 
-/// How much of a network's window may pass before an admin signs again.
+/// Whether this device owes its network a root now.
 ///
-/// A quarter. The number that matters is not this one but the gap it leaves: a
-/// device has the remaining three quarters of the window to meet an admin and
-/// take the fresher snapshot before its own runs out. Signing only once a window
-/// had passed would mean every other device went stale first, which is the
-/// failure this is arranged to avoid.
-const SHARE_OF_THE_WINDOW: u64 = 4;
-
-/// Whether this device should sign a fresh snapshot for this network now.
-///
-/// False for a device the roster does not name as an admin — which is most of
-/// them, and is checked before anything else because on a phone the next step
-/// asks for the lock.
+/// An admin publishes a root as soon as an act changes the state: whenever the
+/// state it derives has a root other than the one it holds, or it holds none.
+/// Nothing else — no schedule, no window. A device that is not an admin owes
+/// nothing, and an admin of a state that has not moved owes nothing either: the
+/// same state has one root, whoever signs it again.
 #[must_use]
-pub fn due(roster: &Roster, identity: &NodeIdentity, now: u64) -> bool {
+pub fn owed(roster: &Roster, identity: &NodeIdentity) -> bool {
     let Ok(state) = roster.state() else { return false };
-    due_over(roster, &state, identity, now)
-}
-
-/// Whether a snapshot is due, judged against `state` rather than the roster's
-/// own — the state a batch's operations *will* make, once they are in.
-///
-/// Why it matters: an act that demotes or revokes this device leaves it no
-/// admin, and a snapshot it then signed would be refused by every roster that
-/// took the act. The schedule itself is the roster's; only who is admin is read
-/// from `state`.
-#[must_use]
-pub fn due_over(roster: &Roster, state: &RosterState, identity: &NodeIdentity, now: u64) -> bool {
     if !state.is_admin(&identity.device_id()) {
         return false;
     }
-    // Nothing accepted yet: a founding whose second signature was declined, or a
-    // network that predates snapshots being signed at all.
-    let Some(received_at) = roster.snapshot_received_at() else { return true };
-    // A receipt in the future is a clock that moved. Signing again is the safe
-    // answer: what is written afterwards is dated by the same clock as the
-    // reading, so the pair agree again.
-    if now < received_at {
-        return true;
-    }
-    let window = state.params.snapshot_window;
-    now.saturating_sub(received_at) > window.checked_div(SHARE_OF_THE_WINDOW).unwrap_or(window)
+    roster.snapshot().is_none_or(|held| held.body().root != state.root())
 }
 
-/// The sequence a snapshot signed now must carry.
-///
-/// One past whatever this node holds. The rule the roster enforces is that the
-/// number advances; starting at one when nothing is held keeps the first
-/// snapshot of a network at a number a person reading a log would expect.
-fn next_sequence(roster: &Roster) -> u64 {
-    roster.snapshot().map_or(1, |held| held.body().seq.saturating_add(1))
+/// What `device` shows a peer as a session opens, as bytes: its leaf and proof
+/// against the root `roster` holds, with that root. Empty where it holds no
+/// root, which a peer reads as nothing shown.
+pub(crate) fn evidence_of(roster: &Roster, device: &roster::id::DeviceId) -> Vec<u8> {
+    roster.evidence_for(device).map_or_else(Vec::new, |shown| shown.to_bytes())
+}
+
+/// What `device` shows without the root, as bytes: its leaf, its proof and the
+/// hash of the root `roster` holds. Empty where it holds no root.
+pub(crate) fn shown_of(roster: &Roster, device: &roster::id::DeviceId) -> Vec<u8> {
+    roster
+        .evidence_for(device)
+        .and_then(|evidence| evidence.shown().ok())
+        .map_or_else(Vec::new, |shown| shown.to_bytes())
+}
+
+/// What a board provisioned before its admission starts from, as `roster`
+/// holds it: the root, the parameters under it with the root of the devices'
+/// tree beside them, and the evidence of the network's anchors that are full
+/// members (`scalable-membership` 15.4). `None` where it holds no root.
+#[must_use]
+pub fn provisioning(roster: &Roster) -> Option<crate::control::Provisioning> {
+    let held = roster.snapshot()?;
+    let copied;
+    let state = match roster.held_state() {
+        Some(state) => state,
+        None => {
+            copied = roster.state_for_root(&held.body().root)?.1;
+            &copied
+        }
+    };
+    // Whom a board turns to: the network's anchors; where it names none (a
+    // home network), a few of its full members, admins first, since an admin
+    // signs the roots a board holds. Without any, a board admitted has nobody
+    // it knows how to reach.
+    let full = |device: &roster::id::DeviceId| {
+        state.devices.get(device).is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Full)
+    };
+    let turned_to: Vec<roster::id::DeviceId> = if state.params.anchors.is_empty() {
+        let mut fulls = state.devices.full_members();
+        fulls.sort_by_key(|device| !state.is_admin(device));
+        fulls.truncate(light_node::seeking::FULLS_PER_MEMBER);
+        fulls
+    } else {
+        state.params.anchors.iter().copied().filter(|anchor| full(anchor)).collect()
+    };
+    let anchors = turned_to
+        .iter()
+        .map(|device| evidence_of(roster, device))
+        .filter(|evidence| !evidence.is_empty())
+        .map(hex::encode)
+        .collect();
+    Some(crate::control::Provisioning {
+        root: hex::encode(held.to_bytes()),
+        devices_root: hex::encode(state.devices.root()),
+        params: hex::encode(state.params.to_bytes()),
+        relay: state.params.relay.clone()?,
+        anchors,
+    })
 }
 
 #[cfg(test)]
@@ -352,6 +353,44 @@ mod tests {
         let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted(), "the genesis is accepted");
         (roster, founder, bytes)
+    }
+
+    /// A board provisioned for a network with no anchors is given its admin,
+    /// a full member, to turn to: given nobody, it would be admitted and reach
+    /// no one.
+    #[test]
+    fn a_network_without_anchors_gives_a_board_its_admin() {
+        let founder = NodeIdentity::generate().expect("generates");
+        let mut params =
+            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                .expect("valid");
+        params.relay = Some(format!("{}@relay.example:8443", "ab".repeat(32)));
+        let genesis = OperationCore::new(
+            1,
+            founder.signing_key().algorithm(),
+            OperationBody::CreateNetwork {
+                device: founder.device_spec("laptop", Role::Admin, true, vec![]).expect("spec"),
+                params,
+            },
+            vec![],
+            founder.signing_key().key_id(),
+            roster::id::NetworkId::from_bytes([0; 32]),
+        )
+        .expect("well-formed");
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
+        assert!(
+            roster.offer_bytes(&founder.sign_operation(&genesis).expect("signs")).is_accepted()
+        );
+        let bytes = sign_over_heads(&roster, &founder).expect("an admin signs");
+        assert!(roster.offer_snapshot(&bytes).is_accepted());
+
+        let given = provisioning(&roster).expect("a bundle");
+        assert_eq!(given.anchors.len(), 1, "the admin, and nobody else to give");
+        let evidence = roster::membership::Evidence::from_bytes(
+            &hex::decode(given.anchors.first().unwrap()).unwrap(),
+        )
+        .expect("evidence");
+        assert_eq!(evidence.leaf.record.id, founder.device_id());
     }
 
     /// The same, for tests that do not need the bytes.
@@ -394,10 +433,10 @@ mod tests {
         assert!(refusal.contains("not an admin"), "and says why: {refusal}");
     }
 
-    /// The sequence advances, because a roster refuses one that does not — and a
-    /// second snapshot that could never be accepted is worse than none.
+    /// A second root over a roster that has not changed is the root already
+    /// held: the same state has one root, whoever signs it again.
     #[test]
-    fn a_second_snapshot_advances_the_sequence() {
+    fn a_second_snapshot_over_the_same_roster_is_the_one_held() {
         let (mut roster, founder) = founded();
 
         let first = sign_over_heads(&roster, &founder).expect("signs");
@@ -406,95 +445,28 @@ mod tests {
         let admission = roster.offer_snapshot(&second);
 
         assert!(admission.is_accepted(), "the second is accepted too: {admission:?}");
-        assert_eq!(Some(2), roster.snapshot().map(|held| held.body().seq), "and it is the second");
+        assert_eq!(
+            Some(1),
+            roster.snapshot().map(|held| held.body().generation),
+            "and it is the one already held"
+        );
     }
 
-    /// The window a network is founded with, for reading the arithmetic below.
-    fn window_of(roster: &Roster) -> u64 {
-        roster.state().expect("a network").params.snapshot_window
-    }
-
-    /// An admin with nothing accepted signs at once. A founding whose second
-    /// signature was declined leaves exactly this, and it must not wait a
-    /// quarter of a month to be put right.
+    /// An admin with nothing held owes a root at once.
     #[test]
-    fn an_admin_holding_no_snapshot_is_due_at_once() {
+    fn an_admin_holding_no_root_owes_one() {
         let (roster, founder) = founded();
-
-        assert!(due(&roster, &founder, crate::state::wall_seconds()), "there is nothing to be old");
+        assert!(owed(&roster, &founder), "there is nothing held");
     }
 
-    /// The cadence, and the gap it leaves. Signing only once the window had
-    /// passed would mean every other device went stale before the fresher one
-    /// existed.
+    /// Owed when the state moves, and not before: the same state has one root.
     #[test]
-    fn an_admin_signs_again_well_before_its_own_roster_would_go_stale() {
-        let (mut roster, founder) = founded();
-        let window = window_of(&roster);
+    fn an_admin_owes_a_root_when_the_state_changes_and_only_then() {
+        let (mut roster, founder, _genesis) = founded_with_bytes();
         let bytes = sign_over_heads(&roster, &founder).expect("signs");
         assert!(roster.offer_snapshot(&bytes).is_accepted());
-        // A snapshot dates nothing; freshness comes from an attestation.
-        let dated = crate::attesting::sign_over_heads(&roster, &founder).expect("attests");
-        assert!(roster.offer_attestation(&dated).is_accepted());
-        let accepted_at = roster.snapshot_received_at().expect("dated");
+        assert!(!owed(&roster, &founder), "nothing has changed since");
 
-        assert!(!due(&roster, &founder, accepted_at), "not the moment it was accepted");
-        assert!(
-            !due(&roster, &founder, accepted_at.saturating_add(window / 8)),
-            "nor a while after"
-        );
-        assert!(
-            due(&roster, &founder, accepted_at.saturating_add(window / 2)),
-            "but well before the window is out"
-        );
-
-        // The property that matters: whatever the cadence is, a device taking the
-        // fresher snapshot has most of the window left to do it in.
-        let signs_again_after = window / SHARE_OF_THE_WINDOW;
-        assert!(
-            signs_again_after < window,
-            "an admin that waited a whole window would let every other device go stale first"
-        );
-    }
-
-    /// Checked before anything reaches a key, because on a phone the next step
-    /// asks for the lock — and a member would be asked for ever, for nothing.
-    #[test]
-    fn a_member_is_never_due_however_long_it_waits() {
-        let (roster, _founder) = founded();
-        let member = NodeIdentity::generate().expect("generates");
-        let window = window_of(&roster);
-
-        for elapsed in [0, window, window.saturating_mul(100)] {
-            assert!(
-                !due(&roster, &member, crate::state::wall_seconds().saturating_add(elapsed)),
-                "a device that is not an admin attests to nothing, ever"
-            );
-        }
-    }
-
-    /// A clock that moved backwards is answered by signing again, so that what is
-    /// written afterwards is dated by the same clock as the reading.
-    #[test]
-    fn a_receipt_in_the_future_is_due() {
-        let (mut roster, founder) = founded();
-        let bytes = sign_over_heads(&roster, &founder).expect("signs");
-
-        // Dated explicitly, because what is under test is a receipt the clock
-        // cannot have produced — which is what a clock that moved leaves behind.
-        let dated_at = 10_000;
-        assert!(roster.restore_snapshot(&bytes, dated_at).is_accepted());
-
-        assert!(due(&roster, &founder, dated_at.saturating_sub(60)), "the clock moved");
-    }
-
-    /// **A snapshot over a preview is the one signing would have made.** The
-    /// member's admission is previewed, a snapshot is built over the preview, and
-    /// it must equal the one built over a roster that really took the admission —
-    /// and be accepted by that roster once signed.
-    #[test]
-    fn a_snapshot_over_a_preview_is_the_one_signing_makes() {
-        let (roster, founder, genesis) = founded_with_bytes();
         let member = NodeIdentity::generate().expect("generates");
         let state = roster.state().expect("a network");
         let add = roster::types::OperationCore::new(
@@ -508,37 +480,30 @@ mod tests {
             state.network,
         )
         .expect("well-formed");
+        assert!(roster.offer_bytes(&founder.sign_operation(&add).expect("signs")).is_accepted());
+        assert!(owed(&roster, &founder), "an admission moves the state");
 
-        let previewed = after(&roster, core::slice::from_ref(&add), &founder, 0)
-            .expect("previews")
-            .expect("nothing is held, so one is due");
-
-        let mut signed = Roster::with_clock(Box::new(crate::state::WallClock));
-        assert!(signed.offer_bytes(&genesis).is_accepted());
-        let added = founder.sign_operation(&add).expect("signs");
-        assert!(signed.offer_bytes(&added).is_accepted());
-        assert_eq!(body_over_heads(&signed, &founder).expect("a body"), previewed);
-
-        let bytes = founder.sign_snapshot(&previewed).expect("signs");
-        assert!(signed.offer_snapshot(&bytes).is_accepted(), "and that roster takes it");
+        let next = sign_over_heads(&roster, &founder).expect("signs the next");
+        assert!(roster.offer_snapshot(&next).is_accepted());
+        assert_eq!(roster.snapshot().map(|held| held.body().generation), Some(2));
+        assert!(!owed(&roster, &founder));
     }
 
-    /// **An act that leaves this device no admin is owed no snapshot by it.**
-    /// Judged on the state the batch will make, not on the roster as it stands:
-    /// signing one would be signing something every roster that took the act
-    /// would refuse.
+    /// A member owes nothing, ever.
     #[test]
-    fn a_snapshot_is_due_only_where_the_previewed_state_keeps_this_device_admin() {
-        let (roster, founder, _genesis) = founded_with_bytes();
-        let now_admin = roster.state().expect("a network");
-        assert!(due_over(&roster, &now_admin, &founder, 0), "admin, and nothing held");
+    fn a_member_never_owes_a_root() {
+        let (roster, _founder) = founded();
+        let member = NodeIdentity::generate().expect("generates");
+        assert!(!owed(&roster, &member));
+    }
 
-        let mut no_longer = now_admin;
-        no_longer.devices.retain(|id, _| *id != founder.device_id());
-        assert!(
-            !due_over(&roster, &no_longer, &founder, 0),
-            "the roster still names it admin, and the state after the act does not"
-        );
+    /// A root is signed with the attestation key, which asks nobody.
+    #[test]
+    fn a_root_is_signed_with_the_attestation_key() {
+        let (roster, founder) = founded();
+        let bytes = sign_over_heads(&roster, &founder).expect("signs");
+        let raw = roster::snapshot::RawSnapshot::decode(&bytes).expect("decodes");
+        assert_eq!(raw.body().author, founder.attestation_key().public_key().key_id());
     }
 
     /// A network with an admin and an ordinary member: the roster, the admin's
@@ -744,7 +709,7 @@ mod tests {
         assert_eq!(1, admins.len());
     }
 
-    /// A device holding nothing is not cautious.    /// A device holding nothing is not cautious. There is no network to be
+    /// A device holding nothing is not cautious. There is no network to be
     /// careful about, and saying otherwise would make every daemon that has
     /// never joined one refuse peers it does not have.
     #[test]
@@ -754,7 +719,7 @@ mod tests {
         assert_eq!(None, cautious(&mut nothing), "there is no roster to be old");
     }
 
-    /// A phone's signing key lives in the keystore and every use of it asks for    /// A phone's signing key lives in the keystore and every use of it asks for
+    /// A phone's signing key lives in the keystore and every use of it asks for
     /// the lock. The recurring path must therefore never reach one — a prompt a
     /// person did not ask for, arriving repeatedly, is a worse product than a
     /// roster a few days older than it could be.
@@ -766,35 +731,24 @@ mod tests {
     #[test]
     fn the_recurring_path_never_reaches_a_key_held_elsewhere() {
         let node = crate::code_of(include_str!("node.rs"));
+        let snapshots = crate::code_of(include_str!("snapshots.rs"));
         let service = crate::code_of(include_str!("service.rs"));
 
         assert!(
             node.contains("pub(crate) async fn attest_unattended(&self)"),
             "the unattended path exists under its own name"
         );
+        // A root is signed with the attestation key, which asks nobody, so the
+        // recurring path may publish one: what it must never do is reach the
+        // signing key a phone's keystore guards with the lock.
         assert!(
-            node.contains("if self.identity.signing_key().custodian().is_some() {")
-                && node.contains("return;"),
-            "and it stops before signing when the key is held elsewhere"
+            snapshots.contains("identity.attestation_key().signer()"),
+            "a root is signed with the attestation key"
         );
+        assert!(!snapshots.contains("identity.sign_snapshot("), "and never with the signing key");
         assert!(
             service.contains("attest_unattended().await"),
             "the daemon's recurring work calls the unattended one"
-        );
-        assert!(
-            !service.contains(
-                ".attest_now().await;
-        }
-
-        let mut gathered"
-            ),
-            "and never the attended one from the recurring path"
-        );
-
-        // Where the attended one is called, a person has just signed something.
-        assert!(
-            service.contains("network.node().attest_now().await;"),
-            "the attended path is reached from an admin act"
         );
     }
 

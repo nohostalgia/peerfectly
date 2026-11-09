@@ -77,10 +77,56 @@ impl TestRelay {
             )
             .expect("an acceptor")
         });
+        unreachable_is_not_an_error(&udp);
         tokio::spawn(convesso_tokio::relay_server::serve_with(relay, udp, listener, acceptor));
         Self { host: format!("127.0.0.1:{port}"), key, tls }
     }
 }
+
+/// Stops Windows reporting a datagram that could not be delivered as an error
+/// on the socket's next read.
+///
+/// Windows turns the ICMP *port unreachable* that comes back for a datagram
+/// sent to a port nobody holds any more into `WSAECONNRESET` on the next
+/// `recv_from`, and the relay's server takes that as its end. In this process
+/// that is every test that closes a node the relay still writes to — an
+/// enrolment endpoint, a device switched off — and the relay stopped under the
+/// rest of the test (found running the member-delivery test, 2026-10-27).
+/// Linux reports no such error on an unconnected socket, which is where relays
+/// run.
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "WSAIoctl is a Win32 API and has no safe wrapper; the unsafe surface is one call"
+)]
+fn unreachable_is_not_an_error(socket: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket as _;
+
+    use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, WSAIoctl};
+
+    let mut off: u32 = 0;
+    let mut returned: u32 = 0;
+    // SAFETY: the socket is open for the length of the call, the input is one
+    // `BOOL` read from a live local, and no output buffer or overlapped
+    // operation is passed.
+    let _set = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            core::ptr::from_mut(&mut off).cast(),
+            4,
+            core::ptr::null_mut(),
+            0,
+            &mut returned,
+            core::ptr::null_mut(),
+            None,
+        )
+    };
+}
+
+/// Nothing to change where an undeliverable datagram is not reported.
+#[cfg(not(windows))]
+const fn unreachable_is_not_an_error(_socket: &UdpSocket) {}
 
 /// A founded network of three devices.
 pub struct Network {
@@ -92,6 +138,11 @@ pub struct Network {
     pub third: Arc<NodeIdentity>,
     /// Derived state.
     pub state: RosterState,
+    /// A root over that state, signed by the founder.
+    pub root: Vec<u8>,
+    /// What each device shows a peer as a session opens: its compact
+    /// evidence, against that root.
+    pub evidence: std::collections::HashMap<roster::id::DeviceId, Vec<u8>>,
 }
 
 impl Network {
@@ -153,7 +204,30 @@ impl Network {
         assert!(node.offer_bytes(&genesis_bytes).is_accepted());
         assert!(node.offer_bytes(&add_bytes).is_accepted());
         assert!(node.offer_bytes(&third_bytes).is_accepted());
-        Self { founder, joiner, third, state: node.state().expect("derives") }
+        let state = node.state().expect("derives");
+
+        let heads = node.heads();
+        let depths = heads
+            .iter()
+            .map(|head| node.dag().depth(node.dag().position(head).expect("held")))
+            .collect();
+        let body = roster::snapshot::Snapshot::over(
+            &state,
+            roster::snapshot::Covering { heads, depths },
+            founder.signing_key().key_id(),
+            None,
+        )
+        .expect("a root");
+        let root = roster::snapshot::sign_snapshot(&body, founder.signer()).expect("signs");
+        assert!(node.offer_snapshot(&root).is_accepted());
+        let evidence = [&founder, &joiner, &third]
+            .iter()
+            .map(|device| {
+                let evidence = node.evidence_for(&device.device_id()).expect("a member");
+                (device.device_id(), evidence.shown().expect("its root reads").to_bytes())
+            })
+            .collect();
+        Self { founder, joiner, third, state, root, evidence }
     }
 
     /// Founds a network on `relay`.

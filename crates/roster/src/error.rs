@@ -115,10 +115,6 @@ pub enum Error {
     /// Refusing it is what blocks a rollback served by a compromised
     /// peer.
     SnapshotSequenceRegressed,
-    /// Two snapshots share a sequence number and disagree. Both are refused:
-    /// this is either two admins acting at once or an author equivocating, and
-    /// picking a winner between them would hide it.
-    SnapshotSequenceConflict,
     /// A snapshot's stated state disagrees with what this node derives from the
     /// operations it holds. The node's own derivation wins.
     SnapshotStateMismatch,
@@ -173,7 +169,6 @@ impl Error {
             Self::Equivocated => "equivocated",
             Self::StaleOperation => "stale_operation",
             Self::SnapshotSequenceRegressed => "snapshot_sequence_regressed",
-            Self::SnapshotSequenceConflict => "snapshot_sequence_conflict",
             Self::SnapshotStateMismatch => "snapshot_state_mismatch",
             Self::SnapshotUnverified => "snapshot_unverified",
             Self::CompactionRefused(_) => "compaction_refused",
@@ -220,7 +215,6 @@ impl Error {
         "equivocated",
         "stale_operation",
         "snapshot_sequence_regressed",
-        "snapshot_sequence_conflict",
         "snapshot_state_mismatch",
         "snapshot_unverified",
         "compaction_refused",
@@ -301,7 +295,6 @@ mod tests {
             Error::Equivocated,
             Error::StaleOperation,
             Error::SnapshotSequenceRegressed,
-            Error::SnapshotSequenceConflict,
             Error::SnapshotStateMismatch,
             Error::SnapshotUnverified,
             Error::CompactionRefused("sample"),

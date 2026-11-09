@@ -14,4 +14,18 @@ if [ -n "${TPM2TOOLS_TCTI:-}" ]; then
         --daemon
 fi
 
-exec /usr/local/bin/peerfectlyd
+if [ -z "${TPM2TOOLS_TCTI:-}" ]; then
+    exec /usr/local/bin/peerfectlyd "$@"
+fi
+
+# With a TPM, stopped as a machine shuts down: the daemon first, then the TPM
+# told it is going off. A TPM that loses power without that counts the next
+# start as a failed authorisation (TPM 2.0's defence against power-cycling past
+# its lockout), so three `docker compose restart`s in a row would lock it out.
+/usr/local/bin/peerfectlyd "$@" &
+daemon=$!
+trap 'kill -TERM "$daemon" 2>/dev/null; wait "$daemon"; tpm2_shutdown -c 2>/dev/null; exit 0' TERM INT
+wait "$daemon"
+status=$?
+tpm2_shutdown -c 2>/dev/null
+exit "$status"

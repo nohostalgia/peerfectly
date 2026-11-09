@@ -1,4 +1,191 @@
 {
+  "administrator": [
+    [
+      "Status",
+      false
+    ],
+    [
+      "Waiting",
+      false
+    ],
+    [
+      {
+        "Up": {
+          "network": "casa"
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Down": {
+          "network": "casa"
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Pending": {
+          "network": null
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Revoked": {
+          "network": "casa"
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Exposed": {
+          "network": null
+        }
+      },
+      false
+    ],
+    [
+      {
+        "Invite": {
+          "admin": false,
+          "groups": [],
+          "ipv4": null,
+          "light": true,
+          "minutes": 30,
+          "name": "tv",
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Withdraw": {
+          "name": "tv",
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Approve": {
+          "name": "tv",
+          "network": "casa",
+          "replace": false
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Reject": {
+          "name": "tv",
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Join": {
+          "invite": "peerfectly-invite-v1:abc",
+          "name": "phone"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "CancelJoin": {
+          "label": "joining"
+        }
+      },
+      true
+    ],
+    [
+      "Confirm",
+      true
+    ],
+    [
+      "Abandon",
+      true
+    ],
+    [
+      {
+        "Forget": {
+          "label": "casa",
+          "last_admin": false
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Found": {
+          "devices": null,
+          "ipv4_range": null,
+          "label": "casa",
+          "name": "pixel",
+          "relay": null,
+          "suffix": "casa.internal",
+          "window_days": null
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Revoke": {
+          "network": "casa",
+          "reason": "stolen",
+          "target": {
+            "Id": "0a1b-2c3d-4e5f-6a7b"
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
+        "RevokeVoiding": {
+          "network": "casa",
+          "reason": "stolen",
+          "target": {
+            "Id": "0a1b-2c3d-4e5f-6a7b"
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
+        "SetAnchors": {
+          "anchors": [
+            {
+              "Name": "nas"
+            }
+          ],
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "ChangeRelay": {
+          "immediately": false,
+          "network": "casa",
+          "relay": "r.example"
+        }
+      },
+      true
+    ]
+  ],
   "outcomes": [
     {
       "Reported": {
@@ -33,19 +220,134 @@
                     }
                   }
                 }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": "Founds"
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Promotes": [
+                      {
+                        "id": "0a1b-2c3d-4e5f-6a7b",
+                        "name": "nas"
+                      },
+                      true
+                    ]
+                  }
+                }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": {
+                    "Demotes": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
+                  }
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Renames": [
+                      {
+                        "id": "1b2c-3d4e-5f6a-7b8c",
+                        "name": "laptop"
+                      },
+                      "tablet"
+                    ]
+                  }
+                }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": "SetsParameters"
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "ChangesSettings": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
+                  }
+                }
+              },
+              {
+                "device": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "first": {
+                  "depth": null,
+                  "does": {
+                    "AdmitsBatch": {
+                      "count": 3,
+                      "label": "lot 2026-10 A"
+                    }
+                  }
+                },
+                "pairs": 1,
+                "second": {
+                  "depth": null,
+                  "does": {
+                    "Admits": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
+                  }
+                }
               }
             ],
             "address": "fd00::4",
             "admin": true,
+            "anchors": [
+              {
+                "id": "0a1b-2c3d-4e5f-6a7b",
+                "name": "nas"
+              }
+            ],
+            "arrived": "tv",
             "confirmation": null,
             "custody": "KeyStore",
+            "full_members": [
+              {
+                "id": "0a1b-2c3d-4e5f-6a7b",
+                "name": "nas"
+              },
+              {
+                "id": "1b2c-3d4e-5f6a-7b8c",
+                "name": "laptop"
+              }
+            ],
             "id": "3d4e-5f6a-7b8c-9d0e",
             "ipv4": {
               "Held": "100.64.0.4"
             },
+            "ipv4_block": "100.83.0.0/16",
             "label": "home",
             "name": "pixel.home.internal",
             "owner_taken": false,
+            "peer_count": 250,
             "peers": [
               {
                 "address": "fd00::2",
@@ -84,6 +386,7 @@
                 "standing": "Current"
               }
             ],
+            "peers_after": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
             "problem": {
               "at": {
                 "nanos_since_epoch": 0,
@@ -92,6 +395,7 @@
               "cause": "certificate not trusted",
               "subsystem": "relay"
             },
+            "reachable_count": 1,
             "relay": "https://relay.example:443",
             "relay_leaving": {
               "relay": "https://old-relay.example:443",
@@ -100,132 +404,9 @@
                 "secs_since_epoch": 1758300000
               }
             },
-            "revoked": [
-              {
-                "device": {
-                  "id": "2c3d-4e5f-6a7b-8c9d",
-                  "name": null
-                },
-                "last_contact": "NoneRecorded",
-                "revocations": [
-                  {
-                    "by": {
-                      "id": "0a1b-2c3d-4e5f-6a7b",
-                      "name": "nas"
-                    },
-                    "reason": "stolen on the train",
-                    "signer_clock": {
-                      "At": {
-                        "time": {
-                          "nanos_since_epoch": 0,
-                          "secs_since_epoch": 1757000000
-                        }
-                      }
-                    }
-                  },
-                  {
-                    "by": {
-                      "id": "1b2c-3d4e-5f6a-7b8c",
-                      "name": "laptop"
-                    },
-                    "reason": "lost",
-                    "signer_clock": "NotRecorded"
-                  }
-                ]
-              }
-            ],
+            "revoked_count": 1,
             "standing": "Current",
-            "tunnel": "Up",
-            "waiting": [
-              {
-                "does": {
-                  "Revokes": {
-                    "id": "2c3d-4e5f-6a7b-8c9d",
-                    "name": null
-                  }
-                },
-                "owed": [
-                  {
-                    "connected": true,
-                    "device": {
-                      "id": "0a1b-2c3d-4e5f-6a7b",
-                      "name": "nas"
-                    },
-                    "last_contact": {
-                      "Recorded": {
-                        "at": {
-                          "nanos_since_epoch": 0,
-                          "secs_since_epoch": 1757700000
-                        }
-                      }
-                    }
-                  },
-                  {
-                    "connected": false,
-                    "device": {
-                      "id": "1b2c-3d4e-5f6a-7b8c",
-                      "name": "laptop"
-                    },
-                    "last_contact": "NoneRecorded"
-                  }
-                ],
-                "signed_here": {
-                  "At": {
-                    "time": {
-                      "nanos_since_epoch": 0,
-                      "secs_since_epoch": 1757000060
-                    }
-                  }
-                }
-              },
-              {
-                "does": "Founds",
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "Promotes": [
-                    {
-                      "id": "0a1b-2c3d-4e5f-6a7b",
-                      "name": "nas"
-                    },
-                    true
-                  ]
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "Demotes": {
-                    "id": "0a1b-2c3d-4e5f-6a7b",
-                    "name": "nas"
-                  }
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": {
-                  "Renames": [
-                    {
-                      "id": "1b2c-3d4e-5f6a-7b8c",
-                      "name": "laptop"
-                    },
-                    "tablet"
-                  ]
-                },
-                "owed": [],
-                "signed_here": "NotRecorded"
-              },
-              {
-                "does": "SetsParameters",
-                "owed": [],
-                "signed_here": "NotRecorded"
-              }
-            ],
-            "waiting_unlisted": 3
+            "tunnel": "Up"
           },
           {
             "accused": [
@@ -257,23 +438,23 @@
             ],
             "address": null,
             "admin": false,
+            "anchors": [],
+            "arrived": null,
             "confirmation": "Stale",
             "custody": "KeyStore",
+            "full_members": [],
             "id": "4e5f-6a7b-8c9d-0e1f",
             "ipv4": null,
+            "ipv4_block": null,
             "label": "work",
             "name": null,
             "owner_taken": false,
+            "peer_count": 1,
             "peers": [
               {
                 "address": "fd01::2",
                 "id": "5f6a-7b8c-9d0e-1f2a",
-                "ipv4": {
-                  "Collides": {
-                    "id": "6a7b-8c9d-0e1f-2a3b",
-                    "name": "tablet"
-                  }
-                },
+                "ipv4": null,
                 "last_contact": {
                   "Recorded": {
                     "at": {
@@ -296,10 +477,12 @@
                 }
               }
             ],
+            "peers_after": null,
             "problem": null,
+            "reachable_count": 0,
             "relay": null,
             "relay_leaving": null,
-            "revoked": [],
+            "revoked_count": 0,
             "standing": {
               "LastKnown": {
                 "at": {
@@ -308,9 +491,7 @@
                 }
               }
             },
-            "tunnel": "Down",
-            "waiting": [],
-            "waiting_unlisted": 0
+            "tunnel": "Down"
           }
         ],
         "note": "the other machine confirmed the relay",
@@ -319,7 +500,8 @@
             "cause": "IdentityWillNotOpen",
             "label": "old"
           }
-        ]
+        ],
+        "waiting_on": null
       }
     },
     {
@@ -330,34 +512,163 @@
         "may_stop_the_daemon": false,
         "networks": [],
         "note": "one network on this machine belongs to somebody else, and none to you",
-        "unusable": []
+        "unusable": [],
+        "waiting_on": null
       }
     },
     "Done",
     {
-      "Admitting": {
-        "accepted": true,
-        "code": "418209",
-        "fingerprint": "AB:CD",
-        "proposed_name": "tablet",
-        "taken": {
-          "id": "0b0b-0b0b-0b0b-0b0b",
-          "name": "tablet"
-        }
+      "Peers": {
+        "after": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "network": "home",
+        "peers": [
+          {
+            "address": "fd00::2",
+            "id": "0a1b-2c3d-4e5f-6a7b",
+            "ipv4": {
+              "Held": "100.64.0.2"
+            },
+            "last_contact": {
+              "Recorded": {
+                "at": {
+                  "nanos_since_epoch": 0,
+                  "secs_since_epoch": 1757700000
+                }
+              }
+            },
+            "name": "nas.home.internal",
+            "name_resolves": true,
+            "path": "Relay",
+            "reachable": true,
+            "standing": "Current"
+          },
+          {
+            "address": "fd00::7",
+            "id": "1b2c-3d4e-5f6a-7b8c",
+            "ipv4": {
+              "Withheld": {
+                "address": "192.168.1.7",
+                "with": "the local subnet 192.168.1.0/24"
+              }
+            },
+            "last_contact": "NoneRecorded",
+            "name": "laptop.home.internal",
+            "name_resolves": true,
+            "path": null,
+            "reachable": false,
+            "standing": "Current"
+          }
+        ]
       }
     },
-    "Enrolling",
     {
-      "Joining": {
-        "payload": "peerfectly-join:abc",
+      "Revoked": {
+        "after": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "network": "home",
+        "revoked": [
+          {
+            "device": {
+              "id": "2c3d-4e5f-6a7b-8c9d",
+              "name": null
+            },
+            "last_contact": "NoneRecorded",
+            "revocations": [
+              {
+                "by": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "reason": "stolen on the train",
+                "signer_clock": {
+                  "At": {
+                    "time": {
+                      "nanos_since_epoch": 0,
+                      "secs_since_epoch": 1757000000
+                    }
+                  }
+                }
+              },
+              {
+                "by": {
+                  "id": "1b2c-3d4e-5f6a-7b8c",
+                  "name": "laptop"
+                },
+                "reason": "lost",
+                "signer_clock": "NotRecorded"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "Provisioning": {
+        "anchors": [
+          "d4"
+        ],
+        "devices_root": "b2",
+        "params": "c3",
+        "relay": "ab@relay.example:8443",
+        "root": "a1"
+      }
+    },
+    {
+      "JoinStarted": {
+        "conflicts": [
+          "100.64.0.0/10 overlaps 100.64.0.0/10, the block of `casa` on this device"
+        ],
+        "fingerprint": "AB12-CD34-EF56-7890-1234",
+        "label": "joining"
+      }
+    },
+    {
+      "Invited": {
+        "expires_at": 1758300000,
+        "invite": "peerfectly-invite-v1:abc",
+        "name": "sensor",
         "scannable": "▀▄"
       }
     },
     {
-      "Adopted": {
-        "carrying": false,
-        "devices": 3,
-        "suffix": "studio.internal"
+      "Pending": {
+        "invites": [
+          {
+            "expires_at": 1758300000,
+            "name": "sensor",
+            "network": "casa",
+            "request": null,
+            "standing": "open"
+          },
+          {
+            "expires_at": 1758200000,
+            "name": "tablet",
+            "network": "casa",
+            "request": {
+              "arrived_at": 1758190000,
+              "conflicts": [
+                "100.64.0.0/10 overlaps 100.64.12.0/22, a subnet this device is on"
+              ],
+              "fingerprint": "AB12-CD34-EF56-7890-1234",
+              "proposed_name": "Mario's tablet",
+              "taken": {
+                "id": "0b0b-0b0b-0b0b-0b0b",
+                "name": "tablet"
+              }
+            },
+            "standing": "requested"
+          }
+        ],
+        "joins": [
+          {
+            "fingerprint": "9F00-1E2D-3C4B-5A69-7887",
+            "label": "joining",
+            "problem": "the exchange took too long",
+            "requested_at": 1758100060,
+            "since": 1758100000,
+            "standing": "requested"
+          }
+        ],
+        "stopped": "the founding of `casa`, waiting for its relay's key to be confirmed"
       }
     },
     {
@@ -412,6 +723,35 @@
     {
       "OnlyAdmin": {
         "network": "casa"
+      }
+    },
+    {
+      "WouldVoid": {
+        "network": "casa",
+        "voids": "this revocation voids 1 act of laptop [9f2c-1a07-3b44-d0e1] it is concurrent with: rename tv to salotto"
+      }
+    },
+    {
+      "BatchReview": {
+        "block": "100.64.0.2 to 100.64.0.4",
+        "count": 3,
+        "groups": [
+          "sensori"
+        ],
+        "label": "lot 2026-10 A",
+        "mode": "light",
+        "network": "casa",
+        "skipped": [
+          {
+            "name": "sensore-1",
+            "why": "already a member of the network"
+          }
+        ]
+      }
+    },
+    {
+      "Staged": {
+        "count": 100
       }
     },
     {

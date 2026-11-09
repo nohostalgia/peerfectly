@@ -23,7 +23,7 @@
 //! revocation. So this is admission control, not cache management — which also
 //! removes any need to decide *what* to evict, a question with no safe answer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use roster::id::{DeviceId, OperationId};
 

@@ -304,6 +304,15 @@ pub enum Act {
     Renames(Named, String),
     /// Replaces the network's parameters.
     SetsParameters,
+    /// Changes a device's settings: its mode, groups, address or relay.
+    ChangesSettings(Named),
+    /// Admits a batch of devices, with how many and the label it carries.
+    AdmitsBatch {
+        /// How many devices the batch admits.
+        count: u64,
+        /// The label the batch carries, as written by whoever signed it.
+        label: String,
+    },
 }
 
 impl Act {
@@ -334,22 +343,24 @@ impl fmt::Display for Act {
             }
             Self::Renames(device, to) => write!(f, "renaming of {device} to {}", shown(to)),
             Self::SetsParameters => f.write_str("a change to the network's parameters"),
+            Self::ChangesSettings(device) => write!(f, "a change to the settings of {device}"),
+            Self::AdmitsBatch { count, label } => {
+                write!(f, "admission of a batch of {count} devices ({})", shown(label))
+            }
         }
     }
 }
 
-/// A device's IPv4 address in a network, or why it has none here.
+/// A device's IPv4 address in a network, or why it is not usable here.
 ///
 /// An address that silently is not there looks like the network being broken.
 /// Saying why tells a person whether to use the name, the IPv6 address, or move
-/// the network to another range.
+/// the network to another block. A device the network gives no address at all —
+/// one admitted without an offset — has none to report, and is reached by IPv6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ipv4State {
     /// It holds this address, and it is usable on this device.
     Held(Ipv4Addr),
-    /// The network gives it none: this device derives the same address, and
-    /// neither holds it.
-    Collides(Named),
     /// It holds this address, and this device withholds it.
     Withheld {
         /// The address it holds in the network.
@@ -363,9 +374,6 @@ impl fmt::Display for Ipv4State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Held(address) => write!(f, "{address}"),
-            Self::Collides(other) => {
-                write!(f, "no IPv4: its address collides with {other}")
-            }
             Self::Withheld { address, with } => {
                 write!(f, "IPv4 {address} withheld here: it conflicts with {}", shown(with))
             }
@@ -489,28 +497,6 @@ pub struct Branch {
     pub depth: Option<u64>,
 }
 
-/// An operation signed here that some member has not said it holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Waiting {
-    /// What it does.
-    pub does: Act,
-    /// When this device signed it, on this device's own clock.
-    pub signed_here: Signed,
-    /// Every member that has not said it holds it.
-    pub owed: Vec<Owed>,
-}
-
-/// A member an operation is owed to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Owed {
-    /// The member.
-    pub device: Named,
-    /// Whether a session with it is open now.
-    pub connected: bool,
-    /// When this device last had a session with it that spoke.
-    pub last_contact: Contact,
-}
-
 /// Where a network's signing key is kept, on **this** device.
 ///
 /// A fact about this device alone. It is never said about a peer: this device
@@ -613,27 +599,43 @@ pub struct Network {
     /// not come back yet. `None` after the end, whatever the parameters still say.
     #[serde(default)]
     pub relay_leaving: Option<RelayLeaving>,
+    /// The network's IPv4 block, `a.b.c.d/len`, once the parameters are known:
+    /// every device's address is its base plus the device's offset.
+    #[serde(default)]
+    pub ipv4_block: Option<String>,
     /// Devices in it the roster has evidence of having signed two histories.
     ///
     /// Its own field rather than a fault, because only the latest fault is
     /// shown and a detection would vanish behind a dial failure that repeats
     /// every minute.
     pub accused: Vec<Accused>,
-    /// The other devices in it.
+    /// The other devices in it: the first page of them, by id, at most
+    /// [`PEERS_PAGE`]. The rest are asked a page at a time
+    /// ([`Command::Peers`] with `after`): a network of a million boards is not
+    /// put into every answer.
     pub peers: Vec<Peer>,
-    /// The devices this device holds as revoked from it.
+    /// How many other devices it holds, listed here or not. Zero from a
+    /// daemon before pages, whose `peers` were all of them.
+    #[serde(default)]
+    pub peer_count: usize,
+    /// How many of them this device has a session with now.
+    #[serde(default)]
+    pub reachable_count: usize,
+    /// Where the next page of `peers` begins, while more remain.
+    #[serde(default)]
+    pub peers_after: Option<String>,
+    /// Its full members other than this device: the devices its light members
+    /// turn to, and those an anchor is chosen from. Few in any network.
+    #[serde(default)]
+    pub full_members: Vec<Named>,
+    /// How many devices this device holds as revoked from it.
     ///
     /// What this device knows, not an account of the network: a revocation signed
-    /// elsewhere that has not arrived is not here.
-    pub revoked: Vec<Revoked>,
-    /// Operations signed here that some member has not said it holds.
-    ///
-    /// Every revocation, then the others up to a bound, in the order they were
-    /// signed. A bound that could hide a revocation would tell a person the
-    /// stolen laptop is dealt with.
-    pub waiting: Vec<Waiting>,
-    /// How many further operations are waiting and not listed.
-    pub waiting_unlisted: usize,
+    /// elsewhere that has not arrived is not counted. The devices themselves are
+    /// asked a page at a time ([`Command::Revoked`]): they only grow, and a
+    /// network's history is not put into every answer.
+    #[serde(default)]
+    pub revoked_count: usize,
     /// What is wrong in it now: the latest fault, if recent.
     ///
     /// One, and no history. The history is the service's log; a surface needs
@@ -648,6 +650,17 @@ pub struct Network {
     /// a surface that did not show it would leave a person watching their devices
     /// stop answering with nothing anywhere saying why.
     pub confirmation: Option<Unconfirmed>,
+    /// A request one of this network's invites brought, waiting for a person
+    /// to approve or reject it: the name it was invited under.
+    ///
+    /// So that a phone can notify, and offer the pending list: the command that
+    /// issued the invite may have ended hours ago. `None` when nothing waits.
+    #[serde(default)]
+    pub arrived: Option<String>,
+    /// The network's anchors: the full members its light members turn to
+    /// first. Empty where it has none, which is a normal state.
+    #[serde(default)]
+    pub anchors: Vec<Named>,
 }
 
 /// Why a device cannot confirm a network's roster.
@@ -693,14 +706,6 @@ impl Unconfirmed {
                 "check this device's clock, then let an administrator's device become reachable from here. Until then it carries no traffic to devices that are not administrators."
             }
         }
-    }
-}
-
-impl Network {
-    /// Whether anything signed here is waiting to reach another device in it.
-    #[must_use]
-    pub const fn has_unpropagated_work(&self) -> bool {
-        !self.waiting.is_empty() || self.waiting_unlisted > 0
     }
 }
 
@@ -759,13 +764,19 @@ pub enum Trouble {
     /// **Not** a fault, and named separately so that it never reads as one: the
     /// network is perfectly good and this person may not use it.
     SomebodyElses,
+    /// Its directory was changed by something other than this daemon, or holds
+    /// no checkpoint this machine signed: what it says is not believed.
+    ChangedOutside,
 }
 
 impl Trouble {
     /// Whether joining again is what fixes it.
     #[must_use]
     pub const fn rejoining_fixes_it(self) -> bool {
-        matches!(self, Self::NoIdentity | Self::NoRoster | Self::IdentityWillNotOpen)
+        matches!(
+            self,
+            Self::NoIdentity | Self::NoRoster | Self::IdentityWillNotOpen | Self::ChangedOutside
+        )
     }
 }
 
@@ -796,8 +807,36 @@ impl fmt::Display for Trouble {
             Self::SomebodyElses => {
                 "that network belongs to somebody else on this machine. Nothing is wrong with it, and it is not yours to use."
             }
+            Self::ChangedOutside => {
+                "that network's folder was changed by something other than this program, or this machine never vouched for it, so what it holds is not believed. Nothing has been removed. Remove it, or be invited into the network again."
+            }
         })
     }
+}
+
+/// How many devices a page of a network's peers holds at most.
+pub const PEERS_PAGE: usize = 100;
+
+/// A page of a network's other devices, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersPage {
+    /// The network.
+    pub network: String,
+    /// The devices, at most [`PEERS_PAGE`].
+    pub peers: Vec<Peer>,
+    /// Where the next page begins, while more remain.
+    pub after: Option<String>,
+}
+
+/// A page of the devices a network holds as revoked, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedPage {
+    /// The network.
+    pub network: String,
+    /// The devices, at most [`PEERS_PAGE`].
+    pub revoked: Vec<Revoked>,
+    /// Where the next page begins, while more remain.
+    pub after: Option<String>,
 }
 
 /// What the daemon answers.
@@ -865,7 +904,24 @@ pub struct Report {
     /// holds no network at all still needs it: it is the answer to why founding
     /// was refused.
     pub admin_refusal: Option<String>,
+
+    /// What this daemon holds waiting on this person, in words: a founding or a
+    /// move stopped on a relay's key, a join, an admission at the code. `None`
+    /// when nothing waits, or when what waits is somebody else's.
+    ///
+    /// It is what refuses the next founding, join or invite, so a person who
+    /// was refused can read here what it is, and cancel it.
+    #[serde(default)]
+    pub waiting_on: Option<String>,
 }
+
+/// How a refusal says an invite for the same name is still open: a surface
+/// that finds it there can offer to come back to it, or to withdraw it.
+pub const INVITE_STILL_OPEN: &str = "is still open or waiting for approval";
+
+/// How a refusal ends when something already waits on a person: a surface
+/// that finds it there can offer the way to cancel it.
+pub const ALREADY_WAITING: &str = "nothing else starts until it is finished or cancelled";
 
 impl Report {
     /// The same report, with a line about what just happened.
@@ -961,9 +1017,9 @@ pub struct SignaturesWanted {
 
 /// The most items one batch may hold.
 ///
-/// The largest act there is — a revocation, the admission replacing it, and the
-/// snapshot over both — is three. One more is room, not an invitation: a batch
-/// is shown to a person whole, and a list nobody reads is not consent.
+/// The largest act there is — a revocation, the admission replacing it, the
+/// settings its invite chose, and the snapshot over them — is four. A batch is
+/// shown to a person whole, and a list nobody reads is not consent.
 pub const MOST_IN_A_BATCH: usize = 4;
 
 /// One thing in a batch to be signed.
@@ -1168,12 +1224,19 @@ impl Command {
         match self {
             // Reading. What comes back is bounded by what the reader may see.
             Self::Status | Self::Waiting => Needs::Nobody,
-            Self::Peers { network } | Self::Address { network } => match network {
-                // Naming none is asking about everything this person holds,
-                // which is the same question as `Status`.
-                None => Needs::Nobody,
-                Some(_) => Needs::TheOwnerOf(network.clone()),
-            },
+            // Opening a session with a member, as `peers` does with each.
+            Self::Reach { network, .. } => Needs::TheOwnerOf(Some(network.clone())),
+            Self::Peers { network, .. }
+            | Self::Revoked { network, .. }
+            | Self::Address { network }
+            | Self::Pending { network } => {
+                match network {
+                    // Naming none is asking about everything this person holds,
+                    // which is the same question as `Status`.
+                    None => Needs::Nobody,
+                    Some(_) => Needs::TheOwnerOf(network.clone()),
+                }
+            }
 
             // Making a network. There is nobody for it to belong to yet: the
             // owner is recorded as it comes into being, by whoever asked.
@@ -1182,9 +1245,20 @@ impl Command {
             // Changing a tunnel, or acting on a roster.
             Self::Up { network }
             | Self::Down { network }
-            | Self::Admit { network, .. }
+            | Self::Invite { network, .. }
+            | Self::Withdraw { network, .. }
+            | Self::Approve { network, .. }
+            | Self::Provisioning { network }
+            | Self::Reject { network, .. }
             | Self::Revoke { network, .. }
+            | Self::RevokeVoiding { network, .. }
+            | Self::StageBatch { network, .. }
+            | Self::AdmitBatch { network, .. }
             | Self::Rename { network, .. }
+            | Self::SetAnchors { network, .. }
+            | Self::SetIpv4Block { network, .. }
+            | Self::GiveIpv4 { network, .. }
+            | Self::Route { network, .. }
             | Self::ChangeRelay { network, .. } => Needs::TheOwnerOf(network.clone()),
             Self::Expose { network, .. } | Self::Unexpose { network, .. } => {
                 Needs::TheOwnerOfAsAdministrator(network.clone())
@@ -1198,8 +1272,7 @@ impl Command {
 
             // Finishing something already begun.
             Self::Confirm
-            | Self::Replace
-            | Self::ConfirmJoin { .. }
+            | Self::CancelJoin { .. }
             | Self::Abandon
             | Self::Signed { .. }
             | Self::KeyMade { .. }
@@ -1213,7 +1286,7 @@ impl Command {
 
 /// What a person asked for.
 ///
-/// Not `Copy` any more: enrolment carries a payload, and a command that had to
+/// Not `Copy` any more: enrolment carries an invite, and a command that had to
 /// be cheap to copy would have to keep it somewhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1234,6 +1307,30 @@ pub enum Command {
     Peers {
         /// Which network, or `None` when only one could be meant.
         network: Option<String>,
+        /// The page after this one, as [`Network::peers_after`] or
+        /// [`PeersPage::after`] gave it; `None` asks for the report, whose
+        /// networks carry the first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// List the devices a network holds as revoked, with every revocation of
+    /// each.
+    Revoked {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The page after this one, as [`RevokedPage::after`] gave it; `None`
+        /// asks for the first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// Opens a session with the member whose transport key is `transport`,
+    /// now: a board just admitted learns it at once rather than at its next
+    /// attempt.
+    Reach {
+        /// Which network, by name.
+        network: String,
+        /// The member's transport key, hex.
+        transport: String,
     },
     /// Show this device's own overlay address in a network.
     Address {
@@ -1243,68 +1340,117 @@ pub enum Command {
     /// Stop the daemon, taking every network down.
     Stop,
 
-    /// Begin admitting the device that produced this payload.
+    /// Invite a device into a network.
     ///
-    /// Opens the exchange, checks that the device holds both of the keys it
-    /// presented, and works out the confirmation code — and stops there. Nothing
-    /// is signed, because a person has not compared two screens yet.
-    Admit {
-        /// Which network to admit the device into, or `None` when only one could
-        /// be meant.
+    /// Issues an invite — the network's relay, its id and a secret — and keeps,
+    /// on this device only, what the device it brings will be: its name, role,
+    /// mode, groups and address. From then on the daemon dials the rendezvous
+    /// the invite implies, on its own, until a request arrives or the invite
+    /// expires or is withdrawn. So the flow outlives the command: the request is
+    /// kept, asking nobody, and listed by [`Command::Pending`] until a person
+    /// answers it with [`Command::Approve`] or [`Command::Reject`].
+    Invite {
+        /// Which network, or `None` when only one could be meant.
         network: Option<String>,
-        /// The joining payload, as the device printed it.
-        payload: String,
+        /// The name the device is admitted under.
+        name: String,
+        /// Whether it is admitted as an admin.
+        admin: bool,
+        /// Whether it is admitted light. An admin cannot be.
+        light: bool,
+        /// The groups it joins.
+        groups: Vec<String>,
+        /// The IPv4 address it is assigned, inside the network's range.
+        ipv4: Option<String>,
+        /// How long the invite waits for its device's request, in minutes, or
+        /// `None` for a day.
+        minutes: Option<u32>,
     },
 
-    /// Confirm whatever is waiting on this device's own person.
+    /// Withdraw the invite for the device to be called `name`, while nothing has
+    /// been signed through it.
     ///
-    /// Two things wait that way: an **admission**, after a person has looked at
-    /// the device being enrolled and seen it say the code was accepted; and a
-    /// **founding** or a **relay change**, after a person has checked the key a
-    /// relay's host said it serves. Neither carries a value, because in both the person is
-    /// answering a question about something already on screen.
-    ///
-    /// A **join** is the one that does not belong here: what its person supplies
-    /// is digits read off another machine. That is [`Self::ConfirmJoin`].
-    Confirm,
-
-    /// Confirm an admission **and revoke the device already holding that name**.
-    ///
-    /// The other answer to the question [`Outcome::Admitting::taken`] asks.
-    /// [`Self::Confirm`] admits under a name no device holds; this one keeps the
-    /// name and expels whoever had it.
-    ///
-    /// It is a revocation, and a revocation is definitive: the device it names
-    /// never returns to the network. A surface asks before sending it, and shows
-    /// the identifier it falls on — a name is not an identity, and this decision
-    /// is being taken on the strength of one.
-    Replace,
-
-    /// Confirm a join with the digits a person read off the admitting machine.
-    ///
-    /// Sent by the **joining** side. The code travels here, from the person, and
-    /// is compared with the one this device derived. A command carrying no code
-    /// would leave the daemon comparing its own answer with itself — which is
-    /// what this replaces, and what made the check always pass.
-    ConfirmJoin {
-        /// The six digits a person typed.
-        code: String,
+    /// It takes no request from then on, and a request it brought that was
+    /// waiting for a person is dropped.
+    Withdraw {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The name the invite was issued for.
+        name: String,
     },
 
-    /// Drop an enrolment that is waiting, leaving both machines as they were.
-    Abandon,
+    /// What a board provisioned for a network starts from, before it is
+    /// admitted: what a production station writes into it
+    /// (`scalable-membership` 15.4). Read only, and an administrator's.
+    Provisioning {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+    },
 
-    /// Start waiting to be given a network.
+    /// Everything waiting: the invites this device issued and the requests
+    /// they brought, this device's own joins, and an act stopped on a person.
+    Pending {
+        /// Which network's invites, or `None` for every network this person
+        /// holds.
+        network: Option<String>,
+    },
+
+    /// Approve the request that arrived through the invite for `name`.
+    ///
+    /// Signs the admission, and the settings the invite chose, as any
+    /// administrative act; the device is then given the network when it
+    /// answers, by this device or by any full member the admission reaches.
+    Approve {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The name the invite was issued for.
+        name: String,
+        /// Whether to take the name over from the device already holding it,
+        /// **revoking that device** in the same act. A surface asks first, and
+        /// shows the identifier it falls on.
+        replace: bool,
+    },
+
+    /// Reject the request that arrived through the invite for `name`. Nothing
+    /// is signed, and the invite takes no other.
+    Reject {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The name the invite was issued for.
+        name: String,
+    },
+
+    /// Join a network from an invite one of its admins issued.
     ///
     /// Through the daemon for the same reason founding is: the roster that
-    /// arrives has to be the one the daemon is using. A device that joined in
-    /// another process would hold a network its own daemon could not see until it
-    /// restarted, which is the restart this removes.
+    /// arrives has to be the one the daemon is using. The device makes fresh
+    /// keys, proves it holds them, and waits — at the rendezvous the invite
+    /// implies and under its own transport key — until it is admitted or the
+    /// join is cancelled. The command returns at once with the fingerprint a
+    /// person may compare with the admin's; the join is listed by
+    /// [`Command::Pending`] while it waits.
     Join {
-        /// Where to be reachable while waiting.
-        relay: String,
-        /// The name this device proposes for itself.
+        /// The invite, as text.
+        invite: String,
+        /// The name this device proposes for itself. The admin's record decides.
         name: String,
+    },
+
+    /// Confirm whatever is waiting on this device's own person: a **founding**
+    /// or a **relay change**, after a person has checked the key a relay's host
+    /// said it serves. It carries no value, because the person is answering a
+    /// question about something already on screen.
+    Confirm,
+
+    /// Drop the act that is waiting on a person, leaving the machine as it was.
+    Abandon,
+
+    /// Cancel a join in progress: it stops waiting, and its directory and keys
+    /// go. An admission signed for it meanwhile stays in the network, for an
+    /// admin to revoke.
+    CancelJoin {
+        /// The join, by the name the pending list gives it.
+        label: String,
     },
 
     /// Remove a network from this device, carried or not.
@@ -1328,14 +1474,9 @@ pub enum Command {
         last_admin: bool,
     },
 
-    /// Ask what a waiting enrolment has got to.
+    /// Ask what the act waiting on a person has got to.
     ///
-    /// A join has two pauses in it — carrying the payload to an admin, and
-    /// comparing six digits — and the control channel is one request and one
-    /// answer. So the command line asks, rather than being told.
-    ///
-    /// It also answers the other question a surface has: **is anything held at
-    /// all**. The daemon keeps one pending, and it is what refuses the next
+    /// It answers the question a surface has: **is anything held at all**. The daemon keeps one pending, and it is what refuses the next
     /// enrolment, so a surface whose own screens have ended needs to know whether
     /// the daemon still holds something before it offers to start another.
     /// [`Outcome::Done`] means nothing is held; every other answer names what is.
@@ -1365,13 +1506,26 @@ pub enum Command {
         /// The relay, if the network has one: `key@host:port`, or a host whose
         /// relay container is asked for its key (`crate::relay::Given`).
         relay: Option<String>,
-        /// The IPv4 range every device of the network derives its IPv4 address
-        /// in, as `a.b.c.d/len`, or `None` for the default.
+        /// The network's IPv4 block, as `a.b.c.d/len`, or `None` for one the
+        /// daemon proposes (`devices`).
         ///
         /// Text rather than a parsed range so a surface can hand over what a
         /// person typed and have the refusal come back in the daemon's words,
         /// before anything is signed.
         ipv4_range: Option<String>,
+        /// How many devices the network is expected to hold, where no block is
+        /// named: the daemon proposes one four times that, drawn at random
+        /// among those free of this device's other networks and of the
+        /// subnets it is on. `None` for `founding::DEFAULT_EXPECTED`.
+        #[serde(default)]
+        devices: Option<u32>,
+        /// The freshness window, in days, or `None` for none: devices that
+        /// hear nothing signed by an admin for that long turn cautious. It
+        /// buys a bound on how long a cut-off island keeps talking to a device
+        /// revoked elsewhere, at the cost of the island stopping; a network
+        /// with an admin of its own wants none, which is the default.
+        #[serde(default)]
+        window_days: Option<u32>,
     },
 
     /// Expel a device from the network.
@@ -1389,6 +1543,56 @@ pub enum Command {
         reason: String,
     },
 
+    /// Add devices to the batch being put together for a network, before it is
+    /// admitted: a batch file travels in parts, each well within what one
+    /// command may carry. A batch for another network, or one admitted or
+    /// abandoned, starts again.
+    StageBatch {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The devices, in the file's order.
+        devices: Vec<BatchDevice>,
+    },
+
+    /// Admit the batch put together with [`Command::StageBatch`], as one.
+    ///
+    /// Asked first without `reviewed`: the daemon answers with what the batch
+    /// would do ([`Outcome::BatchReview`]) and signs nothing. Asked again with
+    /// the names of the entries the person was shown would be skipped, it signs
+    /// — unless the network moved since, and those are no longer the ones.
+    AdmitBatch {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// A line a person reads: which lot this is.
+        label: String,
+        /// Whether its devices are admitted light.
+        light: bool,
+        /// The groups every device joins.
+        groups: Vec<String>,
+        /// Whether they are admitted IPv6 only. Otherwise each is given an
+        /// offset from the lowest run of the network's block free and long
+        /// enough for them all.
+        #[serde(default)]
+        ipv6_only: bool,
+        /// The entries shown as skipped, once the person has reviewed it.
+        reviewed: Option<Vec<String>>,
+    },
+
+    /// A revocation whose person was told what it voids, and said go ahead.
+    ///
+    /// What a surface sends after [`Outcome::WouldVoid`]: the same revocation,
+    /// with the acknowledgement. Its own command rather than a flag on
+    /// [`Command::Revoke`], so that what every surface already sends keeps
+    /// asking first.
+    RevokeVoiding {
+        /// As [`Command::Revoke`]'s.
+        network: Option<String>,
+        /// As [`Command::Revoke`]'s.
+        target: Target,
+        /// As [`Command::Revoke`]'s.
+        reason: String,
+    },
+
     /// Give a device a new name.
     ///
     /// Named as [`Command::Revoke`] names it, exactly, by name or by id. The new
@@ -1401,6 +1605,61 @@ pub enum Command {
         target: Target,
         /// The name it is to answer to, as the person typed it.
         name: String,
+    },
+
+    /// Set the network's anchor list: the full members light members turn to
+    /// when the one that admitted them is off.
+    ///
+    /// The list given replaces the one held; none clears it. Signed like every
+    /// administrative act. An anchor is a full member and nothing else, so the
+    /// daemon refuses a device that is not one before anything is signed.
+    SetAnchors {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The devices, by the names they answer to. Empty clears the list.
+        anchors: Vec<Target>,
+    },
+
+    /// Move or resize a network's IPv4 block, as its admin.
+    ///
+    /// One change of its parameters: every device keeps its offset and holds
+    /// the address it names in the new block, so every device moves at once
+    /// and nothing is reconnected by hand. A block too small for an offset a
+    /// member holds is refused before anything is signed.
+    SetIpv4Block {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The block, `a.b.c.d/len`, `/10` to `/28`.
+        block: String,
+    },
+
+    /// Exclude a block from a network's IPv4 route, or include it again.
+    ///
+    /// A hole, as a local interface makes one: the peers in it are reached by
+    /// IPv6 only. On this device alone, or, `everywhere`, for every device as
+    /// a signed act of the network's admins.
+    Route {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The block, `a.b.c.d/len` or one address, inside the network's.
+        block: String,
+        /// Whether to include it again rather than exclude it.
+        #[serde(default)]
+        include: bool,
+        /// Whether for every device, as the network's admins.
+        #[serde(default)]
+        everywhere: bool,
+    },
+
+    /// Give a device the lowest IPv4 offset no member holds, as an admin.
+    ///
+    /// For a device that lost its own to another given it at the same time,
+    /// or one admitted with none. A device holding one already is refused.
+    GiveIpv4 {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The device, by the name it answers to.
+        device: Target,
     },
 
     /// The signature a previous answer asked for.
@@ -1525,6 +1784,7 @@ impl Command {
         ("up", true),
         ("down", true),
         ("peers", true),
+        ("revoked", true),
         ("address", true),
         ("stop", false),
         // How a network survives the account that made it being deleted. A
@@ -1532,6 +1792,8 @@ impl Command {
         // only in the tests — found by writing the verification step for it and
         // discovering the word did not work.
         ("takeownership", true),
+        // Everything waiting: invites and their requests, joins, a stopped act.
+        ("pending", true),
     ];
 
     /// The usage line for forgetting a network this device cannot carry.
@@ -1549,6 +1811,206 @@ impl Command {
     /// as revoking: it takes arguments.
     pub const RENAME_USAGE: &'static str = "peerfectly rename <name> <new name> [--network N]\n       \
                                              peerfectly rename --id <id> <new name> [--network N]";
+
+    /// The usage line for withdrawing an invite.
+    pub const WITHDRAW_USAGE: &'static str = "peerfectly withdraw <name> [--network N]";
+
+    /// Reads a withdrawal from the words after `withdraw`: the name the invite
+    /// was issued for.
+    ///
+    /// # Errors
+    ///
+    /// When no name is given, or more than one.
+    pub fn withdrawal(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::WITHDRAW_USAGE);
+        let mut name = None;
+        let mut network = None;
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                flag if flag.starts_with("--") => return Err(usage()),
+                given if name.is_none() && !given.is_empty() => name = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(Self::Withdraw { network, name: name.ok_or_else(usage)? })
+    }
+
+    /// The usage line for approving a request.
+    pub const APPROVE_USAGE: &'static str = "peerfectly approve <name> [--replace] [--network N]";
+
+    /// The usage line for rejecting a request.
+    pub const REJECT_USAGE: &'static str = "peerfectly reject <name> [--network N]";
+
+    /// Reads an approval from the words after `approve`: the name the invite
+    /// was issued for, and whether to take that name over from the device
+    /// already holding it.
+    ///
+    /// # Errors
+    ///
+    /// When no name is given, or more than one, or an option it does not take.
+    pub fn approval(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::APPROVE_USAGE);
+        let mut name = None;
+        let mut network = None;
+        let mut replace = false;
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                "--replace" => replace = true,
+                flag if flag.starts_with("--") => return Err(usage()),
+                given if name.is_none() && !given.is_empty() => name = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        Ok(Self::Approve { network, name: name.ok_or_else(usage)?, replace })
+    }
+
+    /// Reads a rejection from the words after `reject`.
+    ///
+    /// # Errors
+    ///
+    /// When no name is given, or more than one, or an option it does not take.
+    pub fn rejection(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::REJECT_USAGE);
+        match Self::withdrawal(words) {
+            Ok(Self::Withdraw { network, name }) => Ok(Self::Reject { network, name }),
+            _ => Err(usage()),
+        }
+    }
+
+    /// Reads how long an invite waits for its request: a number with `m`, `h`
+    /// or `d` — `30m`, `24h`, `7d` — in minutes.
+    ///
+    /// # Errors
+    ///
+    /// When it is none of those, or is zero.
+    pub fn expiry(text: &str) -> core::result::Result<u32, String> {
+        let refused =
+            || format!("`{text}` is not how long an invite stays open: say it as 30m, 24h or 7d");
+        let Some(unit) = text.chars().last() else { return Err(refused()) };
+        let number = text.strip_suffix(unit).unwrap_or_default();
+        let per: u32 = match unit {
+            'm' => 1,
+            'h' => 60,
+            'd' => 24 * 60,
+            _ => return Err(refused()),
+        };
+        number
+            .parse::<u32>()
+            .ok()
+            .filter(|count| *count > 0)
+            .and_then(|count| count.checked_mul(per))
+            .ok_or_else(refused)
+    }
+
+    /// The usage lines for setting a network's anchors, and clearing them.
+    pub const SET_ANCHORS_USAGE: &'static str = "peerfectly set-anchors <name>... [--network N]\n       \
+                                                  peerfectly set-anchors --none [--network N]";
+
+    /// Reads an anchor list from the words after `set-anchors`.
+    ///
+    /// Here rather than in the command line, as revoking's is: what reaches
+    /// the daemon is signed.
+    ///
+    /// # Errors
+    ///
+    /// When nothing is named and `--none` is not given, when both are, or when
+    /// a flag is not one this knows.
+    pub fn anchors_setting(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::SET_ANCHORS_USAGE);
+        let mut anchors = Vec::new();
+        let mut network = None;
+        let mut none = false;
+        let mut rest = words.iter();
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                "--none" => none = true,
+                flag if flag.starts_with("--") => return Err(usage()),
+                "" => return Err(usage()),
+                name => anchors.push(Target::Name(name.to_owned())),
+            }
+        }
+        // Clearing is said, never implied: a list typed empty by mistake would
+        // leave every light member with no anchor to turn to.
+        if none == anchors.is_empty() {
+            Ok(Self::SetAnchors { network, anchors })
+        } else {
+            Err(usage())
+        }
+    }
+
+    /// The usage lines for a network's IPv4 block and a device's offset in it.
+    pub const IPV4_USAGE: &'static str = "peerfectly ipv4 block <A.B.C.D/N> [--network N]\n       \
+                                           peerfectly ipv4 give <name> [--network N]";
+
+    /// Reads `ipv4 block` or `ipv4 give` from the words after `ipv4`.
+    ///
+    /// # Errors
+    ///
+    /// When the act is neither, its one argument is missing or doubled, or a
+    /// flag is not one this knows.
+    pub fn ipv4_act(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::IPV4_USAGE);
+        let mut rest = words.iter();
+        let act = rest.next().ok_or_else(usage)?;
+        let mut network = None;
+        let mut argument = None;
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                flag if flag.starts_with("--") => return Err(usage()),
+                "" => return Err(usage()),
+                given if argument.is_none() => argument = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        let argument = argument.ok_or_else(usage)?;
+        match act.as_str() {
+            "block" => Ok(Self::SetIpv4Block { network, block: argument }),
+            "give" => Ok(Self::GiveIpv4 { network, device: Target::Name(argument) }),
+            _ => Err(usage()),
+        }
+    }
+
+    /// The usage lines for excluding a block from a network's route, and
+    /// including it again.
+    pub const ROUTE_USAGE: &'static str = "peerfectly route exclude <A.B.C.D[/N]> [--network N] [--everywhere]\n       \
+         peerfectly route include <A.B.C.D[/N]> [--network N] [--everywhere]";
+
+    /// Reads `route exclude` or `route include` from the words after `route`.
+    ///
+    /// # Errors
+    ///
+    /// When the act is neither, its block is missing or doubled, or a flag is
+    /// not one this knows.
+    pub fn route_act(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::ROUTE_USAGE);
+        let mut rest = words.iter();
+        let include = match rest.next().map(String::as_str) {
+            Some("exclude") => false,
+            Some("include") => true,
+            _ => return Err(usage()),
+        };
+        let mut network = None;
+        let mut block = None;
+        let mut everywhere = false;
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "--network" => network = Some(rest.next().ok_or_else(usage)?.clone()),
+                "--everywhere" => everywhere = true,
+                flag if flag.starts_with("--") => return Err(usage()),
+                "" => return Err(usage()),
+                given if block.is_none() => block = Some(given.to_owned()),
+                _ => return Err(usage()),
+            }
+        }
+        let block = block.ok_or_else(usage)?;
+        Ok(Self::Route { network, block, include, everywhere })
+    }
 
     /// The usage line for moving a network to another relay.
     pub const RELAY_USAGE: &'static str =
@@ -1721,10 +2183,12 @@ impl Command {
             "status" => Ok(Self::Status),
             "up" => Ok(Self::Up { network }),
             "down" => Ok(Self::Down { network }),
-            "peers" => Ok(Self::Peers { network }),
+            "peers" => Ok(Self::Peers { network, after: None }),
+            "revoked" => Ok(Self::Revoked { network, after: None }),
             "address" => Ok(Self::Address { network }),
             "stop" => Ok(Self::Stop),
             "takeownership" => Ok(Self::TakeOwnership { network }),
+            "pending" => Ok(Self::Pending { network }),
             _ => Err(Unknown { name: name.to_owned() }),
         }
     }
@@ -1738,56 +2202,104 @@ impl Command {
         Self::ALL.iter().any(|(word, takes)| *word == name && *takes)
     }
 
-    /// Whether this command changes the machine, and so needs Administrator.
+    /// Whether this command needs an administrator: an elevated console on
+    /// Windows, `sudo` on Linux, the phone's lock on a phone.
     ///
-    /// **It was aspirational and is not any more.** While the daemon created its
-    /// channel with a default descriptor, a medium-integrity process could not
-    /// write to a pipe a high-integrity one had made, so *every* command needed
-    /// an elevated console whatever this said. The channel carries an explicit
-    /// descriptor now, with an integrity label an ordinary process may write to,
-    /// and reading state needs no elevation at all.
+    /// **One rule, decided by the daemon and shown by every surface.** Reading,
+    /// and turning one's own networks on and off, need none: `status`, `peers`,
+    /// `address`, `exposed`, the pending list, `up` and `down`, and the question
+    /// of what waits. Everything else does — founding, joining, inviting,
+    /// approving, revoking, forgetting a network, moving a relay, exposing a
+    /// port, stopping the service — because it changes a roster, the machine,
+    /// or what this device is a member of. The daemon refuses anybody else
+    /// before the act starts ([`Self::needs`] says whose network it must be
+    /// besides), a command line refuses before it asks, and the usage marks the
+    /// same words.
     ///
-    /// **It is not the authorisation table**, and must not be read as one. That
-    /// is [`Self::needs`], which is decided by the daemon against the caller it
-    /// identified. This is a hint the command line prints beside a word, so that
-    /// somebody reading the usage knows which ones will want an elevated console
-    /// — and where the two ever disagree, the daemon's answer is the one that
-    /// happens.
+    /// Exhaustive, with no wildcard: a command added without deciding is a
+    /// build failure.
     #[must_use]
-    pub const fn needs_administrator(&self) -> bool {
-        matches!(
-            self,
-            Self::Up { .. }
-                | Self::Down { .. }
-                | Self::Revoke { .. }
-                | Self::Rename { .. }
-                | Self::Found { .. }
-                | Self::Join { .. }
-                // The two that are the machine's rather than a network's.
-                | Self::Stop
-                | Self::TakeOwnership { .. }
-                | Self::Expose { .. }
-                | Self::Unexpose { .. }
-        )
+    pub const fn needs_an_administrator(&self) -> bool {
+        match self {
+            Self::Status
+            | Self::Peers { .. }
+            | Self::Revoked { .. }
+            | Self::Reach { .. }
+            | Self::Address { .. }
+            | Self::Exposed { .. }
+            | Self::Pending { .. }
+            | Self::Waiting
+            | Self::Up { .. }
+            | Self::Down { .. } => false,
+            Self::Stop
+            | Self::Invite { .. }
+            | Self::Withdraw { .. }
+            | Self::Approve { .. }
+            | Self::Provisioning { .. }
+            | Self::Reject { .. }
+            | Self::Join { .. }
+            | Self::Confirm
+            | Self::Abandon
+            | Self::CancelJoin { .. }
+            | Self::Forget { .. }
+            | Self::Found { .. }
+            | Self::Revoke { .. }
+            | Self::StageBatch { .. }
+            | Self::AdmitBatch { .. }
+            | Self::RevokeVoiding { .. }
+            | Self::Rename { .. }
+            | Self::SetAnchors { .. }
+            | Self::SetIpv4Block { .. }
+            | Self::GiveIpv4 { .. }
+            | Self::Route { .. }
+            | Self::Signed { .. }
+            | Self::TakeOwnership { .. }
+            | Self::ChangeRelay { .. }
+            | Self::Expose { .. }
+            | Self::Unexpose { .. }
+            | Self::KeyMade { .. }
+            | Self::NotSigned { .. } => true,
+        }
+    }
+
+    /// Whether the word a person types needs an administrator, by the rule
+    /// [`Self::needs_an_administrator`] states: for a word that is a command on
+    /// its own, asked of that command; every word that takes more acts, except
+    /// `exposed`, which reads.
+    #[must_use]
+    pub fn word_needs_an_administrator(word: &str) -> bool {
+        match Self::parse(word, None) {
+            Ok(command) => command.needs_an_administrator(),
+            Err(_) if word == "exposed" => Self::Exposed { network: None }.needs_an_administrator(),
+            Err(_) => true,
+        }
     }
 
     /// Whether this command is part of enrolling a device.
     ///
-    /// These three are not in [`Self::ALL`]: two of them are meaningless typed
-    /// on their own, and the first carries a payload, so a person reaches them
-    /// through `peerfectly admit` rather than by naming them.
+    /// These are not in [`Self::ALL`]: some are meaningless typed on their own,
+    /// and the others carry an invite or its details, so a person reaches them
+    /// through `peerfectly invite` and `peerfectly join` rather than by naming
+    /// them.
     #[must_use]
     pub const fn is_enrolment(&self) -> bool {
         matches!(
             self,
-            Self::Admit { .. } | Self::Confirm | Self::Abandon | Self::Join { .. } | Self::Waiting
+            Self::Invite { .. }
+                | Self::Approve { .. }
+                | Self::Reject { .. }
+                | Self::CancelJoin { .. }
+                | Self::Confirm
+                | Self::Abandon
+                | Self::Join { .. }
+                | Self::Waiting
         )
     }
 
     /// The word that invokes it.
     ///
     /// The empty string for a command a person does not reach by typing one
-    /// word: the enrolment ones carry a payload, and founding and joining carry
+    /// word: the enrolment ones carry an invite, and founding and joining carry
     /// more than a person would type as a single token.
     #[must_use]
     pub const fn word(&self) -> &'static str {
@@ -1796,9 +2308,11 @@ impl Command {
             Self::Up { .. } => "up",
             Self::Down { .. } => "down",
             Self::Peers { .. } => "peers",
+            Self::Revoked { .. } => "revoked",
             Self::Address { .. } => "address",
             Self::Stop => "stop",
             Self::TakeOwnership { .. } => "takeownership",
+            Self::Pending { .. } => "pending",
             _ => "",
         }
     }
@@ -1807,7 +2321,7 @@ impl Command {
     /// it names. `None` for a read, which changes nothing and which a tray asks
     /// every two seconds.
     ///
-    /// **Chosen fields, never the command.** Several carry an enrolment payload,
+    /// **Chosen fields, never the command.** Several carry an invite,
     /// a confirmation code, a signature or a public key, and none of those
     /// belongs in a log every administrator of the machine can read. Written out
     /// arm by arm so that a new command has to decide.
@@ -1816,22 +2330,38 @@ impl Command {
         let (word, network) = match self {
             Self::Status
             | Self::Peers { .. }
+            | Self::Revoked { .. }
+            | Self::Reach { .. }
             | Self::Address { .. }
             | Self::Waiting
+            | Self::Pending { .. }
             | Self::Exposed { .. } => return None,
             Self::Up { network } => ("up", network.as_deref()),
             Self::Down { network } => ("down", network.as_deref()),
+            // A read, and still logged: a station took what boards start from.
+            Self::Provisioning { network } => ("provisioning", network.as_deref()),
             Self::Stop => ("stop", None),
-            Self::Admit { network, payload: _ } => ("admit", network.as_deref()),
+            Self::Invite { network, .. } => ("invite", network.as_deref()),
+            Self::Withdraw { network, .. } => ("withdraw", network.as_deref()),
+            Self::Approve { network, .. } => ("approve", network.as_deref()),
+            Self::Reject { network, .. } => ("reject", network.as_deref()),
             Self::Confirm => ("confirm", None),
-            Self::Replace => ("replace", None),
-            Self::ConfirmJoin { code: _ } => ("confirm join", None),
             Self::Abandon => ("abandon", None),
+            Self::CancelJoin { .. } => ("cancel join", None),
             Self::Join { .. } => ("join", None),
             Self::Forget { label, .. } => ("forget", Some(label.as_str())),
             Self::Found { label, .. } => ("found", Some(label.as_str())),
-            Self::Revoke { network, .. } => ("revoke", network.as_deref()),
+            Self::Revoke { network, .. } | Self::RevokeVoiding { network, .. } => {
+                ("revoke", network.as_deref())
+            }
+            Self::StageBatch { network, .. } => ("stage batch", network.as_deref()),
+            Self::AdmitBatch { network, .. } => ("admit batch", network.as_deref()),
             Self::Rename { network, .. } => ("rename", network.as_deref()),
+            Self::SetAnchors { network, .. } => ("set-anchors", network.as_deref()),
+            Self::SetIpv4Block { network, .. } => ("ipv4 block", network.as_deref()),
+            Self::GiveIpv4 { network, .. } => ("ipv4 give", network.as_deref()),
+            Self::Route { network, include: false, .. } => ("route exclude", network.as_deref()),
+            Self::Route { network, include: true, .. } => ("route include", network.as_deref()),
             Self::Signed { .. } => ("signed", None),
             Self::TakeOwnership { network } => ("takeownership", network.as_deref()),
             Self::ChangeRelay { network, .. } => ("relay", network.as_deref()),
@@ -1852,16 +2382,21 @@ impl Outcome {
         match self {
             Self::Reported(_) => "reported",
             Self::Done => "done",
-            Self::Admitting { .. } => "admitting",
-            Self::Enrolling => "enrolling",
-            Self::Joining { .. } => "joining",
-            Self::Adopted { .. } => "adopted",
+            Self::Provisioning(_) => "provisioning",
+            Self::Peers(_) => "peers",
+            Self::Revoked(_) => "revoked",
+            Self::Invited { .. } => "invited",
+            Self::JoinStarted { .. } => "joining",
+            Self::Pending(_) => "pending",
             Self::ConfirmingRelay { .. } => "confirming a relay",
             Self::NeedsSignatures(_) => "needs signatures",
             Self::Declined { .. } => "declined",
             Self::NeedsKey(_) => "needs a key",
             Self::NotAllowed { .. } => "not allowed",
             Self::OnlyAdmin { .. } => "only admin",
+            Self::WouldVoid { .. } => "would void",
+            Self::BatchReview { .. } => "batch review",
+            Self::Staged { .. } => "staged",
             Self::Exposed { .. } => "exposed",
             Self::Failed { .. } => "failed",
         }
@@ -1939,6 +2474,173 @@ pub struct TakenName {
     pub id: String,
 }
 
+/// One device of a batch file, as the command line read it: what its board
+/// gave the production station. Keys are Ed25519 public keys, in hexadecimal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchDevice {
+    /// The name it is admitted under.
+    pub name: String,
+    /// Its serial, as printed on it; empty for none.
+    #[serde(default)]
+    pub serial: String,
+    /// Its signing key.
+    pub signing: String,
+    /// Its transport key.
+    pub transport: String,
+    /// Its attestation key: every member holds one.
+    pub attestation: String,
+}
+
+/// What a board provisioned before its admission starts from: all of it public,
+/// and checked by the board as it is taken (`roster::member::LightMember::
+/// awaiting`), every byte hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provisioning {
+    /// The root this node holds, signed.
+    pub root: String,
+    /// The root of the devices' tree under it.
+    pub devices_root: String,
+    /// The network's parameters under it.
+    pub params: String,
+    /// The network's relay, as written in its parameters.
+    pub relay: String,
+    /// The evidence, against that root, of the full members a board turns to:
+    /// the network's anchors, or where it names none, a few of its full
+    /// members, admins first.
+    pub anchors: Vec<String>,
+}
+
+/// The name of the one format of a batch file this build reads.
+pub const BATCH_FORMAT: &str = "peerfectly-batch-v1";
+
+/// A batch file: what a production station wrote of a lot of boards, for an
+/// admin to admit. JSON, so that whatever runs the station can write it, and
+/// a person can read it:
+///
+/// ```json
+/// { "format": "peerfectly-batch-v1", "label": "lot 2026-10 A",
+///   "devices": [ { "name": "sensor-001", "serial": "SN0001",
+///                  "signing": "…", "transport": "…", "attestation": "…" } ] }
+/// ```
+///
+/// It carries public keys only: whoever copies it learns which keys will be
+/// members, and can be none of them. What the admin decides — the mode, the
+/// groups, the address block — is not in it, but given when it is admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchFile {
+    /// [`BATCH_FORMAT`].
+    pub format: String,
+    /// Which lot this is.
+    pub label: String,
+    /// Its devices.
+    pub devices: Vec<BatchDevice>,
+}
+
+impl BatchFile {
+    /// Reads a batch file's text.
+    ///
+    /// # Errors
+    ///
+    /// In words, when it is not JSON of this shape, or another format.
+    pub fn read(text: &str) -> core::result::Result<Self, String> {
+        let file: Self = serde_json::from_str(text)
+            .map_err(|cause| format!("that is not a batch file: {cause}"))?;
+        if file.format != BATCH_FORMAT {
+            return Err(format!(
+                "that batch file is `{}`, and this build reads `{BATCH_FORMAT}`",
+                shown(&file.format)
+            ));
+        }
+        if file.devices.is_empty() {
+            return Err("that batch file names no device".to_owned());
+        }
+        Ok(file)
+    }
+}
+
+/// An entry of a batch that would have no effect, and why, as reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedLine {
+    /// The name it would have been admitted under.
+    pub name: String,
+    /// Why it would be skipped.
+    pub why: String,
+}
+
+/// One invite, as listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteLine {
+    /// The network it admits into, by the name it is reported under.
+    pub network: String,
+    /// The name the device is admitted under.
+    pub name: String,
+    /// `open`, `requested`, `approved`, `used`, `rejected`, `expired` or
+    /// `withdrawn`.
+    pub standing: String,
+    /// When it stops taking a request, in seconds since the epoch.
+    pub expires_at: u64,
+    /// The request that arrived through it, if one has.
+    #[serde(default)]
+    pub request: Option<RequestLine>,
+}
+
+/// A request that arrived through an invite: what a person reviews before
+/// approving it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestLine {
+    /// The name the device proposed for itself. The invite's decides.
+    pub proposed_name: String,
+    /// The fingerprint of its signing key, which its own screen shows too.
+    pub fingerprint: String,
+    /// When it arrived, in seconds since the epoch.
+    pub arrived_at: u64,
+    /// The device already answering to the name it would be admitted under,
+    /// if one does: approving then either admits it under another name, or
+    /// replaces that device, revoking it.
+    #[serde(default)]
+    pub taken: Option<TakenName>,
+    /// Where the network's IPv4 block coincides with the device's other
+    /// networks or the subnets it is on, as it said: for the person approving,
+    /// who may move the network first. Unproved, and deciding nothing.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+}
+
+/// One of this device's own joins, waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinLine {
+    /// The name the join is known by here until its network arrives.
+    pub label: String,
+    /// The fingerprint of this device's new signing key, for a person to
+    /// compare with the admin's list.
+    pub fingerprint: String,
+    /// `registering`, `waiting`, `requested`, or `failed`.
+    pub standing: String,
+    /// When it began, in seconds since the epoch.
+    pub since: u64,
+    /// When the admin's daemon said it has the request, once it has.
+    #[serde(default)]
+    pub requested_at: Option<u64>,
+    /// What last went wrong, if anything: an exchange refused, or why the join
+    /// cannot go on.
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+/// Everything waiting on this device, for the pending list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingList {
+    /// The invites this device issued, open or ended a short while ago, with
+    /// the requests they brought.
+    pub invites: Vec<InviteLine>,
+    /// This device's own joins.
+    pub joins: Vec<JoinLine>,
+    /// An act stopped on a person — a founding or a relay move waiting on a
+    /// relay's key, a signature — described, if there is one.
+    #[serde(default)]
+    pub stopped: Option<String>,
+}
+
 /// What the daemon sends back over the control channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1948,69 +2650,47 @@ pub enum Outcome {
     /// The command succeeded and there is nothing to say.
     Done,
 
-    /// An enrolment is open and waiting for a person to compare two screens.
+    /// What a board provisioned for the network starts from.
+    Provisioning(Provisioning),
+
+    /// A page of a network's other devices, after the one asked.
+    Peers(PeersPage),
+
+    /// A page of the devices a network holds as revoked.
+    Revoked(RevokedPage),
+
+    /// A join has begun, and waits until it is admitted or cancelled.
     ///
-    /// Nothing has been signed. The device this describes is a member of
-    /// nothing, and will stay one unless a person confirms.
-    Admitting {
-        /// The name the joining device proposed for itself.
-        proposed_name: String,
-        /// Its signing key's fingerprint, in the shape a person can compare.
+    /// Nothing has been signed and this device is a member of nothing yet.
+    JoinStarted {
+        /// The name the join is listed under until its network arrives: what
+        /// cancelling it names.
+        label: String,
+        /// The fingerprint of this device's new signing key, which the admin
+        /// reviewing the request is shown too.
         fingerprint: String,
-        /// The code to display, which the other device's person must type.
-        code: String,
-        /// The device already answering to the proposed name, if one does.
-        ///
-        /// `Some` means the admission stops here for an answer:
-        /// [`Command::Confirm`] admits under a name no device holds, and
-        /// [`Command::Replace`] keeps the name and revokes the device named
-        /// below. Before this, the second device quietly became `name-2` and the
-        /// admin learned of it from the device list.
-        taken: Option<TakenName>,
-        /// Whether that device has said the code was accepted.
-        ///
-        /// False until it does. What this side's person is asked depends on it:
-        /// until the far side has confirmed, there is nothing to ask about, and
-        /// asking anyway is how a person answers a question about a screen that
-        /// has not changed yet.
-        accepted: bool,
+        /// Where the network's IPv4 block coincides with this device's other
+        /// networks or the subnets it is on; the request carries them to the
+        /// admin.
+        #[serde(default)]
+        conflicts: Vec<String>,
     },
 
-    /// An admin has reached this device, and a person must type what that
-    /// machine is showing.
-    ///
-    /// It carries **no code**. The device derived one, and telling the person
-    /// what it is would turn typing back into agreeing: they would read it from
-    /// this screen instead of the admin's, and this screen is the one an
-    /// attacker who dialled first controls. A client cannot display what it is
-    /// never given.
-    Enrolling,
-    /// A join is waiting for an admin to come to this device.
-    ///
-    /// Nothing has been signed and this device is a member of nothing. The
-    /// payload is what a person carries to an admin.
-    Joining {
-        /// The payload as text.
-        payload: String,
-        /// The same payload, drawn.
+    /// An invite was issued, and the daemon dials the device it brings.
+    Invited {
+        /// The invite as text, to send or paste.
+        invite: String,
+        /// The same invite, drawn.
         scannable: String,
+        /// The name the device will be admitted under.
+        name: String,
+        /// When it stops taking a request, in seconds since the epoch, unless
+        /// withdrawn first.
+        expires_at: u64,
     },
 
-    /// A join ended with a network adopted.
-    Adopted {
-        /// The suffix every name in it sits under.
-        suffix: String,
-        /// How many devices it has, this one included.
-        devices: usize,
-        /// Whether that network is carrying traffic once the join has ended.
-        ///
-        /// A first join leaves it down: §2.6b makes turning a network on the
-        /// person's own act. A join that **replaced** this device's membership
-        /// inherits the choice made about that network, so one that was up is up
-        /// again — and a surface that ended every join by saying how to turn the
-        /// tunnel on would be telling the person to do what has already been done.
-        carrying: bool,
-    },
+    /// Everything waiting on this device.
+    Pending(PendingList),
 
     /// A relay's key, asked of its host, is waiting to be confirmed before it is
     /// signed.
@@ -2084,6 +2764,43 @@ pub enum Outcome {
     OnlyAdmin {
         /// The network, by the name it is reported under.
         network: String,
+    },
+
+    /// A revocation of an admin would void acts of that admin's which this
+    /// device cannot keep: batches it holds only by their header, and acts
+    /// resting on another's batch too recent to wait for.
+    ///
+    /// **Nothing was signed.** A surface shows what is voided and, on yes,
+    /// sends [`Command::RevokeVoiding`].
+    WouldVoid {
+        /// The network, by the name it is reported under.
+        network: String,
+        /// What the revocation voids, in words.
+        voids: String,
+    },
+
+    /// What a batch would do, for a person to review. **Nothing was signed.**
+    BatchReview {
+        /// The network, by the name it is reported under.
+        network: String,
+        /// How many devices it holds.
+        count: u64,
+        /// Its label.
+        label: String,
+        /// The mode its devices are admitted in.
+        mode: String,
+        /// The groups they join.
+        groups: Vec<String>,
+        /// The IPv4 addresses they are given, first to last, if any.
+        block: Option<String>,
+        /// The entries that would have no effect, and why.
+        skipped: Vec<SkippedLine>,
+    },
+
+    /// How many devices the batch being put together holds now.
+    Staged {
+        /// How many.
+        count: u64,
     },
 
     /// What is open, each port to the one network it was opened to.
@@ -2161,7 +2878,7 @@ mod exposure_words {
             Command::Unexpose { network: casa.clone(), protocol: Protocol::Tcp, port: 1 };
         assert_eq!(Needs::TheOwnerOfAsAdministrator(casa.clone()), expose.needs());
         assert_eq!(Needs::TheOwnerOfAsAdministrator(casa.clone()), unexpose.needs());
-        assert!(expose.needs_administrator() && unexpose.needs_administrator());
+        assert!(expose.needs_an_administrator() && unexpose.needs_an_administrator());
         assert_eq!(Needs::TheOwnerOf(casa.clone()), Command::Exposed { network: casa }.needs());
         assert_eq!(Needs::Nobody, Command::Exposed { network: None }.needs());
     }
@@ -2192,19 +2909,20 @@ mod tests {
         out
     }
 
-    fn report(standing: Standing, waiting: Vec<Waiting>) -> Report {
+    fn report(standing: Standing) -> Report {
         Report {
-            networks: vec![network(standing, waiting)],
+            networks: vec![network(standing)],
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
             could_stop_the_daemon: false,
         }
     }
 
-    fn network(standing: Standing, waiting: Vec<Waiting>) -> Network {
+    fn network(standing: Standing) -> Network {
         Network {
             label: "test".to_owned(),
             tunnel: Tunnel::Down,
@@ -2217,8 +2935,11 @@ mod tests {
             custody: Custody::HeldHere,
             owner_taken: false,
             confirmation: None,
+            arrived: None,
+            anchors: Vec::new(),
             relay: Some("https://relay.example:443".to_owned()),
             relay_leaving: None,
+            ipv4_block: Some("100.64.0.0/10".to_owned()),
             accused: Vec::new(),
             peers: vec![Peer {
                 name: "nas.example.internal".to_owned(),
@@ -2231,23 +2952,21 @@ mod tests {
                 standing,
                 last_contact: Contact::NoneRecorded,
             }],
-            revoked: Vec::new(),
-            waiting,
-            waiting_unlisted: 0,
+            peer_count: 0,
+            reachable_count: 0,
+            peers_after: None,
+            full_members: Vec::new(),
+            revoked_count: 0,
             problem: None,
         }
     }
 
-    /// Each IPv4 state reads as what it is: the address, the device it collides
-    /// with, or the conflict that withholds it.
+    /// Each IPv4 state reads as what it is: the address, or the conflict that
+    /// withholds it.
     #[test]
     fn each_ipv4_state_says_what_is_true() {
         let held = Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2));
         assert_eq!(held.to_string(), "100.64.0.2");
-
-        let collides = Ipv4State::Collides(named("tablet", 8));
-        let said = collides.to_string();
-        assert!(said.contains("collides") && said.contains("tablet"), "{said}");
 
         let withheld = Ipv4State::Withheld {
             address: Ipv4Addr::new(192, 168, 1, 9),
@@ -2257,7 +2976,7 @@ mod tests {
         assert!(said.contains("192.168.1.9") && said.contains("withheld"), "{said}");
         assert!(said.contains("192.168.1.0/24"), "and names the conflict: {said}");
 
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).peers.first_mut().unwrap().ipv4 = Some(withheld);
         let status = report.to_string();
         assert!(
@@ -2270,7 +2989,7 @@ mod tests {
 
     #[test]
     fn a_peers_path_is_said_beside_its_reachability() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         assert!(
             report.peers(None).to_string().contains("yes, via relay"),
             "{}",
@@ -2297,7 +3016,6 @@ mod tests {
     fn every_ipv4_state_round_trips() {
         for state in [
             Ipv4State::Held(Ipv4Addr::new(100, 64, 0, 2)),
-            Ipv4State::Collides(named("tablet", 8)),
             Ipv4State::Withheld {
                 address: Ipv4Addr::new(10, 0, 0, 1),
                 with: "the relay".to_owned(),
@@ -2335,7 +3053,7 @@ mod tests {
     /// serious thing the roster can say.
     #[test]
     fn an_equivocation_is_reported_beside_a_problem() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).accused = vec![accused("laptop")];
         the_one(&mut report).problem = Some(crate::node::Fault {
             subsystem: "transport".to_owned(),
@@ -2352,7 +3070,7 @@ mod tests {
     /// revoking is a person's act — with the command they would use.
     #[test]
     fn a_detection_says_nothing_was_revoked_and_names_the_command() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).accused = vec![accused("laptop")];
 
         let shown = report.to_string();
@@ -2366,7 +3084,7 @@ mod tests {
     /// an attacker.
     #[test]
     fn a_detection_says_a_restored_backup_looks_the_same() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         the_one(&mut report).accused = vec![accused("laptop")];
 
         let shown = report.to_string();
@@ -2376,7 +3094,7 @@ mod tests {
     /// Nothing is said when there is nothing to say.
     #[test]
     fn an_ordinary_report_says_nothing_about_equivocation() {
-        let shown = report(Standing::Current, Vec::new()).to_string();
+        let shown = report(Standing::Current).to_string();
         assert!(!shown.contains("EQUIVOCATION"), "{shown}");
     }
 
@@ -2384,7 +3102,7 @@ mod tests {
     /// the daemon loaded has to be visible rather than inferred from behaviour.
     #[test]
     fn the_relay_is_reported_as_trusted_by_its_key() {
-        let mut reported = report(Standing::Current, Vec::new());
+        let mut reported = report(Standing::Current);
         let key = convesso_core::identity::Identity::from_ed25519_seed(&[5; 32]).unwrap();
         the_one(&mut reported).relay = Some(transport_convesso::relay::written(
             key.address().as_bytes(),
@@ -2393,7 +3111,7 @@ mod tests {
         ));
         assert!(reported.to_string().contains("(trusted by its key)"), "{reported}");
 
-        let mut none = report(Standing::Current, Vec::new());
+        let mut none = report(Standing::Current);
         the_one(&mut none).relay = None;
         assert!(none.to_string().contains("no relay"), "{none}");
     }
@@ -2401,7 +3119,7 @@ mod tests {
     /// A failure a person can act on has to be a failure they can see.
     #[test]
     fn what_went_wrong_is_shown() {
-        let mut reported = report(Standing::Current, Vec::new());
+        let mut reported = report(Standing::Current);
         the_one(&mut reported).problem = Some(crate::node::Fault {
             subsystem: "transport".to_owned(),
             cause: "laptop: the peer could not be reached".to_owned(),
@@ -2419,7 +3137,7 @@ mod tests {
     /// Nothing wrong, nothing said.
     #[test]
     fn a_healthy_report_says_nothing_about_faults() {
-        let shown = report(Standing::Current, Vec::new()).to_string();
+        let shown = report(Standing::Current).to_string();
         assert!(!shown.contains("problem"), "{shown}");
         assert!(!shown.contains("recently"), "{shown}");
     }
@@ -2428,7 +3146,7 @@ mod tests {
     /// date in 1970.
     #[test]
     fn a_network_never_up_says_nothing_is_known() {
-        let never = report(Standing::LastKnown { at: SystemTime::UNIX_EPOCH }, Vec::new());
+        let never = report(Standing::LastKnown { at: SystemTime::UNIX_EPOCH });
         let shown = never.to_string();
         assert!(shown.contains("last known: nothing seen yet"), "{shown}");
         assert!(!shown.contains("1970") && !shown.contains("days ago"), "{shown}");
@@ -2439,7 +3157,7 @@ mod tests {
     fn a_remembered_answer_says_when_it_was_true() {
         let then =
             SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_000)).expect("representable");
-        let remembered = report(Standing::LastKnown { at: then }, Vec::new());
+        let remembered = report(Standing::LastKnown { at: then });
 
         assert!(!remembered.only().expect("one").standing.is_current());
         let shown = remembered.to_string();
@@ -2453,7 +3171,7 @@ mod tests {
 
     #[test]
     fn a_current_answer_says_so() {
-        let live = report(Standing::Current, Vec::new());
+        let live = report(Standing::Current);
         assert!(live.only().expect("one").standing.is_current());
         assert!(live.to_string().contains("(now)"));
     }
@@ -2479,81 +3197,6 @@ mod tests {
         assert_eq!(reason, "the machine was lost");
         assert!(!reason.contains("--"), "no option ever belongs in a signed reason");
         assert_eq!(network.as_deref(), Some("casa"), "and the network is its own field");
-    }
-
-    /// A revocation signed here, owed to the devices given.
-    fn revocation_owed_to(owed: &[(&str, bool)]) -> Waiting {
-        Waiting {
-            does: Act::Revokes(named("stolen", 3)),
-            signed_here: Signed::NotRecorded,
-            owed: owed
-                .iter()
-                .zip(20u8..)
-                .map(|((name, connected), tag)| Owed {
-                    device: named(name, tag),
-                    connected: *connected,
-                    last_contact: Contact::NoneRecorded,
-                })
-                .collect(),
-        }
-    }
-
-    /// A device that has not confirmed, as the person would need to name it.
-    fn lagging(name: &str, connected: bool) -> Waiting {
-        revocation_owed_to(&[(name, connected)])
-    }
-
-    /// An operation nobody else has seen is a decision the person believes they
-    /// have made. It has to be visible without being asked for — and naming the
-    /// device is the half of it that can be acted on.
-    #[test]
-    fn unpropagated_operations_name_the_devices_that_lack_them() {
-        let waiting = report(Standing::Current, vec![lagging("laptop", false)]);
-        assert!(waiting.only().expect("one").has_unpropagated_work());
-        let shown = waiting.to_string();
-        assert!(shown.contains("laptop"), "the device is named: {shown}");
-        assert!(shown.contains("revocation of stolen"), "with what it is missing: {shown}");
-        assert!(shown.contains("waiting"), "{shown}");
-    }
-
-    /// Waiting is the right advice for a device that has not appeared, and
-    /// precisely the wrong advice for one that is connected and still has not
-    /// taken the operation. The report has to tell them apart.
-    #[test]
-    fn a_device_out_of_contact_is_told_to_be_waited_for() {
-        let shown = report(Standing::Current, vec![lagging("laptop", false)]).to_string();
-        assert!(shown.contains("not in contact"), "{shown}");
-        assert!(shown.contains("Leave the tunnel up"), "{shown}");
-    }
-
-    #[test]
-    fn a_connected_device_that_has_not_confirmed_is_not_a_wait() {
-        let shown = report(Standing::Current, vec![lagging("desktop", true)]).to_string();
-        assert!(shown.contains("connected"), "{shown}");
-        assert!(
-            !shown.contains("Leave the tunnel up"),
-            "the device is already here; waiting is not the remedy: {shown}"
-        );
-        assert!(shown.contains("still admits"), "what it costs is said: {shown}");
-    }
-
-    /// Both situations at once, each with its own sentence.
-    #[test]
-    fn each_situation_gets_the_remedy_that_fits_it() {
-        let shown = report(
-            Standing::Current,
-            vec![revocation_owed_to(&[("laptop", false), ("nas", true)])],
-        )
-        .to_string();
-        assert!(shown.contains("Leave the tunnel up"), "{shown}");
-        assert!(shown.contains("still admits"), "{shown}");
-    }
-
-    /// A device that is its network's only member has nobody to be outstanding
-    /// toward. The report must not invent a warning out of that.
-    #[test]
-    fn nothing_waiting_is_not_mentioned() {
-        assert!(!report(Standing::Current, Vec::new()).to_string().contains("waiting"));
     }
 
     #[test]
@@ -2592,20 +3235,101 @@ mod tests {
     }
 
     /// If reading status needed Administrator, a person would run everything
-    /// elevated — worse than the problem elevation solves.
+    /// elevated — worse than the problem elevation solves. And a member may turn
+    /// its own networks on and off; everything that changes a roster, the
+    /// machine or a membership needs one, forgetting a network included.
     #[test]
-    fn reading_does_not_need_administrator_and_changing_does() {
-        assert!(!Command::Status.needs_administrator());
-        assert!(!Command::Peers { network: None }.needs_administrator());
-        assert!(!Command::Address { network: None }.needs_administrator());
+    fn reading_and_up_and_down_need_no_administrator_and_everything_else_does() {
+        for reading in [
+            Command::Status,
+            Command::Peers { network: None, after: None },
+            Command::Address { network: None },
+            Command::Exposed { network: None },
+            Command::Pending { network: None },
+            Command::Waiting,
+            Command::Up { network: None },
+            Command::Down { network: None },
+        ] {
+            assert!(!reading.needs_an_administrator(), "{reading:?}");
+        }
+        for acting in [
+            Command::Stop,
+            Command::TakeOwnership { network: None },
+            Command::Forget { label: "casa".to_owned(), last_admin: false },
+            Command::Join { invite: String::new(), name: "laptop".to_owned() },
+            Command::Approve { network: None, name: "laptop".to_owned(), replace: false },
+            Command::Reject { network: None, name: "laptop".to_owned() },
+            Command::Withdraw { network: None, name: "laptop".to_owned() },
+            Command::CancelJoin { label: "joining".to_owned() },
+            Command::Abandon,
+        ] {
+            assert!(acting.needs_an_administrator(), "{acting:?}");
+        }
+    }
 
-        assert!(Command::Up { network: None }.needs_administrator());
-        assert!(Command::Down { network: None }.needs_administrator());
+    /// An approval, a rejection and an expiry read what was typed and refuse
+    /// what was not meant.
+    #[test]
+    fn approving_rejecting_and_expiring_read_what_was_typed() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::approval(&words("laptop --replace --network casa")),
+            Ok(Command::Approve {
+                network: Some("casa".to_owned()),
+                name: "laptop".to_owned(),
+                replace: true
+            })
+        );
+        assert_eq!(
+            Command::approval(&words("laptop")),
+            Ok(Command::Approve { network: None, name: "laptop".to_owned(), replace: false })
+        );
+        assert!(Command::approval(&[]).is_err());
+        assert!(Command::approval(&words("laptop desk")).is_err());
+        assert_eq!(
+            Command::rejection(&words("laptop")),
+            Ok(Command::Reject { network: None, name: "laptop".to_owned() })
+        );
+        assert!(Command::rejection(&words("laptop --replace")).is_err());
 
-        // The two the daemon decides against the machine rather than against a
-        // network, so the hint and the table agree on them.
-        assert!(Command::Stop.needs_administrator());
-        assert!(Command::TakeOwnership { network: None }.needs_administrator());
+        assert_eq!(Command::expiry("30m"), Ok(30));
+        assert_eq!(Command::expiry("24h"), Ok(24 * 60));
+        assert_eq!(Command::expiry("7d"), Ok(7 * 24 * 60));
+        for refused in ["0h", "h", "", "3", "1w", "-1d", "1.5h", "3é"] {
+            assert!(Command::expiry(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// The words a person types follow the same rule as the commands they send,
+    /// so the usage and the command line's own refusal say what the daemon does.
+    #[test]
+    fn the_words_follow_the_commands() {
+        for word in ["status", "peers", "address", "exposed", "pending", "up", "down"] {
+            assert!(!Command::word_needs_an_administrator(word), "{word}");
+        }
+        for word in [
+            "found",
+            "join",
+            "invite",
+            "approve",
+            "reject",
+            "withdraw",
+            "cancel",
+            "revoke",
+            "rename",
+            "forget",
+            "relay",
+            "set-anchors",
+            "ipv4",
+            "route",
+            "expose",
+            "unexpose",
+            "admit",
+            "stop",
+            "takeownership",
+        ] {
+            assert!(Command::word_needs_an_administrator(word), "{word}");
+        }
     }
 
     /// **Taking a network is reachable by typing it.**
@@ -2643,7 +3367,7 @@ mod tests {
 
     #[test]
     fn the_control_protocol_round_trips() {
-        let sent = Outcome::Reported(report(Standing::Current, vec![lagging("laptop", false)]));
+        let sent = Outcome::Reported(report(Standing::Current));
         let bytes = serde_json::to_vec(&sent).expect("encodes");
         let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
         assert_eq!(back, sent);
@@ -2651,19 +3375,36 @@ mod tests {
 
     /// Every command survives the pipe, the enrolment ones included.
     ///
-    /// Those three carry the only command that has a payload, and they are the
-    /// only ones a person does not type by name — so nothing else would notice
-    /// if they stopped encoding.
+    /// Those carry an invite or its details, and they are the only ones a
+    /// person does not type by name — so nothing else would notice if they
+    /// stopped encoding.
     #[test]
     fn every_command_round_trips() {
         let all = [
             Command::Status,
             Command::Up { network: None },
             Command::Down { network: None },
-            Command::Peers { network: None },
+            Command::Peers { network: None, after: None },
             Command::Address { network: None },
             Command::Stop,
-            Command::Admit { network: None, payload: "peerfectly-join-v1:abcdef".to_owned() },
+            Command::Invite {
+                network: None,
+                name: "sensor".to_owned(),
+                admin: false,
+                light: true,
+                groups: vec!["sensori".to_owned()],
+                ipv4: Some("100.64.0.9".to_owned()),
+                minutes: Some(120),
+            },
+            Command::Withdraw { network: None, name: "sensor".to_owned() },
+            Command::Pending { network: None },
+            Command::Approve { network: None, name: "sensor".to_owned(), replace: true },
+            Command::Reject { network: None, name: "sensor".to_owned() },
+            Command::CancelJoin { label: "network".to_owned() },
+            Command::Join {
+                invite: "peerfectly-invite-v1:abcdef".to_owned(),
+                name: "board".to_owned(),
+            },
             Command::Confirm,
             Command::Abandon,
             Command::Forget { label: "casa".to_owned(), last_admin: true },
@@ -2704,29 +3445,41 @@ mod tests {
         assert_eq!("only admin", back.kind());
     }
 
-    /// The admitting side's answer carries three things a person reads off a
-    /// screen, and all three have to arrive.
+    /// What a person reviews before approving survives the pipe: the names, the
+    /// fingerprint, when it arrived, and the device holding the name.
     #[test]
-    fn an_admitting_answer_round_trips() {
-        let sent = Outcome::Admitting {
-            proposed_name: "laptop".to_owned(),
-            fingerprint: "AB:CD:EF".to_owned(),
-            code: "004217".to_owned(),
-            // The device already answering to that name, with the identifier the
-            // decision falls on — a name is not an identity.
-            taken: Some(TakenName {
+    fn a_pending_list_round_trips() {
+        let sent = Outcome::Pending(PendingList {
+            invites: vec![InviteLine {
+                network: "casa".to_owned(),
                 name: "laptop".to_owned(),
-                id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
-            }),
-            accepted: false,
-        };
-
+                standing: "requested".to_owned(),
+                expires_at: 1_800_000_000,
+                request: Some(RequestLine {
+                    proposed_name: "Mario's laptop".to_owned(),
+                    fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                    arrived_at: 1_799_990_000,
+                    taken: Some(TakenName {
+                        name: "laptop".to_owned(),
+                        id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
+                    }),
+                    conflicts: Vec::new(),
+                }),
+            }],
+            joins: vec![JoinLine {
+                label: "network".to_owned(),
+                fingerprint: "AB12-CD34-EF56-7890-1234".to_owned(),
+                standing: "requested".to_owned(),
+                since: 1_799_980_000,
+                requested_at: Some(1_799_990_000),
+                problem: None,
+            }],
+            stopped: None,
+        });
         let bytes = serde_json::to_vec(&sent).expect("encodes");
         let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
         assert_eq!(back, sent);
-
-        let Outcome::Admitting { code, .. } = back else { panic!("the shape must survive") };
-        assert_eq!(code, "004217", "a leading zero is part of the code, not formatting");
+        assert_eq!("pending", back.kind());
     }
 
     /// The request a person is asked to authorise has to survive the pipe with
@@ -2913,41 +3666,26 @@ mod tests {
         assert_eq!(SigningKind::Possession, SigningKind::from(RequestKind::Possession));
     }
 
-    /// And the joining side's answer carries no code at all, which is the whole
-    /// of it: a client cannot show a person the number they are supposed to be
-    /// reading off the other machine.
-    #[test]
-    fn the_joining_answer_carries_no_code() {
-        let bytes = serde_json::to_vec(&Outcome::Enrolling).expect("encodes");
-        let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
-        assert_eq!(back, Outcome::Enrolling);
-
-        let text = String::from_utf8(bytes).expect("json is text");
-        assert!(!text.contains("code"), "the joining side's answer names no code: {text}");
-    }
-
-    /// The digits a person typed travel to the daemon, and a leading zero is
-    /// part of them.
-    #[test]
-    fn a_typed_code_round_trips() {
-        let sent = Command::ConfirmJoin { code: "004217".to_owned() };
-        let bytes = serde_json::to_vec(&sent).expect("encodes");
-        let back: Command = serde_json::from_slice(&bytes).expect("decodes");
-        assert_eq!(back, sent);
-    }
-
-    /// The three enrolment commands are not among the words a person types, and
-    /// they need no elevation: the daemon is already running as whatever it runs
-    /// as, and enrolling changes nothing on the machine.
+    /// The enrolment commands that carry an invite or its details are not among
+    /// the single words a person types, and they need an administrator, as
+    /// every act does.
     #[test]
     fn the_enrolment_commands_are_not_typed_by_name() {
         for command in [
-            Command::Admit { network: None, payload: String::new() },
+            Command::Invite {
+                network: None,
+                name: String::new(),
+                admin: false,
+                light: false,
+                groups: Vec::new(),
+                ipv4: None,
+                minutes: None,
+            },
             Command::Confirm,
             Command::Abandon,
         ] {
             assert!(command.is_enrolment());
-            assert!(!command.needs_administrator());
+            assert!(command.needs_an_administrator());
             assert!(
                 !Command::ALL
                     .iter()
@@ -3030,7 +3768,7 @@ mod tests {
     #[test]
     fn nothing_in_a_rendered_report_obeys_what_another_device_wrote() {
         let hostile = "x\u{1b}[31m\u{202e}y";
-        let mut report = report(Standing::Current, vec![revocation_owed_to(&[(hostile, false)])]);
+        let mut report = report(Standing::Current);
         let network = the_one(&mut report);
         network.relay = Some(hostile.to_owned());
         if let Some(peer) = network.peers.first_mut() {
@@ -3045,7 +3783,7 @@ mod tests {
             },
             second: Branch { does: Act::Admits(named(hostile, 3)), depth: None },
         }];
-        network.revoked = vec![Revoked {
+        let revoked = vec![Revoked {
             device: named(hostile, 4),
             revocations: vec![Revocation {
                 by: named(hostile, 5),
@@ -3060,7 +3798,7 @@ mod tests {
             at: SystemTime::UNIX_EPOCH,
         });
 
-        let drawn = report.to_string();
+        let drawn = format!("{report}{}", crate::views::RevokedRows(&revoked));
         assert!(!drawn.contains('\u{1b}'), "an escape reached the terminal: {drawn:?}");
         assert!(!drawn.contains('\u{202e}'), "an override reached the terminal: {drawn:?}");
     }
@@ -3069,23 +3807,25 @@ mod tests {
     #[test]
     fn what_was_signed_is_what_is_carried() {
         let hostile = "x\u{1b}[31m\u{202e}y";
-        let sent = Outcome::Reported(report(Standing::Current, vec![lagging(hostile, false)]));
+        let mut report = report(Standing::Current);
+        if let Some(peer) = the_one(&mut report).peers.first_mut() {
+            peer.name = hostile.to_owned();
+        }
+        let sent = Outcome::Reported(report);
         let back: Outcome = serde_json::from_slice(&serde_json::to_vec(&sent).unwrap()).unwrap();
         let Outcome::Reported(back) = back else { panic!("the shape must survive") };
         let name = back
             .networks
             .first()
-            .and_then(|network| network.waiting.first())
-            .and_then(|waiting| waiting.owed.first())
-            .and_then(|owed| owed.device.name.clone());
+            .and_then(|network| network.peers.first())
+            .map(|peer| peer.name.clone());
         assert_eq!(name.as_deref(), Some(hostile));
     }
 
     #[test]
     fn a_revoked_device_is_listed_as_held_here_with_the_signers_clock() {
         let then = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_757_000_000)).unwrap();
-        let mut report = report(Standing::Current, Vec::new());
-        the_one(&mut report).revoked = vec![
+        let revoked = vec![
             Revoked {
                 device: named("laptop", 4),
                 revocations: vec![Revocation {
@@ -3102,9 +3842,9 @@ mod tests {
             },
         ];
 
-        let drawn = report.to_string();
+        let drawn = crate::views::RevokedRows(&revoked).to_string();
         let said = said(&drawn);
-        assert!(said.contains("the revocations this device holds"), "{drawn}");
+        assert!(said.contains("laptop"), "{drawn}");
         // 2025-09-04 15:33 UTC: the 4th or the 5th in any zone, never the seconds.
         assert!(said.contains("the revoking device's clock said 2025-09-0"), "{drawn}");
         assert!(!said.contains("1757000000"), "{drawn}");
@@ -3118,12 +3858,10 @@ mod tests {
 
     #[test]
     fn no_recorded_contact_is_not_never() {
-        let drawn = report(Standing::Current, vec![lagging("laptop", false)]).to_string();
-        assert!(said(&drawn).contains("no contact with this device recorded"), "{drawn}");
-        assert!(!drawn.to_lowercase().contains("never"), "{drawn}");
+        assert_eq!(Contact::NoneRecorded.to_string(), "no contact with this device recorded");
 
         let at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_757_000_040)).unwrap();
-        let mut recorded = report(Standing::Current, Vec::new());
+        let mut recorded = report(Standing::Current);
         if let Some(peer) = the_one(&mut recorded).peers.first_mut() {
             peer.last_contact = Contact::Recorded { at };
         }
@@ -3136,7 +3874,7 @@ mod tests {
 
     #[test]
     fn an_equivocation_shows_its_branches_and_no_time() {
-        let mut report = report(Standing::Current, Vec::new());
+        let mut report = report(Standing::Current);
         let mut detail = accused("laptop");
         detail.pairs = 6;
         the_one(&mut report).accused = vec![detail];
@@ -3156,39 +3894,10 @@ mod tests {
         }
     }
 
-    /// A member that confirmed said it holds an operation. Whether it applies it
-    /// cannot be seen from here.
-    #[test]
-    fn a_confirmation_is_never_described_as_enforcement() {
-        let drawn = report(
-            Standing::Current,
-            vec![revocation_owed_to(&[("laptop", false), ("nas", true)])],
-        )
-        .to_string();
-        for claim in ["applies", "applying", "enforces", "enforcing", "in effect"] {
-            assert!(
-                !drawn.contains(claim),
-                "`{claim}` says more than a confirmation shows: {drawn}"
-            );
-        }
-    }
-
-    #[test]
-    fn operations_not_listed_are_counted_and_never_hide_a_revocation() {
-        let mut report = report(Standing::Current, vec![lagging("laptop", false)]);
-        the_one(&mut report).waiting_unlisted = 5;
-        let drawn = report.to_string();
-        assert!(drawn.contains("and 5 more operations waiting"), "{drawn}");
-        assert!(said(&drawn).contains("No revocation is among them"), "{drawn}");
-    }
-
     #[test]
     fn a_time_the_operation_does_not_carry_is_not_dated() {
         assert_eq!(Signed::from_ts(3), Signed::NotRecorded);
         assert!(matches!(Signed::from_ts(1_757_000_040_000), Signed::At { .. }));
-        let drawn = report(Standing::Current, vec![lagging("laptop", false)]).to_string();
-        assert!(drawn.contains("no time recorded"), "{drawn}");
-        assert!(!drawn.contains("1970"), "{drawn}");
     }
 
     /// A relay change is a transition, unless it is told otherwise, to a relay
@@ -3224,6 +3933,106 @@ mod tests {
         ] {
             assert!(Command::relay_change(&words(wrong)).is_err(), "`{wrong}` is not a change");
         }
+    }
+
+    #[test]
+    fn a_batch_file_is_read_and_its_format_held_to() {
+        let device = r#"{ "name": "s1", "serial": "SN1", "signing": "aa", "transport": "bb", "attestation": "cc" }"#;
+        let file = format!(
+            r#"{{ "format": "peerfectly-batch-v1", "label": "lot", "devices": [{device}] }}"#
+        );
+        let read = BatchFile::read(&file).unwrap();
+        assert_eq!((read.label.as_str(), read.devices.len()), ("lot", 1));
+
+        let other = file.replace("peerfectly-batch-v1", "peerfectly-batch-v9");
+        assert!(BatchFile::read(&other).unwrap_err().contains("peerfectly-batch-v1"));
+        let empty = r#"{ "format": "peerfectly-batch-v1", "label": "lot", "devices": [] }"#;
+        assert!(BatchFile::read(empty).unwrap_err().contains("no device"));
+        assert!(BatchFile::read("not json").is_err());
+    }
+
+    #[test]
+    fn a_withdrawal_names_one_invite() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::withdrawal(&words("sensor --network casa")).unwrap(),
+            Command::Withdraw { network: Some("casa".to_owned()), name: "sensor".to_owned() }
+        );
+        assert!(Command::withdrawal(&[]).is_err(), "no name");
+        assert!(Command::withdrawal(&words("sensor laptop")).is_err(), "two names");
+        assert!(Command::withdrawal(&words("sensor --all")).is_err(), "a flag it does not know");
+    }
+
+    #[test]
+    fn an_anchor_list_is_read_by_name_and_cleared_only_when_said() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+
+        assert_eq!(
+            Command::anchors_setting(&words("nas server --network casa")).unwrap(),
+            Command::SetAnchors {
+                network: Some("casa".to_owned()),
+                anchors: vec![Target::Name("nas".to_owned()), Target::Name("server".to_owned())],
+            }
+        );
+        assert_eq!(
+            Command::anchors_setting(&words("--none")).unwrap(),
+            Command::SetAnchors { network: None, anchors: Vec::new() }
+        );
+
+        assert!(Command::anchors_setting(&[]).is_err(), "an empty list is not a clearing");
+        assert!(Command::anchors_setting(&words("--network casa")).is_err(), "nor is a network");
+        assert!(Command::anchors_setting(&words("nas --none")).is_err(), "not both");
+        assert!(Command::anchors_setting(&words("--id 0a1b")).is_err(), "by name only");
+        assert!(Command::anchors_setting(&words("nas --network")).is_err(), "a network flag alone");
+    }
+
+    /// `route exclude` and `route include`, here or everywhere.
+    #[test]
+    fn the_route_acts_read_as_typed() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::route_act(&words("exclude 100.64.9.0/24 --network casa --everywhere")),
+            Ok(Command::Route {
+                network: Some("casa".to_owned()),
+                block: "100.64.9.0/24".to_owned(),
+                include: false,
+                everywhere: true,
+            })
+        );
+        assert_eq!(
+            Command::route_act(&words("include 100.64.9.7")),
+            Ok(Command::Route {
+                network: None,
+                block: "100.64.9.7".to_owned(),
+                include: true,
+                everywhere: false,
+            })
+        );
+        for wrong in ["exclude", "drop 10.0.0.0/16", "exclude a b", "include 10.0.0.1 --now"] {
+            assert!(Command::route_act(&words(wrong)).is_err(), "{wrong}");
+        }
+        assert!(Command::word_needs_an_administrator("route"));
+    }
+
+    /// `ipv4 block` and `ipv4 give`, each with its one argument.
+    #[test]
+    fn the_ipv4_acts_read_as_typed() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            Command::ipv4_act(&words("block 10.9.0.0/16 --network casa")),
+            Ok(Command::SetIpv4Block {
+                network: Some("casa".to_owned()),
+                block: "10.9.0.0/16".to_owned()
+            })
+        );
+        assert_eq!(
+            Command::ipv4_act(&words("give laptop")),
+            Ok(Command::GiveIpv4 { network: None, device: Target::Name("laptop".to_owned()) })
+        );
+        for wrong in ["block", "give a b", "move 10.0.0.0/16", "block 10.0.0.0/16 --now"] {
+            assert!(Command::ipv4_act(&words(wrong)).is_err(), "{wrong}");
+        }
+        assert!(Command::word_needs_an_administrator("ipv4"));
     }
 
     #[test]
@@ -3281,7 +4090,7 @@ mod tests {
             reason: "lost".to_owned(),
         };
         assert_eq!(rename.needs(), revoke.needs());
-        assert_eq!(rename.needs_administrator(), revoke.needs_administrator());
+        assert_eq!(rename.needs_an_administrator(), revoke.needs_an_administrator());
     }
 
     #[test]

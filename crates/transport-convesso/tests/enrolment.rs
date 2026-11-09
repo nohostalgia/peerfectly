@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use identity::NodeIdentity;
-use transport_convesso::enrolment::{Admitting, Channel, MAX_MESSAGE, Waiting};
+use transport_convesso::enrolment::{Admitting, Channel, MAX_MESSAGE, Waiting, rendezvous_key};
 use transport_convesso::fixture::{Network, TestRelay};
 
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -22,17 +22,37 @@ async fn exchange(waiting: &Waiting, admitting: &Admitting, relay: &str) -> (Cha
     (reached.expect("reaches"), accepted.expect("accepts"))
 }
 
+/// A joining device waits under its own transport key too: a member holding its
+/// admission dials that key, and the channel authenticates the device as it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_waiting_under_its_own_key_is_reached_there() {
+    let relay = TestRelay::start().await;
+    let joining = NodeIdentity::generate().unwrap();
+
+    let waiting = Waiting::under_own_key(&joining, &relay.written()).await.unwrap();
+    tokio::time::timeout(PATIENCE, waiting.online()).await.expect("registers at the relay");
+    assert_eq!(waiting.transport_key(), joining.transport_key().public_key());
+
+    let admitting = Admitting::dialling().await.unwrap();
+    let (admin, _joiner) = exchange(&waiting, &admitting, &relay.written()).await;
+    assert_eq!(
+        admin.peer().unwrap(),
+        joining.transport_key().public_key(),
+        "the device's own key, as the handshake authenticated it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exchange_binds_both_ends_to_one_channel() {
     let relay = TestRelay::start().await;
     let network = Network::on(&relay);
-    let joining = NodeIdentity::generate().unwrap();
+    let seed = [0x4c; 32];
 
-    let waiting = Waiting::listen(&joining, &relay.written()).await.unwrap();
+    let waiting = Waiting::at_rendezvous(&seed, &relay.written()).await.unwrap();
     tokio::time::timeout(PATIENCE, waiting.online()).await.expect("registers at the relay");
     assert_eq!(waiting.relay(), relay.written());
 
-    let admitting = Admitting::dialling(&network.founder, &network.state).await.unwrap();
+    let admitting = Admitting::dialling().await.unwrap();
     let (mut admin, mut joiner) = exchange(&waiting, &admitting, &relay.written()).await;
 
     // One channel: the same material, and each side sees the other's key.
@@ -40,7 +60,7 @@ async fn an_exchange_binds_both_ends_to_one_channel() {
     assert_eq!(admin.material().unwrap().len(), 32);
     assert_eq!(joiner.peer().unwrap(), admin.own(), "the admitting key, as authenticated");
     assert_eq!(admin.peer().unwrap(), joiner.own());
-    assert_eq!(joiner.own(), joining.transport_key().public_key(), "the joining device's own key");
+    assert_eq!(joiner.own(), rendezvous_key(&seed).unwrap(), "the key it waits under");
     assert_ne!(
         admin.own(),
         network.founder.transport_key().public_key(),
@@ -59,7 +79,7 @@ async fn an_exchange_binds_both_ends_to_one_channel() {
     assert!(admin.send(&vec![0; MAX_MESSAGE + 1]).await.is_err(), "and no larger");
 
     // A second exchange, from another admission, is another channel.
-    let again = Admitting::dialling(&network.founder, &network.state).await.unwrap();
+    let again = Admitting::dialling().await.unwrap();
     let (second, _) = exchange(&waiting, &again, &relay.written()).await;
     assert_ne!(second.material().unwrap(), admin.material().unwrap());
 }
@@ -67,8 +87,7 @@ async fn an_exchange_binds_both_ends_to_one_channel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_nobody_waits_as_is_not_reached() {
     let relay = TestRelay::start().await;
-    let network = Network::on(&relay);
-    let admitting = Admitting::dialling(&network.founder, &network.state).await.unwrap();
+    let admitting = Admitting::dialling().await.unwrap();
     let nobody = NodeIdentity::generate().unwrap();
     let reached = tokio::time::timeout(
         Duration::from_secs(30),
@@ -77,4 +96,35 @@ async fn a_device_nobody_waits_as_is_not_reached() {
     .await
     .expect("the dial finishes");
     assert!(reached.is_err());
+}
+
+/// An invited device waits under the key its invite's secret derives, and the
+/// admin that issued the invite derives the same key and dials it; the admin's
+/// endpoint dials only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invited_device_is_reached_at_its_rendezvous_key() {
+    let relay = TestRelay::start().await;
+    let seed = [0x5a; 32];
+
+    let waiting = Waiting::at_rendezvous(&seed, &relay.written()).await.unwrap();
+    tokio::time::timeout(PATIENCE, waiting.online()).await.expect("registers at the relay");
+    let key = rendezvous_key(&seed).unwrap();
+    assert_eq!(waiting.transport_key(), key, "waiting under the key the secret derives");
+
+    let admitting = Admitting::dialling().await.unwrap();
+    let written = relay.written();
+    let (reached, accepted) = tokio::time::timeout(PATIENCE, async {
+        tokio::join!(admitting.reach(&key, &written), waiting.accept())
+    })
+    .await
+    .expect("the exchange opens");
+    let (mut admin, mut joiner) = (reached.unwrap(), accepted.unwrap());
+    assert_eq!(admin.material().unwrap(), joiner.material().unwrap());
+    joiner.send(b"keys").await.unwrap();
+    assert_eq!(tokio::time::timeout(PATIENCE, admin.receive()).await.unwrap().unwrap(), b"keys");
+
+    // Another secret is another key, and the device waiting at this one is not
+    // found there.
+    let elsewhere = rendezvous_key(&[0x5b; 32]).unwrap();
+    assert_ne!(elsewhere, key);
 }

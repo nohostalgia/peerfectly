@@ -40,9 +40,23 @@ impl Admin {
         let depths = vec![1; heads.len()];
         Snapshot::new(
             7,
-            vec![0xa0],
-            heads,
-            depths,
+            vec![[0xa0; 32]],
+            [0xa0; 32],
+            roster::snapshot::Covering { heads, depths },
+            Vec::new(),
+            roster::leaf::DeviceLeaf {
+                record: self
+                    .identity
+                    .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+                    .unwrap()
+                    .into_record(roster::id::OperationId::from_bytes([1; 32]))
+                    .unwrap(),
+                settings: roster::leaf::DeviceSettings::default(),
+            },
+            roster::membership::MembershipProof {
+                devices: roster::merkle::Proof { siblings: Vec::new() },
+                parameters: [0; 32],
+            },
             self.identity.signing_key().key_id(),
             self.network,
         )
@@ -117,8 +131,14 @@ fn an_act_and_its_snapshot_hold_together() {
     assert_eq!(2, read.len());
 }
 
+/// An approval of the request for `laptop`, replacing the device holding the
+/// name or not.
+fn approving(replace: bool) -> Command {
+    Command::Approve { network: None, name: "laptop".to_owned(), replace }
+}
+
 /// A replacement: a revocation, the admission built on it, and the snapshot
-/// over both — for an admission confirmation, and nothing else.
+/// over both — for an approval that replaces, and nothing else.
 #[test]
 fn a_replacement_holds_together_only_as_an_admission() {
     let admin = Admin::new();
@@ -127,8 +147,12 @@ fn a_replacement_holds_together_only_as_an_admission() {
     let over = admin.snapshot_over(vec![admit.id()]);
     let items = || vec![operation(&revoke), operation(&admit), snapshot(&over)];
 
-    assert!(holds_together(&Command::Replace, &batch("casa", items())).is_ok());
-    assert!(holds_together(&Command::Confirm, &batch("casa", items())).is_ok());
+    assert!(holds_together(&approving(true), &batch("casa", items())).is_ok());
+    let refused = holds_together(&approving(false), &batch("casa", items())).unwrap_err();
+    assert!(
+        refused.contains("two acts"),
+        "an approval that does not replace revokes nothing: {refused}"
+    );
     let refused = holds_together(&revoking(None), &batch("casa", items())).unwrap_err();
     assert!(refused.contains("two acts"), "{refused}");
 }
@@ -196,7 +220,7 @@ fn acts_that_do_not_follow_one_another_are_refused() {
     let revoke = revocation(&admin, Vec::new());
     let beside = admission(&admin, Vec::new());
     let refused = holds_together(
-        &Command::Replace,
+        &approving(true),
         &batch("casa", vec![operation(&revoke), operation(&beside)]),
     )
     .unwrap_err();
@@ -285,6 +309,31 @@ fn a_settings_change_must_carry_what_was_typed() {
     assert!(!matches_what_was_asked(&relay("elsewhere.example"), &moving));
 }
 
+/// An anchor list signed holds one anchor for each name typed, case aside; and
+/// is described with the anchors it sets.
+#[test]
+fn an_anchor_list_must_be_as_long_as_the_names_typed() {
+    let admin = Admin::new();
+    let one = DeviceId::from_bytes([1; 32]);
+    let two = DeviceId::from_bytes([2; 32]);
+    let setting = |anchors: Vec<DeviceId>| {
+        admin.core(OperationBody::SetNetwork(params().with_anchors(anchors).unwrap()), Vec::new())
+    };
+    let named = |names: &[&str]| Command::SetAnchors {
+        network: None,
+        anchors: names.iter().map(|name| Target::Name((*name).to_owned())).collect(),
+    };
+    assert!(matches_what_was_asked(&named(&["nas", "server"]), &setting(vec![one, two])));
+    assert!(matches_what_was_asked(&named(&["nas", "NAS"]), &setting(vec![one])), "case aside");
+    assert!(!matches_what_was_asked(&named(&["nas"]), &setting(vec![one, two])), "one more");
+    assert!(!matches_what_was_asked(&named(&["nas", "server"]), &setting(vec![one])));
+    assert!(matches_what_was_asked(&named(&[]), &setting(Vec::new())), "a clearing");
+
+    let described =
+        describe(&Read::Operation(Box::new(setting(vec![one]))), "casa", &named(&["nas"])).act;
+    assert!(described.contains(&daemon::control::short_id(&one)), "{described}");
+}
+
 /// The reason a revocation gives is the one typed.
 #[test]
 fn a_revocation_must_carry_the_reason_typed() {
@@ -314,6 +363,8 @@ fn a_founding_typed_in_upper_case_is_the_one_asked_for() {
         suffix: "home.internal".to_owned(),
         relay: None,
         ipv4_range: None,
+        devices: None,
+        window_days: None,
     };
     assert!(matches_what_was_asked(&asked("Laptop"), &founding));
     assert!(matches_what_was_asked(&asked("laptop"), &founding));
@@ -364,7 +415,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
 
     let text = said(&Read::Operation(Box::new(revocation(&admin, Vec::new()))), &revoking(None));
     assert!(text.contains("revoke `laptop`") && text.contains("sold"), "{text}");
-    assert!(text.contains("permanent"), "{text}");
+    assert!(text.contains("invited again"), "{text}");
 
     let text = said(&Read::Operation(Box::new(admission(&admin, Vec::new()))), &Command::Confirm);
     assert!(text.contains("admit `laptop`") && text.contains("a member"), "{text}");
@@ -396,7 +447,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("rename `laptop` (") && text.contains("to `desk`"), "{text}");
 
     let body = admin.snapshot_over(vec![OperationId::from_bytes([3; 32])]);
-    let text = said(&Read::Snapshot(body), &Command::Confirm);
+    let text = said(&Read::Snapshot(Box::new(body)), &Command::Confirm);
     assert!(text.contains("current membership") && text.contains("snapshot 7"), "{text}");
     assert!(text.contains("routine") && text.contains("nobody's access changes"), "{text}");
     assert!(!text.contains("head"), "no jargon: {text}");
@@ -405,7 +456,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("prove") && text.contains("no roster changes"), "{text}");
 }
 
-/// A settings change shows the new values: relay, IPv4 range — and that
+/// A settings change shows the new values: relay, IPv4 block — and that
 /// everybody follows them.
 #[test]
 fn a_settings_change_shows_its_values() {
@@ -414,7 +465,7 @@ fn a_settings_change_shows_its_values() {
     let change = admin.core(OperationBody::SetNetwork(changed), Vec::new());
     let text = said(&Read::Operation(Box::new(change)), &Command::Confirm);
     assert!(text.contains("relay.example"), "{text}");
-    assert!(text.contains("IPv4 range"), "{text}");
+    assert!(text.contains("IPv4 block"), "{text}");
     assert!(text.contains("every device in casa follows this"), "{text}");
 }
 
@@ -442,19 +493,19 @@ fn the_list_names_the_network_and_every_act() {
     let admit = admission(&admin, vec![revoke.id()]);
     let over = admin.snapshot_over(vec![admit.id()]);
     let read = holds_together(
-        &Command::Replace,
+        &approving(true),
         &batch("ufficio", vec![operation(&revoke), operation(&admit), snapshot(&over)]),
     )
     .unwrap();
 
-    let shown = listed(&read, "ufficio", &Command::Replace);
+    let shown = listed(&read, "ufficio", &approving(true));
     assert!(shown.starts_with("ufficio: 3 acts to sign with this network's admin key"), "{shown}");
     assert!(shown.contains("  1. revoke"), "{shown}");
     assert!(shown.contains("  2. admit"), "{shown}");
     assert!(shown.contains("  3. record"), "{shown}");
-    assert!(shown.contains("permanent"), "{shown}");
+    assert!(shown.contains("invited again"), "{shown}");
 
-    let line = summary(&read, "ufficio", &Command::Replace);
+    let line = summary(&read, "ufficio", &approving(true));
     assert!(line.starts_with("peerfectly · ufficio: revoke"), "{line}");
     assert!(!line.contains('\n'), "one line: {line}");
 }

@@ -179,11 +179,11 @@ impl Lifecycle {
 
     /// Brings what is installed while up in line with what is wanted.
     ///
-    /// Only IPv4 moves: host routes no longer wanted come out first, then this
-    /// device's IPv4 address changes if it must, then new host routes go in. The
-    /// prefix route, the IPv6 address and the rule are never touched, and
-    /// anything in `wanted` that is not an IPv4 host route or address is ignored.
-    /// Other peers' routes are left alone.
+    /// Only IPv4 moves: IPv4 routes no longer wanted come out first, then this
+    /// device's IPv4 address changes if it must, then new IPv4 routes go in —
+    /// the block, or its parts around a hole. The prefix route, the IPv6
+    /// address and the rule are never touched, and anything in `wanted` that is
+    /// not an IPv4 route or address is ignored.
     ///
     /// Every step is attempted even after one fails, and `up` records what is
     /// actually installed afterwards, so the next reconciliation starts from the
@@ -194,21 +194,43 @@ impl Lifecycle {
     /// When something could not be added or removed. The error names what is
     /// left behind.
     pub async fn reconcile(&self, up: &mut Up, wanted: &Plan) -> Result<()> {
-        let wanted_hosts: Vec<Route> = wanted
-            .hosts()
-            .map(|route| {
-                Route::host(route.ipv4_host().unwrap_or(Ipv4Addr::UNSPECIFIED), up.interface)
-            })
+        let wanted_blocks: Vec<Route> = wanted
+            .ipv4_routes()
+            .filter_map(|route| route.ipv4_block())
+            .map(|(address, prefix_len)| Route::ipv4(address, prefix_len, up.interface))
             .collect();
         let mut left = Vec::new();
         let mut failed = None;
 
-        let stale: Vec<Route> = up
-            .routes
-            .iter()
-            .filter(|route| route.ipv4_host().is_some() && !wanted_hosts.contains(route))
-            .copied()
-            .collect();
+        let held_blocks: Vec<Route> =
+            up.routes.iter().filter(|route| route.ipv4_block().is_some()).copied().collect();
+        let routes_move = held_blocks.iter().any(|route| !wanted_blocks.contains(route))
+            || wanted_blocks.iter().any(|route| !up.routes.contains(route));
+        // Where any IPv4 route moves, all of them do: off, and on again after
+        // the address, as when the network comes up. Linux takes every IPv4
+        // route of an interface away with its last IPv4 address, so a route
+        // kept across the address going would be believed installed and gone.
+        let wanted_ipv4 = wanted.ipv4();
+        let address_goes = up.ipv4.is_some() && (routes_move || up.ipv4 != wanted_ipv4);
+        let (stale, fresh) = if routes_move || address_goes {
+            (held_blocks, wanted_blocks)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // **The address off before any route covering it moves, and on again
+        // after.** Windows, asked to remove an IPv4 route covering this
+        // device's `/32` while the address was held, left the address half
+        // there: in no table, nothing reaching it, and every attempt to make it
+        // again answered "already there" until the adapter itself was made
+        // again (2026-11-02, a person's PC, `route include` after `route
+        // exclude`). Taken off cleanly first, as a move of the block always
+        // did, it comes back whole.
+        if address_goes && let Some(old) = up.ipv4.take() {
+            // Not residue on its own, as in `undo`: it goes with the adapter.
+            let _removed = self.machine.remove_address(up.interface, old.into()).await;
+        }
+
         for route in stale {
             match self.machine.remove_route(&route).await {
                 Ok(()) => up.routes.retain(|held| *held != route),
@@ -219,27 +241,18 @@ impl Lifecycle {
             }
         }
 
-        let wanted_ipv4 = wanted.ipv4();
-        if up.ipv4 != wanted_ipv4 {
-            if let Some(old) = up.ipv4 {
-                // Not residue on its own, as in `undo`: it goes with the adapter.
-                let _removed = self.machine.remove_address(up.interface, old.into()).await;
-                up.ipv4 = None;
-            }
-            if let Some(new) = wanted_ipv4 {
-                match self.machine.assign_address(up.interface, new.into()).await {
-                    Ok(()) => up.ipv4 = Some(new),
-                    Err(failure) => {
-                        failed.get_or_insert(failure);
-                    }
+        if up.ipv4.is_none()
+            && let Some(new) = wanted_ipv4
+        {
+            match self.machine.assign_address(up.interface, new.into()).await {
+                Ok(()) => up.ipv4 = Some(new),
+                Err(failure) => {
+                    failed.get_or_insert(failure);
                 }
             }
         }
 
-        for route in wanted_hosts {
-            if up.routes.contains(&route) {
-                continue;
-            }
+        for route in fresh {
             match self.machine.install_route(&route).await {
                 Ok(()) => up.routes.push(route),
                 Err(failure) => {
@@ -252,6 +265,21 @@ impl Lifecycle {
             None => Ok(()),
             Some(failure) => Err(Self::wrap(failure, Step::InstallingRoutes, left)),
         }
+    }
+
+    /// Gives the adapter this device's IPv4 address back where the machine says
+    /// it no longer holds it. `Ok(true)` when it was given back.
+    ///
+    /// # Errors
+    ///
+    /// When it could not be given back.
+    pub async fn keep_ipv4(&self, up: &Up) -> Result<bool> {
+        let Some(held) = up.ipv4 else { return Ok(false) };
+        if self.machine.holds_address(up.interface, held.into()).await != Some(false) {
+            return Ok(false);
+        }
+        self.machine.assign_address(up.interface, held.into()).await?;
+        Ok(true)
     }
 
     /// Takes the tunnel down, removing everything it installed.
@@ -345,17 +373,18 @@ mod tests {
     use crate::machine::testing::{Fail, Recording};
 
     fn state() -> RosterState {
-        RosterState {
-            network: NetworkId::from_bytes([1; 32]),
-            params: NetworkParams::new(
+        RosterState::from_parts(
+            NetworkId::from_bytes([1; 32]),
+            NetworkParams::new(
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "example.internal",
                 2_592_000,
             )
             .expect("valid"),
-            devices: BTreeMap::new(),
-            revoked: BTreeSet::new(),
-        }
+            BTreeMap::new(),
+            BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     fn resolver() -> Ipv6Addr {
@@ -422,17 +451,18 @@ mod tests {
 
     /// A second network, with its own prefix and its own suffix.
     fn other_state() -> RosterState {
-        RosterState {
-            network: roster::id::NetworkId::from_bytes([2; 32]),
-            params: roster::types::NetworkParams::new(
+        RosterState::from_parts(
+            roster::id::NetworkId::from_bytes([2; 32]),
+            roster::types::NetworkParams::new(
                 vec![0xfd, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "lavoro.internal",
                 2_592_000,
             )
             .expect("valid"),
-            devices: std::collections::BTreeMap::new(),
-            revoked: std::collections::BTreeSet::new(),
-        }
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+            Default::default(),
+        )
     }
 
     #[tokio::test]
@@ -533,28 +563,40 @@ mod tests {
         text.parse().expect("valid")
     }
 
-    /// The plan a reconciliation is handed: this device at `own`, and these peers.
-    fn wanted(own: Option<&str>, peers: &[&str]) -> Plan {
+    /// The plan a reconciliation is handed: this device at `own`, and the
+    /// network's block less these holes, each `a.b.c.d/len`.
+    fn wanted(own: Option<&str>, holes: &[&str]) -> Plan {
+        let holes: Vec<crate::conflicts::Hole> = holes
+            .iter()
+            .map(|text| {
+                let (address, prefix_len) = text.split_once('/').expect("a block");
+                crate::conflicts::Hole {
+                    address: at(address),
+                    prefix_len: prefix_len.parse().expect("a length"),
+                    why: crate::conflicts::Conflict::Gateway,
+                }
+            })
+            .collect();
         Plan::wanted(
             &state().params,
             Interface::new(7),
             Some(resolver()),
             own.map(at),
-            peers.iter().map(|peer| at(peer)),
+            Some(&holes),
         )
         .expect("usable")
     }
 
-    fn host_routes(machine: &Recording) -> Vec<String> {
-        let mut hosts: Vec<String> = machine
+    fn ipv4_routes(machine: &Recording) -> Vec<String> {
+        let mut routes: Vec<String> = machine
             .installed()
             .routes
             .iter()
-            .filter(|route| route.ipv4_host().is_some())
+            .filter(|route| route.ipv4_block().is_some())
             .map(Route::prefix_text)
             .collect();
-        hosts.sort();
-        hosts
+        routes.sort();
+        routes
     }
 
     async fn brought_up() -> (Arc<Recording>, Lifecycle, Up) {
@@ -565,36 +607,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciling_assigns_this_devices_ipv4_address_and_routes_each_peer() {
+    async fn reconciling_assigns_this_devices_ipv4_address_and_routes_the_block() {
         let (machine, lifecycle, mut up) = brought_up().await;
 
-        lifecycle
-            .reconcile(&mut up, &wanted(Some("100.64.0.1"), &["100.64.0.2", "100.64.0.3"]))
-            .await
-            .expect("reconciles");
+        lifecycle.reconcile(&mut up, &wanted(Some("100.64.0.1"), &[])).await.expect("reconciles");
 
-        assert_eq!(host_routes(&machine), vec!["100.64.0.2/32", "100.64.0.3/32"]);
+        assert_eq!(ipv4_routes(&machine), vec!["100.64.0.0/10"], "one route, whatever the size");
         assert!(machine.installed().addresses.contains(&IpAddr::V4(at("100.64.0.1"))));
         assert_eq!(up.ipv4(), Some(at("100.64.0.1")));
+
+        // An admission or a revocation is the same plan: nothing moves.
+        let before = machine.installed();
+        lifecycle.reconcile(&mut up, &wanted(Some("100.64.0.1"), &[])).await.expect("again");
+        assert_eq!(machine.installed().routes, before.routes);
     }
 
-    /// An admission adds one route and a revocation removes one, and nothing
-    /// else moves.
+    /// A hole appearing takes its part out of the route, and its going gives the
+    /// block back whole — the caller hands a plan with it, then without.
     #[tokio::test]
-    async fn an_admission_adds_one_route_and_a_revocation_removes_one() {
+    async fn a_hole_appearing_splits_the_route_and_disappearing_restores_it() {
         let (machine, lifecycle, mut up) = brought_up().await;
         let own = Some("100.64.0.1");
-        lifecycle.reconcile(&mut up, &wanted(own, &["100.64.0.2"])).await.expect("ok");
+        lifecycle.reconcile(&mut up, &wanted(own, &[])).await.expect("ok");
         let prefix_before = machine.installed().routes.first().copied();
 
-        lifecycle
-            .reconcile(&mut up, &wanted(own, &["100.64.0.2", "100.64.0.3"]))
-            .await
-            .expect("admitted");
-        assert_eq!(host_routes(&machine), vec!["100.64.0.2/32", "100.64.0.3/32"]);
+        lifecycle.reconcile(&mut up, &wanted(own, &["100.64.0.0/11"])).await.expect("a hole");
+        assert_eq!(ipv4_routes(&machine), vec!["100.96.0.0/11"]);
 
-        lifecycle.reconcile(&mut up, &wanted(own, &["100.64.0.3"])).await.expect("revoked");
-        assert_eq!(host_routes(&machine), vec!["100.64.0.3/32"]);
+        lifecycle.reconcile(&mut up, &wanted(own, &[])).await.expect("restored");
+        assert_eq!(ipv4_routes(&machine), vec!["100.64.0.0/10"]);
 
         assert_eq!(machine.installed().routes.first().copied(), prefix_before, "the prefix stays");
         assert_eq!(
@@ -604,26 +645,245 @@ mod tests {
         );
     }
 
-    /// A peer withheld because a conflict appeared loses its route, and gets it
-    /// back when the conflict goes — the caller hands a plan without it, then
-    /// with it.
+    /// A machine that loses this device's IPv4 address whenever a route is
+    /// removed, as Windows did when the block's route was split and joined.
+    struct Forgetful(Arc<Recording>);
+
+    #[async_trait::async_trait]
+    impl Machine for Forgetful {
+        async fn create_adapter(
+            &self,
+            name: &str,
+            guid: [u8; 16],
+        ) -> Result<(Interface, Arc<dyn tunnel::Packets>)> {
+            self.0.create_adapter(name, guid).await
+        }
+        async fn remove_adapter(&self, interface: Interface) -> Result<()> {
+            self.0.remove_adapter(interface).await
+        }
+        async fn assign_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.0.assign_address(interface, address).await
+        }
+        async fn remove_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.0.remove_address(interface, address).await
+        }
+        async fn holds_address(&self, _interface: Interface, address: IpAddr) -> Option<bool> {
+            Some(self.0.installed().addresses.contains(&address))
+        }
+        async fn install_route(&self, route: &Route) -> Result<()> {
+            self.0.install_route(route).await
+        }
+        async fn remove_route(&self, route: &Route) -> Result<()> {
+            for address in self.0.installed().addresses {
+                if address.is_ipv4() {
+                    self.0.remove_address(route.interface(), address).await?;
+                }
+            }
+            self.0.remove_route(route).await
+        }
+        async fn install_rule(&self, rule: &Rule) -> Result<()> {
+            self.0.install_rule(rule).await
+        }
+        async fn remove_rule(&self, rule: &Rule) -> Result<()> {
+            self.0.remove_rule(rule).await
+        }
+        async fn sweep_rules(&self) -> Result<bool> {
+            self.0.sweep_rules().await
+        }
+    }
+
+    /// An address the machine dropped when a route moved is given back in the
+    /// same pass: splitting the block around a hole, and joining it again,
+    /// leave this device's address on the adapter.
     #[tokio::test]
-    async fn a_conflict_appearing_removes_a_route_and_disappearing_restores_it() {
-        let (machine, lifecycle, mut up) = brought_up().await;
+    async fn an_address_the_machine_dropped_when_a_route_moved_is_given_back() {
+        let machine = Arc::new(Recording::new());
+        let lifecycle =
+            Lifecycle::new(Arc::new(Forgetful(Arc::clone(&machine))) as Arc<dyn Machine>);
+        let (mut up, _device) = lifecycle.up("test", &state(), resolver()).await.expect("comes up");
         let own = Some("100.64.0.1");
-        lifecycle
-            .reconcile(&mut up, &wanted(own, &["100.64.0.2", "100.64.0.3"]))
-            .await
-            .expect("ok");
+        lifecycle.reconcile(&mut up, &wanted(own, &[])).await.expect("ok");
+        for holes in [&["100.64.0.2/32"][..], &[]] {
+            lifecycle.reconcile(&mut up, &wanted(own, holes)).await.expect("ok");
+            assert!(
+                machine.installed().addresses.contains(&IpAddr::V4(at("100.64.0.1"))),
+                "still on the adapter after {holes:?}"
+            );
+        }
+    }
 
-        lifecycle.reconcile(&mut up, &wanted(own, &["100.64.0.3"])).await.expect("withheld");
-        assert_eq!(host_routes(&machine), vec!["100.64.0.3/32"]);
+    /// A machine that, as Windows did, leaves an address half there when a
+    /// route covering it is removed while it is held: gone from the adapter,
+    /// and refused as "already there" from then on.
+    struct Haunted {
+        machine: Arc<Recording>,
+        ghosts: std::sync::Mutex<Vec<IpAddr>>,
+    }
 
-        lifecycle
-            .reconcile(&mut up, &wanted(own, &["100.64.0.2", "100.64.0.3"]))
-            .await
-            .expect("restored");
-        assert_eq!(host_routes(&machine), vec!["100.64.0.2/32", "100.64.0.3/32"]);
+    #[async_trait::async_trait]
+    impl Machine for Haunted {
+        async fn create_adapter(
+            &self,
+            name: &str,
+            guid: [u8; 16],
+        ) -> Result<(Interface, Arc<dyn tunnel::Packets>)> {
+            self.machine.create_adapter(name, guid).await
+        }
+        async fn remove_adapter(&self, interface: Interface) -> Result<()> {
+            self.machine.remove_adapter(interface).await
+        }
+        async fn assign_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            if self.ghosts.lock().expect("not poisoned").contains(&address) {
+                return Err(Error::Parameters { cause: "already there, and nowhere".to_owned() });
+            }
+            self.machine.assign_address(interface, address).await
+        }
+        async fn remove_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.machine.remove_address(interface, address).await
+        }
+        async fn install_route(&self, route: &Route) -> Result<()> {
+            self.machine.install_route(route).await
+        }
+        async fn remove_route(&self, route: &Route) -> Result<()> {
+            if let Some((base, len)) = route.ipv4_block() {
+                let mask = u32::MAX.checked_shl(32_u32.saturating_sub(u32::from(len))).unwrap_or(0);
+                for address in self.machine.installed().addresses {
+                    if let IpAddr::V4(held) = address
+                        && u32::from(held) & mask == u32::from(base) & mask
+                    {
+                        self.machine.remove_address(route.interface(), address).await?;
+                        self.ghosts.lock().expect("not poisoned").push(address);
+                    }
+                }
+            }
+            self.machine.remove_route(route).await
+        }
+        async fn install_rule(&self, rule: &Rule) -> Result<()> {
+            self.machine.install_rule(rule).await
+        }
+        async fn remove_rule(&self, rule: &Rule) -> Result<()> {
+            self.machine.remove_rule(rule).await
+        }
+        async fn sweep_rules(&self) -> Result<bool> {
+            self.machine.sweep_rules().await
+        }
+    }
+
+    /// Splitting the block around a hole and joining it again never removes a
+    /// route covering this device's address while the address is held, so the
+    /// address comes through both, on a machine that would otherwise lose it.
+    #[tokio::test]
+    async fn a_route_covering_the_address_moves_only_with_the_address_off() {
+        let machine = Arc::new(Recording::new());
+        let haunted =
+            Haunted { machine: Arc::clone(&machine), ghosts: std::sync::Mutex::default() };
+        let lifecycle = Lifecycle::new(Arc::new(haunted) as Arc<dyn Machine>);
+        let (mut up, _device) = lifecycle.up("test", &state(), resolver()).await.expect("comes up");
+        let own = Some("100.64.0.1");
+        lifecycle.reconcile(&mut up, &wanted(own, &[])).await.expect("ok");
+        for holes in [&["100.64.0.2/32"][..], &[], &["100.64.0.0/11"], &[]] {
+            lifecycle.reconcile(&mut up, &wanted(own, holes)).await.expect("no ghost made");
+            assert!(
+                machine.installed().addresses.contains(&IpAddr::V4(at("100.64.0.1"))),
+                "on the adapter after {holes:?}"
+            );
+        }
+    }
+
+    /// A machine that, as Linux does, takes every IPv4 route of an interface
+    /// away with its last IPv4 address, and finds no route to remove after.
+    struct Flushing(Arc<Recording>);
+
+    #[async_trait::async_trait]
+    impl Machine for Flushing {
+        async fn create_adapter(
+            &self,
+            name: &str,
+            guid: [u8; 16],
+        ) -> Result<(Interface, Arc<dyn tunnel::Packets>)> {
+            self.0.create_adapter(name, guid).await
+        }
+        async fn remove_adapter(&self, interface: Interface) -> Result<()> {
+            self.0.remove_adapter(interface).await
+        }
+        async fn assign_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.0.assign_address(interface, address).await
+        }
+        async fn remove_address(&self, interface: Interface, address: IpAddr) -> Result<()> {
+            self.0.remove_address(interface, address).await?;
+            if !self.0.installed().addresses.iter().any(IpAddr::is_ipv4) {
+                for route in self.0.installed().routes {
+                    if route.ipv4_block().is_some() {
+                        self.0.remove_route(&route).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        async fn install_route(&self, route: &Route) -> Result<()> {
+            self.0.install_route(route).await
+        }
+        async fn remove_route(&self, route: &Route) -> Result<()> {
+            self.0.remove_route(route).await
+        }
+        async fn install_rule(&self, rule: &Rule) -> Result<()> {
+            self.0.install_rule(rule).await
+        }
+        async fn remove_rule(&self, rule: &Rule) -> Result<()> {
+            self.0.remove_rule(rule).await
+        }
+        async fn sweep_rules(&self) -> Result<bool> {
+            self.0.sweep_rules().await
+        }
+    }
+
+    /// Where the machine takes the routes away with the address, every route
+    /// wanted is there after each change: a hole, its going, a new address.
+    #[tokio::test]
+    async fn routes_taken_with_the_address_are_all_put_back() {
+        let machine = Arc::new(Recording::new());
+        let lifecycle =
+            Lifecycle::new(Arc::new(Flushing(Arc::clone(&machine))) as Arc<dyn Machine>);
+        let (mut up, _device) = lifecycle.up("test", &state(), resolver()).await.expect("comes up");
+        for (own, holes) in [
+            ("100.64.0.1", &[][..]),
+            ("100.64.0.1", &["100.64.0.2/32"]),
+            ("100.64.0.1", &[]),
+            ("100.64.0.9", &[]),
+        ] {
+            let plan = wanted(Some(own), holes);
+            lifecycle.reconcile(&mut up, &plan).await.expect("ok");
+            let mut held: Vec<String> = machine
+                .installed()
+                .routes
+                .iter()
+                .filter(|route| route.ipv4_block().is_some())
+                .map(Route::prefix_text)
+                .collect();
+            let mut planned: Vec<String> =
+                plan.ipv4_routes().map(|route| route.prefix_text()).collect();
+            held.sort();
+            planned.sort();
+            assert_eq!(held, planned, "after {own} less {holes:?}");
+            assert!(machine.installed().addresses.contains(&IpAddr::V4(at(own))));
+        }
+    }
+
+    /// An address the machine says it no longer holds is given back by the
+    /// check that runs every second, and one it holds is left alone.
+    #[tokio::test]
+    async fn an_address_the_machine_says_it_lost_is_given_back() {
+        let machine = Arc::new(Recording::new());
+        let lifecycle =
+            Lifecycle::new(Arc::new(Forgetful(Arc::clone(&machine))) as Arc<dyn Machine>);
+        let (mut up, _device) = lifecycle.up("test", &state(), resolver()).await.expect("comes up");
+        lifecycle.reconcile(&mut up, &wanted(Some("100.64.0.1"), &[])).await.expect("ok");
+        assert!(!lifecycle.keep_ipv4(&up).await.expect("asked"), "held: nothing to do");
+
+        let own = IpAddr::V4(at("100.64.0.1"));
+        machine.remove_address(up.interface(), own).await.expect("dropped behind its back");
+        assert!(lifecycle.keep_ipv4(&up).await.expect("given back"));
+        assert!(machine.installed().addresses.contains(&own));
     }
 
     /// The prefix route, the IPv6 address and the rule are never touched while
@@ -635,7 +895,7 @@ mod tests {
 
         let nothing = Plan::default();
         lifecycle.reconcile(&mut up, &nothing).await.expect("reconciles");
-        lifecycle.reconcile(&mut up, &wanted(None, &["100.64.9.9"])).await.expect("ok");
+        lifecycle.reconcile(&mut up, &wanted(None, &["100.64.9.0/24"])).await.expect("ok");
         lifecycle.reconcile(&mut up, &nothing).await.expect("reconciles");
 
         let after = machine.installed();
@@ -644,19 +904,20 @@ mod tests {
         assert_eq!(after.rules, before.rules, "and the rule");
     }
 
-    /// Never a default route of either family, and never the range as a whole.
+    /// Never a default route of either family, and no IPv4 route wider than the
+    /// network's block.
     #[tokio::test]
-    async fn no_default_route_and_no_whole_range_ever_appear() {
+    async fn no_default_route_and_nothing_wider_than_the_block_ever_appear() {
         let (machine, lifecycle, mut up) = brought_up().await;
         lifecycle
-            .reconcile(&mut up, &wanted(Some("100.64.0.1"), &["100.64.0.0", "100.127.255.255"]))
+            .reconcile(&mut up, &wanted(Some("100.64.0.1"), &["100.64.0.0/30", "100.127.255.0/24"]))
             .await
             .expect("reconciles");
 
         for route in machine.installed().routes {
             assert!(!route.is_default_route(), "{route}");
-            if route.ipv4_host().is_some() {
-                assert_eq!(route.prefix_length(), 32, "{route}");
+            if route.ipv4_block().is_some() {
+                assert!(route.prefix_length() >= 10, "{route}");
             }
         }
     }
@@ -676,13 +937,13 @@ mod tests {
         assert!(machine.installed().addresses.iter().all(IpAddr::is_ipv6), "withheld here");
     }
 
-    /// Taking down after reconciling removes the host routes and the IPv4
+    /// Taking down after reconciling removes the IPv4 routes and the IPv4
     /// address too.
     #[tokio::test]
     async fn taking_down_removes_what_reconciling_added() {
         let (machine, lifecycle, mut up) = brought_up().await;
         lifecycle
-            .reconcile(&mut up, &wanted(Some("100.64.0.1"), &["100.64.0.2"]))
+            .reconcile(&mut up, &wanted(Some("100.64.0.1"), &["100.64.0.2/32"]))
             .await
             .expect("ok");
         lifecycle.down(&up).await.expect("goes down");

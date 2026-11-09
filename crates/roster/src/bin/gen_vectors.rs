@@ -3,7 +3,7 @@
 //! Run deliberately, never on build:
 //!
 //! ```text
-//! cargo run -p roster --bin gen-vectors
+//! cargo run -p roster --bin gen_vectors
 //! ```
 //!
 //! The corpus is committed, and regenerating it must produce a visible diff. A
@@ -78,10 +78,16 @@ struct Merge {
     rule: &'static str,
     /// The operations, hex, in creation order.
     operations: Vec<String>,
+    /// Batch pieces, hex, offered after every operation.
+    pieces: Vec<String>,
     /// Hex of the canonical derived state, when the set derives.
     state: Option<String>,
     /// Hex of the state fingerprint, when the set derives.
     fingerprint: Option<String>,
+    /// Hex of the state root — devices and parameters as tree leaves — when
+    /// the set derives. What a light member is shown, so a second
+    /// implementation must reach the same bytes.
+    root: Option<String>,
     /// The expected failure kind, when the set does not derive.
     error_kind: Option<&'static str>,
     /// Operations that must be disregarded, and why: hex id and reason kind.
@@ -211,6 +217,10 @@ const UNCOVERABLE_KINDS: &[&str] = &[
     // implementations may differ and both be right, so pinning it in a shared
     // corpus would be wrong. `snapshots.rs` covers every gate directly.
     "compaction_refused",
+    // Only attestations have a sequence that must advance now, and attestations
+    // have no shared corpus: they are dated by each node's own clock, which no
+    // vector can pin. `snapshots.rs` covers the regression directly.
+    "snapshot_sequence_regressed",
 ];
 
 // ---------------------------------------------------------------------------
@@ -305,6 +315,30 @@ fn body_of(op_type: OperationType) -> OperationBody {
             OperationBody::Rename { device: target, name: "workstation".to_owned() }
         }
         OperationType::SetNetwork => OperationBody::SetNetwork(params()),
+        OperationType::SetDevice => OperationBody::SetDevice {
+            device: target,
+            change: roster::leaf::SettingsChange {
+                mode: Some(roster::leaf::Mode::Light),
+                groups: Some(vec![roster::leaf::Group::new("sensori").expect("a group")]),
+                ipv4: Some(Some([0, 0, 0, 9])),
+                relay: None,
+            },
+        },
+        OperationType::AdmitBatch => OperationBody::AdmitBatch(
+            roster::batch::BatchHeader::new(
+                roster::batch::Commitment {
+                    count: 500,
+                    entries: [0x5a; 32],
+                    pieces: 40,
+                    layout: [0x5b; 32],
+                },
+                roster::leaf::Mode::Light,
+                vec![roster::leaf::Group::new("sensori").expect("a group")],
+                None,
+                "lot A",
+            )
+            .expect("a header"),
+        ),
     }
 }
 
@@ -512,14 +546,14 @@ fn build_negatives() -> Vec<Negative> {
         "network parameters omitting the relay field",
         "missing_field",
         set_network({
+            // Two of the three fields every parameters map carries: the window
+            // may be left out, the relay may not.
             let mut out = Vec::new();
-            out.push(0xa3);
+            out.push(0xa2);
             push_text(&mut out, "ula");
             push_bytes(&mut out, &[0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
             push_text(&mut out, "suffix");
             push_text(&mut out, "example.internal");
-            push_text(&mut out, "snapshot_window");
-            out.push(0x01);
             out
         }),
     );
@@ -617,10 +651,15 @@ fn build_negatives() -> Vec<Negative> {
         // which stopped being *one more* the day the schema grew to eight keys,
         // and the vector went on passing — as a duplicate key, under a name that
         // said otherwise.
+        // As many repeated ranges as it takes for the map to really hold one
+        // entry more than the schema: four fixed keys, the rest ranges.
         set_network(params_map_with_ipv4(
             u8::try_from(roster::types::NETWORK_PARAMS_SCHEMA.len().saturating_add(1))
                 .unwrap_or(u8::MAX),
-            &[&[10, 42, 0, 0, 16], &[10, 42, 0, 0, 16], &[10, 42, 0, 0, 16]],
+            &vec![
+                &[10_u8, 42, 0, 0, 16][..];
+                roster::types::NETWORK_PARAMS_SCHEMA.len().saturating_sub(3)
+            ],
             false,
         )),
     );
@@ -901,12 +940,14 @@ struct Chain {
     pub net: Option<NetworkId>,
     /// Makes otherwise-identical operations distinct.
     nonce: u64,
+    /// Batch pieces, offered after every operation.
+    pieces: Vec<Vec<u8>>,
 }
 
 impl Chain {
     /// Starts an empty history.
     fn new() -> Self {
-        Self { entries: Vec::new(), net: None, nonce: 0 }
+        Self { entries: Vec::new(), net: None, nonce: 0, pieces: Vec::new() }
     }
 
     /// Creates the network. The founding operation carries the zero network
@@ -1012,6 +1053,9 @@ fn merge_vector(name: &str, rule: &'static str, chain: &Chain) -> Merge {
             refused.push((operation.to_hex(), reason.kind()));
         }
     }
+    for piece in &chain.pieces {
+        let _ = roster.offer_piece(piece);
+    }
     refused.sort_by(|a, b| a.0.cmp(&b.0));
 
     let dag = roster.dag();
@@ -1028,8 +1072,10 @@ fn merge_vector(name: &str, rule: &'static str, chain: &Chain) -> Merge {
                 name: name.to_owned(),
                 rule,
                 operations: chain.hex_operations(),
+                pieces: chain.pieces.iter().map(|piece| hex::encode(piece)).collect(),
                 state: Some(hex::encode(&state.to_bytes())),
                 fingerprint: Some(hex::encode(&state.fingerprint())),
+                root: Some(hex::encode(&state.root())),
                 error_kind: None,
                 invalid,
                 refused,
@@ -1039,8 +1085,10 @@ fn merge_vector(name: &str, rule: &'static str, chain: &Chain) -> Merge {
             name: name.to_owned(),
             rule,
             operations: chain.hex_operations(),
+            pieces: chain.pieces.iter().map(|piece| hex::encode(piece)).collect(),
             state: None,
             fingerprint: None,
+            root: None,
             error_kind: Some(error.kind()),
             invalid: Vec::new(),
             refused,
@@ -1080,7 +1128,8 @@ fn build_merges() -> Vec<Merge> {
     );
     out.push(merge_vector("revocation beats a concurrent promotion", "revocation-wins", &chain));
 
-    // Rule 1 again: a later add does not resurrect a revoked device.
+    // Rule 1 again: an admission that follows the revocation is a deliberate
+    // act, and admits the device again.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
     chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
@@ -1094,9 +1143,137 @@ fn build_merges() -> Vec<Merge> {
         "readd",
         1,
         &["revoke"],
+        OperationBody::AddDevice(device(2, "laptop-again", Role::Member, false)),
+    );
+    out.push(merge_vector("a later admission admits again", "revocation-wins", &chain));
+
+    // Rule 1: an admission concurrent with a revocation of the same device loses.
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    chain.op(
+        "add9",
+        1,
+        &["g"],
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+    );
+    chain.op(
+        "add2",
+        1,
+        &["add9"],
         OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
     );
-    out.push(merge_vector("revocation is definitive", "revocation-wins", &chain));
+    chain.op(
+        "revoke",
+        1,
+        &["add2"],
+        OperationBody::RevokeDevice { device: seed_device_id(2), reason: "stolen".to_owned() },
+    );
+    chain.op(
+        "readd",
+        9,
+        &["add2"],
+        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+    );
+    out.push(merge_vector(
+        "an admission concurrent with a revocation loses",
+        "revocation-wins",
+        &chain,
+    ));
+
+    // Settings: two admins change different fields of one device at once, and
+    // both stand.
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    chain.op(
+        "add9",
+        1,
+        &["g"],
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+    );
+    chain.op(
+        "add2",
+        1,
+        &["add9"],
+        OperationBody::AddDevice(device(2, "sensor", Role::Member, false)),
+    );
+    chain.op(
+        "ipv4",
+        1,
+        &["add2"],
+        OperationBody::SetDevice {
+            device: seed_device_id(2),
+            change: roster::leaf::SettingsChange {
+                ipv4: Some(Some([0, 0, 0, 2])),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+    );
+    chain.op(
+        "groups",
+        9,
+        &["add2"],
+        OperationBody::SetDevice {
+            device: seed_device_id(2),
+            change: roster::leaf::SettingsChange {
+                groups: Some(vec![roster::leaf::Group::new("sensori").expect("a group")]),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+    );
+    out.push(merge_vector(
+        "concurrent settings of one device both stand",
+        "settings-per-field",
+        &chain,
+    ));
+
+    // Parameters: two admins change different parameters at once, and both
+    // stand.
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    chain.op(
+        "add9",
+        1,
+        &["g"],
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+    );
+    let mut anchored = params();
+    anchored.anchors = vec![seed_device_id(9)];
+    chain.op("anchors", 1, &["add9"], OperationBody::SetNetwork(anchored));
+    let mut policed = params();
+    policed.policy = vec![roster::parameters::Rule {
+        from: roster::leaf::Group::new("sensori").expect("a group"),
+        to: roster::leaf::Group::new("controller").expect("a group"),
+    }];
+    chain.op("policy", 9, &["add9"], OperationBody::SetNetwork(policed));
+    out.push(merge_vector(
+        "concurrent changes to different parameters both stand",
+        "parameters-per-leaf",
+        &chain,
+    ));
+
+    // Admins are full: promoting a light device has no effect.
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "sensor", Role::Member, false)));
+    chain.op(
+        "light",
+        1,
+        &["add2"],
+        OperationBody::SetDevice {
+            device: seed_device_id(2),
+            change: roster::leaf::SettingsChange {
+                mode: Some(roster::leaf::Mode::Light),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+    );
+    chain.op(
+        "promote",
+        1,
+        &["light"],
+        OperationBody::Promote { device: seed_device_id(2), founder: false },
+    );
+    out.push(merge_vector("a light device is not made an admin", "admins-are-full", &chain));
 
     // Rule 2: concurrent demote beats promote.
     let mut chain = Chain::new();
@@ -1378,6 +1555,7 @@ fn build_merges() -> Vec<Merge> {
         entries: chain.entries.iter().skip(1).cloned().collect(),
         net: chain.net,
         nonce: chain.nonce,
+        pieces: Vec::new(),
     };
     out.push(set_error_vector(
         "an operation set missing its genesis",
@@ -1386,7 +1564,57 @@ fn build_merges() -> Vec<Merge> {
         "missing_genesis",
     ));
 
+    out.push(batch_skip_vector());
+
     out
+}
+
+/// A batch whose entries collide with what its ancestors hold: a member it
+/// names again, and an offset another device holds. Both are skipped, the
+/// rest stand.
+fn batch_skip_vector() -> Merge {
+    let entry = |seed: u8| roster::batch::BatchEntry {
+        keys: device(seed, "fixture", Role::Member, false).keys,
+        name: format!("sensor-{seed}"),
+        serial: format!("SN{seed:04}").into_bytes(),
+        ipv4: Some([0, 0, 0, seed]),
+    };
+    let entries: Vec<roster::batch::BatchEntry> = [20, 21, 22, 23].into_iter().map(entry).collect();
+    let header = roster::batch::BatchHeader::for_entries(
+        &entries,
+        roster::leaf::Mode::Light,
+        Vec::new(),
+        Some(roster::batch::OffsetRun::new([0, 0, 0, 20], 4).expect("a run")),
+        "lot",
+    )
+    .expect("a header");
+
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
+    // Device 20 is admitted on its own first.
+    chain.op(
+        "single",
+        1,
+        &["add2"],
+        OperationBody::AddDevice(device(20, "fixture", Role::Member, false)),
+    );
+    // And device 2 is given the offset entry 22 was given.
+    chain.op(
+        "address",
+        2,
+        &["single"],
+        OperationBody::SetDevice {
+            device: seed_device_id(2),
+            change: roster::leaf::SettingsChange {
+                ipv4: Some(Some([0, 0, 0, 22])),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+    );
+    chain.op("batch", 1, &["address"], OperationBody::AdmitBatch(header));
+    chain.pieces = roster::batch::pieces_of(&chain.id("batch"), &entries).expect("pieces");
+    merge_vector("a batch skips a member and a taken address", "batch-skip", &chain)
 }
 
 /// A vector whose operation set must be rejected as a set.
@@ -1395,8 +1623,10 @@ fn set_error_vector(name: &str, rule: &'static str, chain: &Chain, kind: &'stati
         name: name.to_owned(),
         rule,
         operations: chain.hex_operations(),
+        pieces: chain.pieces.iter().map(|piece| hex::encode(piece)).collect(),
         state: None,
         fingerprint: None,
+        root: None,
         error_kind: Some(kind),
         invalid: Vec::new(),
         // A set that does not place at all is refused as a set; nothing in it is
@@ -1415,21 +1645,38 @@ fn params_named(suffix: &str) -> NetworkParams {
 // Snapshot vectors
 // ---------------------------------------------------------------------------
 
+/// A snapshot body over `state`, at `generation`, signed by the device of
+/// `seed` whether or not it is an admin, committing to `root`.
+///
+/// Built field by field rather than through `Snapshot::over`, because the
+/// corpus needs snapshots no honest builder would produce: one signed by a
+/// member, one committing to a state the history does not imply.
+fn snapshot_body(
+    state: &roster::state::RosterState,
+    covering: roster::snapshot::Covering,
+    generation: u64,
+    seed: u8,
+    root: [u8; 32],
+    network: NetworkId,
+) -> Snapshot {
+    let author = ed25519(seed).key_id();
+    let device = state.device_holding(&author).expect("the signer is in the state");
+    let signer = state.leaf(&device).expect("a member");
+    let proof = roster::membership::MembershipProof::of(state, &device).expect("proves");
+    let previous = if generation == 1 { Vec::new() } else { vec![state.root()] };
+    Snapshot::new(generation, previous, root, covering, Vec::new(), signer, proof, author, network)
+        .expect("well-formed snapshot")
+}
+
 /// Builds a snapshot over the operations a chain's labelled head covers.
 fn snapshot_over(chain: &Chain, seq: u64, seed: u8, head: &str, network: NetworkId) -> Vec<u8> {
     let dag = Dag::from_operations(chain.verified()).expect("the set places");
     let head_id = chain.id(head);
     let index = dag.position(&head_id).expect("head is held");
-    let state = derive(&dag).expect("derives").to_bytes();
-    let body = Snapshot::new(
-        seq,
-        state,
-        vec![head_id],
-        vec![dag.depth(index)],
-        ed25519(seed).key_id(),
-        network,
-    )
-    .expect("well-formed snapshot");
+    let state = derive(&dag).expect("derives");
+    let covering =
+        roster::snapshot::Covering { heads: vec![head_id], depths: vec![dag.depth(index)] };
+    let body = snapshot_body(&state, covering, seq, seed, state.root(), network);
     sign_snapshot(&body, &ed25519(seed)).expect("signs")
 }
 
@@ -1493,14 +1740,20 @@ fn build_snapshots() -> Vec<SnapshotVector> {
             OperationBody::AddDevice(device(9, "ghost", Role::Admin, false)),
         );
         let dag = Dag::from_operations(fabricated.verified()).expect("places");
-        derive(&dag).expect("derives").to_bytes()
+        derive(&dag).expect("derives").root()
     };
     let head_id = chain.id("rename2");
     let dag = Dag::from_operations(chain.verified()).expect("places");
     let depth = dag.depth(dag.position(&head_id).expect("held"));
-    let lying_body =
-        Snapshot::new(1, liar, vec![head_id], vec![depth], ed25519(1).key_id(), network)
-            .expect("well-formed");
+    let honest = derive(&dag).expect("derives");
+    let lying_body = snapshot_body(
+        &honest,
+        roster::snapshot::Covering { heads: vec![head_id], depths: vec![depth] },
+        1,
+        1,
+        liar,
+        network,
+    );
     out.push(SnapshotVector {
         name: "a snapshot claiming a state the history does not imply".to_owned(),
         snapshot: hex::encode(&sign_snapshot(&lying_body, &ed25519(1)).expect("signs")),
@@ -1520,28 +1773,6 @@ fn build_snapshots() -> Vec<SnapshotVector> {
         error_kind: Some("unauthorized_author"),
         follow_up: None,
         follow_up_error: None,
-    });
-
-    // A sequence that does not advance.
-    out.push(SnapshotVector {
-        name: "a snapshot whose sequence number regresses".to_owned(),
-        snapshot: hex::encode(&snapshot_over(&chain, 7, 1, "rename2", network)),
-        operations: operations.clone(),
-        accepted: true,
-        error_kind: None,
-        follow_up: Some(hex::encode(&snapshot_over(&chain, 4, 1, "add2", network))),
-        follow_up_error: Some("snapshot_sequence_regressed"),
-    });
-
-    // Two claims at one number: both refused.
-    out.push(SnapshotVector {
-        name: "two conflicting snapshots at one sequence number".to_owned(),
-        snapshot: hex::encode(&snapshot_over(&chain, 5, 1, "rename2", network)),
-        operations: operations.clone(),
-        accepted: true,
-        error_kind: None,
-        follow_up: Some(hex::encode(&snapshot_over(&chain, 5, 1, "add2", network))),
-        follow_up_error: Some("snapshot_sequence_conflict"),
     });
 
     // A snapshot belonging to another network.
@@ -1967,6 +2198,9 @@ fn render_merge(vectors: &[Merge]) -> String {
             if let Some(fingerprint) = &vector.fingerprint {
                 let _ = writeln!(out, "      \"fingerprint\": \"{fingerprint}\",");
             }
+            if let Some(root) = &vector.root {
+                let _ = writeln!(out, "      \"root\": \"{root}\",");
+            }
         }
         let _ = writeln!(out, "      \"invalid\": [");
         for (position, (id, reason)) in vector.invalid.iter().enumerate() {
@@ -1986,6 +2220,15 @@ fn render_merge(vectors: &[Merge]) -> String {
             );
         }
         let _ = writeln!(out, "      ],");
+        if !vector.pieces.is_empty() {
+            let _ = writeln!(out, "      \"pieces\": [");
+            for (position, piece) in vector.pieces.iter().enumerate() {
+                let comma =
+                    if position.saturating_add(1) == vector.pieces.len() { "" } else { "," };
+                let _ = writeln!(out, "        \"{piece}\"{comma}");
+            }
+            let _ = writeln!(out, "      ],");
+        }
         let _ = writeln!(out, "      \"operations\": [");
         for (position, operation) in vector.operations.iter().enumerate() {
             let comma =

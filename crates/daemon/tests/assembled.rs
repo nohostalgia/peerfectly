@@ -42,6 +42,9 @@ struct Fixture {
     joiner: Arc<NodeIdentity>,
     genesis: Vec<u8>,
     add: Vec<u8>,
+    /// The joiner's IPv4 offset, given after its admission as an admin's
+    /// daemon gives it.
+    given: Vec<u8>,
     network: NetworkId,
     state: RosterState,
 }
@@ -80,16 +83,34 @@ impl Fixture {
         )
         .expect("well-formed");
         let add_bytes = sign_operation(&add, founder.signer()).expect("signs");
+        let given = OperationCore::new(
+            3,
+            founder.signing_key().algorithm(),
+            OperationBody::SetDevice {
+                device: joiner.device_id(),
+                change: roster::leaf::SettingsChange {
+                    ipv4: Some(Some(2_u32.to_be_bytes())),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+            vec![add.id()],
+            founder.signing_key().key_id(),
+            network,
+        )
+        .expect("well-formed");
+        let given_bytes = sign_operation(&given, founder.signer()).expect("signs");
 
         let mut node = Roster::with_clock(Box::new(daemon::state::WallClock));
         assert!(node.offer_bytes(&genesis_bytes).is_accepted());
         assert!(node.offer_bytes(&add_bytes).is_accepted());
+        assert!(node.offer_bytes(&given_bytes).is_accepted());
 
         Self {
             founder,
             joiner,
             genesis: genesis_bytes,
             add: add_bytes,
+            given: given_bytes,
             network,
             state: node.state().expect("derives"),
         }
@@ -100,6 +121,7 @@ impl Fixture {
         let mut roster = Roster::with_clock(Box::new(daemon::state::WallClock));
         assert!(roster.offer_bytes(&self.genesis).is_accepted());
         assert!(roster.offer_bytes(&self.add).is_accepted());
+        assert!(roster.offer_bytes(&self.given).is_accepted());
         roster
     }
 
@@ -273,6 +295,15 @@ fn packet(source: Ipv6Addr, destination: Ipv6Addr) -> Vec<u8> {
 /// Two assembled nodes with a session between them, ready to be pumped.
 async fn pair() -> (Fixture, Assembled, Assembled, Arc<dyn Session>, Arc<dyn Session>) {
     let fixture = Fixture::found();
+    let roster = fixture.roster();
+    pair_holding(fixture, roster).await
+}
+
+/// As [`pair`], the founder holding a roster of the caller's choosing.
+async fn pair_holding(
+    fixture: Fixture,
+    founder_roster: Roster,
+) -> (Fixture, Assembled, Assembled, Arc<dyn Session>, Arc<dyn Session>) {
     let fabric = MemoryFabric::new();
 
     let founder_transport = Arc::new(
@@ -288,8 +319,13 @@ async fn pair() -> (Fixture, Assembled, Assembled, Arc<dyn Session>, Arc<dyn Ses
     let dialled: Arc<dyn Session> = Arc::from(dialled.expect("establishes"));
     let accepted: Arc<dyn Session> = Arc::from(accepted.expect("establishes"));
 
-    let founder =
-        assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+    let founder = assemble_holding(
+        &fixture,
+        founder_roster,
+        &fixture.founder,
+        founder_transport as Arc<dyn Transport>,
+    )
+    .await;
     let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
 
     (fixture, founder, joiner, dialled, accepted)
@@ -353,6 +389,8 @@ async fn an_admission_while_up_makes_ipv4_routable_and_a_revocation_refuses_it()
     }
 
     founder.node.admit_without_activating(&fixture.add).await.expect("the founder may add");
+    assert_eq!(watched.borrow_and_update().of(&joiner), None, "admitted, not given one yet");
+    founder.node.admit_without_activating(&fixture.given).await.expect("the founder may set");
     assert!(watched.has_changed().expect("the node is alive"), "the change is signalled");
     assert_eq!(watched.borrow_and_update().of(&joiner), Some(address));
 
@@ -505,6 +543,40 @@ async fn crossing_sessions_keep_the_one_the_lower_id_dialled_in_either_order() {
         }
         assert_eq!(founder.node.session_count().await, 1);
     }
+}
+
+/// **A session the peer lost is not kept against it.** Past the moment two
+/// dials can cross, a dial from the peer that keeps the lower id's session
+/// means it no longer holds that one: the new session is kept and the old
+/// closed. Kept instead, every dial it made was closed for a session only this
+/// side still had (found in the testbed, 18.1).
+#[tokio::test]
+async fn a_dial_after_the_crossing_window_replaces_a_session_the_peer_lost() {
+    let (fixture, founder, _joiner, dialled, _accepted) = pair().await;
+    let peer = dialled.peer();
+    let lower_dials_here = fixture.founder.device_id() < peer;
+    let (kept, other) = if lower_dials_here {
+        (Opening::Dialled, Opening::Accepted)
+    } else {
+        (Opening::Accepted, Opening::Dialled)
+    };
+    founder.node.closed(&peer).await;
+    let held = Watched::to(peer);
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&held))), kept).await;
+
+    // Within the window, a crossing dial is settled as before.
+    let crossing = Watched::to(peer);
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&crossing))), other).await;
+    assert!(crossing.closed() && !held.closed(), "two dials crossing keep the lower id's");
+
+    // Past it, the peer dialled because it lost the one held here.
+    tokio::time::pause();
+    tokio::time::advance(daemon::limits::CROSSING_DIALS + std::time::Duration::from_secs(1)).await;
+    let again = Watched::to(peer);
+    founder.node.opened(Box::new(WatchedHandle(Arc::clone(&again))), other).await;
+    assert!(held.closed(), "the session the peer lost is closed");
+    assert!(!again.closed(), "and its new one kept");
+    assert_eq!(founder.node.session_count().await, 1);
 }
 
 /// **A dial that returns has registered its session**: whoever asks next
@@ -923,6 +995,7 @@ async fn the_roster_is_rebuilt_from_what_arrived() {
 
     log.append(&fixture.genesis).expect("appends");
     log.append(&fixture.add).expect("appends");
+    log.append(&fixture.given).expect("appends");
 
     let mut rebuilt = Roster::with_clock(Box::new(daemon::state::WallClock));
     for operation in log.read().expect("reads") {
@@ -1152,6 +1225,38 @@ async fn an_unused_session_is_closed_without_a_fault() {
     assert_eq!(None, founder.node.fault().await, "and nothing went wrong");
 }
 
+/// A session with a light member is not closed however long it carries
+/// nothing: it is how the light member hears of a new root.
+#[tokio::test(start_paused = true)]
+async fn an_unused_session_with_a_light_member_is_kept() {
+    let fixture = Fixture::found();
+    let mut roster = fixture.roster();
+    let core = OperationCore::new(
+        3,
+        fixture.founder.signing_key().algorithm(),
+        OperationBody::SetDevice {
+            device: fixture.joiner.device_id(),
+            change: roster::leaf::SettingsChange {
+                mode: Some(roster::leaf::Mode::Light),
+                ..roster::leaf::SettingsChange::default()
+            },
+        },
+        roster.heads(),
+        fixture.founder.signing_key().key_id(),
+        fixture.network,
+    )
+    .expect("well-formed");
+    let light = sign_operation(&core, fixture.founder.signer()).expect("signs");
+    assert!(roster.offer_bytes(&light).is_accepted());
+
+    let (fixture, founder, _joiner, dialled, _accepted) = pair_holding(fixture, roster).await;
+    register(&founder, &dialled).await;
+
+    tokio::time::advance(IDLE * 6).await;
+    founder.node.close_idle(IDLE).await;
+    assert!(founder.node.has_session(&fixture.joiner.device_id()).await, "still open");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_session_in_use_is_kept() {
     let (fixture, founder, joiner, dialled, accepted) = pair().await;
@@ -1289,7 +1394,11 @@ async fn a_rename_is_in_force_on_both_members() {
     let signed = sign_operation(&rename, fixture.founder.signer()).expect("signs");
     let before = joiner.node.state().await.expect("derives");
     assert_eq!(
-        before.devices.get(&fixture.joiner.device_id()).map(|record| record.name.as_str()),
+        before
+            .devices
+            .get(&fixture.joiner.device_id())
+            .map(|record| record.name.clone())
+            .as_deref(),
         Some("joiner"),
         "named `joiner` before"
     );

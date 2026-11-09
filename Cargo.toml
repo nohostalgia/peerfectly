@@ -5,14 +5,17 @@ members = [
     "crates/daemon",
     "crates/enrollment",
     "crates/identity",
+    "crates/light-node",
     "crates/linux-daemon",
     "crates/local-discovery",
+    "crates/member-store",
     "crates/programs",
     "crates/relay-server",
     "crates/roster",
     "crates/roster-sync",
     "crates/transport",
     "crates/transport-convesso",
+    "crates/transport-wire",
     "crates/tunnel",
     "crates/windows-daemon",
 ]
@@ -22,7 +25,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.4.1"
+version = "0.5.0"
 license = "AGPL-3.0-or-later"
 # Built and shipped from here, as programs and packages; none of the crates
 # goes to crates.io, and they depend on each other by path.
@@ -35,17 +38,23 @@ rust-version = "1.95"
 [workspace.dependencies]
 # The transport, from its repository, fixed to one commit: a new one is taken on
 # purpose, never by an update.
-convesso-core = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
-convesso-stream = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
-convesso-tokio = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
-convesso-relay = { git = "https://github.com/nohostalgia/convesso", rev = "d9d7e6f71398a3a0ac36cf35d035b35744748615" }
+convesso-core = { git = "https://github.com/nohostalgia/convesso", rev = "f55e0a18d08938cbc2de657d19baf2b6702fd87a" }
+convesso-stream = { git = "https://github.com/nohostalgia/convesso", rev = "f55e0a18d08938cbc2de657d19baf2b6702fd87a" }
+convesso-tokio = { git = "https://github.com/nohostalgia/convesso", rev = "f55e0a18d08938cbc2de657d19baf2b6702fd87a" }
+convesso-relay = { git = "https://github.com/nohostalgia/convesso", rev = "f55e0a18d08938cbc2de657d19baf2b6702fd87a" }
 # Canonical CBOR. Chosen over serde-based codecs so encoding stays byte-exact and
 # under our control.
 minicbor = { version = "2.3.0", features = ["alloc"] }
-blake3 = "1.8.7"
+# Without their `std` defaults, so the roster builds for a microcontroller
+# (`no_std` + `alloc`); a crate that runs on an operating system asks for `std`.
+blake3 = { version = "1.8.7", default-features = false }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
-p256 = { version = "0.14.0", features = ["ecdsa"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
 signature = "3.0.0"
+# The shared pointer of a build without `std`, on any microcontroller: native
+# atomics where the chip has them; where it has none (an ESP32-C3), what the
+# firmware tells `portable-atomic` to use.
+portable-atomic-util = { version = "0.2.8", default-features = false, features = ["alloc"] }
 getrandom = "0.4.3"
 tokio = { version = "1.48.0", features = ["sync", "rt", "macros", "time"] }
 async-trait = "0.1.90"
@@ -79,4 +88,21 @@ opt-level = 3
 # The neighbour simulation scores every pair of five thousand members, which is
 # seventy-five million hashes: minutes unoptimised, seconds optimised.
 [profile.dev.package.blake3]
+opt-level = 3
+
+# Every signature a simulated network checks — tens of thousands of roots and
+# proofs for ten thousand light members — goes through these: twenty minutes
+# unoptimised (`daemon::simulator`).
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+# A full member's layers and base are read through redb, every entry checked
+# against its tree: a million boards' measurement is hours unoptimised.
+[profile.dev.package.redb]
 opt-level = 3

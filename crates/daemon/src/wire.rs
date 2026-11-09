@@ -155,17 +155,27 @@ mod tests {
     }
 
     fn state() -> RosterState {
-        RosterState {
-            network: NetworkId::from_bytes([1; 32]),
-            params: NetworkParams::new(
+        RosterState::from_parts(
+            NetworkId::from_bytes([1; 32]),
+            NetworkParams::new(
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "example.internal",
                 2_592_000,
             )
             .expect("valid"),
-            devices: [record(1, "nas")].into_iter().map(|item| (item.id, item)).collect(),
-            revoked: BTreeSet::new(),
-        }
+            [record(1, "nas")].into_iter().map(|item| (item.id, item)).collect(),
+            BTreeSet::new(),
+            // The nas given the block's first host.
+            [(
+                DeviceId::from_bytes([1; 32]),
+                roster::leaf::DeviceSettings {
+                    ipv4: Some(1_u32.to_be_bytes()),
+                    ..roster::leaf::DeviceSettings::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
     }
 
     fn query_bytes(name: &str, kind: RecordType) -> Vec<u8> {
@@ -230,14 +240,18 @@ mod tests {
     fn held(withheld: bool) -> Ipv4View {
         let state = state();
         let device = DeviceId::from_bytes([1; 32]);
-        Ipv4View {
-            holdings: std::sync::Arc::new(tunnel::Ipv4Holdings::of_state(&state)),
-            withheld: std::sync::Arc::new(if withheld {
-                [(device, crate::conflicts::Conflict::Gateway)].into_iter().collect()
-            } else {
-                std::collections::BTreeMap::new()
-            }),
-        }
+        let holdings = tunnel::Ipv4Holdings::of_state(&state);
+        let holes = holdings
+            .of(&device)
+            .filter(|_| withheld)
+            .map(|address| crate::conflicts::Hole {
+                address,
+                prefix_len: 32,
+                why: crate::conflicts::Conflict::Gateway,
+            })
+            .into_iter()
+            .collect();
+        Ipv4View { holdings: std::sync::Arc::new(holdings), withheld: std::sync::Arc::new(holes) }
     }
 
     fn answered(view: &Ipv4View, name: &str, kind: RecordType) -> Message {

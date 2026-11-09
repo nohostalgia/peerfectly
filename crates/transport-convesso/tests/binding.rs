@@ -16,8 +16,9 @@ use roster::types::Algorithm;
 use transport::error::Error;
 use transport::session::{Path, Session, Transport};
 use transport_convesso::fixture::{Network, TestRelay};
-use transport_convesso::frame::{Frame, Reason};
+use transport_convesso::frame::{Frame, Limits, OWN, Reason, VERSION};
 use transport_convesso::{BuildError, ConvessoTransport};
+use transport_wire::parts::Joiner;
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -226,7 +227,8 @@ async fn another_version_is_refused_as_such() {
     let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
 
     let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
-    let open = Frame::Open { version: 99, id: 42 }.encode();
+    let open =
+        Frame::Open { version: 99, id: 42, limits: Limits::LEAST, evidence: Vec::new() }.encode();
     raw.send_message(Address::parse(founder_key).unwrap(), open).await.unwrap();
 
     let answer = tokio::time::timeout(PATIENCE, async {
@@ -242,6 +244,40 @@ async fn another_version_is_refused_as_such() {
     assert_eq!(answer, Some(Frame::Refuse { id: 42, reason: Reason::Version }));
 }
 
+/// **A refused open leaves no session.** A peer whose `OPEN` is refused passed
+/// the handshake, and the accepting side closes convesso's session with it
+/// once the refusal has had time to reach it: kept, the keys outlived the
+/// refusal on that side alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_open_leaves_no_session() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let open =
+        Frame::Open { version: 99, id: 42, limits: Limits::LEAST, evidence: Vec::new() }.encode();
+    raw.send_message(Address::parse(founder_key).unwrap(), open).await.unwrap();
+
+    let (refusal, closed) = tokio::time::timeout(PATIENCE, async {
+        let mut refusal = None;
+        while let Some(event) = events.next().await {
+            match event {
+                ContextEvent::Message { data, .. } => refusal = Frame::decode(&data),
+                ContextEvent::Closed { by_peer, .. } => return (refusal, Some(by_peer)),
+                _ => {}
+            }
+        }
+        (refusal, None)
+    })
+    .await
+    .expect("the session closes");
+    assert_eq!(refusal, Some(Frame::Refuse { id: 42, reason: Reason::Version }), "refused first");
+    assert_eq!(closed, Some(true), "the accepting side closed it");
+}
+
 /// The next frame `events` delivers as a message.
 async fn next_frame(events: &mut ContextEvents) -> Option<Frame> {
     tokio::time::timeout(PATIENCE, async {
@@ -254,6 +290,117 @@ async fn next_frame(events: &mut ContextEvents) -> Option<Frame> {
     })
     .await
     .expect("a frame comes")
+}
+
+/// A peer that says it takes small messages, as a microcontroller does, is
+/// sent a payload larger than that in parts, each within what it said, and
+/// puts it back together whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_taking_small_messages_is_sent_a_large_payload_in_parts() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let to_founder = Address::parse(founder_key).unwrap();
+
+    let open = Frame::Open { version: VERSION, id: 5, limits: Limits::LEAST, evidence: Vec::new() };
+    raw.send_message(to_founder, open.encode()).await.unwrap();
+    let Some(Frame::Accept { id: 5, limits, .. }) = next_frame(&mut events).await else {
+        panic!("the open is accepted");
+    };
+    assert_eq!(limits, OWN, "and the founder says what it takes");
+    let session = tokio::time::timeout(PATIENCE, founder.accept()).await.unwrap().unwrap();
+
+    let payload = vec![7u8; 10_000];
+    session.send(&payload).await.unwrap();
+    let mut joiner = Joiner::new();
+    let mut messages = 0_usize;
+    let arrived = tokio::time::timeout(PATIENCE, async {
+        while let Some(event) = events.next().await {
+            if let ContextEvent::Message { data, .. } = event {
+                assert!(data.len() <= Limits::LEAST.message_len(), "{} bytes", data.len());
+                messages += 1;
+                if let Some(frame) = joiner.take(&data, Limits::LEAST.frame_len()) {
+                    return Frame::decode(&frame);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .expect("the payload comes");
+    assert_eq!(arrived, Some(Frame::Payload { id: 5, bytes: payload }));
+    assert!(messages > 1, "in parts");
+
+    // Larger than it puts back together: refused here rather than lost there.
+    let too_large = vec![1u8; Limits::LEAST.frame_len()];
+    assert!(matches!(session.send(&too_large).await, Err(Error::PayloadTooLarge { .. })));
+}
+
+/// **A session outlives convesso's.** Past its keys' life convesso tells the
+/// session idle and forgets it, and each side ends its reader so that the
+/// channel is forgotten too. The next payload, from either side, opens a new
+/// convesso session and arrives on the same session of this binding.
+///
+/// Waits out the keys' life on the real clock: run by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "waits three minutes: cargo test -p transport-convesso --test binding -- --ignored"]
+async fn a_session_carries_on_after_convesso_forgets_its_own() {
+    let (_relay, _network, founder, joiner) = pair().await;
+    let (dialled, accepted) = session(&founder, &joiner).await;
+    dialled.send(b"before").await.unwrap();
+    assert_eq!(accepted.recv().await.unwrap(), b"before".to_vec());
+
+    tokio::time::sleep(Duration::from_secs(200)).await;
+
+    dialled.send(b"after, one way").await.unwrap();
+    let got = tokio::time::timeout(PATIENCE, accepted.recv()).await.expect("arrives").unwrap();
+    assert_eq!(got, b"after, one way".to_vec());
+
+    tokio::time::sleep(Duration::from_secs(200)).await;
+
+    accepted.send(b"after, the other").await.unwrap();
+    let got = tokio::time::timeout(PATIENCE, dialled.recv()).await.expect("arrives").unwrap();
+    assert_eq!(got, b"after, the other".to_vec());
+}
+
+/// **A payload for a session this node does not hold is answered with a
+/// `CLOSE`, once.** What a peer that crashed and came back looks like from
+/// the other side: convesso starts its new session's channels anew without a
+/// reset, so the frames of a session it kept arrive for a session id nobody
+/// holds. Told, the sender ends that session rather than send into nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_for_a_session_nobody_holds_is_answered_with_a_close() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let to_founder = Address::parse(founder_key).unwrap();
+
+    for _ in 0..2 {
+        let stale = Frame::Payload { id: 77, bytes: b"into nothing".to_vec() }.encode();
+        raw.send_message(to_founder, stale).await.unwrap();
+    }
+    assert_eq!(
+        next_frame(&mut events).await,
+        Some(Frame::Close { id: 77, reason: Reason::Ordinary })
+    );
+
+    // Once: the second stale payload brings no second close.
+    let more = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = events.next().await {
+            if let ContextEvent::Message { data, .. } = event {
+                return Frame::decode(&data);
+            }
+        }
+        None
+    })
+    .await;
+    assert!(more.is_err(), "told once: {more:?}");
 }
 
 /// **An `ACCEPT` for a dial given up on is answered with a `CLOSE`.** The far
@@ -295,7 +442,12 @@ async fn an_accept_for_a_dial_given_up_on_is_closed() {
     dialling.abort();
     let _ = dialling.await;
 
-    raw.send_message(to_founder, Frame::Accept { id }.encode()).await.unwrap();
+    raw.send_message(
+        to_founder,
+        Frame::Accept { id, limits: Limits::LEAST, evidence: Vec::new() }.encode(),
+    )
+    .await
+    .unwrap();
     assert_eq!(next_frame(&mut events).await, Some(Frame::Close { id, reason: Reason::Ordinary }));
 }
 
@@ -391,14 +543,26 @@ async fn a_revoked_device_is_closed_and_then_refused_in_the_handshake() {
     }
 
     // The revoked device still holds the old state, so it dials as a member
-    // would: the founder's handshake is what refuses it.
-    let dial = tokio::time::timeout(PATIENCE, joiner.connect(&founder.transport_key()))
-        .await
-        .expect("the dial finishes");
-    match dial {
-        Err(error) => assert!(error.is_membership_refusal(), "{error:?}"),
-        Ok(_) => panic!("a revoked device must not establish"),
-    }
+    // would: the founder's handshake is what refuses it. A dial made at once
+    // may meet the old channel being reset instead, and fail as unreachable:
+    // with signatures fast, as in a release build, it does. It never
+    // establishes, and once the old channel is gone it is refused as what it
+    // is.
+    let refused = tokio::time::timeout(PATIENCE, async {
+        loop {
+            match joiner.connect(&founder.transport_key()).await {
+                Ok(_) => panic!("a revoked device must not establish"),
+                Err(error) if error.is_membership_refusal() => return error,
+                Err(Error::PeerUnreachable { .. }) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(other) => panic!("neither a refusal nor the old channel: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("refused within patience");
+    assert!(refused.is_membership_refusal(), "{refused:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -733,4 +897,380 @@ async fn a_session_nobody_reads_holds_back_its_peer_alone() {
         .unwrap();
     assert_eq!(received, b"from another peer".to_vec());
     flood.abort();
+}
+
+// ---------------------------------------------------------------------------
+// A node holding no roster
+// ---------------------------------------------------------------------------
+
+/// A judge believing only the network's root.
+fn believing(network: &Network) -> transport_convesso::node::Judge {
+    let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
+    Arc::new(move |shown: &roster::membership::Shown| shown.against == root)
+}
+
+/// The joiner as a light member, on `relay`, showing `evidence`.
+async fn light(network: &Network, evidence: Vec<u8>) -> ConvessoTransport {
+    ConvessoTransport::bind_light(
+        &network.joiner,
+        network.state.network,
+        network.state.params.clone(),
+        evidence,
+        believing(network),
+    )
+    .await
+    .unwrap()
+}
+
+/// A full member that shows its evidence, as a daemon holding a root does.
+async fn full_showing(network: &Network, who: &Arc<NodeIdentity>) -> ConvessoTransport {
+    let node = ConvessoTransport::bind(who, network.state.clone()).await.unwrap();
+    node.update_evidence(network.evidence.get(&who.device_id()).unwrap().clone());
+    node
+}
+
+#[tokio::test]
+async fn a_light_member_and_a_full_one_authenticate_each_other_both_ways() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let (dialled, accepted) = session(&joiner, &full).await;
+    assert_eq!(dialled.peer(), network.founder.device_id(), "the light one learns who it reached");
+    assert_eq!(accepted.peer(), network.joiner.device_id(), "the full one knows it by its state");
+
+    let (dialled, accepted) = session(&full, &joiner).await;
+    assert_eq!(dialled.peer(), network.joiner.device_id());
+    assert_eq!(accepted.peer(), network.founder.device_id(), "known by its evidence");
+}
+
+/// A light member holds no roster, so it knows nobody it has not met: a member
+/// admitted a moment ago, dialling it first, is still read, and judged by what
+/// it shows.
+#[tokio::test]
+async fn a_light_member_is_reached_by_a_full_one_it_never_met() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let (dialled, accepted) = session(&full, &joiner).await;
+    assert_eq!(dialled.peer(), network.joiner.device_id());
+    assert_eq!(accepted.peer(), network.founder.device_id(), "known by its evidence");
+}
+
+#[tokio::test]
+async fn a_light_member_refuses_a_proof_of_another_devices_leaf() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    // The third device shows the founder's evidence: valid, and not its own.
+    let impostor = ConvessoTransport::bind(&network.third, network.state.clone()).await.unwrap();
+    impostor.update_evidence(network.evidence.get(&network.founder.device_id()).unwrap().clone());
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(impostor.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let key = impostor.transport_key();
+    let dialled = tokio::time::timeout(PATIENCE, joiner.connect(&key)).await.unwrap();
+    assert!(
+        matches!(dialled, Err(ref error) if error.is_membership_refusal()),
+        "{:?}",
+        dialled.as_ref().err()
+    );
+
+    // And dialled by it, it refuses the same way.
+    let key = joiner.transport_key();
+    let (dialled, _) = tokio::time::timeout(PATIENCE, async {
+        tokio::join!(
+            impostor.connect(&key),
+            tokio::time::timeout(Duration::from_secs(3), joiner.accept())
+        )
+    })
+    .await
+    .unwrap();
+    assert!(dialled.is_err(), "a light member takes no session on another's proof");
+}
+
+#[tokio::test]
+async fn a_light_member_refuses_a_peer_showing_nothing() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let silent = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    let joiner =
+        light(&network, network.evidence.get(&network.joiner.device_id()).unwrap().clone()).await;
+    tokio::time::timeout(PATIENCE, async { tokio::join!(silent.online(), joiner.online()) })
+        .await
+        .unwrap();
+    let key = silent.transport_key();
+    let dialled = tokio::time::timeout(PATIENCE, joiner.connect(&key)).await.unwrap();
+    assert!(dialled.is_err());
+}
+
+#[tokio::test]
+async fn a_light_member_cuts_off_a_peer_its_view_no_longer_believes() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    // A view that believes the founder until told it was invalidated.
+    let invalidated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
+    let judge: transport_convesso::node::Judge = {
+        let invalidated = Arc::clone(&invalidated);
+        Arc::new(move |shown: &roster::membership::Shown| {
+            shown.against == root
+                && !(invalidated.load(Ordering::SeqCst) && shown.leaf.record.name == "founder")
+        })
+    };
+    let joiner = ConvessoTransport::bind_light(
+        &network.joiner,
+        network.state.network,
+        network.state.params.clone(),
+        network.evidence.get(&network.joiner.device_id()).unwrap().clone(),
+        judge,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+    let (dialled, _accepted) = session(&joiner, &full).await;
+
+    joiner.reconsider();
+    assert!(dialled.send(b"still").await.is_ok(), "nothing changed, nothing closes");
+
+    invalidated.store(true, Ordering::SeqCst);
+    joiner.reconsider();
+    assert!(
+        matches!(dialled.send(b"gone").await, Err(Error::ClosedOnMembershipLoss)),
+        "a peer the view stopped believing is cut off"
+    );
+}
+
+/// A light member that believes the full one only once it has taken the
+/// chain `chain`, asking after `held`: the judge, and how it catches up.
+fn catching_up_on(
+    network: &Network,
+    held: [u8; 32],
+    chain: &'static [u8],
+) -> (transport_convesso::node::Judge, transport::session::CatchingUp, Arc<AtomicUsize>) {
+    let caught_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let root = roster::snapshot::RawSnapshot::decode(&network.root).unwrap().body().root;
+    let judge: transport_convesso::node::Judge = {
+        let caught_up = Arc::clone(&caught_up);
+        Arc::new(move |shown: &roster::membership::Shown| {
+            shown.against == root && caught_up.load(Ordering::SeqCst)
+        })
+    };
+    let behind = {
+        let caught_up = Arc::clone(&caught_up);
+        let asked = Arc::clone(&asked);
+        Arc::new(move |_: &[u8]| {
+            if caught_up.load(Ordering::SeqCst) {
+                return None;
+            }
+            asked.fetch_add(1, Ordering::SeqCst);
+            Some(held)
+        })
+    };
+    let take = Arc::new(move |_: &[u8], roots: &[u8]| {
+        let taken = roots == chain;
+        if taken {
+            caught_up.store(true, Ordering::SeqCst);
+        }
+        taken
+    });
+    (judge, transport::session::CatchingUp { behind, take }, asked)
+}
+
+/// Roots served for `held` alone: `chain`.
+fn serving(held: [u8; 32], chain: &'static [u8]) -> transport::session::RootsAfter {
+    Arc::new(move |since: [u8; 32], _room: usize| {
+        Box::pin(async move { if since == held { chain.to_vec() } else { Vec::new() } })
+    })
+}
+
+/// A light member shown evidence on a root it cannot place asks the peer for
+/// the roots after its own, takes them, and believes the peer: dialling, and
+/// dialled. Before, it refused every member holding roots it had missed, and
+/// had nobody left to ask (testbed, 18.1).
+#[tokio::test]
+async fn a_light_member_catches_up_while_a_session_opens() {
+    const HELD: [u8; 32] = [7; 32];
+    const CHAIN: &[u8] = b"the roots after seven";
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    full.serve_roots(serving(HELD, CHAIN));
+
+    for light_dials in [true, false] {
+        let (judge, catching, asked) = catching_up_on(&network, HELD, CHAIN);
+        let joiner = ConvessoTransport::bind_light(
+            &network.joiner,
+            network.state.network,
+            network.state.params.clone(),
+            network.evidence.get(&network.joiner.device_id()).unwrap().clone(),
+            judge,
+        )
+        .await
+        .unwrap();
+        joiner.catch_up_by(catching);
+        tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+            .await
+            .unwrap();
+
+        let (dialled, accepted) =
+            if light_dials { session(&joiner, &full).await } else { session(&full, &joiner).await };
+        let (light_side, full_side) =
+            if light_dials { (dialled, accepted) } else { (accepted, dialled) };
+        assert_eq!(light_side.peer(), network.founder.device_id(), "dialling: {light_dials}");
+        assert_eq!(full_side.peer(), network.joiner.device_id());
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once");
+        light_side.send(b"through").await.unwrap();
+        assert_eq!(full_side.recv().await.unwrap(), b"through".to_vec());
+    }
+}
+
+/// A peer with nothing to answer is refused as before, within the dial's
+/// patience.
+#[tokio::test]
+async fn a_light_member_still_refuses_a_peer_with_no_roots_to_give() {
+    const HELD: [u8; 32] = [7; 32];
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let full = full_showing(&network, &network.founder).await;
+    let (judge, catching, _) = catching_up_on(&network, HELD, b"never sent");
+    let joiner = ConvessoTransport::bind_light(
+        &network.joiner,
+        network.state.network,
+        network.state.params.clone(),
+        network.evidence.get(&network.joiner.device_id()).unwrap().clone(),
+        judge,
+    )
+    .await
+    .unwrap();
+    joiner.catch_up_by(catching);
+    tokio::time::timeout(PATIENCE, async { tokio::join!(full.online(), joiner.online()) })
+        .await
+        .unwrap();
+
+    let dialled = tokio::time::timeout(PATIENCE, joiner.connect(&full.transport_key()))
+        .await
+        .expect("answered within patience");
+    assert!(
+        matches!(dialled, Err(ref error) if error.is_membership_refusal()),
+        "{:?}",
+        dialled.as_ref().err()
+    );
+}
+
+#[tokio::test]
+async fn a_rotated_transport_key_ends_the_session_it_authenticated() {
+    let (_relay, network, founder, joiner) = pair().await;
+    let (dialled, _accepted) = session(&founder, &joiner).await;
+
+    // The same device, under a new transport key: the record the state holds
+    // for it no longer names the key this session authenticated.
+    let mut rotated = network.state.clone();
+    let fresh = NodeIdentity::generate().unwrap();
+    rotated.devices.modify(&network.joiner.device_id(), |record| {
+        for entry in &mut record.keys {
+            if entry.purpose == roster::types::KeyPurpose::Transport {
+                *entry = roster::types::KeyEntry::new(
+                    Algorithm::Ed25519,
+                    roster::types::KeyPurpose::Transport,
+                    fresh.transport_key().public_key().as_bytes().to_vec(),
+                )
+                .unwrap();
+            }
+        }
+    });
+    founder.update_state(rotated).await;
+    assert!(
+        matches!(dialled.send(b"old key").await, Err(Error::ClosedOnMembershipLoss)),
+        "the session under the old key is closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Access groups
+// ---------------------------------------------------------------------------
+
+/// The fixture's state with the founder a controller, the other two sensors,
+/// and, where `policy` says so, sensors allowed to reach controllers only.
+fn grouped(network: &Network, policy: bool) -> roster::state::RosterState {
+    let group = |name: &str| roster::leaf::Group::new(name).unwrap();
+    let mut state = network.state.clone();
+    let in_group = |name: &str| {
+        roster::leaf::DeviceSettings::new(roster::leaf::Mode::Full, vec![group(name)], None, None)
+            .unwrap()
+    };
+    state.set_settings(network.founder.device_id(), in_group("controller"));
+    state.set_settings(network.joiner.device_id(), in_group("sensori"));
+    state.set_settings(network.third.device_id(), in_group("sensori"));
+    if policy {
+        state.params.policy =
+            vec![roster::parameters::Rule { from: group("sensori"), to: group("controller") }];
+    }
+    state
+}
+
+/// The three devices' nodes, each holding `state`.
+async fn three(
+    relay: &TestRelay,
+    network: &Network,
+    state: &roster::state::RosterState,
+) -> (ConvessoTransport, ConvessoTransport, ConvessoTransport) {
+    let _ = relay;
+    let founder = ConvessoTransport::bind(&network.founder, state.clone()).await.unwrap();
+    let joiner = ConvessoTransport::bind(&network.joiner, state.clone()).await.unwrap();
+    let third = ConvessoTransport::bind(&network.third, state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, async {
+        tokio::join!(founder.online(), joiner.online(), third.online())
+    })
+    .await
+    .unwrap();
+    (founder, joiner, third)
+}
+
+#[tokio::test]
+async fn a_sensor_may_reach_its_controller_and_nothing_else() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let state = grouped(&network, true);
+    let (controller, sensor, other) = three(&relay, &network, &state).await;
+
+    let (dialled, accepted) = session(&sensor, &controller).await;
+    assert_eq!(accepted.peer(), network.joiner.device_id(), "the controller accepts");
+    drop((dialled, accepted));
+
+    let key = other.transport_key();
+    let refused = tokio::time::timeout(PATIENCE, sensor.connect(&key)).await.unwrap();
+    assert!(matches!(refused, Err(Error::NotAllowed)), "{:?}", refused.as_ref().err());
+}
+
+#[tokio::test]
+async fn a_changed_policy_closes_what_it_no_longer_allows() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let open = grouped(&network, false);
+    let (_controller, sensor, other) = three(&relay, &network, &open).await;
+    let (_dialled, accepted) = session(&sensor, &other).await;
+
+    other.update_state(grouped(&network, true)).await;
+    assert!(
+        matches!(accepted.send(b"after").await, Err(Error::NotAllowed)),
+        "the receiver closes the session the new policy does not allow"
+    );
 }

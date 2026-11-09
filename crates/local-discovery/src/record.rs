@@ -33,7 +33,13 @@ use crate::limits;
 /// Length-first: `key`, `seq` and `net` are three bytes and compare bytewise;
 /// `addrs` is five. Alphabetical order would put `addrs` first and produce bytes
 /// a conforming decoder refuses.
-pub const RECORD_SCHEMA: &[&str] = &["key", "net", "seq", "addrs"];
+pub const RECORD_SCHEMA: &[&str] = &["key", "net", "seq", "addrs", "shown"];
+
+/// The record's fields that may be absent.
+///
+/// `shown` is left out when there is nothing to show, so a record without it
+/// encodes exactly as records did before it existed.
+pub const RECORD_OPTIONAL: &[&str] = &["shown"];
 
 /// Where a device says it can be reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,10 @@ pub struct Record {
     /// Opaque strings. This crate does not parse them: the transport decides
     /// what an address means.
     pub addresses: Vec<String>,
+    /// What the device shows of its membership — its leaf, the proof of it and
+    /// the root's hash — so that a member holding no roster can recognise it.
+    /// Opaque here, and empty for nothing.
+    pub shown: Vec<u8>,
 }
 
 impl Record {
@@ -70,20 +80,36 @@ impl Record {
         if addresses.iter().any(|address| address.len() > limits::MAX_ADDRESS_LEN) {
             return Err(Error::Malformed(roster::Error::LimitExceeded("address length")));
         }
-        Ok(Self { key, network, sequence, addresses })
+        Ok(Self { key, network, sequence, addresses, shown: Vec::new() })
+    }
+
+    /// The same record, showing `shown`.
+    ///
+    /// # Errors
+    ///
+    /// When it is longer than [`limits::MAX_SHOWN_LEN`].
+    pub fn showing(mut self, shown: Vec<u8>) -> Result<Self> {
+        if shown.len() > limits::MAX_SHOWN_LEN {
+            return Err(Error::Malformed(roster::Error::LimitExceeded("shown length")));
+        }
+        self.shown = shown;
+        Ok(self)
     }
 
     /// Writes the canonical bytes a signature covers.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.map(4);
+        writer.map(if self.shown.is_empty() { 4 } else { 5 });
         writer.key("key").bytes(self.key.as_bytes());
         writer.key("net").bytes(self.network.as_bytes());
         writer.key("seq").u64(self.sequence);
         writer.key("addrs").array(self.addresses.len() as u64);
         for address in &self.addresses {
             writer.str(address);
+        }
+        if !self.shown.is_empty() {
+            writer.key("shown").bytes(&self.shown);
         }
         writer.finish()
     }
@@ -99,7 +125,8 @@ impl Record {
         }
         let available = input.len();
         let mut reader = Reader::new(input);
-        let mut map = reader.map(RECORD_SCHEMA).map_err(Error::Malformed)?;
+        let mut map =
+            reader.map_with_optional(RECORD_SCHEMA, RECORD_OPTIONAL).map_err(Error::Malformed)?;
 
         let key_bytes = map
             .key("key")
@@ -138,9 +165,23 @@ impl Record {
             addresses
         };
 
+        let shown = match map.optional_key("shown").map_err(Error::Malformed)? {
+            Some(value) => {
+                let shown = value
+                    .bytes(limits::MAX_SHOWN_LEN, "shown length")
+                    .map_err(Error::Malformed)?
+                    .to_vec();
+                // Absence has one spelling: the key left out, never written empty.
+                if shown.is_empty() {
+                    return Err(Error::Malformed(roster::Error::NonCanonical));
+                }
+                shown
+            }
+            None => Vec::new(),
+        };
         map.finish().map_err(Error::Malformed)?;
         reader.finish().map_err(Error::Malformed)?;
-        Self::new(key, network, sequence, addresses)
+        Self::new(key, network, sequence, addresses)?.showing(shown)
     }
 }
 
@@ -166,6 +207,14 @@ mod tests {
     #[test]
     fn a_record_encodes_to_its_known_bytes() {
         assert_eq!(hex_of(&record().encode()), KNOWN_BYTES);
+    }
+
+    #[test]
+    fn a_record_showing_its_membership_survives_its_encoding_and_one_without_is_unchanged() {
+        let shown = record().showing(vec![7; 300]).unwrap();
+        assert_eq!(Record::decode(&shown.encode()), Ok(shown));
+        assert_eq!(hex_of(&record().showing(Vec::new()).unwrap().encode()), KNOWN_BYTES);
+        assert!(record().showing(vec![0; limits::MAX_SHOWN_LEN + 1]).is_err());
     }
 
     #[test]

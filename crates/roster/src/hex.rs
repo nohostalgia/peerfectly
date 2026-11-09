@@ -5,6 +5,8 @@
 //! produced by a binary in this crate, which cannot reach a dev-dependency, so
 //! the conversion lives here rather than being pulled in.
 
+use crate::prelude::*;
+
 /// Encodes bytes as lowercase hex.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {

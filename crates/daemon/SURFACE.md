@@ -105,7 +105,6 @@ find out from a browser that cannot find it.
 | field | whose clock | how to say it |
 |---|---|---|
 | `Revocation::signer_clock` | the revoking admin's | "the revoking device's clock said …", never "revoked at …" |
-| `Waiting::signed_here` | this device's | "signed here at …" |
 | `Contact::Recorded` | this device's | "last contact with this device …", never "last online" |
 | `Branch` | — | has no time on purpose: both branches were signed by the accused |
 
@@ -115,17 +114,6 @@ no time, never as a date near 1970.
 
 `Contact::NoneRecorded` means no contact is recorded on this device. Draw it as
 that, never as "never": a device in contact before the record existed has none.
-
-### A confirmation is a claim of holding, not of applying
-
-A device absent from `Waiting::owed` said, in its own offer, that it holds the
-operation. Nothing here shows that it applies it. Do not draw it as done,
-enforced or in effect.
-
-### A bound that is shown
-
-`Network::waiting_unlisted` counts operations that were not listed. Revocations
-are never among them. Say that there are more; never draw the list as complete.
 
 ### A network this device cannot confirm says so, and says which
 

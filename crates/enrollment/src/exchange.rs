@@ -1,23 +1,33 @@
-//! Proving that one device holds both of the keys it presented.
+//! Proving that one device holds the keys it presented.
 //!
-//! The channel proves the **transport** key: the admitting side dials that key,
-//! and nobody who does not hold it can answer. It proves nothing about the
-//! **signing** key, which is only a field in a payload that is public.
+//! The channel of an invite proves only the rendezvous key the invite's secret
+//! derives: it proves nothing about the **signing** or **transport** key the
+//! device presents in its introduction.
 //!
 //! That gap matters because a device's identity is derived from its signing key.
-//! A payload pairing one device's signing key with an attacker's transport key
+//! An introduction pairing one device's signing key with an attacker's transport key
 //! would have an admin sign an operation binding that identity — and that
 //! overlay address — to the attacker. Worse, a roster keeps the **first**
 //! admission of a device id and ignores later ones, so the real holder of that
 //! signing key could never afterwards be admitted under its own identity. The
 //! damage would not be repairable.
 //!
-//! So the joining device signs the exchange's channel material with its signing
-//! key, and the admitting side verifies that signature against the signing key
-//! the payload carries. One signature, one verification, no extra round trip —
-//! the channel material already exists for the confirmation code — and because
-//! the signature covers that material it cannot be gathered on one channel and
-//! presented on another.
+//! So the joining device proves each key it presents, and the admitting side
+//! verifies those proofs against the keys the introduction carries:
+//!
+//! - its **transport** key signs the exchange's channel material, so that proof
+//!   cannot be gathered on one channel and presented on another;
+//! - its **signing** key signs the join's **request**: the invite it answers and
+//!   the other two keys it brings ([`request_material`]). That proof is made
+//!   once, when the person runs the join, because the key may be one only a
+//!   person can unlock, and the exchanges of an asynchronous join happen when
+//!   the daemons meet, with nobody there. A copy of it is worth nothing to
+//!   anybody else: it names keys whose private halves they do not hold, for one
+//!   invite only.
+
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use roster::cbor::{Reader, Writer};
 use roster::sign::{PublicKey, Signer};
@@ -34,7 +44,29 @@ use crate::limits;
 /// exists for.
 pub const DOMAIN_POSSESSION: &str = "peerfectly enrolment possession v1";
 
-/// A joining device's proof that it holds the signing key it presented.
+/// The derivation context for a join's request, which the signing key proves.
+pub const DOMAIN_REQUEST: &str = "peerfectly join request v1";
+
+/// What a joining device's signing key signs: the invite it answers — the
+/// network and the rendezvous it waits at — and the transport and attestation
+/// keys it brings, so the three keys of one device cannot be paired with
+/// another's.
+#[must_use]
+pub fn request_material(
+    network: &roster::id::NetworkId,
+    rendezvous: &PublicKey,
+    transport: &PublicKey,
+    attestation: &PublicKey,
+) -> Vec<u8> {
+    let mut material = Vec::with_capacity(32 * 4);
+    material.extend_from_slice(network.as_bytes());
+    material.extend_from_slice(rendezvous.as_bytes());
+    material.extend_from_slice(transport.as_bytes());
+    material.extend_from_slice(attestation.as_bytes());
+    blake3::derive_key(DOMAIN_REQUEST, &material).to_vec()
+}
+
+/// A joining device's proof that it holds a key it presented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Possession {
     /// The signature over this exchange's derived challenge.
@@ -42,11 +74,12 @@ pub struct Possession {
 }
 
 impl Possession {
-    /// Signs this exchange's challenge with the device's signing key.
+    /// Signs the challenge `material` derives — a channel's material, or a
+    /// request's.
     ///
     /// # Errors
     ///
-    /// When the channel material is empty, or the signer refuses.
+    /// When the material is empty, or the signer refuses.
     pub fn prove(signer: &dyn Signer, channel: &[u8]) -> Result<Self> {
         let challenge = challenge(channel)?;
         Ok(Self { signature: signer.sign(&challenge)? })
@@ -60,6 +93,7 @@ impl Possession {
     /// # Errors
     ///
     /// When the channel material is empty.
+    #[cfg(feature = "std")]
     pub fn request(
         signing: &PublicKey,
         channel: &[u8],
@@ -78,19 +112,20 @@ impl Possession {
     /// # Errors
     ///
     /// When the channel material is empty, or the identity's key does not sign.
+    #[cfg(feature = "std")]
     pub fn prove_detached(identity: &identity::NodeIdentity, channel: &[u8]) -> Result<Self> {
         let request = Self::request(&identity.signing_key().public_key(), channel)?;
         let signature = identity.sign_request(&request).map_err(Error::NotProved)?;
         Ok(Self { signature })
     }
 
-    /// Checks the proof against the signing key a payload named.
+    /// Checks the proof against the key an introduction named.
     ///
     /// # Errors
     ///
     /// [`Error::PossessionUnproved`] when the signature does not verify, which
     /// is the same answer for a forged proof, a proof for another channel, and a
-    /// payload whose two keys belong to two different devices. A caller learns
+    /// introduction whose keys belong to two different devices. A caller learns
     /// only that this device must not be admitted, which is all it needs.
     pub fn verify(&self, signing: &PublicKey, channel: &[u8]) -> Result<()> {
         let challenge = challenge(channel)?;
@@ -125,17 +160,81 @@ fn challenge(channel: &[u8]) -> Result<[u8; 32]> {
 /// Field names of the envelope every message travels in, in canonical order.
 pub const ENVELOPE_SCHEMA: &[&str] = &["body", "kind"];
 
-/// Field names of the joining device's opening message.
-pub const HELLO_SCHEMA: &[&str] = &["kind", "proof"];
-
 /// Field names of the admitting side's delivery.
 pub const ADMISSION_SCHEMA: &[&str] = &["kind", "roster", "snapshot"];
 
-/// Field names of the joining device's statement that the code matched.
-pub const ACCEPTED_SCHEMA: &[&str] = &["kind"];
+/// Field names of a part of the base state, in canonical order.
+pub const BASE_SCHEMA: &[&str] = &["kind", "root", "pieces"];
+
+/// How many state pieces one [`Message::Base`] carries at most: as many as fit
+/// a message, with room for the root beside them.
+pub const BASE_PIECES_PER_MESSAGE: usize = 14;
+
+/// Field names of a part of the batches' pieces, in canonical order.
+pub const BATCH_SCHEMA: &[&str] = &["kind", "pieces"];
+
+/// How many batch pieces one [`Message::Batch`] carries at most: as many as
+/// fit a message, each as large as an operation may be.
+pub const BATCH_PIECES_PER_MESSAGE: usize = 120;
+
+/// Field names of the admitting side's statement that the request was received.
+pub const RECEIVED_SCHEMA: &[&str] = &["kind"];
 
 /// Field names of the joining device's answer.
 pub const OUTCOME_SCHEMA: &[&str] = &["kind", "taken"];
+
+/// The fields of an introduction, in canonical order.
+pub const INTRODUCE_SCHEMA: &[&str] =
+    &["alg", "kind", "name", "sign", "proof", "trans", "attest", "tproof", "conflicts"];
+
+/// What an invited device says of itself as the exchange opens: the keys it
+/// minted for this network, the name it proposes, and proof that it holds the
+/// keys it presents.
+///
+/// In an invite's exchange the channel authenticates only the rendezvous key,
+/// which proves nothing about the device's own keys. So both the signing key,
+/// which its identity comes from, and the transport key, which its sessions
+/// will be authenticated by, prove themselves over the channel's material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Introduction {
+    /// Its signing key: its identity.
+    pub signing: PublicKey,
+    /// Its transport key: what its sessions are authenticated by.
+    pub transport: PublicKey,
+    /// Its attestation key.
+    pub attestation: PublicKey,
+    /// The name it proposes. The inviting admin's record decides.
+    pub name: String,
+    /// Proof over the channel's material that it holds the signing key.
+    pub possession: Possession,
+    /// The same, for the transport key.
+    pub transport_possession: Possession,
+    /// Where the network's IPv4 block, as its invite said it, coincides with
+    /// the device's other networks or the subnets it is on, in its own words:
+    /// for the admin approving to see, and perhaps move the network. Nothing
+    /// proves them, and nothing is decided by them.
+    pub conflicts: Vec<String>,
+}
+
+impl Introduction {
+    /// Checks both proofs: the signing key's over the join's request — the
+    /// invite answered, through `network` and `rendezvous` — and the transport
+    /// key's over this channel's `material`.
+    ///
+    /// # Errors
+    ///
+    /// When either proof does not hold.
+    pub fn verify(
+        &self,
+        material: &[u8],
+        network: &roster::id::NetworkId,
+        rendezvous: &PublicKey,
+    ) -> Result<()> {
+        let request = request_material(network, rendezvous, &self.transport, &self.attestation);
+        self.possession.verify(&self.signing, &request)?;
+        self.transport_possession.verify(&self.transport, material)
+    }
+}
 
 /// What one side says to the other.
 ///
@@ -145,27 +244,44 @@ pub const OUTCOME_SCHEMA: &[&str] = &["kind", "taken"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// Joiner to admitting side: the proof that it holds its signing key.
+    /// Invited joiner to admitting side: what it is, and proof of it.
+    Introduce(Introduction),
+
+    /// Admitting side to joiner: the request was received and is kept, pending
+    /// a person's approval. The exchange ends here; nothing has been signed.
     ///
-    /// It carries no payload. The admitting side already read one, and the
-    /// channel it dialled proves the transport key in it; a second copy here
-    /// would be a second source for one fact, which is a thing to disagree with.
-    Hello {
-        /// The proof over this exchange's channel material.
-        possession: Possession,
+    /// It carries nothing, and proves nothing: whoever holds the invite can say
+    /// it. It only tells the joining device that waiting on is the next thing.
+    Received,
+
+    /// Admitting side to joiner, before the admission: part of the state the
+    /// admitting side's roster rests on, with the root that commits to it.
+    ///
+    /// Sent only where that roster was compacted, so that its operations no
+    /// longer reach back to the genesis, and as many times as the pieces need:
+    /// a large network's state does not fit one message. Every part carries the
+    /// same root. Nothing in it is believed until the last piece is in and the
+    /// state makes the root, and the root's signature checks against its
+    /// author in that state.
+    Base {
+        /// The signed root, as its author signed it.
+        root: Vec<u8>,
+        /// Pieces of the state, as `roster::transfer::pieces_of` cuts them.
+        pieces: Vec<Vec<u8>>,
     },
 
-    /// Joiner to admitting side: the code a person entered matched.
+    /// Admitting side to joiner, before the admission: pieces of the batches
+    /// among the operations to come, as many times as they need.
     ///
-    /// It carries nothing. Both sides computed the same code from the channel,
-    /// so a field repeating it would be a second source for one fact — and
-    /// sending the digits a person typed would put them on the channel, which is
-    /// what an attacker who dialled the waiting device first controls.
-    ///
-    /// What it carries is *timing*: until this arrives, the admitting side does
-    /// not know whether anybody compared anything, and signing before it would
-    /// deliver the whole roster to a device whose person has confirmed nothing.
-    Accepted,
+    /// A batch's operation is only its header; the roster takes it into the
+    /// graph once its pieces are in, and whatever follows it — an admission
+    /// signed after a batch among them — waits until then. Each piece names its
+    /// batch and proves against that batch's header, so nothing here is
+    /// believed for having been sent.
+    Batch {
+        /// Pieces, as `roster::batch::pieces_of` cuts them.
+        pieces: Vec<Vec<u8>>,
+    },
 
     /// Admitting side to joiner: the network, after a person confirmed.
     ///
@@ -204,8 +320,10 @@ impl Message {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Hello { .. } => "hello",
-            Self::Accepted => "accepted",
+            Self::Introduce(_) => "introduce",
+            Self::Received => "received",
+            Self::Base { .. } => "base",
+            Self::Batch { .. } => "batch",
             Self::Admission { .. } => "admit",
             Self::Outcome { .. } => "outcome",
         }
@@ -215,17 +333,48 @@ impl Message {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let body = match self {
-            Self::Hello { possession } => {
+            Self::Introduce(introduction) => {
                 let mut writer = Writer::new();
-                writer.map(2);
-                writer.key("kind").str("hello");
-                writer.key("proof").bytes(possession.as_bytes());
+                writer.map(9);
+                writer.key("alg").str(introduction.signing.algorithm().as_str());
+                writer.key("kind").str("introduce");
+                writer.key("name").str(&introduction.name);
+                writer.key("sign").bytes(introduction.signing.as_bytes());
+                writer.key("proof").bytes(introduction.possession.as_bytes());
+                writer.key("trans").bytes(introduction.transport.as_bytes());
+                writer.key("attest").bytes(introduction.attestation.as_bytes());
+                writer.key("tproof").bytes(introduction.transport_possession.as_bytes());
+                writer.key("conflicts").array(introduction.conflicts.len() as u64);
+                for conflict in &introduction.conflicts {
+                    writer.str(conflict);
+                }
                 writer.finish()
             }
-            Self::Accepted => {
+            Self::Received => {
                 let mut writer = Writer::new();
                 writer.map(1);
-                writer.key("kind").str("accepted");
+                writer.key("kind").str("received");
+                writer.finish()
+            }
+            Self::Base { root, pieces } => {
+                let mut writer = Writer::new();
+                writer.map(3);
+                writer.key("kind").str("base");
+                writer.key("root").bytes(root);
+                writer.key("pieces").array(pieces.len() as u64);
+                for piece in pieces {
+                    writer.bytes(piece);
+                }
+                writer.finish()
+            }
+            Self::Batch { pieces } => {
+                let mut writer = Writer::new();
+                writer.map(2);
+                writer.key("kind").str("batch");
+                writer.key("pieces").array(pieces.len() as u64);
+                for piece in pieces {
+                    writer.bytes(piece);
+                }
                 writer.finish()
             }
             Self::Admission { operations, snapshot } => {
@@ -297,25 +446,99 @@ impl Message {
     fn decode_body(kind: &str, body: &[u8], available: usize) -> Result<Self> {
         let mut reader = Reader::new(body);
         match kind {
-            "hello" => {
-                let mut map = reader.map(HELLO_SCHEMA)?;
-                if map.key("kind")?.str(16, "message kind")? != "hello" {
+            "introduce" => {
+                let mut map = reader.map(INTRODUCE_SCHEMA)?;
+                let algorithm =
+                    roster::types::Algorithm::parse(map.key("alg")?.str(16, "algorithm")?)?;
+                if map.key("kind")?.str(16, "message kind")? != "introduce" {
                     return Err(Error::Malformed("the body names a different message"));
                 }
+                let name = map
+                    .key("name")?
+                    .str(limits::MAX_PROPOSED_NAME_LEN, "proposed name")?
+                    .to_owned();
+                if name.is_empty() {
+                    return Err(Error::Empty("proposed name"));
+                }
+                let signing = PublicKey::new(
+                    algorithm,
+                    map.key("sign")?.bytes(algorithm.public_key_len(), "signing key")?.to_vec(),
+                )?;
                 let proof =
                     map.key("proof")?.bytes(roster::limits::SIGNATURE_LEN, "proof")?.to_vec();
+                let ed25519 = roster::types::Algorithm::Ed25519;
+                let transport = PublicKey::new(
+                    ed25519,
+                    map.key("trans")?.bytes(ed25519.public_key_len(), "transport key")?.to_vec(),
+                )?;
+                let attestation = PublicKey::new(
+                    ed25519,
+                    map.key("attest")?.bytes(ed25519.public_key_len(), "attestation key")?.to_vec(),
+                )?;
+                let transport_proof =
+                    map.key("tproof")?.bytes(roster::limits::SIGNATURE_LEN, "proof")?.to_vec();
+                let reading = map.key("conflicts")?;
+                let count = reading.array(limits::MAX_CONFLICTS, "conflicts")?;
+                let mut conflicts = Vec::with_capacity(count);
+                for _ in 0..count {
+                    conflicts.push(reading.str(limits::MAX_CONFLICT_LEN, "conflict")?.to_owned());
+                }
                 map.finish()?;
                 reader.finish()?;
-                Ok(Self::Hello { possession: Possession::from_bytes(proof) })
+                Ok(Self::Introduce(Introduction {
+                    signing,
+                    transport,
+                    attestation,
+                    name,
+                    possession: Possession::from_bytes(proof),
+                    transport_possession: Possession::from_bytes(transport_proof),
+                    conflicts,
+                }))
             }
-            "accepted" => {
-                let mut map = reader.map(ACCEPTED_SCHEMA)?;
-                if map.key("kind")?.str(16, "message kind")? != "accepted" {
+            "received" => {
+                let mut map = reader.map(RECEIVED_SCHEMA)?;
+                if map.key("kind")?.str(16, "message kind")? != "received" {
                     return Err(Error::Malformed("the body names a different message"));
                 }
                 map.finish()?;
                 reader.finish()?;
-                Ok(Self::Accepted)
+                Ok(Self::Received)
+            }
+            "base" => {
+                let mut map = reader.map(BASE_SCHEMA)?;
+                if map.key("kind")?.str(16, "message kind")? != "base" {
+                    return Err(Error::Malformed("the body names a different message"));
+                }
+                let root =
+                    map.key("root")?.bytes(roster::limits::MAX_SNAPSHOT_SIZE, "root")?.to_vec();
+                let value = map.key("pieces")?;
+                let declared = value.array(BASE_PIECES_PER_MESSAGE, "state pieces")?;
+                let mut pieces = Vec::new();
+                for _ in 0..declared {
+                    pieces.push(
+                        value.bytes(roster::limits::MAX_STATE_PIECE_SIZE, "state piece")?.to_vec(),
+                    );
+                }
+                map.finish()?;
+                reader.finish()?;
+                Ok(Self::Base { root, pieces })
+            }
+            "batch" => {
+                let mut map = reader.map(BATCH_SCHEMA)?;
+                if map.key("kind")?.str(16, "message kind")? != "batch" {
+                    return Err(Error::Malformed("the body names a different message"));
+                }
+                let value = map.key("pieces")?;
+                let declared = value.array(BATCH_PIECES_PER_MESSAGE, "batch pieces")?;
+                let mut pieces = Vec::new();
+                for _ in 0..declared {
+                    pieces.push(
+                        value.bytes(roster::limits::MAX_OPERATION_SIZE, "batch piece")?.to_vec(),
+                    );
+                }
+                map.finish()?;
+                reader.finish()?;
+                Ok(Self::Batch { pieces })
             }
             "admit" => {
                 let mut map = reader.map_with_optional(ADMISSION_SCHEMA, &["snapshot"])?;
@@ -379,17 +602,16 @@ mod tests {
             .expect("the holder's own key verifies");
     }
 
-    /// The attack this exists for: a payload naming one device's signing key
-    /// beside another's transport key. The channel authenticates the transport
-    /// key, so only this catches it.
+    /// The attack this exists for: an introduction naming one device's signing
+    /// key beside the presenter's own keys.
     #[test]
-    fn a_payload_mixing_two_devices_keys_is_refused() {
+    fn an_introduction_borrowing_another_devices_key_is_refused() {
         let victim = NodeIdentity::generate().expect("generates");
         let attacker = NodeIdentity::generate().expect("generates");
         let channel = b"the attacker's exchange";
 
         // The attacker holds its own keys and can sign with them, but the
-        // payload it substituted names the victim's signing key.
+        // introduction it sends names the victim's signing key.
         let proof = Possession::prove(attacker.signing_key().signer(), channel).expect("signs");
 
         assert!(matches!(
@@ -444,16 +666,26 @@ mod tests {
         assert!(Possession::prove(device.signing_key().signer(), &[]).is_err());
     }
 
-    fn hello() -> Message {
+    fn introduce() -> Message {
         let device = NodeIdentity::generate().expect("generates");
-        let possession =
-            Possession::prove(device.signing_key().signer(), b"one exchange").expect("signs");
-        Message::Hello { possession }
+        let material = b"one exchange";
+        Message::Introduce(Introduction {
+            signing: device.signing_key().public_key(),
+            transport: device.transport_key().public_key(),
+            attestation: device.attestation_key().public_key(),
+            name: "laptop".to_owned(),
+            possession: Possession::prove(device.signing_key().signer(), material).expect("signs"),
+            transport_possession: Possession::prove(device.transport_key().signer(), material)
+                .expect("signs"),
+            conflicts: vec!["the Wi-Fi here is on 100.83.4.0/24".to_owned()],
+        })
     }
 
     fn messages() -> Vec<Message> {
         vec![
-            hello(),
+            introduce(),
+            Message::Base { root: vec![1], pieces: vec![vec![2, 3]] },
+            Message::Batch { pieces: vec![vec![2, 3], Vec::new()] },
             Message::Admission { operations: vec![vec![1, 2, 3], vec![4, 5]], snapshot: None },
             Message::Admission { operations: Vec::new(), snapshot: None },
             // Both spellings of the snapshot field, because absence is a
@@ -463,7 +695,7 @@ mod tests {
                 snapshot: Some(vec![9, 8, 7, 6]),
             },
             Message::Admission { operations: Vec::new(), snapshot: Some(Vec::new()) },
-            Message::Accepted,
+            Message::Received,
             Message::Outcome { taken: true },
             Message::Outcome { taken: false },
         ]
@@ -484,8 +716,8 @@ mod tests {
     /// rather than by being told a value it already has.
     #[test]
     fn the_acceptance_carries_nothing_but_its_kind() {
-        let bytes = Message::Accepted.encode();
-        assert_eq!(Message::decode(&bytes).expect("decodes"), Message::Accepted);
+        let bytes = Message::Received.encode();
+        assert_eq!(Message::decode(&bytes).expect("decodes"), Message::Received);
 
         // One key in the body, and it is the kind. A field here would be a
         // second source for a value both sides already computed.
@@ -494,16 +726,21 @@ mod tests {
         let body =
             envelope.key("body").expect("a body").bytes(256, "body").expect("bytes").to_vec();
         let mut inner = roster::cbor::Reader::new(&body);
-        let mut map = inner.map(ACCEPTED_SCHEMA).expect("the body's map");
-        assert_eq!(map.key("kind").expect("kind").str(16, "kind").expect("text"), "accepted");
+        let mut map = inner.map(RECEIVED_SCHEMA).expect("the body's map");
+        assert_eq!(map.key("kind").expect("kind").str(16, "kind").expect("text"), "received");
         map.finish().expect("nothing else in it");
     }
 
     #[test]
     fn the_schemas_are_in_canonical_key_order() {
-        for schema in
-            [ENVELOPE_SCHEMA, HELLO_SCHEMA, ACCEPTED_SCHEMA, ADMISSION_SCHEMA, OUTCOME_SCHEMA]
-        {
+        for schema in [
+            ENVELOPE_SCHEMA,
+            INTRODUCE_SCHEMA,
+            RECEIVED_SCHEMA,
+            ADMISSION_SCHEMA,
+            OUTCOME_SCHEMA,
+            BASE_SCHEMA,
+        ] {
             assert!(roster::cbor::is_canonical_schema(schema), "{schema:?}");
         }
     }
@@ -522,10 +759,10 @@ mod tests {
             body.key("taken").bool(true);
             body.finish()
         });
-        writer.key("kind").str("hello");
+        writer.key("kind").str("introduce");
         let lying = writer.finish();
 
-        assert!(matches!(Message::decode(&lying), Err(Error::Malformed(_))));
+        assert!(Message::decode(&lying).is_err(), "a lie is refused");
     }
 
     /// The acceptance has one field and no room for another. A body carrying
@@ -536,14 +773,14 @@ mod tests {
     fn an_acceptance_carrying_anything_else_is_refused() {
         let mut body = Writer::new();
         body.map(2);
-        body.key("kind").str("accepted");
+        body.key("kind").str("received");
         body.key("taken").bool(true);
         let body = body.finish();
 
         let mut writer = Writer::new();
         writer.map(2);
         writer.key("body").bytes(&body);
-        writer.key("kind").str("accepted");
+        writer.key("kind").str("received");
 
         assert!(Message::decode(&writer.finish()).is_err());
     }
@@ -557,12 +794,12 @@ mod tests {
         writer.key("body").bytes(&{
             let mut body = Writer::new();
             body.map(1);
-            body.key("kind").str("accepted");
+            body.key("kind").str("received");
             body.finish()
         });
-        writer.key("kind").str("hello");
+        writer.key("kind").str("introduce");
 
-        // Refused on the body, which does not have the shape a greeting needs,
+        // Refused on the body, which does not have the shape an introduction needs,
         // rather than on the mismatch that would have been found after it.
         // Either way it never decodes.
         Message::decode(&writer.finish()).expect_err("a lie is refused");
@@ -620,5 +857,81 @@ mod tests {
         let derived = challenge(channel).expect("derives");
         assert_ne!(derived.as_slice(), channel.as_slice());
         assert_ne!(derived, blake3::derive_key("some other context", channel));
+    }
+
+    #[test]
+    fn an_introduction_round_trips_and_proves_both_keys() {
+        let identity = identity::NodeIdentity::generate().unwrap();
+        let material = [5u8; 32];
+        let network = roster::id::NetworkId::from_bytes([7; 32]);
+        let rendezvous = identity::NodeIdentity::generate().unwrap().transport_key().public_key();
+        let request = request_material(
+            &network,
+            &rendezvous,
+            &identity.transport_key().public_key(),
+            &identity.attestation_key().public_key(),
+        );
+        let introduction = Introduction {
+            signing: identity.signing_key().public_key(),
+            transport: identity.transport_key().public_key(),
+            attestation: identity.attestation_key().public_key(),
+            name: "sensor".to_owned(),
+            possession: Possession::prove(identity.signer(), &request).unwrap(),
+            transport_possession: Possession::prove(identity.transport_key().signer(), &material)
+                .unwrap(),
+            conflicts: Vec::new(),
+        };
+        let message = Message::Introduce(introduction.clone());
+        assert_eq!(Message::decode(&message.encode()).unwrap(), message);
+        assert!(introduction.verify(&material, &network, &rendezvous).is_ok());
+        assert!(
+            introduction.verify(&[6u8; 32], &network, &rendezvous).is_err(),
+            "the transport proof over another channel proves nothing"
+        );
+        let elsewhere = roster::id::NetworkId::from_bytes([8; 32]);
+        assert!(
+            introduction.verify(&material, &elsewhere, &rendezvous).is_err(),
+            "nor does the request, for another invite"
+        );
+
+        // A transport key whose holder did not sign is refused, and so is a
+        // transport key the signing key's request did not name.
+        let other = identity::NodeIdentity::generate().unwrap();
+        let borrowed =
+            Introduction { transport: other.transport_key().public_key(), ..introduction };
+        assert!(borrowed.verify(&material, &network, &rendezvous).is_err());
+        assert!(roster::cbor::is_canonical_schema(INTRODUCE_SCHEMA));
+    }
+
+    #[test]
+    fn a_part_of_the_base_round_trips_and_is_bounded() {
+        let message =
+            Message::Base { root: vec![1, 2, 3], pieces: vec![vec![4; 10], Vec::new(), vec![5]] };
+        assert_eq!(Message::decode(&message.encode()).unwrap(), message);
+
+        let full = Message::Base {
+            root: Vec::new(),
+            pieces: vec![vec![0; 4]; BASE_PIECES_PER_MESSAGE + 1],
+        };
+        assert!(Message::decode(&full.encode()).is_err(), "more pieces than a part carries");
+
+        // As many as a part may carry, each as large as a piece may be, fit a
+        // message with room for a root.
+        let largest = Message::Base {
+            root: vec![0; roster::limits::MAX_SNAPSHOT_SIZE],
+            pieces: vec![vec![0; roster::limits::MAX_STATE_PIECE_SIZE]; BASE_PIECES_PER_MESSAGE],
+        };
+        assert!(largest.encode().len() <= limits::MAX_EXCHANGE_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn a_part_of_the_batches_is_bounded() {
+        let full = Message::Batch { pieces: vec![vec![0; 4]; BATCH_PIECES_PER_MESSAGE + 1] };
+        assert!(Message::decode(&full.encode()).is_err(), "more pieces than a part carries");
+
+        let largest = Message::Batch {
+            pieces: vec![vec![0; roster::limits::MAX_OPERATION_SIZE]; BATCH_PIECES_PER_MESSAGE],
+        };
+        assert!(largest.encode().len() <= limits::MAX_EXCHANGE_MESSAGE_SIZE);
     }
 }

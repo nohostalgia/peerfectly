@@ -1171,3 +1171,317 @@ this branch. The nodes are rebuilt with the change and started fresh (`down -v`,
   other, 4 of 4.
 - The fixture `daemon/tests/fixtures/stranded-join/roster.log` was replaced with `a`'s roster from
   step 1.
+
+# Branch `scalable-membership`: what binds a network's folder to this machine
+
+## S1. The machine key and the sealed identities, against a software TPM
+
+`local-integrity`, `identity`. In the testbed:
+
+```powershell
+docker compose -f crates\linux-daemon\testbed\compose.yaml run --build --rm tests
+```
+
+**Expect**: in `tests/tpm.rs`, `the_machine_key_signs_with_nobody_present`,
+`the_daemon_keeps_its_machine_key_in_the_tpm` and `a_sealed_secret_opens_only_on_its_tpm` pass: the
+machine key is made once with no authorisation and no lockout, signs what the roster verifies, and
+does not load on another TPM; once its file is gone, or with no TPM, it is reported lost and not
+replaced; a sealed secret opens only on its own TPM.
+
+**Result**: run, 2026-10-25, in the testbed, passed.
+- `tests/tpm.rs`: 10 passed, the three above among them. The esys `TPM Error` lines are the second
+  TPM refusing to load the first's key and secret, as expected.
+- The library tests: 64 passed, with `tun`'s interface renamed `pftest00001`. It was
+  `peerfectlytest00001`, longer than the kernel's fifteen characters, since the rename.
+- `cargo clippy -p linux-daemon -p identity --all-targets -- -D warnings`: clean.
+
+## S3. A headless anchor serves a light member whose admitter is off
+
+`10.6`, `10.7`, `10.8`. In the testbed, whose `anchor` service runs `peerfectlyd --headless` with no
+`/dev/net/tun` and no `NET_ADMIN`:
+
+1. On `a`: `sudo peerfectly found casa --name a --relay https://relay:8444`, then `up`.
+2. On `a`: `sudo peerfectly invite anchor --network casa`; on `anchor`: `peerfectly join <invite>`,
+   then `up`.
+3. On `a`: `sudo peerfectly invite b --network casa --light`; on `b`: `sudo peerfectly join <invite>`,
+   then `up`.
+4. With an empty anchor list: stop `b`; on `a`, `sudo peerfectly rename anchor ancora`; stop `a`;
+   start `b`; on `b`, `dig @<b's address> ancora.casa.internal AAAA` and the same for `anchor`.
+5. Start `a`; on `a`, `sudo peerfectly set-anchors ancora --network casa`; then repeat step 4 with a
+   rename of `ancora` to `ancora2`.
+
+**Expect**:
+- the anchor comes up with no interface of its own (`ip -br link` shows `lo` and `eth0`);
+- `b` becomes light (`light.member`, no `roster.log`);
+- with `a` off, `b` reaches the anchor among the full members it keeps, adopts the root the anchor
+  shows, and answers the new name and not the old one;
+- `set-anchors` shows `anchors <the anchor's id>` before signing, the list reaches `b` with the next
+  root, and step 4 holds again through the named anchor.
+
+**Result**: run, 2026-10-25/26, in the testbed, passed after four fixes, each found here:
+- **The invite timeout.** An invite's dial bounded the whole exchange by 20 s, so a joining device
+  whose person typed the passphrase for its proof of possession more slowly was dropped. Now the
+  20 s bound only reaching it.
+- **A root one step ahead.** A light member refused a full member whose evidence rested on a root one
+  step ahead of its own: not a member, it said. The root a peer shows is now verified and adopted
+  where it follows, as `membership-roots` asks.
+- **A deadlock on the footing.** A light member asked for what it stands on from inside the
+  session's reader, so the answer waited behind the question and timed out. The upkeep asks now, and
+  of the first member met after every start.
+- **A light member that missed its root.** A device invited as light, up a moment after the root
+  that makes it light went out, stayed full and talked to nobody until it restarted. It now keeps in
+  touch with full members until that root arrives.
+
+The testbed itself: a software TPM killed without `TPM2_Shutdown` counts the next start as a failed
+authorisation, so three `restart`s locked `b`'s TPM and its network was held down as changed outside
+(correctly: its machine key would not sign). The entrypoint now stops the daemon and shuts the TPM
+down orderly.
+
+Left open, for 10.2: a TPM in lockout is taken for no TPM. New keys would then go to sealed files,
+and the network be held down, when the TPM only had to be waited for.
+
+## S4. Invites, resume and a batch, from the command line
+
+`13.1`. In the testbed of S3, with `casa` founded on `a` and `anchor` and `b` joined:
+
+1. On `a`, as `alice`: `peerfectly invite tv --network casa` (no `sudo`); then with `sudo`, and
+   `ctrl-c` while it waits; `peerfectly invites casa`; `peerfectly withdraw tv --network casa`;
+   `peerfectly invites casa` again.
+2. On `a`: three boards' Ed25519 keys made with `openssl genpkey -algorithm ed25519`, written as
+   `/tmp/lot.json` (`"format": "peerfectly-batch-v1"`, label `lotto prova 1`, `sensore-1..3`, each
+   with `signing`, `transport` and `attestation` in hex). `peerfectly admit --batch /tmp/lot.json
+   --network casa --light --ipv4-block 100.64.9.0/28` without `sudo`; then with `sudo` and
+   `--group sensori`, answering `yes` and the passphrase.
+3. The same file with `--ipv4-block 192.168.1.0/28`; then the same file again with `--light`.
+4. On `a`: `sudo peerfectly invite c --network casa`, `ctrl-c`. On `c`: `sudo peerfectly join
+   <invite>`, its passphrase three times. On `a`: `sudo peerfectly resume`; the digits typed on `c`;
+   `yes` and the passphrase on `a`.
+5. Step 4 again for `c2`, with `a` waiting at the invite; then on `c`, `sudo peerfectly up casa`,
+   `peerfectly peers casa`, and a ping to `b`.
+
+**Expect**:
+- without `sudo`, `invite` and `admit` refuse before anything is issued or read: *only root can
+  reach* the network's key;
+- `ctrl-c` says the invite stays open, until when, and prints `peerfectly resume` and
+  `peerfectly withdraw tv`; `invites` lists each invite as `open` with its time left, `used`, or
+  `withdrawn`; `withdraw` says *the invite for tv admits nobody now*;
+- the batch review shows the count, label, mode, groups, block and `skipped none`, then one act
+  *admit a batch of 3 devices, `lotto prova 1`, as light* and one passphrase entry; `peers` lists
+  `sensore-1..3`;
+- a block outside `100.64.0.0/10` is refused with *Nothing was signed*; the same lot again lists all
+  three as *already a member of the network*;
+- `resume` shows the waiting device's name, key and six digits, and signs on `yes`; `c` joins;
+- `c2` joins a network holding the batch, and reaches `a`, `anchor` and `b`.
+
+**Result**: run, 2026-10-26, in the testbed, passed after one fix found here, and with three
+smaller ones:
+- **An admission after a batch was refused by the joining device.** `c` refused what `resume` had
+  signed: *the admission was not signed by an admin of that network*. A batch's operation is only
+  its header, and the invite delivered operations alone, so `c`'s roster held the batch incomplete
+  and the admission resting on it waiting; `c` did not find itself. Any invite in a network that
+  had admitted a batch would have failed. The exchange now carries the pieces of the admitter's
+  batches (`Message::Batch`, before the admission), the joining device offers each batch its pieces
+  as soon as it holds the header, and keeps them in `pieces.log`. `c2` then joined, 8 devices.
+- The invite list padded nothing and repeated *open until* for used invites; `withdraw` said
+  nothing; the batch's consequence read *they will reach … and they will reach them*; the usage did
+  not say `invite` and `resume` need `sudo`; the admitter said *that name was already in use* when
+  the invite's name differed from the one the device proposed.
+
+Then, for 13.2's counterpart where there is no tray: `c` founded `uff` on the testbed relay, invited
+`pc-a2` and stopped waiting, and `a` joined. `status` on `c` showed *the device invited as pc-a2 has
+arrived, and is waiting at the code* with `peerfectly resume`; `resume` signed it, `a` adopted `uff`
+(2 devices), and the line left `status`.
+
+Two findings here were fixed after, and run again on 2026-10-26:
+- **Reaching a light member just after joining.** `c2`'s first packets to `b` (light) were dropped,
+  *no answer within 20s*, for about a minute after its join. Two causes. The joining device was
+  delivered the root held before its admission, so it had no proof of itself to show; the admitter
+  now delivers the root that follows the admission, signed over what the device receives, following
+  its own. And `b`'s transport read only peers it had met: convesso holds a peer's messages until a
+  receiver is open for it, and a light member, holding no roster, opened none for a new member, so
+  the open was never read. A light node now reads whoever connects, and judges what it shows
+  (`transport-convesso`, `a_light_member_is_reached_by_a_full_one_it_never_met`). Run again with
+  `c` joining as `c7`: `up` at 14:42:05, and 6 of 6 pings to `b` answered by 14:42:10, the first
+  held about five seconds while the session opened.
+- **The waiting list did not scale with batches or light members.** `status` on `a` listed every
+  board that had never connected under every operation, and `b`, light, under all of them for
+  ever. Now a member never in contact is counted in one line (*4 devices have never been in
+  contact with this one*), and a light member says which root it holds after adopting one, which a
+  full member holding it counts as holding everything beneath. Run again: `status` on `a` shows
+  that line and no waiting list.
+
+Left open:
+- **Revoking an admin with a void.** Not run here: the testbed has no free machine left to admit
+  as a second admin. Covered by `service::revoking_an_admin_says_what_it_voids_before_signing`.
+
+## S5. Enrolment that waits: requests, approval later, delivery by a member, and the rules
+
+`scalable-membership` 14.1–14.5 and 14.7. In the testbed of S3, rebuilt and recreated, so every node
+starts with nothing. The interactive steps driven through a pseudo-terminal (`script`), the
+passphrases fed on its input.
+
+1. On `a`, as `alice` with `sudo`: `peerfectly found casa --name a --relay https://relay:8444`;
+   `peerfectly up casa` without `sudo`. Without `sudo`: `invite tv`, `forget casa`, `pending`.
+2. On `a`: `peerfectly invite anchor --network casa` and `peerfectly invite b --network casa --expires
+   2h`. On `anchor`: `peerfectly join <invite>`, then `pending` on both; on `a`, `approve anchor`.
+3. The admin off: `docker compose stop a`; on `b`, `join <invite>`; `docker compose restart b` while
+   it waits; `start a`; `pending` on both; `restart a` with the request pending; `approve b`.
+4. The device off when approved, and the admin off when it comes back: `b` up; on `a`, `invite c`;
+   on `c`, `join`; once `pending` on `a` shows it, `stop c`; `approve c`; thirty seconds for the
+   admission to spread; `stop a`; `start c`.
+5. A request from somebody holding the invite: `a` started; `invite tv`; `c` (a member already)
+   joins with it as `tv`; on `a`, `pending`, `reject tv`, then `approve tv`; on `c`, `pending`,
+   `cancel joining`.
+6. An altered join: on `a`, `invite spare`; `b` joins with it; `join.json` edited (`spare` →
+   `planted`); `restart b`; `pending`; `cancel joining`. Then `c` up, and pings from `b` and `c` to
+   `a` and `b` over the tunnel.
+7. A planted request: the testbed recreated, `casa` founded again; `invite tv`, `c` joins, `reject
+   tv`; `invites.json` edited (`rejected` → `waiting`) while the daemon runs; `pending` a few seconds
+   later. Again for `tv3`, edited and `restart a` at once.
+
+**Expect**:
+- without `sudo`, `invite` and `forget` are refused before anything is asked of the daemon (*needs
+  sudo*); `up` and `pending` answer; the usage marks the same words;
+- `invite` prints the invite and returns, saying until when it is open and how to approve;
+- `join` prints the device's key and returns; `pending` on the joining device shows the join, and
+  *the request was received* once the admin's daemon has it; on the admin, the request with the same
+  key and when it arrived;
+- a request made while the admin is off is taken when it is back; restarts on either side change
+  nothing; the approved device gets the network within seconds, and the invite reads `used`;
+- the device off when approved gets the network from a member that is not the admin, with the admin
+  off;
+- a rejected request admits nobody, cannot be approved after, and the joining device waits until it
+  is cancelled;
+- an altered join is not resumed, is listed as one that cannot go on, and is cancelled;
+- a planted request is not listed, whether the daemon runs or restarts, and that is said in the log.
+
+**Result**: run, 2026-10-27, in the testbed, passed after one fix found here.
+- Step 1: `invite` and `forget` without `sudo` said *`peerfectly invite` needs sudo. Nothing was
+  asked of the daemon.*; `up` and `pending` (*nothing is waiting*) answered.
+- Step 2: `anchor`'s key `1283-C3A6-3243-57A1-5FD0` on both screens, the request taken within
+  seconds of the join, approved with one passphrase; `anchor` held `casa`, 2 devices; `anchor` *used*.
+- Step 3: `b` joined at 01:52 with `a` stopped, and waited through its restart; `a`, started, took
+  the request (`4630-D6B1-A00E-3546-3C44` on both), kept it across its own restart, and once
+  approved `b` held `casa`, 3 devices, `b` *used*, nothing waiting on `b`.
+- Step 4: `c` was approved while stopped; `anchor` and `b` held 4 devices thirty seconds later; `a`
+  stopped at 01:54:38 and `c` started; at 01:54:39 `b` logged *a new member, 257d-70cf-db63-0007,
+  was given the network from here* and `c` *this device was admitted into casa*. Nothing waiting on
+  `c`.
+- Step 5: the request for `tv` came with `c`'s second key; `reject` said *nothing was signed*; the
+  devices stayed 4; `approve tv` said *no request for `tv` is waiting*; `c`'s join waited, and
+  `cancel joining` removed it and its keys.
+- Step 6: `b` said *this device's join `joining`: it cannot go on — the join was changed outside the
+  daemon; it was not resumed*, and the log a warning; `cancel joining` removed it. `c` up; 4 of 4
+  pings from `c` to `a`, 3 of 3 to `b`, 3 of 3 from `b` to `a`.
+- **A planted request was believed, then fixed.** In the first run of step 7 the planted request
+  was listed, and still after a restart. The checkpoint hashed whatever `invites.json` held when it
+  was written, so the next checkpoint after a plant vouched for it. Now the checkpoint keeper
+  remembers the records the daemon itself wrote (named before each write) and vouches for those;
+  records that are not those are dropped when read and said once
+  (`service::a_request_planted_while_the_daemon_runs_is_not_believed`). Run again on the rebuilt
+  testbed: while the daemon ran, `pending` said *nothing is waiting* and the log *the invite records
+  were changed outside the daemon, so they are not used*; planted and restarted at once, the start
+  said *the invite records were not the ones its checkpoint names, and were dropped*.
+- A smaller one in that second run: after a drop at the start, the first read said the records were
+  changed outside a second time. The keeper is now told of the drop
+  (`service::a_planted_invite_admits_nobody`).
+
+Found by the same reading: a light member's state was vouched for the same way — the hash of the
+file when the checkpoint is written — with the same weakness while the daemon runs. Fixed the same
+way: the keeper holds the hash of what the daemon wrote, or found at start as the checkpoint names
+it, and the checkpoint names that (`checkpoint::a_light_member_is_vouched_for_as_the_daemon_wrote_it`,
+`node::light::a_light_member_planted_while_the_daemon_runs_is_not_vouched_for`). A planted file is
+not read while the daemon runs, and at the next start the network is refused as changed outside, as
+for a roster. Daemon tests only; not run in the testbed, which has no light member.
+
+## S6. Batches, sibling roots, a light member behind, and an island
+
+`scalable-membership` 18.1. In the testbed of S5, recreated, so every node starts with nothing:
+`casa` founded on `a`; `anchor` invited full and set as the anchor; `b` invited light; `c` invited
+with `--admin`, its keys a file sealed with a passphrase. The acts driven through a pseudo-terminal,
+the passphrases fed on its input.
+
+1. A batch: on `a`, a file of 2000 boards with fresh Ed25519 keys, `peerfectly admit --batch
+   /tmp/lot2000.json --network casa --light`. Devices on `c` and `anchor`, and the CPU of every
+   container, every ten seconds. Then `docker compose restart c`, timed until `status` answers.
+2. Sibling roots: `docker network disconnect` of `a`; on `a`, `revoke scheda-1` and `rename scheda-5
+   sensore-a5`; on `c`, `revoke scheda-2` and `rename scheda-6 sensore-c6`; `a` connected again.
+   Devices on the three full members; `peers` on `b`, which followed `c`'s branch meanwhile.
+3. A light member behind: `stop b`; on `a`, two renames, so two roots; `start b`; `peers` on `b`, and
+   pings from `b` to `a` and `c` over the tunnel.
+4. An island: `stop relay` for a minute and a half; pings `a`→`c` and `b`→`a`; `restart c` with
+   the relay still down, and `a`→`c` again; `status` on every node. Then `start relay`, a minute,
+   and the CPU and memory of every container.
+
+A revocation passing an incomplete batch is not staged: the testbed's kernel has no `act_police` to
+slow one node's traffic, and the revocation would queue behind the pieces anyway. The roster and
+daemon tests cover it.
+
+**Expect**: the batch reaches every full member in seconds, with the CPU at rest after; a member
+restarts in seconds with the batch in its log; both admins' revocations and renames stand on every
+full member after they meet; the light member on the other branch believes every full member after
+the merge; a light member two roots behind believes them as soon as it is back; the island keeps
+working with no fuse, and finds itself again on the LAN.
+
+**Result**: run, 2026-10-28, in the testbed, passed after the fixes the first run found (below).
+- Step 1: one consent, 2000 devices, skipped none; `c` and `anchor` held 2004 devices at the first
+  look, seven seconds after the signature, and every container stayed under 1% of CPU. `c`
+  restarted and answered with 2004 devices after 3 s.
+- Step 2: the revocations failed at first (*the roster refused it: unknown_target*): fixed, below.
+  After the fix: apart, each side 2003 devices; 45 s after `a` came back, `a`, `c` and `anchor` 2002,
+  with all four renames. `b` reached `a`, `c` and `anchor` directly.
+- Step 3: `b` reached the three full members 1 s after its start, nothing refused in its log; 3 of
+  3 pings to `a` and to `c`.
+- Step 4: 3 of 3 pings `a`→`c`, 2 of 3 `b`→`a` with the relay down; `c` restarted without it and
+  answered 3 of 3; no node said it could not confirm its roster. At rest after: 0.14% to 0.45% of
+  CPU; 104 to 132 MiB on the full members holding the batch, 13 MiB on `b`. No `confirmations`
+  file anywhere.
+
+**Found by the first run, which stopped half way, and fixed with tests:**
+- A device invited light stayed full and fell behind for good: the root naming it light came with
+  its admission, and nothing looked again (`Node::started`).
+- A session one side had lost was kept by the other's tie-break, which then closed every new one
+  from that peer (`CROSSING_DIALS`; `assembled::a_dial_after_the_crossing_window_replaces_a_session_the_peer_lost`).
+- With the 2000-board batch in its log a daemon spent minutes of start-up at 100% of a core: every
+  derivation rebuilt every board's device id, for every board. The ids are now worked out once,
+  when the batch enters the graph.
+- Full members dialled every board as a new member, building the whole delivery for each dial.
+  Boards reach the network themselves (`bulk-admission`), and the delivery is built once a round.
+- Every author dialled every board after every act it signed (pressing). Pressing, per-member
+  confirmations and the waiting report are removed.
+- `b`, on `c`'s branch, refused every full member after the merge, for good: it could not place
+  their root, and had nobody left to ask. A light member now asks the peer for the roots after its
+  own as the session opens (`BEHIND` and `ROOTS` in `transport-convesso`), and switches to a heavier
+  branch it had set aside.
+- A board revoked minutes after its batch could not be revoked: the revocation was anchored off the
+  recent batch that admitted it (`batches::a_board_of_a_recent_batch_is_revoked_over_its_batch`).
+  The person was told *the network would not come up*; a refusal by the roster now says *nothing
+  was revoked* (or *renamed*).
+
+Left to convesso: each frame walks every session the endpoint ever had, so a member that dialled
+thousands of absent boards spent a core in `Session::expire` while it did (`design.md`, *Requests
+to convesso*, 4).
+
+## S2. On a machine with a hardware TPM
+
+On a Linux machine with `/dev/tpmrm0`, the archive of this branch installed:
+
+```powershell
+sudo peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+sudo cat /var/lib/peerfectly/machine.kind
+```
+```powershell
+sudo head -c 22 /var/lib/peerfectly/networks/prova/identity
+```
+
+Then with the daemon stopped, copy another network's `roster.log` over `prova`'s, start it, and run
+`peerfectly status`; put the original back, and start it once more.
+
+**Expect**: `machine.kind` reads `hardware`, `machine.tpm` is there and `machine.key` is not; the
+identity begins with `peerfectly wrapped v1`; the boot asks for no passphrase; with the other roster
+`status` reports `prova` as changed outside the program and does not carry it, and with the original
+back it is carried.
+
+**Result**: not run.

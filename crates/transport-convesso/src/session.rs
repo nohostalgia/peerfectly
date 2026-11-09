@@ -19,29 +19,37 @@ use transport::fragment::{self, Reassembler};
 use transport::limits;
 use transport::session::Session;
 
-use crate::frame::{Frame, PACKET_HEADER, Reason, SessionId};
+use crate::frame::{Frame, Reason, SessionId};
 
-/// The datagram data a relayed convesso packet carries: 1,380 bytes on the
-/// relay (`PROTOCOL.md §6`), less the 31 of convesso's own transport framing.
-/// The relay is the narrowest path, so a fragment cut to this fits on every
-/// path a session may take (design D7).
-pub const DATAGRAM_ROOM: usize = 1_380 - 31;
+/// The datagram data a relayed convesso packet carries (design D7), as
+/// `transport_wire::frame` says it.
+pub const DATAGRAM_ROOM: usize = transport_wire::frame::DATAGRAM_ROOM;
 
 /// The room a fragment has inside a datagram, its own header included.
-pub const FRAGMENT_ROOM: usize = DATAGRAM_ROOM - PACKET_HEADER;
+pub const FRAGMENT_ROOM: usize = transport_wire::frame::FRAGMENT_ROOM;
 
 /// One session, as the transport and the peer's reader share it.
 pub struct Live {
     /// Its id, the dialler's choice.
     pub id: SessionId,
-    /// The device at the other end.
-    pub device: DeviceId,
+    /// The device at the other end. Settable once, for a node holding no
+    /// roster, which learns it from the far end's evidence as the dial is
+    /// answered.
+    device: std::sync::RwLock<DeviceId>,
+    /// What the far end showed of its membership, for a node holding no roster
+    /// to judge it by again when what it believes changes.
+    evidence: std::sync::Mutex<Vec<u8>>,
+    /// Whether the far end opened it: the sessions this node accepted are the
+    /// ones its access policy decides.
+    inbound: std::sync::atomic::AtomicBool,
     /// The same peer, as convesso authenticates it.
     pub peer: PeerId,
     /// And as convesso dials it.
     pub address: Address,
     /// The context, to send in.
     context: Context,
+    /// What the peer takes, to cut what is sent to it to that.
+    wire: std::sync::Arc<crate::wire::Wire>,
     /// Payloads arrived, waiting for the caller.
     payloads_in: mpsc::Sender<Vec<u8>>,
     payloads_out: Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -58,15 +66,24 @@ pub struct Live {
 
 impl Live {
     /// A session with `device`, open.
-    pub fn new(id: SessionId, device: DeviceId, address: Address, context: Context) -> Arc<Self> {
+    pub fn new(
+        id: SessionId,
+        device: DeviceId,
+        address: Address,
+        context: Context,
+        wire: Arc<crate::wire::Wire>,
+    ) -> Arc<Self> {
         let (payloads_in, payloads_out) = mpsc::channel(limits::SESSION_QUEUE);
         let (packets_in, packets_out) = mpsc::channel(limits::PACKET_QUEUE);
         Arc::new(Self {
             id,
-            device,
+            device: std::sync::RwLock::new(device),
+            evidence: std::sync::Mutex::new(Vec::new()),
+            inbound: std::sync::atomic::AtomicBool::new(false),
             peer: address.peer_id(),
             address,
             context,
+            wire,
             payloads_in,
             payloads_out: Mutex::new(payloads_out),
             packets_in,
@@ -75,6 +92,40 @@ impl Live {
             next_packet: AtomicU32::new(0),
             closed: watch::Sender::new(None),
         })
+    }
+
+    /// The device at the other end.
+    pub fn device(&self) -> DeviceId {
+        self.device.read().map_or_else(|poisoned| *poisoned.into_inner(), |device| *device)
+    }
+
+    /// Whether the far end opened this session.
+    pub fn inbound(&self) -> bool {
+        self.inbound.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Marks this session as opened by the far end.
+    pub fn set_inbound(&self) {
+        self.inbound.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// What the far end showed of its membership.
+    pub fn evidence(&self) -> Vec<u8> {
+        self.evidence.lock().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    /// Records what the far end showed of its membership.
+    pub fn set_evidence(&self, evidence: Vec<u8>) {
+        if let Ok(mut held) = self.evidence.lock() {
+            *held = evidence;
+        }
+    }
+
+    /// Records the device at the other end, as its evidence showed it.
+    pub fn set_device(&self, device: DeviceId) {
+        if let Ok(mut held) = self.device.write() {
+            *held = device;
+        }
     }
 
     /// Why the session ended, if it has.
@@ -150,7 +201,7 @@ fn sending_failed(error: &NodeError) -> Error {
 #[async_trait]
 impl Session for SessionHandle {
     fn peer(&self) -> DeviceId {
-        self.0.device
+        self.0.device()
     }
 
     async fn send(&self, payload: &[u8]) -> Result<()> {
@@ -161,11 +212,23 @@ impl Session for SessionHandle {
             return Err(reason);
         }
         let message = Frame::Payload { id: self.0.id, bytes: payload.to_vec() }.encode();
-        self.0
-            .context
-            .send_message(self.0.address, message)
-            .await
-            .map_err(|error| sending_failed(&error))
+        // Larger than the peer puts back together: it would be dropped there.
+        let largest = self.0.wire.limits(&self.0.peer).frame_len();
+        if message.len() > largest {
+            return Err(Error::PayloadTooLarge {
+                len: payload.len(),
+                limit: largest.saturating_sub(crate::frame::PAYLOAD_HEADER),
+            });
+        }
+        let _sending = self.0.wire.sending(&self.0.peer).await;
+        for piece in self.0.wire.messages(&self.0.peer, message) {
+            self.0
+                .context
+                .send_message(self.0.address, piece)
+                .await
+                .map_err(|error| sending_failed(&error))?;
+        }
+        Ok(())
     }
 
     async fn recv(&self) -> Result<Vec<u8>> {
@@ -251,8 +314,14 @@ impl Session for SessionHandle {
             let close = Frame::Close { id: self.0.id, reason: Reason::Ordinary }.encode();
             let context = self.0.context.clone();
             let address = self.0.address;
+            let pieces = self.0.wire.messages(&self.0.peer, close);
+            let wire = std::sync::Arc::clone(&self.0.wire);
+            let peer = self.0.peer;
             tokio::spawn(async move {
-                let _ = context.send_message(address, close).await;
+                let _sending = wire.sending(&peer).await;
+                for piece in pieces {
+                    let _ = context.send_message(address, piece).await;
+                }
             });
         }
         Ok(())

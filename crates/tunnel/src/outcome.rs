@@ -6,7 +6,7 @@
 //! mistake, and an operator needs to tell those apart at a glance.
 
 use core::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use core::net::{IpAddr, Ipv4Addr};
 
 use roster::id::DeviceId;
 

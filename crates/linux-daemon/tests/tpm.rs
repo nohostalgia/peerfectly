@@ -259,3 +259,67 @@ fn an_empty_entry_refuses_without_costing_a_guess() {
     assert!(tpm.sign(&stored, b"wrong guess", b"revoke").is_err());
     assert!(lockout_counter(&swtpm) > before, "where a wrong passphrase is one");
 }
+
+/// **This machine's own key needs nobody.** Made with no authorisation, exempt
+/// from the lockout it has nothing to guess for, loaded only by the TPM that
+/// made it, and signing what the roster's P-256 verifies.
+#[test]
+#[ignore = "needs swtpm: run in the testbed"]
+fn the_machine_key_signs_with_nobody_present() {
+    let swtpm = Swtpm::start();
+    let tpm = swtpm.tpm();
+    let stored = tpm.create_unattended().unwrap();
+    assert!(stored.unattended_attributes_hold().unwrap(), "fixedTPM, and noDA");
+    assert!(!stored.attributes_hold().unwrap(), "and not a passphrase key's attributes");
+    let stored = Stored::from_bytes(&stored.to_bytes()).unwrap();
+    let public = tpm.load_check(&stored).unwrap();
+    let signature = tpm.sign_unattended(&stored, b"a checkpoint").unwrap();
+    let key = PublicKey::new(Algorithm::P256, public).unwrap();
+    key.verify(b"a checkpoint", &signature).unwrap();
+
+    // Another TPM cannot load it.
+    let other = Swtpm::start();
+    assert!(other.tpm().load_check(&stored).is_err());
+}
+
+/// **The daemon's machine key is in the TPM, made once, and gone means lost.**
+#[test]
+#[ignore = "needs swtpm: run in the testbed"]
+fn the_daemon_keeps_its_machine_key_in_the_tpm() {
+    use daemon::keys::Keys as _;
+
+    let swtpm = Swtpm::start();
+    let home = tempfile::tempdir().unwrap();
+    let keys =
+        linux_daemon::custody::keys::LinuxKeys::with(home.path().join("keys"), Some(swtpm.tpm()));
+    let (first, made) = keys.machine_key(home.path()).unwrap();
+    assert!(made);
+    assert!(home.path().join("machine.tpm").exists());
+    assert!(!home.path().join("machine.key").exists(), "no software key");
+    let (again, made) = keys.machine_key(home.path()).unwrap();
+    assert!(!made);
+    assert_eq!(first.public(), again.public());
+    let signature = again.sign(b"a checkpoint").unwrap();
+    first.public().verify(b"a checkpoint", &signature).unwrap();
+
+    // The file gone: the key is lost, and not replaced.
+    std::fs::remove_file(home.path().join("machine.tpm")).unwrap();
+    assert!(keys.machine_key(home.path()).is_err());
+    // Nor with no TPM at all.
+    let without = linux_daemon::custody::keys::LinuxKeys::with(home.path().join("keys"), None);
+    assert!(without.machine_key(home.path()).is_err());
+}
+
+/// **The transport keys' file key opens only on this TPM.**
+#[test]
+#[ignore = "needs swtpm: run in the testbed"]
+fn a_sealed_secret_opens_only_on_its_tpm() {
+    let swtpm = Swtpm::start();
+    let tpm = swtpm.tpm();
+    let stored = tpm.seal_secret(&[7; 32]).unwrap();
+    let stored = Stored::from_bytes(&stored.to_bytes()).unwrap();
+    assert_eq!(tpm.unseal_secret(&stored).unwrap().as_slice(), &[7; 32]);
+
+    let other = Swtpm::start();
+    assert!(other.tpm().unseal_secret(&stored).is_err(), "a copy on another machine");
+}

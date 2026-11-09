@@ -1,60 +1,97 @@
 //! Which device holds which IPv4 address.
 //!
-//! # Held only when unique among present and revoked devices
+//! # An offset in the network's block
 //!
-//! Thirty-two bits cannot keep every device id apart, so two devices of one
-//! network can derive the same [`crate::ipv4_candidate`]. When they do, **neither
-//! holds it**. The rule reads only sets — the devices present and the devices
-//! revoked — and never an order, because admission order is gone once a roster
-//! is compacted: a rule reading it would give a node fed a snapshot different
-//! addresses from a node fed the whole history.
+//! A device holds the address its offset names in the network's block: the
+//! block's base plus the offset an admin assigned it at admission
+//! (`roster::leaf::Ipv4Offset`), where that is one of the block's hosts —
+//! neither its first address nor its last. A device with no offset, or with one
+//! the block does not hold, holds no IPv4 address and is reached by IPv6.
 //!
-//! Revoked devices count. A present device never holds the address a revoked
-//! one derives, so a revoked device's address is never reused, with nothing to
-//! reserve or expire — including in the window where one node has seen the
-//! revocation and another still routes to the revoked device.
+//! Nothing is derived from a device's id any more. A derived candidate
+//! collided as a network grew — a million devices in the default `/10` left a
+//! fifth of them without one — and no rule keeping an address from moving
+//! could settle it, the state keeping no admission order (`scalable-membership`
+//! 19). An admin who admits knows which offsets are taken, and gives the next.
 //!
-//! What it gives up: two admissions made apart that derive one candidate leave
-//! both devices without IPv4. Admission refuses every collision it can see, so
-//! only concurrent ones get this far; they are reported by name, and IPv6 and
-//! the name keep working.
+//! Two claims on one offset are settled by derivation, as any other claim on an
+//! address: the latest keeps it, and every device a later claim overruled has
+//! lost it for good (`roster::state`). So a state holds each offset once at
+//! most, and the holdings read it as it is.
+//!
+//! The rule reads only what a roster state keeps — the devices present, their
+//! settings, the network's block — and never an order or the set of revoked
+//! devices: a node resting on a root and one holding the history agree.
+//!
+//! # Of a state, read as asked
+//!
+//! The holdings of a state are a view of it: what a device holds is read from
+//! its leaf, and who holds an address from the state's index of offsets. Not
+//! maps of every device, which held 649 bytes a device at a fleet's size and
+//! were decided again whole at every change (`scalable-membership` 16.6).
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::net::Ipv4Addr;
 
-use roster::id::{DeviceId, NetworkId};
+use roster::id::DeviceId;
+use roster::leaf::Ipv4Offset;
 use roster::state::RosterState;
 use roster::types::Ipv4Range;
 
-use crate::address::ipv4_candidate;
-
-/// Why a present device holds no IPv4 address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Collision {
-    /// The address it would have held.
-    pub candidate: Ipv4Addr,
-    /// The other devices, present or revoked, that derive the same one.
-    pub with: BTreeSet<DeviceId>,
-}
-
 /// The IPv4 addresses a network's devices hold, in both directions.
-///
-/// Computed whole from a roster state and replaced whole when the roster
-/// changes; nothing updates it in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ipv4Holdings {
-    /// The range addresses were derived in.
-    range: Ipv4Range,
-    /// Each present device holding an address.
-    by_device: BTreeMap<DeviceId, Ipv4Addr>,
-    /// Each held address, and the device holding it.
-    by_address: BTreeMap<Ipv4Addr, DeviceId>,
-    /// Each present device without an address, and why.
-    colliding: BTreeMap<DeviceId, Collision>,
+pub struct Ipv4Holdings(Holdings);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Holdings {
+    /// Of a list of devices, decided as given: what the tests and the
+    /// in-process doubles want.
+    Listed {
+        range: Ipv4Range,
+        by_device: BTreeMap<DeviceId, Ipv4Addr>,
+        by_address: BTreeMap<Ipv4Addr, DeviceId>,
+    },
+    /// Of a roster state, read from it.
+    Of(Box<View>),
 }
+
+/// The holdings of one roster state.
+#[derive(Clone)]
+struct View {
+    state: RosterState,
+    range: Ipv4Range,
+}
+
+impl core::fmt::Debug for View {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("View")
+            .field("network", &self.state.network)
+            .field("range", &self.range)
+            .field("devices", &self.state.devices.root())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two views are equal where their states hold the same devices, settings and
+/// all, in the same network under the same parameters: the holdings are a
+/// function of the devices and the block, and the parameters besides — the
+/// blocks excluded from the route above all — are what a node watching the
+/// holdings re-plans its routes on (`scalable-membership` 19.7).
+impl PartialEq for View {
+    fn eq(&self, other: &Self) -> bool {
+        self.state.network == other.state.network
+            && self.range == other.range
+            && self.state.params == other.state.params
+            && self.state.devices.root() == other.state.devices.root()
+    }
+}
+
+impl Eq for View {}
 
 impl Default for Ipv4Holdings {
-    /// No device holds anything, in the default range.
+    /// No device holds anything, in the default block.
     fn default() -> Self {
         Self::empty(Ipv4Range::DEFAULT)
     }
@@ -64,95 +101,120 @@ impl Ipv4Holdings {
     /// Holdings in which no device holds anything.
     #[must_use]
     pub fn empty(range: Ipv4Range) -> Self {
-        Self {
+        Self(Holdings::Listed { range, by_device: BTreeMap::new(), by_address: BTreeMap::new() })
+    }
+
+    /// The holdings of devices given consecutive offsets in `range`, the first
+    /// device the first of its hosts, in the order given: as an admin admitting
+    /// them one after another would.
+    #[must_use]
+    pub fn from<'a>(range: Ipv4Range, devices: impl IntoIterator<Item = &'a DeviceId>) -> Self {
+        Self::assigned(
             range,
-            by_device: BTreeMap::new(),
-            by_address: BTreeMap::new(),
-            colliding: BTreeMap::new(),
-        }
-    }
-
-    /// Decides the holdings of a network.
-    ///
-    /// `devices` are the devices present, `revoked` those revoked. A device in
-    /// both is counted once. Only present devices hold addresses.
-    #[must_use]
-    pub fn from<'a>(
-        network: &NetworkId,
-        range: Ipv4Range,
-        devices: impl IntoIterator<Item = &'a DeviceId>,
-        revoked: impl IntoIterator<Item = &'a DeviceId>,
-    ) -> Self {
-        let present: BTreeSet<DeviceId> = devices.into_iter().copied().collect();
-        let everyone: BTreeSet<DeviceId> =
-            present.iter().copied().chain(revoked.into_iter().copied()).collect();
-
-        let mut by_candidate: BTreeMap<Ipv4Addr, BTreeSet<DeviceId>> = BTreeMap::new();
-        for device in &everyone {
-            by_candidate
-                .entry(ipv4_candidate(network, device, &range))
-                .or_default()
-                .insert(*device);
-        }
-
-        let mut holdings = Self::empty(range);
-        for (candidate, devices) in by_candidate {
-            for device in devices.iter().filter(|device| present.contains(device)) {
-                if devices.len() == 1 {
-                    holdings.by_device.insert(*device, candidate);
-                    holdings.by_address.insert(candidate, *device);
-                } else {
-                    let with = devices.iter().filter(|other| *other != device).copied().collect();
-                    holdings.colliding.insert(*device, Collision { candidate, with });
-                }
-            }
-        }
-        holdings
-    }
-
-    /// The holdings a roster state implies.
-    #[must_use]
-    pub fn of_state(state: &RosterState) -> Self {
-        Self::from(
-            &state.network,
-            state.params.ipv4_range(),
-            state.devices.keys(),
-            state.revoked.iter(),
+            devices
+                .into_iter()
+                .zip(1_u32..)
+                .map(|(device, offset)| (*device, Some(offset.to_be_bytes()))),
         )
     }
 
-    /// The range addresses were derived in.
+    /// The holdings of devices each with the offset it was assigned, if any.
+    ///
+    /// An offset the block does not hold is as good as none. Two devices given
+    /// one offset — which a derived state never holds — both hold nothing.
     #[must_use]
-    pub const fn range(&self) -> Ipv4Range {
-        self.range
+    pub fn assigned(
+        range: Ipv4Range,
+        devices: impl IntoIterator<Item = (DeviceId, Option<Ipv4Offset>)>,
+    ) -> Self {
+        let mut claims: BTreeMap<Ipv4Addr, Vec<DeviceId>> = BTreeMap::new();
+        for (device, offset) in devices {
+            if let Some(address) = offset.and_then(|offset| range.address_at(offset)) {
+                claims.entry(Ipv4Addr::from(address)).or_default().push(device);
+            }
+        }
+        let mut by_device = BTreeMap::new();
+        let mut by_address = BTreeMap::new();
+        for (address, claimants) in claims {
+            if let [device] = claimants.as_slice() {
+                by_device.insert(*device, address);
+                by_address.insert(address, *device);
+            }
+        }
+        Self(Holdings::Listed { range, by_device, by_address })
+    }
+
+    /// The holdings a roster state implies: a view of it, which costs what
+    /// copying the state costs.
+    #[must_use]
+    pub fn of_state(state: &RosterState) -> Self {
+        Self(Holdings::Of(Box::new(View {
+            state: state.clone(),
+            range: state.params.ipv4_range(),
+        })))
+    }
+
+    /// The holdings `state` implies, where these are the holdings `previous`
+    /// implied: a view of `state`, as [`Self::of_state`].
+    #[must_use]
+    pub fn updated(&self, _previous: &RosterState, state: &RosterState) -> Self {
+        Self::of_state(state)
+    }
+
+    /// The block addresses are in.
+    #[must_use]
+    pub fn range(&self) -> Ipv4Range {
+        match &self.0 {
+            Holdings::Listed { range, .. } => *range,
+            Holdings::Of(view) => view.range,
+        }
     }
 
     /// The address a device holds.
     #[must_use]
     pub fn of(&self, device: &DeviceId) -> Option<Ipv4Addr> {
-        self.by_device.get(device).copied()
+        match &self.0 {
+            Holdings::Listed { by_device, .. } => by_device.get(device).copied(),
+            Holdings::Of(view) => {
+                let leaf = view.state.devices.get(device)?;
+                leaf.settings
+                    .ipv4
+                    .and_then(|offset| view.range.address_at(offset))
+                    .map(Ipv4Addr::from)
+            }
+        }
     }
 
     /// The device holding an address.
     #[must_use]
     pub fn holder(&self, address: Ipv4Addr) -> Option<DeviceId> {
-        self.by_address.get(&address).copied()
+        match &self.0 {
+            Holdings::Listed { by_address, .. } => by_address.get(&address).copied(),
+            Holdings::Of(view) => {
+                let offset = view.range.offset_of(address.octets())?;
+                // Settled to one by derivation; of two, which a state never
+                // holds, neither.
+                match view.state.devices.holding_address(offset).as_slice() {
+                    [device] => Some(*device),
+                    _ => None,
+                }
+            }
+        }
     }
 
-    /// Why a present device holds no address, when it collides.
-    #[must_use]
-    pub fn collision(&self, device: &DeviceId) -> Option<&Collision> {
-        self.colliding.get(device)
-    }
-
-    /// Every held address, by device.
-    pub fn held(&self) -> impl Iterator<Item = (DeviceId, Ipv4Addr)> + '_ {
-        self.by_device.iter().map(|(device, address)| (*device, *address))
-    }
-
-    /// Every present device without an address, and why.
-    pub fn colliding(&self) -> impl Iterator<Item = (&DeviceId, &Collision)> {
-        self.colliding.iter()
+    /// Every held address, by device. Of a state, a walk over every device.
+    pub fn held(&self) -> Box<dyn Iterator<Item = (DeviceId, Ipv4Addr)> + '_> {
+        match &self.0 {
+            Holdings::Listed { by_device, .. } => {
+                Box::new(by_device.iter().map(|(device, address)| (*device, *address)))
+            }
+            Holdings::Of(view) => Box::new(
+                view.state
+                    .devices
+                    .keys()
+                    .filter_map(|device| self.of(&device).map(|address| (device, address))),
+            ),
+        }
     }
 }
 
@@ -165,95 +227,54 @@ mod tests {
         DeviceId::from_bytes([tag; 32])
     }
 
-    fn network() -> NetworkId {
-        NetworkId::from_bytes([7; 32])
-    }
-
-    /// The narrowest range holds fourteen addresses, so a few dozen devices are
-    /// sure to collide somewhere. Finds the first pair that does.
-    fn a_colliding_pair(range: Ipv4Range) -> (DeviceId, DeviceId) {
-        let mut seen: BTreeMap<Ipv4Addr, DeviceId> = BTreeMap::new();
-        for tag in 0..=255 {
-            let candidate = ipv4_candidate(&network(), &device(tag), &range);
-            if let Some(earlier) = seen.insert(candidate, device(tag)) {
-                return (earlier, device(tag));
-            }
-        }
-        panic!("sixteen addresses cannot hold 256 devices apart");
-    }
-
-    fn narrow() -> Ipv4Range {
-        "10.0.0.0/28".parse().expect("allowed")
+    fn range(text: &str) -> Ipv4Range {
+        text.parse().expect("an allowed range")
     }
 
     #[test]
-    fn a_device_alone_holds_its_candidate_in_both_directions() {
-        let range = Ipv4Range::DEFAULT;
-        let holdings = Ipv4Holdings::from(&network(), range, &[device(1)], &[]);
-        let candidate = ipv4_candidate(&network(), &device(1), &range);
-
-        assert_eq!(holdings.of(&device(1)), Some(candidate));
-        assert_eq!(holdings.holder(candidate), Some(device(1)));
-        assert_eq!(holdings.collision(&device(1)), None);
+    fn consecutive_offsets_hold_consecutive_addresses_from_the_first_host() {
+        let holdings = Ipv4Holdings::from(range("10.0.0.0/28"), &[device(1), device(2), device(3)]);
+        assert_eq!(holdings.of(&device(1)), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(holdings.of(&device(3)), Some(Ipv4Addr::new(10, 0, 0, 3)));
+        assert_eq!(holdings.holder(Ipv4Addr::new(10, 0, 0, 2)), Some(device(2)));
+        assert_eq!(holdings.holder(Ipv4Addr::new(10, 0, 0, 4)), None);
     }
 
     #[test]
-    fn a_collision_leaves_both_without_ipv4() {
-        let (one, two) = a_colliding_pair(narrow());
-        let holdings = Ipv4Holdings::from(&network(), narrow(), &[one, two], &[]);
-        let candidate = ipv4_candidate(&network(), &one, &narrow());
-
-        assert_eq!(holdings.of(&one), None);
-        assert_eq!(holdings.of(&two), None);
-        assert_eq!(holdings.holder(candidate), None);
-        let collision = holdings.collision(&one).expect("the reason is kept");
-        assert_eq!(collision.candidate, candidate);
-        assert_eq!(collision.with, BTreeSet::from([two]), "and names the other device");
-        assert_eq!(holdings.collision(&two).map(|c| c.with.clone()), Some(BTreeSet::from([one])));
-    }
-
-    #[test]
-    fn a_revoked_devices_candidate_is_never_held_by_a_present_one() {
-        let (revoked, present) = a_colliding_pair(narrow());
-        let holdings = Ipv4Holdings::from(&network(), narrow(), &[present], &[revoked]);
-
-        assert_eq!(holdings.of(&present), None);
-        assert_eq!(holdings.of(&revoked), None, "a revoked device holds nothing");
-        assert_eq!(
-            holdings.collision(&present).map(|c| c.with.clone()),
-            Some(BTreeSet::from([revoked]))
+    fn an_offset_the_block_does_not_hold_is_as_good_as_none() {
+        // A /28 holds hosts 1 to 14: 0 is its network, 15 its broadcast.
+        let holdings = Ipv4Holdings::assigned(
+            range("10.0.0.0/28"),
+            [
+                (device(1), Some(0_u32.to_be_bytes())),
+                (device(2), Some(15_u32.to_be_bytes())),
+                (device(3), Some(16_u32.to_be_bytes())),
+                (device(4), None),
+                (device(5), Some(14_u32.to_be_bytes())),
+            ],
         );
-        assert!(holdings.colliding().all(|(device, _)| *device != revoked));
+        for tag in 1..=4 {
+            assert_eq!(holdings.of(&device(tag)), None, "device {tag}");
+        }
+        assert_eq!(holdings.of(&device(5)), Some(Ipv4Addr::new(10, 0, 0, 14)));
     }
 
     #[test]
-    fn a_device_both_present_and_revoked_does_not_collide_with_itself() {
-        let holdings = Ipv4Holdings::from(&network(), narrow(), &[device(1)], &[device(1)]);
-        assert!(holdings.of(&device(1)).is_some());
+    fn two_devices_given_one_offset_both_hold_nothing() {
+        let one = Some(3_u32.to_be_bytes());
+        let holdings =
+            Ipv4Holdings::assigned(range("10.0.0.0/28"), [(device(1), one), (device(2), one)]);
+        assert_eq!(holdings.of(&device(1)), None);
+        assert_eq!(holdings.of(&device(2)), None);
+        assert_eq!(holdings.holder(Ipv4Addr::new(10, 0, 0, 3)), None);
     }
 
     #[test]
-    fn the_result_is_independent_of_iteration_order() {
-        let devices: Vec<DeviceId> = (0..40).map(device).collect();
-        let revoked: Vec<DeviceId> = (40..50).map(device).collect();
-        let forward = Ipv4Holdings::from(&network(), narrow(), &devices, &revoked);
-
-        let mut backward_devices = devices.clone();
-        backward_devices.reverse();
-        let mut backward_revoked = revoked.clone();
-        backward_revoked.reverse();
-        let backward =
-            Ipv4Holdings::from(&network(), narrow(), &backward_devices, &backward_revoked);
-
-        assert_eq!(forward, backward);
-        assert!(forward.colliding().next().is_some(), "the fixture exercises collisions");
-    }
-
-    #[test]
-    fn empty_holdings_hold_nothing() {
-        let holdings = Ipv4Holdings::default();
-        assert_eq!(holdings.range(), Ipv4Range::DEFAULT);
-        assert_eq!(holdings.held().count(), 0);
-        assert_eq!(holdings.holder(Ipv4Addr::new(100, 64, 0, 1)), None);
+    fn moving_the_block_moves_every_address_and_no_offset() {
+        let devices = [device(1), device(2)];
+        let before = Ipv4Holdings::from(range("10.0.0.0/24"), &devices);
+        let after = Ipv4Holdings::from(range("10.9.0.0/22"), &devices);
+        assert_eq!(before.of(&device(2)), Some(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(after.of(&device(2)), Some(Ipv4Addr::new(10, 9, 0, 2)));
     }
 }

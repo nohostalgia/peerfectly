@@ -8,6 +8,7 @@ pub mod members;
 pub mod node;
 pub mod relay;
 pub mod session;
+pub mod wire;
 
 pub use error::{BuildError, Result};
 pub use node::ConvessoTransport;

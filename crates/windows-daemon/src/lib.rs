@@ -240,7 +240,7 @@ mod startup {
 
         for speaking in [
             "ConvessoTransport::bind",
-            "Waiting::listen",
+            "Waiting::at_rendezvous",
             "Adapter::create()",
             "connectivity.start",
             "Multicast::",

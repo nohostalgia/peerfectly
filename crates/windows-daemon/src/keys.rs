@@ -150,6 +150,96 @@ impl KeyCustodian for MachineCustodian {
     }
 }
 
+/// This machine's own key, in the TPM: what signs its checkpoints.
+///
+/// Its public half is read from the TPM when it is opened, never from a file.
+struct TpmMachineKey {
+    store: Arc<Store>,
+    name: String,
+    public: PublicKey,
+}
+
+impl daemon::checkpoint::MachineKey for TpmMachineKey {
+    fn public(&self) -> PublicKey {
+        self.public.clone()
+    }
+
+    fn sign(&self, message: &[u8]) -> core::result::Result<Vec<u8>, String> {
+        self.store.sign(&self.name, message)
+    }
+}
+
+/// The TPM, as the place this machine's own key lives.
+struct TpmHardware {
+    store: Arc<Store>,
+    name: String,
+}
+
+impl TpmHardware {
+    fn key(
+        &self,
+        public: &[u8],
+    ) -> core::result::Result<Arc<dyn daemon::checkpoint::MachineKey>, String> {
+        let public =
+            PublicKey::new(Algorithm::P256, public.to_vec()).map_err(|cause| cause.to_string())?;
+        Ok(Arc::new(TpmMachineKey {
+            store: Arc::clone(&self.store),
+            name: self.name.clone(),
+            public,
+        }))
+    }
+}
+
+impl daemon::checkpoint::HardwareKeys for TpmHardware {
+    fn open(
+        &self,
+    ) -> core::result::Result<Option<Arc<dyn daemon::checkpoint::MachineKey>>, String> {
+        match self.store.public_key(&self.name) {
+            Ok(public) => self.key(&public).map(Some),
+            Err(refusal) if crate::platform::custody::is_absent(&refusal) => Ok(None),
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    fn create(&self) -> core::result::Result<Arc<dyn daemon::checkpoint::MachineKey>, String> {
+        let public = self.store.create_unattended(&self.name)?;
+        self.key(&public)
+    }
+}
+
+/// The name of the key the TPM wraps the transport and attestation keys under.
+const WRAPPING: &str = "peerfectly.seal";
+
+/// The TPM, as what the transport and attestation keys are sealed under: their
+/// file opens only on this machine.
+struct TpmWrap {
+    store: Arc<Store>,
+}
+
+impl identity::wrapped::KeyWrap for TpmWrap {
+    fn wrap(&self, key: &[u8; 32]) -> identity::Result<Vec<u8>> {
+        let failed = |detail: String| identity::Error::Storage { detail };
+        match self.store.wrap(WRAPPING, key) {
+            Err(refusal) if crate::platform::custody::is_absent(&refusal) => {
+                self.store.create_wrapping(WRAPPING).map_err(failed)?;
+                self.store.wrap(WRAPPING, key).map_err(failed)
+            }
+            other => other.map_err(failed),
+        }
+    }
+
+    fn unwrap(&self, wrapped: &[u8]) -> identity::Result<identity::wrapped::Zeroizing<[u8; 32]>> {
+        let opened = self
+            .store
+            .unwrap(WRAPPING, wrapped)
+            .map_err(|detail| identity::Error::Storage { detail })?;
+        let opened = identity::wrapped::Zeroizing::new(opened);
+        let key: [u8; 32] =
+            opened.as_slice().try_into().map_err(|_| identity::Error::CorruptIdentity)?;
+        Ok(identity::wrapped::Zeroizing::new(key))
+    }
+}
+
 /// This machine's keys: the signing one in the TPM, the rest here.
 pub struct MachineKeys {
     /// The key store, opened once.
@@ -173,6 +263,35 @@ impl MachineKeys {
             );
         }
         Ok(Self { store: Arc::new(store) })
+    }
+
+    /// This machine's own key, held in the TPM under `name`: what
+    /// [`Keys::machine_key`] answers with, under the name it always uses. Named
+    /// here so that a check run on a real machine can use a key of its own and
+    /// leave the daemon's alone.
+    ///
+    /// # Errors
+    ///
+    /// As [`daemon::checkpoint::machine_key`].
+    pub fn machine_key_named(
+        &self,
+        home: &std::path::Path,
+        name: &str,
+    ) -> Result<(Arc<dyn daemon::checkpoint::MachineKey>, bool)> {
+        daemon::checkpoint::machine_key(
+            home,
+            Some(&TpmHardware { store: Arc::clone(&self.store), name: name.to_owned() }),
+        )
+    }
+
+    /// What the transport and attestation keys are sealed with: under a key the
+    /// TPM wraps, opening what DPAPI sealed before.
+    #[must_use]
+    pub fn sealer(&self) -> identity::wrapped::WrappedSealer<impl identity::wrapped::KeyWrap> {
+        identity::wrapped::WrappedSealer::new(
+            TpmWrap { store: Arc::clone(&self.store) },
+            Box::new(identity::store::PlatformSealer),
+        )
     }
 
     /// The key store, for the component that can reach it.
@@ -222,8 +341,7 @@ impl MachineKeys {
             |cause: identity::Error| Error::State { path: path.clone(), cause: cause.to_string() };
 
         if path.exists() {
-            let held = identity::store::load_with(&path, &identity::store::PlatformSealer, self)
-                .map_err(failed)?;
+            let held = identity::store::load_with(&path, &self.sealer(), self).map_err(failed)?;
 
             // A network whose signing key is a file, on a machine that can
             // protect one. It is refused rather than carried: a device that can
@@ -252,6 +370,13 @@ impl MachineKeys {
 }
 
 impl Keys for MachineKeys {
+    fn machine_key(
+        &self,
+        home: &std::path::Path,
+    ) -> Result<(Arc<dyn daemon::checkpoint::MachineKey>, bool)> {
+        self.machine_key_named(home, daemon::checkpoint::HARDWARE_NAME)
+    }
+
     fn identity(&self, paths: &Paths) -> Result<NodeIdentity> {
         if let Some(held) = self.existing(paths)? {
             return Ok(held);
@@ -343,8 +468,7 @@ impl Keys for MachineKeys {
         )
         .map_err(failed)?;
 
-        identity::store::save_with(&identity, &path, &identity::store::PlatformSealer)
-            .map_err(failed)?;
+        identity::store::save_with(&identity, &path, &self.sealer()).map_err(failed)?;
         Ok(identity)
     }
 }

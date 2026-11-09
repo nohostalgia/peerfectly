@@ -28,6 +28,19 @@ use crate::error::{Error, Result};
 pub struct Adopted {
     /// The state derived from what was delivered.
     pub state: RosterState,
+    /// The root and state the delivered roster rests on, where the admitting
+    /// side had compacted: what the joining device keeps as its own base.
+    pub base: Option<(roster::snapshot::SignedSnapshot, RosterState)>,
+}
+
+/// The base a delivered network rests on, where the admitting side's roster
+/// was compacted: the signed root, and the state it commits to.
+#[derive(Debug, Clone)]
+pub struct Base {
+    /// The root, as its author signed it.
+    pub root: Vec<u8>,
+    /// The state, as assembled from its pieces.
+    pub state: RosterState,
 }
 
 /// Decides whether a delivered network may be adopted.
@@ -39,14 +52,30 @@ pub struct Adopted {
 /// not sign, and [`Error::RosterUnusable`] when what arrived does not derive to
 /// a state at all.
 pub fn adopt(operations: &[Vec<u8>], identity: &NodeIdentity) -> Result<Adopted> {
+    adopt_on(None, operations, &[], identity)
+}
+
+/// As [`adopt`], for a network delivered resting on `base`: the roster rests
+/// on the root and its state, checked against each other and against the
+/// root's author, and takes the operations that follow the root's heads.
+///
+/// # Errors
+///
+/// As [`adopt`], and [`Error::RosterUnusable`] when the base does not check
+/// out.
+pub fn adopt_on(
+    base: Option<Base>,
+    operations: &[Vec<u8>],
+    pieces: &[Vec<u8>],
+    identity: &NodeIdentity,
+) -> Result<Adopted> {
     let signing = identity.signing_key().public_key();
     let transport = identity.transport_key().public_key();
 
     let mut roster = Roster::new();
-    for operation in operations {
-        roster.offer_bytes(operation);
-    }
+    fill(&mut roster, base, operations, pieces)?;
     let state = roster.state()?;
+    let base = roster.dag().base_snapshot().cloned().zip(roster.dag().base_state().cloned());
 
     let me = DeviceId::of_signing_key(signing.as_bytes());
     let Some(record) = state.devices.get(&me) else {
@@ -73,7 +102,79 @@ pub fn adopt(operations: &[Vec<u8>], identity: &NodeIdentity) -> Result<Adopted>
         return Err(Error::NotAdmitted);
     }
 
-    Ok(Adopted { state })
+    Ok(Adopted { state, base })
+}
+
+/// Offers a delivered network to `roster`: resting it on `base` first, where
+/// there is one, and then the operations that follow, each batch among them
+/// given its `pieces` as soon as the roster holds its header.
+///
+/// Fed as each batch is parked rather than after every operation, so that a
+/// log with more batches than the roster holds incomplete at once still fills.
+/// Pieces of batches beneath the base, or of none here, are left unused.
+///
+/// # Errors
+///
+/// When the base does not check out.
+pub fn fill(
+    roster: &mut Roster,
+    base: Option<Base>,
+    operations: &[Vec<u8>],
+    pieces: &[Vec<u8>],
+) -> Result<()> {
+    let offered = match base {
+        None => operations.to_vec(),
+        Some(base) => resting_on(roster, base, operations)?,
+    };
+    let mut by_batch: std::collections::BTreeMap<roster::id::OperationId, Vec<&Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    for piece in pieces {
+        if let Ok(batch) = roster::batch::BatchPiece::batch_of(piece) {
+            by_batch.entry(batch).or_default().push(piece);
+        }
+    }
+    for operation in &offered {
+        roster.offer_bytes(operation);
+        if by_batch.is_empty() {
+            continue;
+        }
+        for batch in roster.awaiting_pieces() {
+            for piece in by_batch.remove(&batch).unwrap_or_default() {
+                roster.offer_piece(piece);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rests `roster` on `base` and returns the operations that follow its heads,
+/// in the order delivered. An operation follows when every parent is a head or
+/// follows; anything else is beneath the base, which already covers it.
+fn resting_on(roster: &mut Roster, base: Base, operations: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    let raw = roster::snapshot::RawSnapshot::decode(&base.root)?;
+    let mut known: std::collections::BTreeSet<roster::id::OperationId> =
+        raw.body().heads.iter().copied().collect();
+    let mut heads = Vec::new();
+    let mut after = Vec::new();
+    for bytes in operations {
+        let Ok(operation) = RawOperation::decode(bytes) else { continue };
+        if known.contains(&operation.id()) {
+            heads.push(bytes.clone());
+        }
+    }
+    roster.rest_on(&base.root, base.state, &heads)?;
+    for bytes in operations {
+        let Ok(operation) = RawOperation::decode(bytes) else { continue };
+        let id = operation.id();
+        if known.contains(&id) {
+            continue;
+        }
+        if operation.core().parents.iter().all(|parent| known.contains(parent)) {
+            known.insert(id);
+            after.push(bytes.clone());
+        }
+    }
+    Ok(after)
 }
 
 /// Whether what arrived contains an admission of this device that the roster
@@ -152,6 +253,63 @@ mod tests {
             operations.push(sign_operation(&add, founder.signer()).expect("signs"));
         }
         operations
+    }
+
+    /// An admission signed after a batch rests on it, and a batch's operation
+    /// is only its header: delivered without its pieces, the admission waits on
+    /// a batch that never completes, and the device finds itself missing.
+    #[test]
+    fn an_admission_after_a_batch_is_adopted_with_the_batch_s_pieces() {
+        use roster::batch::{BatchEntry, BatchHeader};
+        use roster::types::KeyEntry;
+
+        let founder = NodeIdentity::generate().expect("generates");
+        let joiner = NodeIdentity::generate().expect("generates");
+        let board = NodeIdentity::generate().expect("generates");
+        let mut delivered = network(&founder, &joiner, false);
+        let genesis = RawOperation::decode(delivered.first().expect("genesis")).expect("decodes");
+        let network = NetworkId::from_bytes(*genesis.id().as_bytes());
+
+        let mut keys = board.device_spec("board", Role::Member, false, vec![]).expect("spec").keys;
+        keys.sort_by_key(KeyEntry::order_key);
+        let entries = vec![BatchEntry {
+            keys,
+            name: "board".to_owned(),
+            serial: b"SN1".to_vec(),
+            ipv4: None,
+        }];
+        let header =
+            BatchHeader::for_entries(&entries, roster::leaf::Mode::Full, vec![], None, "lot")
+                .expect("header");
+        let batch = OperationCore::new(
+            2,
+            founder.signing_key().algorithm(),
+            OperationBody::AdmitBatch(header),
+            vec![genesis.id()],
+            founder.signing_key().key_id(),
+            network,
+        )
+        .expect("well-formed");
+        delivered.push(sign_operation(&batch, founder.signer()).expect("signs"));
+        let pieces = roster::batch::pieces_of(&batch.id(), &entries).expect("cut");
+
+        let add = OperationCore::new(
+            3,
+            founder.signing_key().algorithm(),
+            OperationBody::AddDevice(
+                joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+            ),
+            vec![batch.id()],
+            founder.signing_key().key_id(),
+            network,
+        )
+        .expect("well-formed");
+        delivered.push(sign_operation(&add, founder.signer()).expect("signs"));
+
+        assert!(adopt(&delivered, &joiner).is_err(), "the header alone holds the admission back");
+        let adopted = adopt_on(None, &delivered, &pieces, &joiner).expect("adopts");
+        let board_id = DeviceId::of_signing_key(board.signing_key().public_key().as_bytes());
+        assert!(adopted.state.devices.get(&board_id).is_some(), "the batch took effect");
     }
 
     #[test]

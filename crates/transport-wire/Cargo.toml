@@ -1,0 +1,14 @@
+[package]
+name = "transport-wire"
+description = "The frames this project's sessions carry over convesso, and how a frame too large for a peer travels in parts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

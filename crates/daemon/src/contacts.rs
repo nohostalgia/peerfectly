@@ -34,7 +34,7 @@
 //! pin a device's last contact in the future for good, while a clock set back
 //! makes one reading early and corrects at the next contact.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roster::id::DeviceId;
@@ -67,9 +67,9 @@ impl LastContacts {
     }
 
     /// Forgets every device not in `kept`. Returns whether anything went.
-    pub(crate) fn retain(&mut self, kept: &BTreeSet<DeviceId>) -> bool {
+    pub(crate) fn retain(&mut self, kept: impl Fn(&DeviceId) -> bool) -> bool {
         let before = self.by_device.len();
-        self.by_device.retain(|device, _| kept.contains(device));
+        self.by_device.retain(|device, _| kept(device));
         self.by_device.len() != before
     }
 }
@@ -112,9 +112,9 @@ impl ContactRecord {
     /// Reads the record back.
     ///
     /// A missing file is an empty record, and so is an unreadable one — with the
-    /// failure returned beside it for the caller to report. Unlike confirmations,
-    /// neither direction of this loss misleads anybody: every device reads as "no
-    /// contact recorded", which is true of what this device now knows.
+    /// failure returned beside it for the caller to report. Neither direction of
+    /// this loss misleads anybody: every device reads as "no contact recorded",
+    /// which is true of what this device now knows.
     pub(crate) fn load(&self) -> (LastContacts, Option<Error>) {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -211,10 +211,10 @@ mod tests {
         let mut contacts = LastContacts::default();
         contacts.touch(device(1), 1);
         contacts.touch(device(2), 1);
-        assert!(contacts.retain(&BTreeSet::from([device(1)])));
+        assert!(contacts.retain(|held| *held == device(1)));
         assert_eq!(contacts.minute(&device(1)), Some(1));
         assert_eq!(contacts.minute(&device(2)), None);
-        assert!(!contacts.retain(&BTreeSet::from([device(1)])), "a second pass drops nothing");
+        assert!(!contacts.retain(|held| *held == device(1)), "a second pass drops nothing");
     }
 
     /// Nothing is kept but one number per device: no history and no address.
@@ -268,9 +268,8 @@ mod tests {
         let sources: &[(&str, &str)] = &[
             ("admitting.rs", include_str!("admitting.rs")),
             ("attesting.rs", include_str!("attesting.rs")),
-            ("channel.rs", include_str!("channel.rs")),
+            ("batches.rs", include_str!("batches.rs")),
             ("clock.rs", include_str!("clock.rs")),
-            ("confirmations.rs", include_str!("confirmations.rs")),
             ("conflicts.rs", include_str!("conflicts.rs")),
             ("connectivity.rs", include_str!("connectivity.rs")),
             ("discovery.rs", include_str!("discovery.rs")),
@@ -281,8 +280,12 @@ mod tests {
             ("founding.rs", include_str!("founding.rs")),
             ("gateway.rs", include_str!("gateway.rs")),
             ("joining.rs", include_str!("joining.rs")),
+            ("joins.rs", include_str!("joins.rs")),
             ("keys.rs", include_str!("keys.rs")),
             ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("invites.rs", include_str!("invites.rs")),
+            ("checkpoint.rs", include_str!("checkpoint.rs")),
+            ("lookup.rs", include_str!("lookup.rs")),
             ("limits.rs", include_str!("limits.rs")),
             ("logging.rs", include_str!("logging.rs")),
             ("machine.rs", include_str!("machine.rs")),
@@ -298,6 +301,7 @@ mod tests {
             ("rule.rs", include_str!("rule.rs")),
             ("schedule.rs", include_str!("schedule.rs")),
             ("signing.rs", include_str!("signing.rs")),
+            ("simulator.rs", include_str!("simulator.rs")),
             ("snapshots.rs", include_str!("snapshots.rs")),
             ("state.rs", include_str!("state.rs")),
             ("wire.rs", include_str!("wire.rs")),
@@ -335,24 +339,22 @@ mod tests {
             );
         }
 
-        // Inside the service, only the report may name it.
+        // Inside the service, only the report may name it: a network described,
+        // and a page of its devices.
         let service = crate::code_of(include_str!("service.rs"));
-        let outside_the_report = service.replace(body_of(&service, "async fn describe("), "");
+        let outside_the_report = service
+            .replace(body_of(&service, "async fn describe("), "")
+            .replace(body_of(&service, "async fn peers_page("), "");
         for token in TOKENS {
             assert!(
                 !outside_the_report.contains(token),
-                "`service.rs` names `{token}` outside `describe`, where only the report is built"
+                "`service.rs` names `{token}` outside `describe` and `peers_page`, where only the                  report is built"
             );
         }
 
         // Inside the node, the functions that pace, dial, route or authorise.
         let node = crate::code_of(include_str!("node.rs"));
         for function in [
-            "async fn lagging(",
-            "pub async fn owed(",
-            "pub async fn pressed(",
-            "pub async fn press(",
-            "async fn dial(",
             "pub async fn enforce_roster(",
             "async fn received_packet(",
             "pub async fn carry_one(",

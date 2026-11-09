@@ -11,13 +11,19 @@ rust-version.workspace = true
 default = []
 # A network and a relay in this process, for this crate's own tests. Off in any
 # ordinary build.
-fixture = ["dep:convesso-relay", "dep:rcgen"]
+fixture = ["dep:convesso-relay", "dep:rcgen", "dep:windows-sys"]
 
 [dependencies]
+# The frames, and a frame too large for a peer cut into parts.
+transport-wire = { path = "../transport-wire" }
 roster = { path = "../roster" }
 transport = { path = "../transport" }
 identity = { path = "../identity" }
 convesso-core = { workspace = true, features = ["alloc", "ed25519-seed"] }
+# The map from a convesso peer id back to the ed25519 key it is the X25519
+# form of: what lets a handshake be judged by the roster's key index alone.
+# The version ed25519-dalek already brings in.
+curve25519-dalek = "=5.0.0"
 convesso-stream = { workspace = true, features = ["alloc"] }
 convesso-tokio = { workspace = true, features = ["stream", "tls"] }
 async-trait.workspace = true
@@ -32,8 +38,15 @@ convesso-relay = { workspace = true, optional = true }
 # there authenticates nothing; the relay's pinned key is what is trusted.
 rcgen = { version = "0.14", optional = true }
 
+# The fixture's relay socket on Windows, which otherwise ends at the first
+# datagram that could not be delivered.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"], optional = true }
+
 [dev-dependencies]
 proptest.workspace = true
+# A microcontroller's sessions, held to this binding (`tests/light_sessions.rs`).
+light-node = { path = "../light-node" }
 # Depending on itself with the feature on is what makes `cargo test` enable it
 # without a flag, while an ordinary build still cannot see it.
 transport-convesso = { path = ".", features = ["fixture"] }

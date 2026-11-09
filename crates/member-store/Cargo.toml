@@ -1,0 +1,19 @@
+[package]
+name = "member-store"
+description = "A full member's base state on disk: the devices, their indexes and their tree, in redb, believed only through a root kept elsewhere."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roster = { path = "../roster" }
+redb = "=4.4.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+blake3 = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

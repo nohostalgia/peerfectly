@@ -29,6 +29,13 @@ pub const MAX_RECORD_ADDRESSES: usize = 16;
 /// Addresses are opaque here, so this bounds a string rather than a parsed form.
 pub const MAX_ADDRESS_LEN: usize = 256;
 
+/// Maximum length of what a record shows of its sender's membership.
+///
+/// A leaf and a proof: a proof grows with the network, and past a network of
+/// some tens of thousands it no longer fits a packet beside the addresses, and
+/// is left out of the announcement.
+pub const MAX_SHOWN_LEN: usize = 1024;
+
 /// Length of the random nonce prefixed to every packet.
 pub const NONCE_LEN: usize = 12;
 

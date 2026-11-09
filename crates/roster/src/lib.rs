@@ -33,7 +33,7 @@
 //!
 //! # Snapshots sit outside the graph
 //!
-//! [`snapshot::Snapshot`] is an admin's signed attestation, not an eighth
+//! [`snapshot::Snapshot`] — a root — is an admin's signed statement, not a tenth
 //! operation type: it never enters the DAG, is never a parent, and never
 //! merges. A node may discard what a snapshot covers, but only under the three
 //! gates in [`roster::Roster::compact`], and only after verifying the snapshot
@@ -52,8 +52,9 @@
 //! its pending set fairly: doing that needs per-peer accounting, and peer
 //! identity is authenticated by the transport. See `FORMAT.md` §19.
 //!
-//! Compaction reclaims bytes, not the `MAX_OPERATIONS` ceiling: retained heads
-//! and everything after them still count against it. See `FORMAT.md` §30.
+//! The `MAX_OPERATIONS` ceiling bounds the window, not the history: each
+//! compaction moves the base forward, so a network that keeps publishing roots
+//! stays under it. See `FORMAT.md` §30.
 //!
 //! # Why the strictness
 //!
@@ -126,18 +127,62 @@
 //! # Ok::<(), roster::Error>(())
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+/// The part of `std`'s prelude that comes from `alloc`, named where a module
+/// needs it, so a module reads the same with `std` and without.
+mod prelude {
+    pub(crate) use alloc::borrow::ToOwned;
+    pub(crate) use alloc::boxed::Box;
+    pub(crate) use alloc::string::String;
+    pub(crate) use alloc::vec;
+    pub(crate) use alloc::vec::Vec;
+}
+
+/// The shared pointer: `std`'s where there is `std`. Without it, on any
+/// microcontroller, `portable-atomic-util`'s, whose counts are native atomics
+/// where the chip has them and a critical section where it has none. It does
+/// not turn an `Arc<T>` into an `Arc<dyn Trait>` by itself on stable Rust, so
+/// the crate makes those through a `Box`.
+pub mod sync {
+    #[cfg(feature = "std")]
+    pub use alloc::sync::Arc;
+    #[cfg(not(feature = "std"))]
+    pub use portable_atomic_util::Arc;
+}
+
+/// Hash maps where there is `std`. Without it, ordered maps from `alloc`, which
+/// the keys here allow: a microcontroller member holds few.
+mod collections {
+    #[cfg(not(feature = "std"))]
+    pub(crate) use alloc::collections::{BTreeMap as HashMap, BTreeSet as HashSet};
+    #[cfg(feature = "std")]
+    pub(crate) use std::collections::{HashMap, HashSet};
+}
+
 pub mod attestation;
+pub mod batch;
 pub mod cbor;
 pub mod dag;
 pub mod error;
 pub mod hex;
 pub mod id;
+pub mod leaf;
+pub mod light;
 pub mod limits;
+pub mod member;
+pub mod members;
+pub mod membership;
+pub mod merkle;
+pub mod parameters;
 pub mod params;
 pub mod roster;
 pub mod sign;
 pub mod snapshot;
 pub mod state;
+pub mod transfer;
 pub mod types;
 
 pub use error::{Error, Result};

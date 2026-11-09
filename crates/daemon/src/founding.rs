@@ -36,6 +36,8 @@ pub struct Founding {
     /// The IPv4 range the network's devices derive their addresses in, if one
     /// other than the default was chosen.
     pub ipv4_range: Option<roster::types::Ipv4Range>,
+    /// The freshness window, in seconds, or `None` for none — the default.
+    pub window: Option<u64>,
 }
 
 /// Reads the IPv4 range a person asked a founding for.
@@ -55,11 +57,125 @@ pub fn ipv4_range(text: Option<&str>) -> Result<Option<roster::types::Ipv4Range>
     let range: roster::types::Ipv4Range = text.parse().map_err(|cause: roster::Error| {
         format!(
             "`{text}` cannot be this network's IPv4 range ({cause}). A range is written \
-             a.b.c.d/len, with a length from 8 to 28, inside 10.0.0.0/8, 172.16.0.0/12, \
+             a.b.c.d/len, with a length from 10 to 28, inside 10.0.0.0/8, 172.16.0.0/12, \
              192.168.0.0/16, 100.64.0.0/10 or 198.18.0.0/15. Nothing was signed."
         )
     })?;
     Ok((range != roster::types::Ipv4Range::DEFAULT).then_some(range))
+}
+
+/// How many devices a network is founded for when its founder says nothing: a
+/// `/16`, 65,534 hosts, four times that.
+pub const DEFAULT_EXPECTED: u32 = 16_000;
+
+/// How many times its expected size a proposed block holds, so a network that
+/// grows past what its founder foresaw is not moved at once.
+const ROOM_TO_GROW: u64 = 4;
+
+/// The blocks a network's block is proposed from, in the order they are tried.
+///
+/// The shared address space first, which home and office networks rarely use;
+/// then the private blocks; then the benchmarking block; `192.168.0.0/16`,
+/// which nearly every home's router hands out from, only when nothing else is
+/// free.
+const POOLS: [([u8; 4], u8); 5] = [
+    ([100, 64, 0, 0], 10),
+    ([10, 0, 0, 0], 8),
+    ([172, 16, 0, 0], 12),
+    ([198, 18, 0, 0], 15),
+    ([192, 168, 0, 0], 16),
+];
+
+/// A block of addresses a proposed block must not overlap: another network's
+/// block, or a subnet this machine is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Taken {
+    /// Any address inside it.
+    pub address: std::net::Ipv4Addr,
+    /// Its prefix length.
+    pub prefix_len: u8,
+}
+
+impl Taken {
+    /// Whether it and `block` share an address.
+    #[must_use]
+    pub fn overlaps_block(&self, block: &roster::types::Ipv4Range) -> bool {
+        self.overlaps(u32::from_be_bytes(block.address()), block.prefix_len())
+    }
+
+    /// Whether it and the block at `base` of `prefix_len` share an address.
+    fn overlaps(&self, base: u32, prefix_len: u8) -> bool {
+        let shorter = self.prefix_len.min(prefix_len).min(32);
+        let mask = u32::MAX.checked_shl(32_u32.saturating_sub(u32::from(shorter))).unwrap_or(0);
+        u32::from(self.address) & mask == base & mask
+    }
+}
+
+/// The prefix length of the smallest block that holds `expected` devices with
+/// room to grow; the widest allowed, `/10`, for more than it holds that way.
+#[must_use]
+pub fn prefix_for(expected: u32) -> u8 {
+    prefix_for_hosts(u64::from(expected.max(1)).saturating_mul(ROOM_TO_GROW))
+}
+
+/// The prefix length of the smallest block with at least `hosts` hosts; the
+/// widest allowed, `/10`, where none is that wide.
+#[must_use]
+pub fn prefix_for_hosts(hosts: u64) -> u8 {
+    (roster::types::Ipv4Range::MIN_PREFIX_LEN..=roster::types::Ipv4Range::MAX_PREFIX_LEN)
+        .rev()
+        .find(|prefix_len| span(32_u8.saturating_sub(*prefix_len)).saturating_sub(2) >= hosts)
+        .unwrap_or(roster::types::Ipv4Range::MIN_PREFIX_LEN)
+}
+
+/// Two to the power `bits`, for the bit counts an IPv4 prefix leaves.
+fn span(bits: u8) -> u64 {
+    1_u64.checked_shl(u32::from(bits)).unwrap_or(u64::MAX)
+}
+
+/// A block for a network of `expected` devices that overlaps nothing `taken`
+/// names, drawn at random among the free blocks of the first pool that has one
+/// (`scalable-membership` 19.3).
+///
+/// At random, because two founders who never met would otherwise both take the
+/// first free block, and a person in both networks would have them in conflict.
+/// `draw(count)` answers an index below `count`.
+///
+/// # Errors
+///
+/// When no pool has a free block that size.
+pub fn propose_block(
+    expected: u32,
+    taken: &[Taken],
+    draw: &mut dyn FnMut(u64) -> u64,
+) -> Result<roster::types::Ipv4Range, Refusal> {
+    let prefix_len = prefix_for(expected);
+    let step = span(32_u8.saturating_sub(prefix_len));
+    for (pool, pool_len) in POOLS {
+        if pool_len > prefix_len {
+            continue;
+        }
+        let count = span(prefix_len.saturating_sub(pool_len));
+        let first = u64::from(u32::from_be_bytes(pool));
+        // From a random start, the first free one after it: as random as a
+        // draw among the free ones wherever few are taken, and certain to end.
+        let start = draw(count).checked_rem(count).unwrap_or(0);
+        for index in (0..count).map(|at| start.saturating_add(at).checked_rem(count).unwrap_or(0)) {
+            let Ok(base) = u32::try_from(first.saturating_add(index.saturating_mul(step))) else {
+                continue;
+            };
+            if taken.iter().any(|taken| taken.overlaps(base, prefix_len)) {
+                continue;
+            }
+            if let Ok(block) = roster::types::Ipv4Range::new(base.to_be_bytes(), prefix_len) {
+                return Ok(block);
+            }
+        }
+    }
+    Err(format!(
+        "no block of /{prefix_len} is free of this device's other networks and the subnets it is \
+         on. Name one with --ipv4-range, or expect fewer devices. Nothing was signed."
+    ))
 }
 
 /// The suffix a founding proposes when a person supplies none.
@@ -235,18 +351,8 @@ fn first_snapshot(
         let _dated = crate::state::write_attestation(paths, &dated, crate::state::wall_seconds());
     }
 
-    // The snapshot needs the signing key, which may be behind a person or out of
-    // reach entirely. When it is out of reach the request goes back to the caller,
-    // who asks: a network with no snapshot has nothing for freshness to be
-    // measured from, so it is worth a second prompt rather than a gap.
-    if !identity.signing_key().answers_here() {
-        let body = crate::snapshots::body_over_heads(&roster, identity).ok()?;
-        return Some(identity::detached::prepare_snapshot(
-            &body,
-            &identity.signing_key().public_key(),
-        ));
-    }
-
+    // The first root is signed with the attestation key, which asks nobody, so
+    // a founding never asks twice whatever holds the signing key.
     let bytes = crate::snapshots::sign_over_heads(&roster, identity).ok()?;
     // Offered to a roster of its own before it is kept, so that what is written
     // is a snapshot this build can verify rather than one it merely produced.
@@ -254,51 +360,6 @@ fn first_snapshot(
         let _kept = crate::state::write_snapshot(paths, &bytes, crate::state::wall_seconds());
     }
     None
-}
-
-/// The body of a network's first snapshot, prepared **before** its genesis is
-/// signed.
-///
-/// Where the signing key is somewhere this process cannot reach, founding is one
-/// batch — the genesis and this — shown to a person together and signed at once.
-/// The genesis has no signature yet, so the snapshot is built over a preview of
-/// it; the body is exactly what [`first_snapshot`] would build over a roster
-/// holding the signed genesis, and the roster that is later offered it checks
-/// that by deriving it again.
-///
-/// `None` only where no body can be built, which leaves a founding with no
-/// snapshot — the state a declined second prompt used to leave, and one an
-/// admin's next act repairs.
-#[must_use]
-pub fn first_snapshot_body(
-    genesis: &OperationCore,
-    identity: &NodeIdentity,
-) -> Option<roster::snapshot::Snapshot> {
-    let nothing_yet = roster::roster::Roster::new();
-    crate::snapshots::after(
-        &nothing_yet,
-        core::slice::from_ref(genesis),
-        identity,
-        crate::state::wall_seconds(),
-    )
-    .ok()
-    .flatten()
-}
-
-/// Keeps a first snapshot that was signed somewhere this process could not sign.
-///
-/// Offered to a roster of its own before it is kept, exactly as one signed here
-/// is: what is written must be a snapshot this build can verify rather than one
-/// it merely received.
-pub fn keep_first_snapshot(paths: &Paths, genesis: &[u8], snapshot: &[u8]) -> bool {
-    let mut roster = roster::roster::Roster::with_clock(Box::new(crate::state::WallClock));
-    if !roster.offer_bytes(genesis).is_accepted() {
-        return false;
-    }
-    if !roster.offer_snapshot(snapshot).is_accepted() {
-        return false;
-    }
-    crate::state::write_snapshot(paths, snapshot, crate::state::wall_seconds()).is_ok()
 }
 
 /// The parameters a founding carries, checked by the roster's own rules.
@@ -315,11 +376,9 @@ fn parameters(identity: &NodeIdentity, wanted: &Founding) -> Result<NetworkParam
         derived_prefix(identity),
         wanted.relay.clone(),
         wanted.suffix.clone(),
-        // Seven days: the roster's own starting point for how long an
-        // attestation stands. Not a founding decision worth asking a person
-        // about yet, and named there rather than written here so the reason it
-        // is no longer thirty sits with the number.
-        roster::limits::DEFAULT_SNAPSHOT_WINDOW,
+        // None unless asked for: an island with an admin of its own keeps
+        // working for as long as it is cut off. Zero is how none is written.
+        wanted.window.unwrap_or(0),
     )
     .map_err(|cause| cause.to_string())?;
 
@@ -384,6 +443,65 @@ mod suffixes {
 }
 
 #[cfg(test)]
+mod blocks {
+    #![allow(clippy::unwrap_used, reason = "a test reports failure by panicking")]
+
+    use super::{DEFAULT_EXPECTED, Taken, prefix_for, propose_block};
+
+    fn taken(text: &str) -> Taken {
+        let (address, prefix_len) = text.split_once('/').unwrap();
+        Taken { address: address.parse().unwrap(), prefix_len: prefix_len.parse().unwrap() }
+    }
+
+    /// Room for four times the devices expected, and never wider than `/10`.
+    #[test]
+    fn a_block_holds_four_times_what_is_expected() {
+        assert_eq!(prefix_for(DEFAULT_EXPECTED), 16);
+        assert_eq!(prefix_for(3), 28, "fourteen hosts hold twelve");
+        assert_eq!(prefix_for(4), 27);
+        assert_eq!(prefix_for(1_000_000), 10);
+        assert_eq!(prefix_for(u32::MAX), 10, "the widest there is");
+    }
+
+    /// Drawn in the shared space, and where the draw falls.
+    #[test]
+    fn a_block_is_drawn_from_the_shared_space() {
+        let block = propose_block(DEFAULT_EXPECTED, &[], &mut |_| 19).unwrap();
+        assert_eq!(block.to_string(), "100.83.0.0/16");
+        let other = propose_block(DEFAULT_EXPECTED, &[], &mut |_| 7).unwrap();
+        assert_ne!(block, other, "two founders drawing differently land apart");
+    }
+
+    /// Another network's block and this machine's subnets are stepped over.
+    #[test]
+    fn a_block_overlaps_nothing_taken() {
+        let block = propose_block(
+            DEFAULT_EXPECTED,
+            &[taken("100.83.0.0/16"), taken("100.84.7.9/24")],
+            &mut |_| 19,
+        )
+        .unwrap();
+        assert_eq!(block.to_string(), "100.85.0.0/16", "the first free one after the draw");
+    }
+
+    /// With the shared space taken whole — a phone on mobile data behind a
+    /// carrier's NAT — the next pool is tried.
+    #[test]
+    fn a_taken_pool_moves_to_the_next() {
+        let block = propose_block(DEFAULT_EXPECTED, &[taken("100.64.0.0/10")], &mut |_| 0).unwrap();
+        assert_eq!(block.to_string(), "10.0.0.0/16");
+    }
+
+    /// Nothing free anywhere is said, with what to do about it.
+    #[test]
+    fn nothing_free_is_refused_in_words() {
+        let everything = [taken("0.0.0.0/1"), taken("128.0.0.0/1")];
+        let refused = propose_block(DEFAULT_EXPECTED, &everything, &mut |_| 0).unwrap_err();
+        assert!(refused.contains("--ipv4-range"), "{refused}");
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
     use roster::roster::Roster;
@@ -396,6 +514,7 @@ mod tests {
             suffix: "peerfectly.internal".to_owned(),
             relay: Some("https://relay.example:443".to_owned()),
             ipv4_range: None,
+            window: None,
         }
     }
 
@@ -425,6 +544,16 @@ mod tests {
         assert_eq!(state.params.relay.as_deref(), Some("https://relay.example:443"));
     }
 
+    /// A founding that asks for nothing sets no window: an island with an admin
+    /// of its own keeps working for as long as it is cut off.
+    #[test]
+    fn a_default_founding_sets_no_window() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let paths = Paths::under(scratch.path());
+        found(&paths, &wanted()).expect("founds");
+        assert_eq!(state_at(&paths).params.snapshot_window, 0);
+    }
+
     /// A network with no snapshot has nothing for freshness to measure from, so
     /// its own founder would begin unable to confirm the roster it just made.
     #[test]
@@ -432,7 +561,10 @@ mod tests {
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let paths = Paths::under(scratch.path());
 
-        found(&paths, &wanted()).expect("founds");
+        // A network that asked for a window: one with none is never stale.
+        let windowed =
+            Founding { window: Some(roster::limits::DEFAULT_SNAPSHOT_WINDOW), ..wanted() };
+        found(&paths, &windowed).expect("founds");
 
         let (bytes, at) = crate::state::read_snapshot(&paths).expect("a snapshot was kept");
         assert!(at > 0, "dated on this device's wall clock, not left at the epoch");

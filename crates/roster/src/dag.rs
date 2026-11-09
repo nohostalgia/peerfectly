@@ -21,10 +21,11 @@
 //! because the alternative to detecting it is looping forever on input someone
 //! else supplied.
 
-use std::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
+use crate::prelude::*;
 
 use crate::error::{Error, Result};
-use crate::id::{KeyId, NetworkId, OperationId};
+use crate::id::{DeviceId, KeyId, NetworkId, OperationId};
 use crate::limits;
 use crate::sign::VerifiedOperation;
 use crate::snapshot::SignedSnapshot;
@@ -45,7 +46,20 @@ pub enum Foundation {
     /// operations naming them as parents can still be placed; they are marked
     /// covered so their effects are not applied twice, being already inside the
     /// snapshot's state.
-    Snapshot(Box<SignedSnapshot>),
+    Snapshot(Box<Footing>),
+}
+
+/// A snapshot, and the state it commits to.
+///
+/// A snapshot carries only the root of its state, so the state a compacted
+/// graph rests on is held beside it: the one this node derived when it verified
+/// the snapshot, or the one it received as leaves and checked against the root.
+#[derive(Debug, Clone)]
+pub struct Footing {
+    /// The snapshot.
+    pub snapshot: SignedSnapshot,
+    /// The state whose root it signs.
+    pub state: crate::state::RosterState,
 }
 
 /// A fixed set of operation indices.
@@ -99,6 +113,27 @@ impl BitSet {
     }
 }
 
+/// A whole batch a graph holds: its layer, the entries and the device each
+/// admits, shared with every state the batch is laid in.
+///
+/// The devices are worked out once, as the batch goes in. Derivation reads
+/// them every time it resolves a state, and working out a device's id checks
+/// every one of its keys: done there, two thousand boards cost a daemon minutes
+/// of start-up (found in the testbed, 18.1).
+type HeldBatch = crate::sync::Arc<crate::members::Layer>;
+
+/// Where a graph keeps the layers of its whole batches: in memory, or in a
+/// store, which a full member of a fleet gives it so that a million boards
+/// are not held in memory.
+#[derive(Clone, Default)]
+struct LayersIn(Option<crate::sync::Arc<dyn crate::members::LayerStore>>);
+
+impl core::fmt::Debug for LayersIn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.0.is_some() { "a store" } else { "memory" })
+    }
+}
+
 /// A causally ordered set of verified operations.
 ///
 /// Operations are stored in a topological order: an operation's parents always
@@ -118,7 +153,7 @@ pub struct Dag {
     /// Index of the founding operation, once present.
     genesis: Option<usize>,
     /// The snapshot this graph rests on, once it has compacted.
-    base: Option<Box<SignedSnapshot>>,
+    base: Option<Box<Footing>>,
     /// Whether each operation is already accounted for by the base snapshot.
     ///
     /// A covered operation is retained only as an anchor for its children. Its
@@ -127,6 +162,11 @@ pub struct Dag {
     covered: Vec<bool>,
     /// The network this graph belongs to, derived from the founding operation.
     network: Option<NetworkId>,
+    /// The entries of each batch the graph holds, by the header's id.
+    ///
+    /// A header is inserted only once every entry is in, so every batch here
+    /// is whole.
+    batch_entries: HashMap<OperationId, HeldBatch>,
     /// Forks whose operations compaction would otherwise have discarded.
     ///
     /// Kept whole — body, signature and all — because they are the evidence of an
@@ -153,6 +193,8 @@ pub struct Dag {
     /// concurrent with nothing, and two foundings by one author are two networks
     /// rather than one fork.
     by_author: HashMap<KeyId, Vec<usize>>,
+    /// Where whole batches' layers are kept.
+    layers_in: LayersIn,
     /// How many held operations are not revocations.
     ///
     /// Counted as they are inserted rather than scanned, because it is asked on
@@ -176,8 +218,7 @@ impl Dag {
     /// part in a cycle — the two are distinguished, because they mean very
     /// different things about the sender.
     pub fn from_operations(operations: Vec<VerifiedOperation>) -> Result<Self> {
-        let present: std::collections::HashSet<OperationId> =
-            operations.iter().map(VerifiedOperation::id).collect();
+        let present: HashSet<OperationId> = operations.iter().map(VerifiedOperation::id).collect();
 
         let mut dag = Self::new();
         let mut remaining = operations;
@@ -370,16 +411,131 @@ impl Dag {
     /// What this graph rests on.
     #[must_use]
     pub fn foundation(&self) -> Option<Foundation> {
-        if let Some(snapshot) = &self.base {
-            return Some(Foundation::Snapshot(snapshot.clone()));
+        if let Some(footing) = &self.base {
+            return Some(Foundation::Snapshot(footing.clone()));
         }
         self.genesis.map(Foundation::Genesis)
+    }
+
+    /// Inserts a batch's header with its entries, which are what it admits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::insert`].
+    pub fn insert_batch(
+        &mut self,
+        operation: VerifiedOperation,
+        entries: Vec<crate::batch::BatchEntry>,
+    ) -> Result<()> {
+        let id = operation.id();
+        let OperationBody::AdmitBatch(header) = &operation.core().body else {
+            return Err(Error::InvalidValue(
+                "a batch's entries under an operation that is no batch",
+            ));
+        };
+        let layer = match &self.layers_in.0 {
+            // Kept in the store, and read back through the entries root the
+            // signed header names: only what the batch committed to is believed.
+            Some(store) => {
+                store.put(&id, &entries)?;
+                crate::members::Layer::stored(
+                    id,
+                    header.mode,
+                    header.groups.clone(),
+                    crate::sync::Arc::clone(store),
+                    header.entries,
+                    entries.len(),
+                )
+            }
+            None => crate::members::Layer::new(id, header.mode, header.groups.clone(), entries),
+        };
+        self.insert(operation)?;
+        self.batch_entries.insert(id, crate::sync::Arc::new(layer));
+        Ok(())
+    }
+
+    /// Keeps the layers of the batches that become whole from here on in
+    /// `store`, rather than in memory.
+    pub fn keep_layers_in(&mut self, store: crate::sync::Arc<dyn crate::members::LayerStore>) {
+        self.layers_in = LayersIn(Some(store));
+    }
+
+    /// The layers of the whole batches this graph holds.
+    pub fn layers(&self) -> impl Iterator<Item = &crate::sync::Arc<crate::members::Layer>> {
+        self.batch_entries.values()
+    }
+
+    /// Where the layers of whole batches are kept, if not in memory.
+    #[must_use]
+    pub fn layer_store(&self) -> Option<&crate::sync::Arc<dyn crate::members::LayerStore>> {
+        self.layers_in.0.as_ref()
+    }
+
+    /// The layer of a batch this graph holds: its entries, its devices and
+    /// their indexes, shared with every state it is laid in.
+    #[must_use]
+    pub fn batch_layer(
+        &self,
+        batch: &OperationId,
+    ) -> Option<&crate::sync::Arc<crate::members::Layer>> {
+        self.batch_entries.get(batch)
+    }
+
+    /// The entries of a batch this graph holds.
+    #[must_use]
+    pub fn entries_of(&self, batch: &OperationId) -> Option<Vec<crate::batch::BatchEntry>> {
+        self.batch_entries.get(batch).map(|held| held.entries())
+    }
+
+    /// The devices a batch this graph holds admits, each with its entry, in
+    /// device order. Entries that break the rules every device keeps are not
+    /// among them.
+    pub fn batch_devices(
+        &self,
+        batch: &OperationId,
+    ) -> impl Iterator<Item = (DeviceId, crate::batch::BatchEntry)> + '_ {
+        self.batch_entries.get(batch).into_iter().flat_map(|held| held.devices())
+    }
+
+    /// The entry admitting `device` in a batch this graph holds.
+    #[must_use]
+    pub fn batch_entry(
+        &self,
+        batch: &OperationId,
+        device: &DeviceId,
+    ) -> Option<crate::batch::BatchEntry> {
+        self.batch_entries.get(batch)?.entry(device)
     }
 
     /// The snapshot this graph rests on, if it has compacted.
     #[must_use]
     pub fn base_snapshot(&self) -> Option<&SignedSnapshot> {
-        self.base.as_deref()
+        self.base.as_deref().map(|footing| &footing.snapshot)
+    }
+
+    /// The state the snapshot this graph rests on commits to, if it has
+    /// compacted.
+    #[must_use]
+    pub fn base_state(&self) -> Option<&crate::state::RosterState> {
+        self.base.as_deref().map(|footing| &footing.state)
+    }
+
+    /// Puts `state` in place of the state the base rests on: the same state,
+    /// kept elsewhere — read back from a store once it is written there.
+    ///
+    /// # Errors
+    ///
+    /// When this graph rests on no base, or `state` is not the one its root
+    /// signs.
+    pub fn replace_base_state(&mut self, state: crate::state::RosterState) -> Result<()> {
+        let Some(footing) = self.base.as_mut() else {
+            return Err(Error::CompactionRefused("the graph rests on no base"));
+        };
+        if state.root() != footing.snapshot.body().root {
+            return Err(Error::SnapshotStateMismatch);
+        }
+        footing.state = state;
+        Ok(())
     }
 
     /// Whether an operation is already accounted for by the base snapshot.
@@ -396,8 +552,15 @@ impl Dag {
     /// operations name them as parents; everything beneath them is gone. Their
     /// depths come from the snapshot, which is why it carries them: guessing
     /// them would change the last-writer-wins tie-break across the boundary.
-    pub fn from_snapshot(snapshot: SignedSnapshot, heads: Vec<VerifiedOperation>) -> Result<Self> {
+    pub fn from_snapshot(
+        snapshot: SignedSnapshot,
+        state: crate::state::RosterState,
+        heads: Vec<VerifiedOperation>,
+    ) -> Result<Self> {
         let body = snapshot.body().clone();
+        if state.root() != body.root {
+            return Err(Error::SnapshotStateMismatch);
+        }
         if heads.len() != body.heads.len() {
             return Err(Error::SnapshotUnverified);
         }
@@ -419,7 +582,7 @@ impl Dag {
             dag.depths.push(depth);
             dag.covered.push(true);
         }
-        dag.base = Some(Box::new(snapshot));
+        dag.base = Some(Box::new(Footing { snapshot, state }));
         Ok(dag)
     }
 
@@ -429,8 +592,15 @@ impl Dag {
     /// as complete signed operations, so their children remain placeable. The
     /// caller is responsible for the preconditions; see
     /// [`crate::roster::Roster::compact`], which checks them.
-    pub fn compact(&mut self, snapshot: SignedSnapshot) -> Result<usize> {
+    pub fn compact(
+        &mut self,
+        snapshot: SignedSnapshot,
+        state: crate::state::RosterState,
+    ) -> Result<usize> {
         let body = snapshot.body().clone();
+        if state.root() != body.root {
+            return Err(Error::CompactionRefused("the state is not the one the snapshot signs"));
+        }
 
         // Every head must be held, or the graph would lose its anchors.
         let mut head_indices = Vec::with_capacity(body.heads.len());
@@ -462,13 +632,17 @@ impl Dag {
             .collect();
         let discarded = self.operations.len().saturating_sub(keep.len());
 
-        let mut rebuilt = Self { network: Some(body.network), ..Self::default() };
+        let mut rebuilt = Self {
+            network: Some(body.network),
+            layers_in: self.layers_in.clone(),
+            ..Self::default()
+        };
 
         // Evidence first, before the operations it points at are gone. Carried
         // forward from an earlier compaction, plus any fork this one would
         // discard.
         rebuilt.kept_evidence = core::mem::take(&mut self.kept_evidence);
-        let surviving: std::collections::HashSet<usize> = keep.iter().copied().collect();
+        let surviving: HashSet<usize> = keep.iter().copied().collect();
         for fork in self.forks() {
             if surviving.contains(&fork.first) && surviving.contains(&fork.second) {
                 continue;
@@ -512,6 +686,9 @@ impl Dag {
             let depth = self.depths.get(old_index).copied().unwrap_or(0);
 
             rebuilt.positions.insert(operation.id(), index);
+            if let Some(entries) = self.batch_entries.get(&operation.id()) {
+                rebuilt.batch_entries.insert(operation.id(), entries.clone());
+            }
             if !matches!(operation.core().body, OperationBody::RevokeDevice { .. }) {
                 rebuilt.non_revocations = rebuilt.non_revocations.saturating_add(1);
             }
@@ -521,7 +698,7 @@ impl Dag {
             rebuilt.covered.push(is_head);
         }
 
-        rebuilt.base = Some(Box::new(snapshot));
+        rebuilt.base = Some(Box::new(Footing { snapshot, state }));
         *self = rebuilt;
         Ok(discarded)
     }
@@ -608,17 +785,19 @@ impl Dag {
             .collect()
     }
 
-    /// The device a `revoke_device`, `demote`, `promote` or `rename` targets.
+    /// The device a `revoke_device`, `demote`, `promote`, `rename` or `set_device` targets.
     #[must_use]
     pub(crate) fn target_of(body: &OperationBody) -> Option<crate::id::DeviceId> {
         match body {
             OperationBody::RevokeDevice { device, .. }
             | OperationBody::Promote { device, .. }
             | OperationBody::Demote { device }
-            | OperationBody::Rename { device, .. } => Some(*device),
+            | OperationBody::Rename { device, .. }
+            | OperationBody::SetDevice { device, .. } => Some(*device),
             OperationBody::CreateNetwork { .. }
             | OperationBody::AddDevice(_)
-            | OperationBody::SetNetwork(_) => None,
+            | OperationBody::SetNetwork(_)
+            | OperationBody::AdmitBatch(_) => None,
         }
     }
 }

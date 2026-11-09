@@ -12,13 +12,19 @@
 //! Deciding it inside the call that writes the table would mean it could only be
 //! tested by a person watching a routing table on Windows.
 //!
-//! # IPv4 is routed per peer, never per range
+//! # IPv4 is routed by block, less its holes
 //!
-//! A route for a network's whole IPv4 range would capture every address in it,
-//! including hosts on the machine's own networks that happen to fall inside —
-//! `100.64.0.0/10` is where every phone behind carrier-grade NAT lives. A host
-//! route captures only the peer. There is no way to express a range route here:
-//! the only IPv4 destination a [`Route`] can hold is one address.
+//! A network's IPv4 is its block, routed whole: two routes a network, its IPv6
+//! prefix and its block, whatever its size (`scalable-membership` 19.6). A route
+//! per peer was as many routes as members — a million for a fleet, more than
+//! Android's one interface could be told and minutes to install on Linux.
+//!
+//! The block is the network's own and holds nothing that is not, except where
+//! this machine already uses some of it: an interface's address or subnet, a
+//! gateway, the relay, another network. Those are holes
+//! ([`crate::conflicts::holes`]), and the block is routed as the fewest aligned
+//! blocks that cover the rest. `100.64.0.0/10` is where every phone behind
+//! carrier-grade NAT lives, and its `/30` is a hole the size of a `/30`.
 
 use core::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -60,8 +66,9 @@ impl fmt::Display for Interface {
 pub enum Destination {
     /// A network's IPv6 prefix.
     Prefix(Prefix),
-    /// One IPv4 address: a peer's, as a `/32`.
-    Host(Ipv4Addr),
+    /// A block of IPv4 addresses: a network's, or a part of it, with its
+    /// prefix length.
+    Ipv4(Ipv4Addr, u8),
 }
 
 /// One route: a destination, and the adapter it goes to.
@@ -80,10 +87,16 @@ impl Route {
         Self { destination: Destination::Prefix(prefix), interface }
     }
 
-    /// A host route for one peer's IPv4 address through an adapter.
+    /// A route for a block of IPv4 addresses through an adapter.
+    #[must_use]
+    pub const fn ipv4(address: Ipv4Addr, prefix_len: u8, interface: Interface) -> Self {
+        Self { destination: Destination::Ipv4(address, prefix_len), interface }
+    }
+
+    /// A route for one IPv4 address through an adapter, as a `/32`.
     #[must_use]
     pub const fn host(address: Ipv4Addr, interface: Interface) -> Self {
-        Self { destination: Destination::Host(address), interface }
+        Self::ipv4(address, 32, interface)
     }
 
     /// What it covers.
@@ -97,15 +110,16 @@ impl Route {
     pub const fn prefix(&self) -> Option<Prefix> {
         match self.destination {
             Destination::Prefix(prefix) => Some(prefix),
-            Destination::Host(_) => None,
+            Destination::Ipv4(..) => None,
         }
     }
 
-    /// The IPv4 address it covers, when it is a host route.
+    /// The IPv4 block it covers, with its prefix length, when it is an IPv4
+    /// route.
     #[must_use]
-    pub const fn ipv4_host(&self) -> Option<Ipv4Addr> {
+    pub const fn ipv4_block(&self) -> Option<(Ipv4Addr, u8)> {
         match self.destination {
-            Destination::Host(address) => Some(address),
+            Destination::Ipv4(address, prefix_len) => Some((address, prefix_len)),
             Destination::Prefix(_) => None,
         }
     }
@@ -120,18 +134,18 @@ impl Route {
     ///
     /// A zero-length prefix matches every address. Nothing in this crate may
     /// produce one, and this exists so that claim can be checked rather than
-    /// asserted in prose. A host route is one address and never a default.
+    /// asserted in prose. An IPv4 route is part of a block of `/10` or longer.
     #[must_use]
     pub const fn is_default_route(&self) -> bool {
         match self.destination {
             Destination::Prefix(prefix) => prefix.bits() == 0,
-            Destination::Host(_) => false,
+            Destination::Ipv4(_, prefix_len) => prefix_len == 0,
         }
     }
 
     /// The IPv6 prefix's sixteen octets, zero-padded past its length.
     ///
-    /// All zero for a host route, which has no IPv6 prefix; read
+    /// All zero for an IPv4 route, which has no IPv6 prefix; read
     /// [`Self::destination`] to tell the two apart.
     #[must_use]
     pub fn octets(&self) -> [u8; 16] {
@@ -149,7 +163,7 @@ impl Route {
     pub fn prefix_length(&self) -> u8 {
         match self.destination {
             Destination::Prefix(prefix) => u8::try_from(prefix.bits()).unwrap_or(u8::MAX),
-            Destination::Host(_) => 32,
+            Destination::Ipv4(_, prefix_len) => prefix_len,
         }
     }
 
@@ -160,7 +174,7 @@ impl Route {
             Destination::Prefix(prefix) => {
                 format!("{}/{}", Ipv6Addr::from(self.octets()), prefix.bits())
             }
-            Destination::Host(address) => format!("{address}/32"),
+            Destination::Ipv4(address, prefix_len) => format!("{address}/{prefix_len}"),
         }
     }
 }
@@ -174,8 +188,8 @@ impl fmt::Display for Route {
 /// The routes and addresses that should exist while the tunnel is up.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
-    /// In the order they should be installed: the prefix first, then one host
-    /// route per peer, in address order.
+    /// In the order they should be installed: the prefix first, then the
+    /// block less its holes, in address order.
     routes: Vec<Route>,
     /// This device's own addresses on the adapter.
     addresses: Vec<IpAddr>,
@@ -191,17 +205,17 @@ impl Plan {
     ///
     /// When the parameters do not describe a usable prefix.
     pub fn for_network(params: &NetworkParams, interface: Interface) -> Result<Self> {
-        Self::wanted(params, interface, None, None, [])
+        Self::wanted(params, interface, None, None, None)
     }
 
     /// Everything a network that is up should have on this device.
     ///
     /// The prefix route; this device's IPv6 address, when given; its IPv4
-    /// address, when it holds one; and one host route for each peer IPv4 address
-    /// given — which the caller has already cut down to the peers that hold one
-    /// and are not withheld here. There is no argument, flag, environment
-    /// variable or configuration file that adds anything else — every input is
-    /// derived from the roster.
+    /// address, when it holds one; and, where `holes` is given, the network's
+    /// block less those holes ([`crate::conflicts::routed`]) — `None` routes no
+    /// IPv4 at all. There is no argument, flag, environment variable or
+    /// configuration file that adds anything else: the block is the roster's,
+    /// and a hole only ever takes away from it.
     ///
     /// # Errors
     ///
@@ -211,7 +225,7 @@ impl Plan {
         interface: Interface,
         own: Option<Ipv6Addr>,
         own_ipv4: Option<Ipv4Addr>,
-        peers: impl IntoIterator<Item = Ipv4Addr>,
+        holes: Option<&[crate::conflicts::Hole]>,
     ) -> Result<Self> {
         // The second line. The roster refuses a prefix outside `fd00::/8`, or of
         // any length but a `/64`, where the parameters are decoded; this refuses
@@ -245,18 +259,12 @@ impl Plan {
             });
         }
 
-        let range = params.ipv4_range();
-        let mut hosts: Vec<Ipv4Addr> = peers
-            .into_iter()
-            // This device's own address is assigned, not routed; and an address
-            // outside the range is nothing the holdings could have produced.
-            .filter(|address| Some(*address) != own_ipv4 && range.contains(address.octets()))
-            .collect();
-        hosts.sort_unstable();
-        hosts.dedup();
+        let blocks = holes
+            .map(|holes| crate::conflicts::routed(params.ipv4_range(), holes))
+            .unwrap_or_default();
 
         let routes = core::iter::once(Route::new(prefix, interface))
-            .chain(hosts.into_iter().map(|address| Route::host(address, interface)))
+            .chain(blocks.into_iter().map(|(address, len)| Route::ipv4(address, len, interface)))
             .collect();
         let addresses = own.map(IpAddr::V6).into_iter().chain(own_ipv4.map(IpAddr::V4)).collect();
         Ok(Self { routes, addresses })
@@ -283,9 +291,9 @@ impl Plan {
         })
     }
 
-    /// The IPv4 host routes, in address order.
-    pub fn hosts(&self) -> impl Iterator<Item = Route> + '_ {
-        self.routes.iter().filter(|route| route.ipv4_host().is_some()).copied()
+    /// The IPv4 routes, in address order.
+    pub fn ipv4_routes(&self) -> impl Iterator<Item = Route> + '_ {
+        self.routes.iter().filter(|route| route.ipv4_block().is_some()).copied()
     }
 
     /// Whether this plan would capture traffic for the whole internet.
@@ -340,25 +348,25 @@ pub fn removals(installed: &[Route], present: &[Route]) -> Vec<Route> {
 
 /// The blocks of addresses a network's tunnel actually carries.
 ///
-/// Its overlay prefix, which is routed whole, and one block per IPv4 address
-/// that has a host route into the adapter: this device's own, and each peer's
-/// that is not withheld. The connectivity layer is told these so it never
+/// Its overlay prefix, which is routed whole; this device's own IPv4 address;
+/// and the parts of its IPv4 block routed into the adapter. The connectivity
+/// layer is told these so it never
 /// carries a session over a path that runs through the tunnel that session
 /// carries — the addresses of a tunnel adapter look like any other address of
 /// the machine, so nobody below can tell.
 ///
-/// **What is routed, not what is declared.** A network may declare an IPv4 range
-/// that overlaps the house's own network; every address in it that would collide
-/// is then withheld and has no route, so a path to such an address goes out of
-/// the machine's real interface and is an ordinary path. Avoiding the declared
-/// range would refuse the local network itself — measured, on a device holding a
-/// network whose range covers `192.168.1.0/24`: every direct path to a peer on
-/// the same Wi-Fi was refused and the session stayed on the relay.
+/// **What is routed, not what is declared.** A network's block may overlap the
+/// house's own network; that part is a hole and has no route, so a path to an
+/// address in it goes out of the machine's real interface and is an ordinary
+/// path. Avoiding the declared block would refuse the local network itself —
+/// measured, on a device holding a network whose range covers `192.168.1.0/24`:
+/// every direct path to a peer on the same Wi-Fi was refused and the session
+/// stayed on the relay.
 #[must_use]
 pub fn served(
     params: &NetworkParams,
     own_ipv4: Option<Ipv4Addr>,
-    peers: impl IntoIterator<Item = Ipv4Addr>,
+    routed: &[(Ipv4Addr, u8)],
 ) -> Vec<transport::Range> {
     let mut served = Vec::new();
 
@@ -374,10 +382,10 @@ pub fn served(
         served.push(range);
     }
 
-    // One address at a time on the IPv4 side, exactly as the routes are: a host
-    // route captures one address, and so does this.
-    for address in own_ipv4.into_iter().chain(peers) {
-        if let Some(range) = transport::Range::new(IpAddr::V4(address), 32) {
+    // On the IPv4 side exactly what the routes capture, and this device's own.
+    let own = own_ipv4.map(|address| (address, 32));
+    for (address, prefix_len) in own.into_iter().chain(routed.iter().copied()) {
+        if let Some(range) = transport::Range::new(IpAddr::V4(address), prefix_len) {
             served.push(range);
         }
     }
@@ -412,27 +420,26 @@ mod tests {
     }
 
     /// What the connectivity layer is told to keep away from: the whole overlay
-    /// prefix, and one block per IPv4 address that has a route into the adapter.
+    /// prefix, this device's own IPv4 address, and what is routed of the block.
     #[test]
-    fn a_network_serves_its_prefix_and_every_address_it_routes() {
+    fn a_network_serves_its_prefix_and_what_it_routes() {
         let served = served(
             &params(vec![0xfd, 0x01, 0, 0, 0, 0, 0, 0]),
             Some("100.117.31.3".parse().unwrap()),
-            ["100.99.120.85".parse().unwrap()],
+            &[("100.64.0.0".parse().unwrap(), 10)],
         );
         let told: Vec<String> = served.iter().map(ToString::to_string).collect();
-        assert_eq!(told, vec!["fd01::/64", "100.117.31.3/32", "100.99.120.85/32"]);
+        assert_eq!(told, vec!["fd01::/64", "100.117.31.3/32", "100.64.0.0/10"]);
     }
 
-    /// A range a network declares is not what its tunnel carries. Every address
-    /// in it may be withheld — because it collides with the house's own network
-    /// — and then nothing of it is routed and nothing of it is refused. Avoiding
-    /// the declared range instead would refuse the local network itself.
+    /// A block a network declares is not what its tunnel carries. All of it may
+    /// be a hole — the house's own network — and then nothing of it is routed
+    /// and nothing of it is refused. Avoiding the declared block instead would
+    /// refuse the local network itself.
     #[test]
-    fn a_declared_range_that_routes_nothing_is_not_served() {
-        let mut collides = params(vec![0xfd, 0x01, 0, 0, 0, 0, 0, 0]);
-        collides.ipv4 = Some(roster::types::Ipv4Range::new([192, 168, 1, 0], 24).unwrap());
-        let served = served(&collides, None, []);
+    fn a_declared_block_that_routes_nothing_is_not_served() {
+        let collides = params(vec![0xfd, 0x01, 0, 0, 0, 0, 0, 0]);
+        let served = served(&collides, None, &[]);
         let told: Vec<String> = served.iter().map(ToString::to_string).collect();
         assert_eq!(told, vec!["fd01::/64"], "the prefix alone: no IPv4 address is routed");
 
@@ -446,11 +453,14 @@ mod tests {
         let served = served(
             &params(vec![0xfd, 0x01, 0, 0, 0, 0, 0, 0]),
             Some("100.117.31.3".parse().unwrap()),
-            ["100.99.120.85".parse().unwrap()],
+            &[("100.99.120.0".parse().unwrap(), 24)],
         );
         let own = served.get(1).unwrap();
         assert!(own.contains(&"100.117.31.3".parse().unwrap()));
         assert!(!own.contains(&"100.117.31.4".parse().unwrap()));
+        let block = served.get(2).unwrap();
+        assert!(block.contains(&"100.99.120.85".parse().unwrap()));
+        assert!(!block.contains(&"100.99.121.1".parse().unwrap()));
 
         let prefix = served.first().unwrap();
         assert!(prefix.contains(&"fd01::7".parse().unwrap()));
@@ -472,48 +482,51 @@ mod tests {
         text.parse().expect("valid")
     }
 
-    /// One `/32` per peer, the prefix first, and this device's own addresses
-    /// assigned rather than routed.
+    /// Two routes, whatever the network's size: the prefix and the block; and
+    /// this device's own addresses assigned rather than routed.
     #[test]
-    fn the_wanted_plan_routes_each_peer_and_assigns_this_devices_addresses() {
+    fn the_wanted_plan_routes_the_block_and_assigns_this_devices_addresses() {
         let own: Ipv6Addr = "fd00::1".parse().expect("valid");
         let plan = Plan::wanted(
             &params(DERIVED.to_vec()),
             adapter(),
             Some(own),
             Some(at("100.64.0.9")),
-            [at("100.64.3.4"), at("100.64.0.9"), at("100.64.1.2"), at("100.64.1.2")],
+            Some(&[]),
         )
         .expect("usable");
 
         let texts: Vec<String> = plan.routes().iter().map(Route::prefix_text).collect();
-        assert_eq!(texts, vec!["fd00:1122::/64", "100.64.1.2/32", "100.64.3.4/32"]);
+        assert_eq!(texts, vec!["fd00:1122::/64", "100.64.0.0/10"]);
         assert_eq!(plan.own_addresses(), &[IpAddr::V6(own), IpAddr::V4(at("100.64.0.9"))]);
         assert_eq!(plan.ipv4(), Some(at("100.64.0.9")));
-        assert_eq!(plan.hosts().count(), 2);
+        assert_eq!(plan.ipv4_routes().count(), 1);
     }
 
-    /// Never a default route of either family, and never the range as a whole:
-    /// an IPv4 route is always one address.
+    /// A hole is left out, and the rest of the block is still routed; no IPv4
+    /// route is ever wider than the block, nor a default.
     #[test]
-    fn no_ipv4_route_is_ever_wider_than_one_address() {
+    fn a_hole_is_left_out_of_the_block() {
+        let hole = crate::conflicts::Hole {
+            address: at("100.64.0.0"),
+            prefix_len: 11,
+            why: crate::conflicts::Conflict::Gateway,
+        };
         let plan = Plan::wanted(
             &params(vec![0xfd, 0, 0, 0, 0, 0, 0, 0]),
             adapter(),
             None,
             None,
-            [at("100.64.0.0"), at("100.127.255.255"), at("192.168.1.1")],
+            Some(&[hole]),
         )
         .expect("usable");
 
         assert!(!plan.claims_a_default_route());
-        for route in plan.hosts() {
-            assert_eq!(route.prefix_length(), 32, "{route}");
-        }
-        assert!(
-            plan.hosts().all(|route| route.ipv4_host() != Some(at("192.168.1.1"))),
-            "an address outside the range is not routed"
-        );
+        let texts: Vec<String> = plan.ipv4_routes().map(|route| route.prefix_text()).collect();
+        assert_eq!(texts, vec!["100.96.0.0/11"], "the half that is not the hole");
+        assert!(plan.ipv4_routes().all(|route| route.prefix_length() >= 10));
+        let none = Plan::wanted(&params(DERIVED.to_vec()), adapter(), None, None, None);
+        assert_eq!(none.expect("usable").ipv4_routes().count(), 0, "no IPv4 asked for, none");
     }
 
     /// The single most consequential thing this daemon does to a machine.
@@ -569,7 +582,7 @@ mod tests {
     fn a_prefix_outside_the_unique_local_range_plans_no_route() {
         let global = params(vec![0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00]);
 
-        match Plan::wanted(&global, adapter(), None, None, []) {
+        match Plan::wanted(&global, adapter(), None, None, None) {
             Err(Error::Parameters { cause }) => {
                 assert!(cause.contains("2001:db8::/64"), "the refusal names the prefix: {cause}");
                 assert!(cause.contains("not unique local"), "and the rule it broke: {cause}");
@@ -582,7 +595,7 @@ mod tests {
     /// network uses — including the prefixes home routers give themselves.
     #[test]
     fn a_prefix_shorter_than_a_slash_64_plans_no_route() {
-        match Plan::wanted(&params(vec![0xfd, 0x00]), adapter(), None, None, []) {
+        match Plan::wanted(&params(vec![0xfd, 0x00]), adapter(), None, None, None) {
             Err(Error::Parameters { cause }) => {
                 assert!(cause.contains("fd00::/16"), "the refusal names the prefix: {cause}");
                 assert!(cause.contains("not a /64"), "and the rule it broke: {cause}");

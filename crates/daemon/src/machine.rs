@@ -64,6 +64,17 @@ pub trait Machine: Send + Sync {
     /// Takes the address back off the adapter.
     async fn remove_address(&self, interface: Interface, address: IpAddr) -> Result<()>;
 
+    /// Whether the adapter holds `address` now, as the machine itself says;
+    /// `None` where this platform cannot tell, which is the default.
+    ///
+    /// Asked once a second of an address this device believes it holds: Windows
+    /// took this device's IPv4 address off the adapter some moments after a
+    /// route covering it was removed, with nothing said (2026-11-02), and an
+    /// address asked for again at once was still there to be "already held".
+    async fn holds_address(&self, _interface: Interface, _address: IpAddr) -> Option<bool> {
+        None
+    }
+
     /// Adds a route.
     async fn install_route(&self, route: &Route) -> Result<()>;
 
@@ -82,6 +93,76 @@ pub trait Machine: Send + Sync {
     /// time it can help: the case that leaves a rule behind is the case where
     /// shutdown did not run.
     async fn sweep_rules(&self) -> Result<bool>;
+}
+
+/// A machine with no packet interface: an anchor's.
+///
+/// An anchor is a full member that carries the roster for others — keeps it,
+/// passes it on, answers lookups and proofs — and sends no packets of its own.
+/// Bringing a network up on it makes the transport, the sync and everything a
+/// peer asks of a full member, and nothing on the machine: no adapter, no
+/// address, no route, no resolution rule. So it needs no privilege to
+/// configure networking, and runs where there is none to have, a container
+/// without a packet device among them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Headless;
+
+/// What stands in for a packet device on a headless machine: what is handed
+/// to it goes nowhere, and it never has anything to send.
+struct Nowhere;
+
+#[async_trait]
+impl Packets for Nowhere {
+    async fn deliver(&self, _packet: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn take(&self) -> std::io::Result<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl Machine for Headless {
+    async fn create_adapter(
+        &self,
+        _name: &str,
+        _guid: [u8; 16],
+    ) -> Result<(Interface, Arc<dyn Packets>)> {
+        Ok((Interface::new(0), Arc::new(Nowhere)))
+    }
+
+    async fn remove_adapter(&self, _interface: Interface) -> Result<()> {
+        Ok(())
+    }
+
+    async fn assign_address(&self, _interface: Interface, _address: IpAddr) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_address(&self, _interface: Interface, _address: IpAddr) -> Result<()> {
+        Ok(())
+    }
+
+    async fn install_route(&self, _route: &Route) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_route(&self, _route: &Route) -> Result<()> {
+        Ok(())
+    }
+
+    async fn install_rule(&self, _rule: &Rule) -> Result<()> {
+        Ok(())
+    }
+
+    async fn remove_rule(&self, _rule: &Rule) -> Result<()> {
+        Ok(())
+    }
+
+    async fn sweep_rules(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -179,7 +260,11 @@ pub(crate) mod testing {
             if self.fail_at == Some(Fail::Address) {
                 return Err(Self::refuse(Step::CreatingAdapter, "told to fail"));
             }
-            self.installed.lock().expect("not poisoned").addresses.push(address);
+            // As every platform takes it: an address already there is no change.
+            let mut installed = self.installed.lock().expect("not poisoned");
+            if !installed.addresses.contains(&address) {
+                installed.addresses.push(address);
+            }
             Ok(())
         }
 

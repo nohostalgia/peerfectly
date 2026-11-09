@@ -36,7 +36,7 @@ pub(crate) enum Read {
     /// A roster operation.
     Operation(Box<OperationCore>),
     /// A roster snapshot.
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     /// A joining device's proof that it holds the key it presented.
     Possession,
 }
@@ -57,7 +57,9 @@ pub(crate) fn read(item: &ToSign) -> Option<Read> {
         SigningKind::Operation => {
             OperationCore::decode(&item.payload).ok().map(|core| Read::Operation(Box::new(core)))
         }
-        SigningKind::Snapshot => Snapshot::decode(&item.payload).ok().map(Read::Snapshot),
+        SigningKind::Snapshot => {
+            Snapshot::decode(&item.payload).ok().map(|body| Read::Snapshot(Box::new(body)))
+        }
         // A proof of possession carries no artifact: its signature is the whole
         // of it. One that carries something is not one.
         SigningKind::Possession => item.payload.is_empty().then_some(Read::Possession),
@@ -82,9 +84,13 @@ fn typed_label(asked: &Command) -> Option<&str> {
     match asked {
         Command::Found { label, .. } => Some(label.as_str()),
         Command::Revoke { network, .. }
+        | Command::RevokeVoiding { network, .. }
         | Command::ChangeRelay { network, .. }
+        | Command::SetAnchors { network, .. }
+        | Command::AdmitBatch { network, .. }
         | Command::Rename { network, .. }
-        | Command::Admit { network, .. } => network.as_deref(),
+        | Command::Approve { network, .. }
+        | Command::Invite { network, .. } => network.as_deref(),
         _ => None,
     }
 }
@@ -104,11 +110,10 @@ fn typed_label(asked: &Command) -> Option<&str> {
 /// is compared as the daemon keeps it, in lower case: `Laptop` typed is
 /// `laptop` signed, and a name that is no name matches nothing.
 ///
-/// A command that is not one of the acts below imposes no expectation: an
-/// admission is confirmed rather than named, and there is nothing to compare.
+/// A command that is not one of the acts below imposes no expectation.
 pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) -> bool {
     match command {
-        Command::Revoke { reason, .. } => matches!(
+        Command::Revoke { reason, .. } | Command::RevokeVoiding { reason, .. } => matches!(
             &core.body,
             OperationBody::RevokeDevice { reason: signed, .. } if signed == reason.trim()
         ),
@@ -127,8 +132,63 @@ pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) ->
             OperationBody::SetNetwork(params)
                 if params.relay.as_deref().is_some_and(|signed| daemon::relay::answers_given(signed, relay))
         ),
+        // The batch signed is the lot the file named, in the mode asked for.
+        Command::AdmitBatch { label, light, .. } => matches!(
+            &core.body,
+            OperationBody::AdmitBatch(header)
+                if header.label == label.trim()
+                    && (header.mode == roster::leaf::Mode::Light) == *light
+        ),
+        // The list signed holds one anchor for each name typed: which devices
+        // they are is the daemon's to resolve, from the roster, and the count is
+        // what this side can hold it to.
+        Command::SetAnchors { anchors, .. } => matches!(
+            &core.body,
+            OperationBody::SetNetwork(params) if anchors_named(anchors, &params.anchors)
+        ),
+        // An approval admits a device, under the name its invite gave or one
+        // made from it where that name is held; where it replaces, the
+        // revocation of the device holding the name comes first.
+        Command::Approve { name, replace, .. } => match &core.body {
+            OperationBody::AddDevice(spec) => {
+                is_named(&spec.name, name)
+                    || spec.name.strip_prefix(name.as_str()).is_some_and(|rest| {
+                        rest.strip_prefix('-').is_some_and(|n| n.parse::<u32>().is_ok())
+                    })
+                    || !*replace
+            }
+            OperationBody::RevokeDevice { .. } => *replace,
+            _ => false,
+        },
         _ => true,
     }
+}
+
+/// Whether `signed` is the anchor list `named` asks for, as far as this side
+/// can tell: one anchor for each name typed, case aside.
+fn anchors_named(named: &[daemon::control::Target], signed: &[roster::id::DeviceId]) -> bool {
+    let mut distinct: Vec<String> = named
+        .iter()
+        .map(|target| match target {
+            daemon::control::Target::Name(name) | daemon::control::Target::Id(name) => {
+                name.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    distinct.sort();
+    distinct.dedup();
+    distinct.len() == signed.len()
+}
+
+/// Whether `settings` sets the device `admission` admits, and nothing beyond
+/// what an invite chooses: its mode, groups and address.
+fn settles(admission: &OperationCore, settings: &OperationCore) -> bool {
+    let (OperationBody::AddDevice(spec), OperationBody::SetDevice { device, change }) =
+        (&admission.body, &settings.body)
+    else {
+        return false;
+    };
+    change.relay.is_none() && spec.device_id().is_ok_and(|admitted| admitted == *device)
 }
 
 /// Whether a signed name is the one typed, as the daemon keeps names.
@@ -185,7 +245,7 @@ pub(crate) fn holds_together(
     let snapshots: Vec<&Snapshot> = read
         .iter()
         .filter_map(|item| match item {
-            Read::Snapshot(body) => Some(body),
+            Read::Snapshot(body) => Some(body.as_ref()),
             _ => None,
         })
         .collect();
@@ -218,12 +278,24 @@ pub(crate) fn holds_together(
             return Err("the acts to sign do not follow one another".to_owned());
         }
     }
-    match operations.as_slice() {
+    // The settings an invite chose follow its admission, for the device it
+    // admits: part of the same act.
+    let acts = match operations.as_slice() {
+        [acts @ .., admission, settings]
+            if matches!(asked, Command::Approve { .. }) && settles(admission, settings) =>
+        {
+            let mut acts = acts.to_vec();
+            acts.push(admission);
+            acts
+        }
+        all => all.to_vec(),
+    };
+    match acts.as_slice() {
         [_] => {}
         [before, after] => {
             let replacing = matches!(before.body, OperationBody::RevokeDevice { .. })
                 && matches!(after.body, OperationBody::AddDevice(_))
-                && matches!(asked, Command::Confirm | Command::Replace);
+                && matches!(asked, Command::Approve { replace: true, .. });
             if !replacing {
                 return Err("two acts were asked for where this command signs one".to_owned());
             }
@@ -257,7 +329,7 @@ pub(crate) fn describe(item: &Read, network: &str, asked: &Command) -> Described
             consequence: "no roster changes".to_owned(),
         },
         Read::Snapshot(body) => Described {
-            act: format!("record {network}'s current membership (snapshot {})", body.seq),
+            act: format!("record {network}'s current membership (snapshot {})", body.generation),
             consequence: "routine: the other devices confirm the roster against it; nobody's \
                           access changes"
                 .to_owned(),
@@ -303,8 +375,8 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
                     short(device),
                     daemon::control::shown(reason)
                 ),
-                consequence: "permanent: a revoked device never comes back under the same \
-                              identity"
+                consequence: "it leaves the network; it can come back only if invited again, \
+                              with new keys"
                     .to_owned(),
             }
         }
@@ -342,7 +414,61 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
             act: format!("change {network}'s settings to: {}", settings(params)),
             consequence: format!("every device in {network} follows this"),
         },
+        OperationBody::SetDevice { device, change } => Described {
+            act: format!(
+                "change the settings of {}({}): {}",
+                // The name the person typed, as with a revocation.
+                match asked {
+                    Command::GiveIpv4 { device: daemon::control::Target::Name(name), .. } => {
+                        format!("`{}` ", daemon::control::shown(name))
+                    }
+                    _ => String::new(),
+                },
+                short(device),
+                changes(change)
+            ),
+            consequence: "every device in the network follows this from the next root".to_owned(),
+        },
+        OperationBody::AdmitBatch(header) => Described {
+            act: format!(
+                "admit a batch of {} devices, `{}`, as {}",
+                header.count,
+                daemon::control::shown(&header.label),
+                header.mode.as_str()
+            ),
+            consequence: format!(
+                "each will reach the devices in {network}, and those devices will reach it"
+            ),
+        },
     }
+}
+
+/// What a settings change sets, as a person would read it.
+fn changes(change: &roster::leaf::SettingsChange) -> String {
+    let mut said = Vec::new();
+    if let Some(mode) = change.mode {
+        said.push(format!("mode {}", mode.as_str()));
+    }
+    if let Some(groups) = &change.groups {
+        let names: Vec<&str> = groups.iter().map(roster::leaf::Group::as_str).collect();
+        said.push(format!("groups [{}]", names.join(", ")));
+    }
+    if let Some(ipv4) = change.ipv4 {
+        // An offset in the network's block: the address it names depends on
+        // the block, so the offset is what is signed and what is said.
+        said.push(ipv4.map_or_else(
+            || "no IPv4 address".to_owned(),
+            |offset| format!("IPv4 offset {} in the network's block", u32::from_be_bytes(offset)),
+        ));
+    }
+    if let Some(relay) = change.relay {
+        said.push(if relay.is_some() {
+            "a relay of its own".to_owned()
+        } else {
+            "the network's relay".to_owned()
+        });
+    }
+    said.join(", ")
 }
 
 /// A network's settings, as a person would want them read out.
@@ -351,7 +477,17 @@ fn settings(params: &NetworkParams) -> String {
         || "no relay".to_owned(),
         |relay| format!("relay {}", daemon::control::shown(relay)),
     );
-    let mut said = format!("{relay}, IPv4 range {}", params.ipv4_range());
+    let mut said = format!("{relay}, IPv4 block {}", params.ipv4_range());
+    if !params.excluded.is_empty() {
+        let excluded: Vec<String> = params.excluded.iter().map(ToString::to_string).collect();
+        said.push_str(&format!(", excluded from its route {}", excluded.join(" ")));
+    }
+    if params.anchors.is_empty() {
+        said.push_str(", no anchors");
+    } else {
+        let anchors: Vec<String> = params.anchors.iter().map(daemon::control::short_id).collect();
+        said.push_str(&format!(", anchors {}", anchors.join(" ")));
+    }
     if let Some(leaving) = &params.leaving {
         let until = std::time::UNIX_EPOCH
             .checked_add(std::time::Duration::from_millis(leaving.until))

@@ -30,6 +30,25 @@ pub const MAX_OFFERED_IDS: usize = roster::limits::MAX_OPERATIONS;
 /// A transfer answers an offer, so it can name at most what a roster holds.
 pub const MAX_TRANSFERRED: usize = roster::limits::MAX_OPERATIONS;
 
+/// How many batch pieces one message carries.
+///
+/// A piece is at most an operation's size, so this many fit one payload with
+/// room to spare. A batch's pieces cross in as many messages as they need.
+pub const MAX_PIECES_PER_MESSAGE: usize = 24;
+
+/// How many state pieces one message carries: each is at most 64 KiB, so
+/// three fit one payload.
+pub const MAX_STATE_PIECES_PER_MESSAGE: usize = 3;
+
+/// How many devices a state transferred to this node may hold.
+///
+/// What a lying sender could make a node hold before the root shows the lie.
+pub const MAX_STATE_DEVICES: usize = 1 << 22;
+
+/// How many batches an offer may say it holds in part: as many as a roster
+/// holds incomplete.
+pub const MAX_PARTIAL_BATCHES: usize = roster::roster::MAX_INCOMPLETE_BATCHES;
+
 #[cfg(test)]
 mod tests {
     use super::*;

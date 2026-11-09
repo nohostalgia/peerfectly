@@ -18,6 +18,7 @@
 use crate::cbor::{Reader, Writer};
 use crate::error::Result;
 use crate::limits::ID_LEN;
+use crate::prelude::*;
 
 /// Declares a 32-byte content-addressed identifier newtype.
 ///

@@ -10,7 +10,9 @@
 //! No approving a device, no revoking one, nothing that puts a key to work. Those
 //! are consequential acts that change who is in a person's network, and a menu
 //! next to the clock — hit by accident, with no confirmation and no context — is
-//! the wrong place for them.
+//! the wrong place for them. Nor does it show what waits — invites, requests
+//! to approve, joins: that is `peerfectly pending`, where each comes with what
+//! to do about it.
 //!
 //! # It is not the only way to control the daemon
 //!

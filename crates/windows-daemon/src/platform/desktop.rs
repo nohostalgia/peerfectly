@@ -1,5 +1,5 @@
-//! Three things the tray asks of the person's desktop: dark menus, the
-//! elevation prompt, and a message window.
+//! What the tray asks of the person's desktop: dark menus, the elevation
+//! prompt, and a message window.
 //!
 //! # Dark menus: tried, never required
 //!

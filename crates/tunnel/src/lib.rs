@@ -43,15 +43,23 @@
 //! - Resolving names. The suffix is a roster parameter this crate reads and does
 //!   not serve.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod address;
 pub mod device;
 pub mod holdings;
 pub mod limits;
+#[cfg(feature = "std")]
 pub mod memory;
 pub mod outcome;
 
-pub use address::{Prefix, address_of, ipv4_candidate};
-pub use device::{Packets, Tunnel, destination_of};
-pub use holdings::{Collision, Ipv4Holdings};
+pub use address::{Prefix, address_of};
+#[cfg(feature = "std")]
+pub use device::Packets;
+pub use device::{Tunnel, destination_of};
+pub use holdings::Ipv4Holdings;
+#[cfg(feature = "std")]
 pub use memory::MemoryDevice;
 pub use outcome::{Error, Inbound, Outbound, Result};

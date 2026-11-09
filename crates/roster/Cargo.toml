@@ -7,17 +7,34 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+# Everything a machine with an operating system has. Without it the crate is
+# `no_std` + `alloc`, for a microcontroller member.
+default = ["std"]
+std = ["blake3/std", "p256/std", "p256/pem", "p256/precomputed-tables", "minicbor/std"]
+
 [dependencies]
 minicbor.workspace = true
 blake3.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 p256.workspace = true
 signature.workspace = true
+portable-atomic-util.workspace = true
+
+# On a chip without atomic instructions the shared pointer counts with
+# `portable-atomic`, which the firmware tells how (its `critical-section` or
+# `unsafe-assume-single-core` feature): a library choosing would clash with a
+# HAL that chose already, as esp-hal does for the ESP32-C3.
 
 [dev-dependencies]
 proptest.workspace = true
 hex.workspace = true
 serde_json.workspace = true
+
+# Writes the shared vectors to files, which needs an operating system.
+[[bin]]
+name = "gen_vectors"
+required-features = ["std"]
 
 [lints]
 workspace = true

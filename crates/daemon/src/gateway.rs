@@ -429,12 +429,7 @@ mod tests {
     }
 
     fn holdings(devices: &[DeviceId]) -> Ipv4Holdings {
-        Ipv4Holdings::from(
-            &roster::id::NetworkId::from_bytes([3; 32]),
-            Ipv4Range::DEFAULT,
-            devices,
-            &[],
-        )
+        Ipv4Holdings::from(Ipv4Range::DEFAULT, devices)
     }
 
     fn ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Vec<u8> {

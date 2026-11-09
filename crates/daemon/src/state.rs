@@ -16,7 +16,7 @@
 //! validation the network path runs, which means a tampered file is refused
 //! rather than trusted for having been on the local disk.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -97,10 +97,34 @@ impl Paths {
         self.root.join("identity")
     }
 
+    /// Where this network's state stood the last time this daemon changed it,
+    /// signed by this machine (`crate::checkpoint`).
+    #[must_use]
+    pub fn checkpoint(&self) -> PathBuf {
+        self.root.join("checkpoint")
+    }
+
     /// The operation log the roster is rebuilt from.
     #[must_use]
     pub fn roster(&self) -> PathBuf {
         self.root.join("roster.log")
+    }
+
+    /// What a light member holds, in place of a roster: its own evidence, its
+    /// view of the roots, the parameters it uses and the peers it checked.
+    #[must_use]
+    pub fn light(&self) -> PathBuf {
+        self.root.join("light.member")
+    }
+
+    /// The pieces of the batches the roster holds, beside its log.
+    ///
+    /// Not in the log itself: a piece is not an operation, and the log is
+    /// replayed one operation at a time. Replayed after it, since a piece is
+    /// taken only once its header is held.
+    #[must_use]
+    pub fn pieces(&self) -> PathBuf {
+        self.root.join("pieces.log")
     }
 
     /// The endpoints last known to work.
@@ -123,6 +147,31 @@ impl Paths {
     #[must_use]
     pub fn snapshot(&self) -> PathBuf {
         self.root.join("snapshot")
+    }
+
+    /// The root the log rests on once it has been compacted.
+    ///
+    /// Not the root held: the one beneath the window, whose covered
+    /// operations the log no longer carries.
+    #[must_use]
+    pub fn base_snapshot(&self) -> PathBuf {
+        self.root.join("base.snapshot")
+    }
+
+    /// The state that root commits to: a store of its devices, their indexes
+    /// and their tree (`member_store`), believed through that root.
+    #[must_use]
+    pub fn base_store(&self) -> PathBuf {
+        self.root.join("base.redb")
+    }
+
+    /// The layers of the batches the roster holds: each batch's entries, their
+    /// indexes and the trees laid over them (`member_store::Layers`), so that a
+    /// fleet's boards are not held in memory. Emptied as the node starts, and
+    /// filled again as the log is replayed.
+    #[must_use]
+    pub fn layers(&self) -> PathBuf {
+        self.root.join("layers.redb")
     }
 
     /// When that snapshot was accepted, on this device's wall clock.
@@ -287,6 +336,29 @@ impl Log {
         file.flush().map_err(|cause| self.failure(&cause))
     }
 
+    /// Replaces the whole log with `operations`, all at once.
+    ///
+    /// Written beside the log and moved over it, so a process stopped half way
+    /// leaves the old log or the new one and never a mixture. For compaction,
+    /// which is the one time the log loses operations: those beneath the base
+    /// it now rests on.
+    ///
+    /// # Errors
+    ///
+    /// When either file cannot be written.
+    pub fn rewrite(&self, operations: &[Vec<u8>]) -> Result<()> {
+        let mut bytes = Vec::new();
+        for operation in operations {
+            let len = u32::try_from(operation.len()).map_err(|_| Error::State {
+                path: self.path.clone(),
+                cause: "an operation larger than the log frames".to_owned(),
+            })?;
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(operation);
+        }
+        replace_file(&self.path, &bytes)
+    }
+
     /// Every operation in the log, in the order it was written.
     ///
     /// A missing file is an empty log: a daemon starting for the first time has
@@ -418,6 +490,155 @@ pub fn read_snapshot(paths: &Paths) -> Option<(Vec<u8>, u64)> {
     let bytes = fs::read(paths.snapshot()).ok()?;
     let at = fs::read_to_string(paths.snapshot_at()).ok()?.trim().parse::<u64>().ok()?;
     (!bytes.is_empty()).then_some((bytes, at))
+}
+
+/// Writes `bytes` beside `path` and moves them over it.
+pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(".new");
+    let beside = PathBuf::from(beside);
+    fs::write(&beside, bytes)
+        .map_err(|cause| Error::State { path: beside.clone(), cause: cause.to_string() })?;
+    fs::rename(&beside, path)
+        .map_err(|cause| Error::State { path: path.to_path_buf(), cause: cause.to_string() })
+}
+
+/// How much of a base store redb may keep in memory: the bound a member of a
+/// million devices runs within is 64 MB in all.
+const BASE_CACHE: usize = 16 << 20;
+
+/// The base stores open in this process, by path.
+///
+/// A store is a database one owner opens at a time, and a network may be put
+/// together again — vouched for, carried again — while what held it before
+/// is still letting go. Every one of them is given the same store.
+static OPEN_STORES: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Weak<member_store::Store>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Opens the store a network's base is kept in, creating an empty one where
+/// there is none; the one already open, where this process holds it.
+///
+/// # Errors
+///
+/// When the store cannot be opened.
+pub fn open_base_store(paths: &Paths) -> Result<std::sync::Arc<member_store::Store>> {
+    let path = paths.base_store();
+    let mut open = OPEN_STORES.lock().map_err(|_| Error::State {
+        path: path.clone(),
+        cause: "the open stores are not readable".to_owned(),
+    })?;
+    open.retain(|_, store| store.strong_count() > 0);
+    if let Some(store) = open.get(&path).and_then(std::sync::Weak::upgrade) {
+        return Ok(store);
+    }
+    let store = member_store::Store::open(&path, BASE_CACHE)
+        .map_err(|cause| Error::State { path: path.clone(), cause: cause.to_string() })?;
+    open.insert(path, std::sync::Arc::downgrade(&store));
+    Ok(store)
+}
+
+/// What this device excludes from a network's IPv4 route, kept beside its log
+/// (`route exclude`, `scalable-membership` 19.7): one block per line,
+/// `a.b.c.d/len`. Unsigned and local: it only ever takes routes away.
+pub const EXCLUDED_FILE: &str = "ipv4-excluded";
+
+/// The blocks this device excludes from the network kept under `root`. A
+/// missing or unreadable file excludes nothing; a line that does not read is
+/// left out.
+#[must_use]
+pub fn excluded_here(root: &std::path::Path) -> Vec<roster::types::Excluded> {
+    std::fs::read_to_string(root.join(EXCLUDED_FILE))
+        .map(|text| text.lines().filter_map(|line| line.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Keeps the blocks this device excludes from the network kept under `root`.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn keep_excluded_here(
+    root: &std::path::Path,
+    excluded: &[roster::types::Excluded],
+) -> std::io::Result<()> {
+    let path = root.join(EXCLUDED_FILE);
+    if excluded.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => Err(cause),
+            _ => Ok(()),
+        };
+    }
+    let text: String = excluded.iter().map(|block| format!("{block}\n")).collect();
+    std::fs::write(path, text)
+}
+
+/// How much of a layers file redb may keep in memory: with the base's, inside
+/// the 64 MB a member of a million devices runs within.
+const LAYERS_CACHE: usize = 16 << 20;
+
+/// The layers files open in this process, by path: one owner at a time, as
+/// for the base stores.
+static OPEN_LAYERS: std::sync::Mutex<BTreeMap<PathBuf, std::sync::Weak<member_store::Layers>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Opens the file a network's batch layers are kept in, creating an empty one
+/// where there is none; the one already open, where this process holds it.
+///
+/// # Errors
+///
+/// When the file cannot be opened.
+pub fn open_layers(paths: &Paths) -> Result<std::sync::Arc<member_store::Layers>> {
+    let path = paths.layers();
+    let mut open = OPEN_LAYERS.lock().map_err(|_| Error::State {
+        path: path.clone(),
+        cause: "the open layers are not readable".to_owned(),
+    })?;
+    open.retain(|_, layers| layers.strong_count() > 0);
+    if let Some(layers) = open.get(&path).and_then(std::sync::Weak::upgrade) {
+        return Ok(layers);
+    }
+    let layers = member_store::Layers::open(&path, LAYERS_CACHE)
+        .map_err(|cause| Error::State { path: path.clone(), cause: cause.to_string() })?;
+    open.insert(path, std::sync::Arc::downgrade(&layers));
+    Ok(layers)
+}
+
+/// Keeps the base a compacted log rests on: its root and that root's state.
+///
+/// Written before the log is rewritten, so that a log which no longer carries
+/// the operations beneath the base is never left without the base.
+///
+/// The root is written as the bytes it was signed over, which is what its
+/// encoding reproduces. The state is not signed at all: it is derived, written
+/// to `store` — as the changes since the base it rests on, where it rests on
+/// this store — and believed on reading only because its root is the one the
+/// signed root names.
+///
+/// # Errors
+///
+/// When either cannot be written.
+pub fn write_base(
+    paths: &Paths,
+    store: &member_store::Store,
+    snapshot: &roster::snapshot::SignedSnapshot,
+    state: &roster::state::RosterState,
+) -> Result<()> {
+    store
+        .write(state)
+        .map_err(|cause| Error::State { path: paths.base_store(), cause: cause.to_string() })?;
+    replace_file(&paths.base_snapshot(), &snapshot.to_bytes())
+}
+
+/// The base a compacted log rests on, where both halves are there: the root's
+/// bytes, and the state `store` holds, its devices read as they are needed.
+#[must_use]
+pub fn read_base(
+    paths: &Paths,
+    store: &std::sync::Arc<member_store::Store>,
+) -> Option<(Vec<u8>, roster::state::RosterState)> {
+    let snapshot = fs::read(paths.base_snapshot()).ok()?;
+    let state = store.state().ok()??;
+    (!snapshot.is_empty()).then_some((snapshot, state))
 }
 
 /// Records the snapshot a network has accepted, and when.
@@ -609,6 +830,22 @@ impl roster::roster::Clock for WallClock {
     fn unix_seconds(&self) -> Option<u64> {
         Some(wall_seconds())
     }
+}
+
+/// The light member kept beside an identity, if this device is one here.
+#[must_use]
+pub fn read_light(paths: &Paths) -> Option<roster::member::LightMember> {
+    let bytes = fs::read(paths.light()).ok()?;
+    roster::member::LightMember::from_bytes(&bytes).ok()
+}
+
+/// Keeps a light member, whole, in place of what was kept before.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+pub fn write_light(paths: &Paths, member: &roster::member::LightMember) -> Result<()> {
+    replace_file(&paths.light(), &member.to_bytes())
 }
 
 #[cfg(test)]

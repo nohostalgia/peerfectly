@@ -393,11 +393,22 @@ mod tests {
         let identity = NodeIdentity::generate().expect("generates");
         let key = identity.signing_key().public_key();
         let operation = prepare_operation(&core(&identity), &key);
+        let record = identity
+            .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+            .expect("a device")
+            .into_record(core(&identity).id())
+            .expect("a record");
         let body = Snapshot::new(
             1,
-            vec![0xa0],
-            vec![core(&identity).id()],
-            vec![0],
+            vec![],
+            [0xa0; 32],
+            roster::snapshot::Covering { heads: vec![core(&identity).id()], depths: vec![0] },
+            vec![],
+            roster::leaf::DeviceLeaf { record, settings: roster::leaf::DeviceSettings::default() },
+            roster::membership::MembershipProof {
+                devices: roster::merkle::Proof { siblings: vec![] },
+                parameters: [0; 32],
+            },
             identity.signing_key().key_id(),
             NetworkId::from_bytes([7; 32]),
         )

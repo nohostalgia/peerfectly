@@ -45,6 +45,10 @@
 //!   on it: refusals are reported rather than swallowed.
 //! - The loop, the schedule and the concurrency shape — `windows-daemon`.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod error;
 pub mod limits;
 pub mod message;

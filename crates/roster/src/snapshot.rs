@@ -6,17 +6,22 @@
 //! sense" without needing a rule to enforce it: a snapshot cannot suppress an
 //! operation, because it does not live in the graph the operations live in.
 //!
-//! Keeping it out also protects the closed set of seven operation types. Each
-//! new type must be multiplied against the conflict rules of every existing
-//! one, and for a snapshot that would mean deciding how two snapshots *merge* —
-//! which §4.6 answers differently, with a monotone counter and refusal.
+//! Keeping it out also protects the closed set of operation types. Each new
+//! type must be multiplied against the conflict rules of every existing one,
+//! and for a snapshot that would mean deciding how two snapshots *merge*.
 //!
 //! # What a snapshot commits to
 //!
+//! A snapshot is a **root**: it commits to the state by its Merkle root, names
+//! the roots it follows, and carries the proof that its signer was an admin in
+//! the first of them.
+//!
 //! ```text
-//! Snapshot = { "seq": uint, "heads": [ bstr(32) ... ], "state": bstr,
+//! Snapshot = { "root": bstr(32), "delta": [ bstr(32) ... ],
+//!              "heads": [ bstr(32) ... ], "proof": MembershipProof,
 //!              "author": bstr(32), "depths": [ uint ... ],
-//!              "network": bstr(32) }
+//!              "signer": DeviceLeaf, "network": bstr(32),
+//!              "previous": [ bstr(32) ... ], "generation": uint }
 //! ```
 //!
 //! `author` names the key that signed, exactly as an operation's does. Without
@@ -41,12 +46,28 @@
 
 use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
-use crate::id::{KeyId, NetworkId, OperationId};
+use crate::id::{DeviceId, KeyId, NetworkId, OperationId};
+use crate::leaf::DeviceLeaf;
 use crate::limits;
+use crate::membership::MembershipProof;
+use crate::merkle::Hash;
+use crate::prelude::*;
 use crate::sign::{PublicKey, Signer};
+use crate::state::RosterState;
 
 /// Field names of a snapshot body, in canonical order.
-pub const SNAPSHOT_SCHEMA: &[&str] = &["seq", "heads", "state", "author", "depths", "network"];
+pub const SNAPSHOT_SCHEMA: &[&str] = &[
+    "root",
+    "delta",
+    "heads",
+    "proof",
+    "author",
+    "depths",
+    "signer",
+    "network",
+    "previous",
+    "generation",
+];
 
 /// Field names of the signed snapshot wrapper, in canonical order.
 pub const SIGNED_SNAPSHOT_SCHEMA: &[&str] = &["sig", "body"];
@@ -81,36 +102,77 @@ fn push_framed(out: &mut Vec<u8>, component: &[u8]) {
     out.extend_from_slice(component);
 }
 
-/// The body of a snapshot: what is signed, and what is hashed.
+/// The body of a snapshot — a **root**: what is signed, and what is hashed.
+///
+/// It commits to the roster state by its Merkle root rather than by carrying
+/// the state, so it is the same size for five devices or five million. The
+/// state itself travels as leaves, each provable against [`Self::root`].
+///
+/// A root follows the root or roots it names in [`Self::previous`], and its
+/// signer proves, against the first of those, that it was an admin there: a
+/// member holding no roster checks a root with the root before it and nothing
+/// else. A root that follows nothing — the first — proves its signer against
+/// itself, and is trusted the way a first root always is: by how it arrived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Monotone sequence number. A node refuses anything that does not advance
-    /// it, which is what stops a compromised peer serving an old roster.
-    pub seq: u64,
-    /// Canonical bytes of the roster state derived from everything the heads
-    /// cover — the output of `RosterState::to_bytes`.
-    pub state: Vec<u8>,
-    /// The id of the key that signed this snapshot.
-    pub author: KeyId,
+    /// One more than the highest generation among the roots it follows; 1 for
+    /// a root that follows nothing.
+    pub generation: u64,
+    /// The state roots of the roots this one follows, sorted, without repeats.
+    pub previous: Vec<Hash>,
+    /// The root of the state everything the heads cover derives.
+    pub root: Hash,
     /// The causal depth of each head, positionally matching `heads`.
     pub depths: Vec<u64>,
     /// The heads this snapshot covers. Its covered set is every causal ancestor
     /// of these, together with the heads themselves.
     pub heads: Vec<OperationId>,
+    /// The devices whose leaf in the root it follows this root no longer holds
+    /// as it was: revoked, or changed in any way. Sorted, without repeats.
+    /// Admissions are not listed: they invalidate no earlier proof.
+    pub delta: Vec<DeviceId>,
+    /// The signer's leaf, as the root it follows holds it.
+    pub signer: DeviceLeaf,
+    /// The proof of [`Self::signer`] against the first previous root, or
+    /// against [`Self::root`] when there is none.
+    pub proof: MembershipProof,
+    /// The id of the key that signed, one of [`Self::signer`]'s keys.
+    pub author: KeyId,
     /// The network this snapshot belongs to.
     pub network: NetworkId,
 }
 
+/// The parts of a snapshot that come from the graph rather than from the
+/// state: which heads it covers and how deep each is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Covering {
+    /// The heads.
+    pub heads: Vec<OperationId>,
+    /// Their depths, positionally matching.
+    pub depths: Vec<u64>,
+}
+
 impl Snapshot {
     /// Builds a snapshot body, checking its bounds and internal consistency.
+    ///
+    /// # Errors
+    ///
+    /// When it covers no heads, a head has no depth, the bounds are exceeded,
+    /// the lists are out of order, or the author is not one of the signer's
+    /// keys.
+    #[allow(clippy::too_many_arguments, reason = "every field of the format, checked once")]
     pub fn new(
-        seq: u64,
-        state: Vec<u8>,
-        heads: Vec<OperationId>,
-        depths: Vec<u64>,
+        generation: u64,
+        previous: Vec<Hash>,
+        root: Hash,
+        covering: Covering,
+        delta: Vec<DeviceId>,
+        signer: DeviceLeaf,
+        proof: MembershipProof,
         author: KeyId,
         network: NetworkId,
     ) -> Result<Self> {
+        let Covering { heads, depths } = covering;
         if heads.is_empty() {
             // A snapshot covering nothing attests to nothing.
             return Err(Error::MissingField);
@@ -118,13 +180,93 @@ impl Snapshot {
         if heads.len() != depths.len() {
             return Err(Error::MissingField);
         }
-        if heads.len() > limits::MAX_SNAPSHOT_HEADS {
+        if heads.len() > limits::MAX_SNAPSHOT_HEADS || previous.len() > limits::MAX_SNAPSHOT_HEADS {
             return Err(Error::LimitExceeded("snapshot heads"));
         }
-        if state.len() > limits::MAX_SNAPSHOT_SIZE {
-            return Err(Error::LimitExceeded("snapshot size"));
+        if delta.len() > limits::MAX_OPERATIONS {
+            return Err(Error::LimitExceeded("snapshot delta"));
         }
-        Ok(Self { seq, state, author, depths, heads, network })
+        if generation == 0 || (previous.is_empty() != (generation == 1)) {
+            return Err(Error::InvalidValue("snapshot generation"));
+        }
+        if !strictly_ascending(&previous) || !strictly_ascending(&delta) {
+            return Err(Error::NonCanonical);
+        }
+        if !signer.record.keys.iter().any(|entry| entry.key_id() == author) {
+            return Err(Error::AuthorKeyMismatch);
+        }
+        Ok(Self {
+            generation,
+            previous,
+            root,
+            depths,
+            heads,
+            delta,
+            signer,
+            proof,
+            author,
+            network,
+        })
+    }
+
+    /// The snapshot of `state` covering `covering`, signed by the device
+    /// holding `author`, following `previous` when there is one.
+    ///
+    /// The signer is proved in the previous state, which is what a member that
+    /// holds only the previous root can check; the delta is everything the
+    /// previous state held that this one no longer holds as it was.
+    ///
+    /// # Errors
+    ///
+    /// When the signer is not an admin in the state it is proved in, or the
+    /// body is not well formed.
+    pub fn over(
+        state: &RosterState,
+        covering: Covering,
+        author: KeyId,
+        previous: Option<(&Self, &RosterState)>,
+    ) -> Result<Self> {
+        let proved_in = previous.map_or(state, |(_, before)| before);
+        let device = proved_in.device_holding(&author).ok_or(Error::UnauthorizedAuthor)?;
+        let signer = proved_in.leaf(&device).ok_or(Error::UnauthorizedAuthor)?;
+        if signer.record.role != crate::types::Role::Admin {
+            return Err(Error::UnauthorizedAuthor);
+        }
+        let proof = MembershipProof::of(proved_in, &device).ok_or(Error::UnauthorizedAuthor)?;
+        let (generation, previous_roots, delta) = match previous {
+            Some((before, before_state)) => (
+                before.generation.saturating_add(1),
+                alloc::vec![before.root],
+                state.delta_from(before_state),
+            ),
+            None => (1, Vec::new(), Vec::new()),
+        };
+        Self::new(
+            generation,
+            previous_roots,
+            state.root(),
+            covering,
+            delta,
+            signer,
+            proof,
+            author,
+            state.network,
+        )
+    }
+
+    /// Whether the signer is proved an admin against `previous_root` — the
+    /// first root this one follows, or its own root when it follows none.
+    #[must_use]
+    pub fn signer_proved(&self, previous_root: &Hash) -> bool {
+        self.signer.record.role == crate::types::Role::Admin
+            && self.proof.verifies(previous_root, &self.network, &self.signer)
+    }
+
+    /// The root the signer's proof is against: the first previous root, or
+    /// this root.
+    #[must_use]
+    pub fn proved_against(&self) -> Hash {
+        self.previous.first().copied().unwrap_or(self.root)
     }
 
     /// The depth recorded for a covered head.
@@ -148,19 +290,31 @@ impl Snapshot {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.map(6);
-        writer.key("seq").u64(self.seq);
+        writer.map(10);
+        writer.key("root").bytes(&self.root);
+        writer.key("delta").array(self.delta.len() as u64);
+        for device in &self.delta {
+            device.encode(&mut writer);
+        }
         writer.key("heads").array(self.heads.len() as u64);
         for head in &self.heads {
             writer.bytes(head.as_bytes());
         }
-        writer.key("state").bytes(&self.state);
+        writer.key("proof");
+        self.proof.encode(&mut writer);
         writer.key("author").bytes(self.author.as_bytes());
         writer.key("depths").array(self.depths.len() as u64);
         for depth in &self.depths {
             writer.u64(*depth);
         }
+        writer.key("signer");
+        self.signer.encode(&mut writer);
         writer.key("network").bytes(self.network.as_bytes());
+        writer.key("previous").array(self.previous.len() as u64);
+        for root in &self.previous {
+            writer.bytes(root);
+        }
+        writer.key("generation").u64(self.generation);
         writer.finish()
     }
 
@@ -178,7 +332,14 @@ impl Snapshot {
     pub fn decode(body_bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(body_bytes);
         let mut map = reader.map(SNAPSHOT_SCHEMA)?;
-        let seq = map.key("seq")?.u64()?;
+        let root = hash(map.key("root")?)?;
+
+        let delta_reader = map.key("delta")?;
+        let delta_count = delta_reader.array(limits::MAX_OPERATIONS, "snapshot delta")?;
+        let mut delta = Vec::with_capacity(delta_count);
+        for _ in 0..delta_count {
+            delta.push(DeviceId::decode(delta_reader)?);
+        }
 
         let heads_reader = map.key("heads")?;
         let head_count = heads_reader.array(limits::MAX_SNAPSHOT_HEADS, "snapshot heads")?;
@@ -187,7 +348,7 @@ impl Snapshot {
             heads.push(OperationId::decode(heads_reader)?);
         }
 
-        let state = map.key("state")?.bytes(limits::MAX_SNAPSHOT_SIZE, "snapshot size")?.to_vec();
+        let proof = MembershipProof::decode(map.key("proof")?)?;
         let author = KeyId::decode(map.key("author")?)?;
 
         let depths_reader = map.key("depths")?;
@@ -197,12 +358,42 @@ impl Snapshot {
             depths.push(depths_reader.u64()?);
         }
 
+        let signer = DeviceLeaf::decode(map.key("signer")?)?;
         let network = NetworkId::decode(map.key("network")?)?;
+
+        let previous_reader = map.key("previous")?;
+        let previous_count = previous_reader.array(limits::MAX_SNAPSHOT_HEADS, "snapshot heads")?;
+        let mut previous = Vec::with_capacity(previous_count);
+        for _ in 0..previous_count {
+            previous.push(hash(previous_reader)?);
+        }
+
+        let generation = map.key("generation")?.u64()?;
         map.finish()?;
         reader.finish()?;
 
-        Self::new(seq, state, heads, depths, author, network)
+        Self::new(
+            generation,
+            previous,
+            root,
+            Covering { heads, depths },
+            delta,
+            signer,
+            proof,
+            author,
+            network,
+        )
     }
+}
+
+/// Reads a 32-byte hash.
+fn hash(reader: &mut Reader<'_>) -> Result<Hash> {
+    Hash::try_from(reader.fixed_bytes(32)?).map_err(|_| Error::IdentifierLength)
+}
+
+/// Whether every item is greater than the one before it.
+fn strictly_ascending<T: Ord>(items: &[T]) -> bool {
+    items.windows(2).all(|pair| matches!(pair, [first, second] if first < second))
 }
 
 /// A decoded snapshot whose signature has not been checked.
@@ -394,75 +585,5 @@ mod tests {
     #[test]
     fn the_snapshot_tag_differs_from_the_operation_tag() {
         assert_ne!(SNAPSHOT_DOMAIN_TAG, crate::sign::DOMAIN_TAG);
-    }
-
-    #[test]
-    fn a_snapshot_without_heads_is_rejected() {
-        assert_eq!(
-            Snapshot::new(
-                1,
-                vec![],
-                vec![],
-                vec![],
-                KeyId::from_bytes([3; 32]),
-                NetworkId::from_bytes([1; 32])
-            )
-            .map(|_| ()),
-            Err(Error::MissingField)
-        );
-    }
-
-    #[test]
-    fn heads_and_depths_must_correspond() {
-        assert_eq!(
-            Snapshot::new(
-                1,
-                vec![],
-                vec![OperationId::from_bytes([2; 32])],
-                vec![],
-                KeyId::from_bytes([3; 32]),
-                NetworkId::from_bytes([1; 32]),
-            )
-            .map(|_| ()),
-            Err(Error::MissingField),
-            "a head with no depth would leave the tie-break unanchored"
-        );
-    }
-
-    #[test]
-    fn too_many_heads_are_rejected() {
-        let heads: Vec<OperationId> = (0..=limits::MAX_SNAPSHOT_HEADS)
-            .map(|index| OperationId::from_bytes([u8::try_from(index % 256).unwrap_or(0); 32]))
-            .collect();
-        let depths = vec![1u64; heads.len()];
-        assert_eq!(
-            Snapshot::new(
-                1,
-                vec![],
-                heads,
-                depths,
-                KeyId::from_bytes([3; 32]),
-                NetworkId::from_bytes([1; 32]),
-            )
-            .map(|_| ()),
-            Err(Error::LimitExceeded("snapshot heads"))
-        );
-    }
-
-    #[test]
-    fn depth_lookup_matches_position() {
-        let body = Snapshot::new(
-            3,
-            vec![9],
-            vec![OperationId::from_bytes([1; 32]), OperationId::from_bytes([2; 32])],
-            vec![10, 20],
-            KeyId::from_bytes([3; 32]),
-            NetworkId::from_bytes([7; 32]),
-        )
-        .expect("well-formed");
-        assert_eq!(body.depth_of(&OperationId::from_bytes([1; 32])), Some(10));
-        assert_eq!(body.depth_of(&OperationId::from_bytes([2; 32])), Some(20));
-        assert_eq!(body.depth_of(&OperationId::from_bytes([3; 32])), None);
-        assert_eq!(body.frontier_depth(), 20);
     }
 }

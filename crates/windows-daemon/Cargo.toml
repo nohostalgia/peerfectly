@@ -28,7 +28,7 @@ async-trait.workspace = true
 # `signal`: Ctrl+C on a waiting join abandons it in the daemon too.
 tokio = { workspace = true, features = ["signal"] }
 # The hash of the driver this daemon will load, checked before loading it.
-blake3.workspace = true
+blake3 = { workspace = true, features = ["std"] }
 # The transport a person's request starts. `daemon` says when; this says which.
 # The control protocol on the pipe, which is this crate's to carry.
 serde = { version = "1.0.228", features = ["derive"] }

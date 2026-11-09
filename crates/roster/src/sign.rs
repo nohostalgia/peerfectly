@@ -33,14 +33,10 @@ use crate::cbor::{Reader, Writer};
 use crate::error::{Error, Result};
 use crate::id::{KeyId, NetworkId, OperationId};
 use crate::limits;
+use crate::prelude::*;
 use crate::types::{Algorithm, OPERATION_SCHEMA, OperationBody, OperationCore, OperationType};
 
-use alloc_borrow::Cow;
-
-/// Keeps the `Cow` import in one place.
-mod alloc_borrow {
-    pub(crate) use std::borrow::Cow;
-}
+use alloc::borrow::Cow;
 
 /// The version tag every signature is bound to.
 ///

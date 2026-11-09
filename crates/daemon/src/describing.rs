@@ -1,8 +1,8 @@
 //! Turning what the roster holds into what the report says about membership.
 //!
 //! Pure functions over the roster and a few facts the node supplies, so every
-//! rule here — who is named how, what is owed to whom, what one equivocating
-//! device may put in front of a person — is tested without a session.
+//! rule here — who is named how, what one equivocating device may put in
+//! front of a person — is tested without a session.
 //!
 //! # One way of naming a device
 //!
@@ -11,7 +11,8 @@
 //! time one of them changed, and "the same device has the same id everywhere"
 //! would be true only by coincidence.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use roster::id::{DeviceId, KeyId};
 use roster::roster::Roster;
@@ -19,51 +20,44 @@ use roster::sign::VerifiedOperation;
 use roster::state::RosterState;
 use roster::types::{DeviceSpec, OperationBody};
 
-use crate::confirmations::Confirmed;
 use crate::contacts::LastContacts;
-use crate::control::{
-    Accused, Act, Branch, Contact, Named, Owed, Revocation, Revoked, Signed, Waiting,
-};
-
-/// How many operations other than revocations the report lists.
-///
-/// Revocations are never counted against it. See [`waiting`].
-pub(crate) const WAITING_LISTED: usize = 20;
+use crate::control::{Accused, Act, Branch, Contact, Named, Revocation, Revoked, Signed};
 
 /// What the report says about one network's membership.
 #[derive(Debug, Clone)]
 pub(crate) struct Membership {
     /// How every device is named.
     pub(crate) directory: Directory,
-    /// The devices held as revoked.
-    pub(crate) revoked: Vec<Revoked>,
     /// The devices with evidence against them.
     pub(crate) accused: Vec<Accused>,
-    /// What signed here is owed to whom.
-    pub(crate) waiting: Vec<Waiting>,
-    /// How many further operations are waiting and not listed.
-    pub(crate) waiting_unlisted: usize,
     /// When each device was last in contact with this one.
     pub(crate) contacts: LastContacts,
 }
 
 /// Every device this roster names, and every key it knows the owner of.
+///
+/// The members are asked as a device is named, through the state's indexes:
+/// a report names a page of them, the accused and the revoked, and a copy of
+/// every member's name and keys per report would be the roster's size at a
+/// million (`scalable-membership` 16.6). What is held is what the valid
+/// operations admitted, which the graph's window bounds.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Directory {
-    /// The name each device goes by: its current name if it is a member, and the
-    /// name it was admitted under otherwise.
+    /// The members, asked first: the name a member goes by now, and its keys.
+    members: roster::members::Members,
+    /// The name each device was admitted under, for those no longer members.
     names: BTreeMap<DeviceId, String>,
-    /// The device each key belongs to.
+    /// The device each key admitted belongs to.
     owners: BTreeMap<KeyId, DeviceId>,
 }
 
 impl Directory {
     /// Builds the directory from the derived state and the valid operations held.
     ///
-    /// Admissions first, in the order held, keeping the first for a device — a
-    /// roster keeps the first admission of a device id for good. Then the current
-    /// members overwrite with the names they go by now, which also covers members
-    /// whose admission a snapshot discarded.
+    /// Admissions, in the order held, keeping the first for a device — a
+    /// roster keeps the first admission of a device id for good. The current
+    /// members answer before them, with the names they go by now, which also
+    /// covers members whose admission a snapshot discarded.
     ///
     /// **Valid operations only.** The graph holds everything that verified,
     /// including operations the roster's rules then disregarded. An admission any
@@ -82,12 +76,7 @@ impl Directory {
             directory.admit(spec);
         }
 
-        for record in state.devices.values() {
-            directory.names.insert(record.id, record.name.clone());
-            for key in &record.keys {
-                directory.owners.insert(KeyId::of_public_key(&key.value), record.id);
-            }
-        }
+        directory.members = state.devices.clone();
         directory
     }
 
@@ -102,7 +91,8 @@ impl Directory {
 
     /// A device, named as well as this roster can.
     pub(crate) fn named(&self, device: &DeviceId) -> Named {
-        Named::new(device, self.names.get(device).cloned())
+        let current = self.members.get(device).map(|leaf| leaf.record.name.clone());
+        Named::new(device, current.or_else(|| self.names.get(device).cloned()))
     }
 
     /// The device behind a key.
@@ -111,7 +101,11 @@ impl Directory {
     /// is the digest of its identifying signing key, which is the key that signs,
     /// so the same bytes name the device.
     pub(crate) fn owner(&self, key: &KeyId) -> DeviceId {
-        self.owners.get(key).copied().unwrap_or_else(|| DeviceId::from_bytes(*key.as_bytes()))
+        self.members
+            .holding(key, None)
+            .map(|leaf| leaf.record.id)
+            .or_else(|| self.owners.get(key).copied())
+            .unwrap_or_else(|| DeviceId::from_bytes(*key.as_bytes()))
     }
 
     /// What an operation does, with every device in it named.
@@ -137,6 +131,10 @@ impl Directory {
                 Act::Renames(self.named(device), name.clone())
             }
             OperationBody::SetNetwork(_) => Act::SetsParameters,
+            OperationBody::SetDevice { device, .. } => Act::ChangesSettings(self.named(device)),
+            OperationBody::AdmitBatch(header) => {
+                Act::AdmitsBatch { count: header.count, label: header.label.clone() }
+            }
         }
     }
 }
@@ -149,7 +147,9 @@ pub(crate) fn contact(contacts: &LastContacts, device: &DeviceId) -> Contact {
         .map_or(Contact::NoneRecorded, |at| Contact::Recorded { at })
 }
 
-/// Every device the roster holds as revoked, with every valid revocation of it.
+/// A page of the devices the roster holds as revoked, by id, after `after`
+/// (`None`: the first), with every valid revocation of each; and where the next
+/// page begins, while more remain.
 ///
 /// Built from the revoked set, not from the revocations: a roster adopted from a
 /// snapshot can hold a device as revoked with the operation that did it long
@@ -163,10 +163,17 @@ pub(crate) fn revoked(
     state: &RosterState,
     valid: &[&VerifiedOperation],
     contacts: &LastContacts,
-) -> Vec<Revoked> {
-    state
-        .revoked
-        .iter()
+    after: Option<DeviceId>,
+) -> (Vec<Revoked>, Option<String>) {
+    let mut listed = match after {
+        Some(after) => state.revoked.range((Excluded(after), Unbounded)),
+        None => state.revoked.range(..),
+    };
+    let page: Vec<&DeviceId> = listed.by_ref().take(crate::control::PEERS_PAGE).collect();
+    let more = listed.next().is_some();
+    let next = more.then(|| page.last().map(|device| device.to_hex())).flatten();
+    let revoked = page
+        .into_iter()
         .map(|device| Revoked {
             device: directory.named(device),
             revocations: valid
@@ -186,7 +193,8 @@ pub(crate) fn revoked(
                 .collect(),
             last_contact: contact(contacts, device),
         })
-        .collect()
+        .collect();
+    (revoked, next)
 }
 
 /// One pair per accused device, and how many pairs it has.
@@ -229,68 +237,6 @@ fn branch(directory: &Directory, roster: &Roster, proof: &roster::roster::Proof)
         does: directory.act(&raw.core().body),
         depth: dag.position(&proof.id).map(|index| dag.depth(index)),
     })
-}
-
-/// Whether an operation can be owed to a member at all.
-///
-/// Never to the device it revokes. That device will not confirm — its sessions
-/// are refused — and an entry that can never clear teaches a person to stop
-/// reading the list. Derivation already drops revoked records from the state, but
-/// this is stated here so that nothing rests on it.
-pub(crate) fn owed_to(operation: &VerifiedOperation, member: &DeviceId) -> bool {
-    !matches!(operation.body(), OperationBody::RevokeDevice { device, .. } if device == member)
-}
-
-/// What signed here some member has not said it holds, per operation.
-///
-/// Revocations first, then the rest in the order they are held, and the rest
-/// bounded by [`WAITING_LISTED`]. Revocations are never bounded: the one list a
-/// person reads before deciding a stolen laptop is dealt with cannot be the list
-/// that dropped its revocation at entry twenty-one.
-pub(crate) fn waiting(
-    directory: &Directory,
-    state: &RosterState,
-    authored: &[&VerifiedOperation],
-    me: &DeviceId,
-    confirmed: &Confirmed,
-    connected: &BTreeSet<DeviceId>,
-    contacts: &LastContacts,
-) -> (Vec<Waiting>, usize) {
-    let mut revocations = Vec::new();
-    let mut others = Vec::new();
-
-    for operation in authored {
-        let owed: Vec<Owed> = state
-            .devices
-            .keys()
-            .filter(|member| *member != me)
-            .filter(|member| owed_to(operation, member))
-            .filter(|member| !confirmed.holds(member, &operation.id()))
-            .map(|member| Owed {
-                device: directory.named(member),
-                connected: connected.contains(member),
-                last_contact: contact(contacts, member),
-            })
-            .collect();
-        if owed.is_empty() {
-            continue;
-        }
-
-        let entry = Waiting {
-            does: directory.act(operation.body()),
-            signed_here: Signed::from_ts(operation.core().ts),
-            owed,
-        };
-        if entry.does.is_revocation() {
-            revocations.push(entry);
-        } else {
-            others.push(entry);
-        }
-    }
-
-    let unlisted = others.len().saturating_sub(WAITING_LISTED);
-    revocations.extend(others.into_iter().take(WAITING_LISTED));
-    (revocations, unlisted)
 }
 
 #[cfg(test)]
@@ -440,19 +386,17 @@ mod tests {
             for index in wanted {
                 covered.insert(full.operation(index).unwrap().clone()).unwrap();
             }
-            let state = roster::state::derive(&covered).unwrap().to_bytes();
+            let state = roster::state::derive(&covered).unwrap();
             let depths = heads
                 .iter()
                 .map(|head| covered.depth(covered.position(&self.id(head)).unwrap()))
                 .collect();
             let ids = heads.iter().map(|head| self.id(head)).collect();
-            let body = Snapshot::new(
-                1,
-                state,
-                ids,
-                depths,
+            let body = Snapshot::over(
+                &state,
+                roster::snapshot::Covering { heads: ids, depths },
                 signer(signer_seed).key_id(),
-                self.network.unwrap(),
+                None,
             )
             .unwrap();
             sign_snapshot(&body, &signer(signer_seed)).unwrap()
@@ -561,7 +505,7 @@ mod tests {
         let roster = history.roster(64);
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let revoked = revoked(&directory, &state, &held, &LastContacts::default());
+        let (revoked, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
 
         let laptop = revoked
             .iter()
@@ -606,7 +550,7 @@ mod tests {
         let roster = history.roster(64);
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let listed = revoked(&directory, &state, &held, &LastContacts::default());
+        let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let laptop = listed.first().unwrap();
         let mut by: Vec<Option<&str>> =
             laptop.revocations.iter().map(|entry| name(&entry.by)).collect();
@@ -657,7 +601,7 @@ mod tests {
 
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let listed = revoked(&directory, &state, &held, &LastContacts::default());
+        let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let reasons: Vec<&str> = listed
             .iter()
             .flat_map(|entry| entry.revocations.iter())
@@ -666,9 +610,12 @@ mod tests {
         assert_eq!(reasons, vec!["stolen"]);
     }
 
-    /// The admission is gone; the revocation is permanent. Listed by id.
+    /// A checkpoint absorbed the revocation: the device is absent from the
+    /// network, and listed neither among the revoked nor among the members
+    /// (`windows-daemon`, "An absorbed revocation leaves the list"). It was
+    /// listed only while the kept state went unrederived after compacting.
     #[test]
-    fn a_revoked_device_whose_admission_was_compacted_away_is_listed_by_id() {
+    fn an_absorbed_revocation_leaves_the_list() {
         let mut history = History::founded_by(1, "nas");
         history.op(
             "laptop",
@@ -708,14 +655,45 @@ mod tests {
 
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let listed = revoked(&directory, &state, &held, &LastContacts::default());
+        let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let laptop =
             listed.iter().find(|entry| entry.device.id == crate::control::short_id(&id(2)));
-        let laptop = laptop.expect("a revoked device is never left out");
-        assert_eq!(laptop.device.name, None, "and nothing held names it");
+        assert!(laptop.is_none(), "not among the revoked");
+        assert!(!state.devices.contains_key(&id(2)), "nor among the members");
     }
 
     // ---- 5.x equivocation -----------------------------------------------------
+
+    /// The revoked are listed a page at a time, by id: every one once, to the
+    /// last, and the cursor says where the next begins only while more remain.
+    #[test]
+    fn the_revoked_are_listed_a_page_at_a_time() {
+        let roster = History::founded_by(1, "nas").roster(64);
+        let (mut state, valid, directory) = view(&roster);
+        let held: Vec<&VerifiedOperation> = valid.iter().collect();
+        for n in 0..250_u32 {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&n.to_be_bytes());
+            state.revoked.insert(DeviceId::from_bytes(bytes));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut after = None;
+        let mut pages = 0_usize;
+        loop {
+            let (page, next) = revoked(&directory, &state, &held, &LastContacts::default(), after);
+            assert!(page.len() <= crate::control::PEERS_PAGE);
+            for entry in page {
+                assert!(seen.insert(entry.device.id.clone()), "{} listed twice", entry.device.id);
+            }
+            pages = pages.saturating_add(1);
+            let Some(next) = next else { break };
+            let bytes: [u8; 32] = hex::decode(next).unwrap().try_into().unwrap();
+            after = Some(DeviceId::from_bytes(bytes));
+        }
+        assert_eq!(seen.len(), 250, "every one, once");
+        assert_eq!(pages, 3);
+    }
 
     #[test]
     fn an_equivocation_is_described_by_its_branches() {
@@ -842,174 +820,5 @@ mod tests {
         assert!(matches!(&only.first.does, Act::Renames(_, to) if to == "left" || to == "right"));
         assert_eq!(only.first.depth, None);
         assert_eq!(only.second.depth, None);
-    }
-
-    // ---- 6.x what is waiting --------------------------------------------------
-
-    /// Constructed so the revoked device is still a member in the state read:
-    /// exclusion by derivation cannot be what makes this pass.
-    #[test]
-    fn an_operation_is_never_owed_to_the_device_it_revokes() {
-        let mut history = History::founded_by(1, "nas");
-        history.op(
-            "laptop",
-            1,
-            &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-        );
-        let before = history.roster(64);
-        let state_before = before.state().unwrap();
-        assert!(state_before.devices.contains_key(&id(2)), "still a member in this state");
-
-        history.op(
-            "revoke",
-            1,
-            &["laptop"],
-            OperationBody::RevokeDevice { device: id(2), reason: "stolen".to_owned() },
-        );
-        let after = history.roster(64);
-        let revocation = after
-            .dag()
-            .operations()
-            .iter()
-            .find(|op| op.id() == history.id("revoke"))
-            .unwrap()
-            .clone();
-
-        assert!(!owed_to(&revocation, &id(2)));
-        assert!(owed_to(&revocation, &id(7)), "and owed to anybody else");
-
-        let (_, _, directory) = view(&before);
-        let (listed, _) = waiting(
-            &directory,
-            &state_before,
-            &[&revocation],
-            &id(1),
-            &Confirmed::default(),
-            &BTreeSet::new(),
-            &LastContacts::default(),
-        );
-        assert!(listed.is_empty(), "the only other member is the one it revokes: {listed:?}");
-    }
-
-    #[test]
-    fn revocations_come_first_and_the_bound_never_hides_one() {
-        let mut history = History::founded_by(1, "nas");
-        history.op(
-            "phone",
-            1,
-            &["g"],
-            OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
-        );
-        history.op(
-            "laptop",
-            1,
-            &["phone"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-        );
-        let mut previous = "laptop".to_owned();
-        for index in 0..25u8 {
-            let label = format!("admit{index}");
-            history.op(
-                &label,
-                1,
-                &[previous.as_str()],
-                OperationBody::AddDevice(device(
-                    index.saturating_add(10),
-                    &format!("d{index}"),
-                    Role::Member,
-                    false,
-                )),
-            );
-            previous = label;
-        }
-        history.op(
-            "revoke",
-            1,
-            &[previous.as_str()],
-            OperationBody::RevokeDevice { device: id(2), reason: "stolen".to_owned() },
-        );
-
-        let roster = history.roster(64);
-        let (state, valid, directory) = view(&roster);
-        let mine: Vec<&VerifiedOperation> = valid
-            .iter()
-            .filter(|op| {
-                matches!(op.body(), OperationBody::AddDevice(spec) if spec.name.starts_with('d'))
-                    || matches!(op.body(), OperationBody::RevokeDevice { .. })
-            })
-            .collect();
-        let (listed, unlisted) = waiting(
-            &directory,
-            &state,
-            &mine,
-            &id(1),
-            &Confirmed::default(),
-            &BTreeSet::from([id(3)]),
-            &LastContacts::default(),
-        );
-
-        assert!(
-            listed.first().unwrap().does.is_revocation(),
-            "the revocation is first, though signed last"
-        );
-        assert_eq!(listed.iter().filter(|entry| entry.does.is_revocation()).count(), 1);
-        assert_eq!(listed.len(), 21, "the revocation and twenty others");
-        assert_eq!(unlisted, 5);
-
-        let owed = &listed.first().unwrap().owed;
-        let phone = owed.iter().find(|entry| name(&entry.device) == Some("phone")).unwrap();
-        assert!(phone.connected, "connection state is carried per member");
-        assert_eq!(phone.last_contact, Contact::NoneRecorded);
-        assert!(matches!(listed.first().unwrap().signed_here, Signed::At { .. }));
-    }
-
-    #[test]
-    fn a_confirmed_member_is_not_owed_and_a_contact_is_carried() {
-        let mut history = History::founded_by(1, "nas");
-        history.op(
-            "phone",
-            1,
-            &["g"],
-            OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
-        );
-        history.op(
-            "laptop",
-            1,
-            &["phone"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-        );
-        history.op(
-            "desk",
-            1,
-            &["laptop"],
-            OperationBody::AddDevice(device(4, "desk", Role::Member, false)),
-        );
-
-        let roster = history.roster(64);
-        let (state, valid, directory) = view(&roster);
-        let desk: Vec<&VerifiedOperation> =
-            valid.iter().filter(|op| op.id() == history.id("desk")).collect();
-
-        let mut confirmed = Confirmed::default();
-        confirmed.confirm(id(3), [history.id("desk")]);
-        let mut contacts = LastContacts::default();
-        contacts.touch(id(2), 29_283_334);
-
-        let (listed, _) =
-            waiting(&directory, &state, &desk, &id(1), &confirmed, &BTreeSet::new(), &contacts);
-        let owed: Vec<Option<&str>> =
-            listed.first().unwrap().owed.iter().map(|entry| name(&entry.device)).collect();
-        assert!(owed.contains(&Some("laptop")) && owed.contains(&Some("desk")));
-        assert!(!owed.contains(&Some("phone")), "the member that said it holds it is not owed it");
-
-        let laptop = listed
-            .first()
-            .unwrap()
-            .owed
-            .iter()
-            .find(|entry| name(&entry.device) == Some("laptop"))
-            .unwrap();
-        assert!(matches!(laptop.last_contact, Contact::Recorded { .. }));
     }
 }

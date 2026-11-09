@@ -240,7 +240,8 @@ impl Home {
     /// that could not be carried, which is a network the person never had.
     ///
     /// Only a directory with no record and an empty log is removed. One that holds
-    /// either is a network, and is never touched here.
+    /// either is a network, and is never touched here; one that holds a join in
+    /// progress is the service's to resume.
     ///
     /// Returns whether anything was removed.
     ///
@@ -249,7 +250,7 @@ impl Home {
     /// When the directory exists and cannot be read or removed.
     pub fn discard_unfounded(&self, label: &Label) -> Result<bool> {
         let paths = self.paths_for(label);
-        if !paths.root().exists() || paths.record().exists() {
+        if !paths.root().exists() || paths.record().exists() || crate::joins::in_progress(&paths) {
             return Ok(false);
         }
         if !crate::state::Log::at(paths.roster()).read()?.is_empty() {
@@ -453,7 +454,11 @@ impl Home {
     /// # Errors
     ///
     /// When the networks directory exists and cannot be read.
-    pub fn recover_every_unrecorded(&self, keys: &dyn crate::keys::Keys) -> Result<Vec<Recovered>> {
+    pub fn recover_every_unrecorded(
+        &self,
+        keys: &dyn crate::keys::Keys,
+        integrity: Option<&crate::checkpoint::Integrity>,
+    ) -> Result<Vec<Recovered>> {
         let networks = self.networks();
         let entries = match std::fs::read_dir(&networks) {
             Ok(entries) => entries,
@@ -468,7 +473,8 @@ impl Home {
                 continue;
             }
             let paths = self.paths_for(&label);
-            if paths.record().exists() {
+            // A join in progress is not a network yet: the service resumes it.
+            if paths.record().exists() || crate::joins::in_progress(&paths) {
                 continue;
             }
             // No identity means no membership this device could hold, and asking for
@@ -477,7 +483,25 @@ impl Home {
                 continue;
             }
 
-            match Self::provable(&paths, keys) {
+            // Only what this machine vouched for: a roster naming this device's
+            // public keys can be written by anybody, and only the checkpoint
+            // shows this daemon wrote it.
+            let proved = Self::provable(&paths, keys);
+            if let Some(integrity) = integrity {
+                let checked = match &proved {
+                    Some(network) => integrity.checked(&paths, network).map(|_| ()),
+                    None => match crate::checkpoint::read(&paths, integrity.key.as_ref()) {
+                        Ok(Some(_)) => Ok(()),
+                        Ok(None) => Err("it has no checkpoint this machine signed".to_owned()),
+                        Err(refusal) => Err(refusal),
+                    },
+                };
+                if let Err(refusal) = checked {
+                    done.push(Recovered::Untrusted(label, refusal));
+                    continue;
+                }
+            }
+            match proved {
                 Some(network) => {
                     // Under the network's own name, not the one it happens to sit
                     // under. A directory in this state was named by the daemon and
@@ -583,6 +607,10 @@ impl Home {
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             let paths = Paths::under(entry.path());
+            // A join in progress is listed as one, not as a network.
+            if crate::joins::in_progress(&paths) {
+                continue;
+            }
 
             match Record::read(&paths) {
                 Ok(record) => survey.held.push(Held { record, paths }),
@@ -607,6 +635,9 @@ pub enum Recovered {
     Carried(Label),
     /// The roster proved no membership, so the directory was removed.
     Discarded(Label),
+    /// It holds no checkpoint this machine signed, so it was neither carried
+    /// nor removed, and why.
+    Untrusted(Label, String),
 }
 
 /// The network a set of paths holds, if its roster proves one.
@@ -690,17 +721,8 @@ mod tests {
         // contact is metadata about the people in one network, and removing the
         // network's directory has to remove it too.
         let contacts = crate::contacts::ContactRecord::beside(&casa.roster()).path().to_path_buf();
-        let confirmations =
-            crate::confirmations::Confirmations::beside(&casa.roster()).path().to_path_buf();
 
-        for one in [
-            casa.roster(),
-            casa.identity(),
-            casa.endpoints(),
-            casa.choice(),
-            contacts,
-            confirmations,
-        ] {
+        for one in [casa.roster(), casa.identity(), casa.endpoints(), casa.choice(), contacts] {
             assert!(one.starts_with(casa.root()), "{} belongs to its own network", one.display());
             assert!(!one.starts_with(lavoro.root()));
         }
@@ -936,7 +958,8 @@ mod tests {
         let paths = stranded(&home, &label);
         assert!(!paths.record().exists(), "this is what the join did not get to");
 
-        let done = home.recover_every_unrecorded(&crate::keys::PlatformKeys).expect("recovers");
+        let done =
+            home.recover_every_unrecorded(&crate::keys::PlatformKeys, None).expect("recovers");
 
         assert_eq!(vec![Recovered::Carried(label.clone())], done);
         let record = Record::read(&paths).expect("the record was written");
@@ -964,7 +987,8 @@ mod tests {
         assert_eq!(label("network"), provisional);
         let _paths = stranded(&home, &provisional);
 
-        let done = home.recover_every_unrecorded(&crate::keys::PlatformKeys).expect("recovers");
+        let done =
+            home.recover_every_unrecorded(&crate::keys::PlatformKeys, None).expect("recovers");
 
         // `stranded` founds a network whose suffix is `casa.internal`.
         assert_eq!(vec![Recovered::Carried(label("casa"))], done);
@@ -1003,7 +1027,8 @@ mod tests {
 
         assert!(describe(&paths).is_some(), "the log does derive a network");
 
-        let done = home.recover_every_unrecorded(&crate::keys::PlatformKeys).expect("recovers");
+        let done =
+            home.recover_every_unrecorded(&crate::keys::PlatformKeys, None).expect("recovers");
 
         assert_eq!(vec![Recovered::Discarded(label)], done);
         assert!(!paths.root().exists(), "and the directory is gone");
@@ -1022,7 +1047,8 @@ mod tests {
         let _made = crate::keys::Keys::identity(&crate::keys::PlatformKeys, &paths)
             .expect("an identity is made");
 
-        let done = home.recover_every_unrecorded(&crate::keys::PlatformKeys).expect("recovers");
+        let done =
+            home.recover_every_unrecorded(&crate::keys::PlatformKeys, None).expect("recovers");
 
         assert_eq!(vec![Recovered::Discarded(label)], done);
         assert!(!paths.root().exists());
@@ -1043,7 +1069,8 @@ mod tests {
 
         // Nothing to prove and nothing to disprove: recovery removes it as
         // proving no membership, which is what it is.
-        let done = home.recover_every_unrecorded(&crate::keys::PlatformKeys).expect("recovers");
+        let done =
+            home.recover_every_unrecorded(&crate::keys::PlatformKeys, None).expect("recovers");
         assert_eq!(vec![Recovered::Discarded(vuoto)], done);
 
         // And the older rule still removes one with no identity either.

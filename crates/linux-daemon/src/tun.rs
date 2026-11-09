@@ -214,7 +214,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs CAP_NET_ADMIN and /dev/net/tun: run in the testbed"]
     async fn the_interface_lives_exactly_as_long_as_the_device() {
-        let name = "peerfectlytest00001";
+        let name = "pftest00001";
         let tun = Tun::open(name).unwrap();
         assert!(std::path::Path::new(&format!("/sys/class/net/{name}")).exists());
         assert_eq!(name, tun.name());

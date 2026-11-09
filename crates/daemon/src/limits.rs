@@ -172,6 +172,44 @@ const _: () = {
     assert!(!PRODUCT.is_empty());
 };
 
+/// How long a light member waits for a lookup's answer before trying the next
+/// member it could ask.
+pub const LOOKUP_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often an admin's daemon dials the rendezvous of its open invites, and
+/// the approved devices that do not have the network yet.
+///
+/// A device is reached within seconds of starting its join whatever the
+/// moment; one dial is a relay connection opened and closed, a few hundred
+/// bytes.
+pub const INVITE_DIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How recently a full member must have been in contact to be handed to a
+/// light member first, in minutes: a week, so that one switched off for the
+/// weekend still counts and one gone for good stops being offered.
+pub const HANDED_SEEN_WITHIN_MINUTES: u64 = 7 * 24 * 60;
+
+/// How long reaching an invited device may take before the next is tried.
+///
+/// Reaching only. A device reached then introduces itself, which may wait on
+/// its person typing a passphrase, and has the exchange's deadline for that:
+/// one bound on the two together dropped every exchange whose person took
+/// longer than this to type it — found in the testbed, where the joining key
+/// was a sealed file.
+pub const INVITE_DIAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long two sessions opened in opposite directions count as two dials
+/// crossing, which both sides settle by keeping the one the lower id dialled.
+/// Past it, a peer that dials again has lost the session held with it, and its
+/// new one is kept. Wide enough for a handshake through the relay.
+pub const CROSSING_DIALS: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long after its admission a new member this device has never been in
+/// contact with is dialled by the members around it, to be brought the
+/// network: three days. A device switched off for longer is still dialled by
+/// the admin that approved it, until it has the network.
+pub const NEWCOMER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3 * 24 * 60 * 60);
+
 #[cfg(test)]
 mod tests {
     use super::*;

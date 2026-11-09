@@ -93,6 +93,35 @@ impl Fixture {
         joiner
     }
 
+    /// Changes a device's settings, the founder signing.
+    pub fn set_device(
+        &mut self,
+        device: DeviceId,
+        change: roster::leaf::SettingsChange,
+    ) -> OperationId {
+        self.author(OperationBody::SetDevice { device, change })
+    }
+
+    /// Admits a batch by its header, the founder signing.
+    pub fn admit_batch(&mut self, header: roster::batch::BatchHeader) -> OperationId {
+        self.author(OperationBody::AdmitBatch(header))
+    }
+
+    /// Signs an operation by the founder naming explicit parents, without
+    /// recording it.
+    pub fn sign_on(&self, body: OperationBody, parents: Vec<OperationId>, ts: u64) -> Vec<u8> {
+        let core = OperationCore::new(
+            ts,
+            self.founder.signing_key().algorithm(),
+            body,
+            parents,
+            self.founder.signing_key().key_id(),
+            self.network,
+        )
+        .expect("well-formed");
+        sign_operation(&core, self.founder.signer()).expect("signs")
+    }
+
     /// Revokes a device.
     pub fn revoke(&mut self, device: DeviceId) -> OperationId {
         self.author(OperationBody::RevokeDevice { device, reason: "test".to_owned() })
@@ -172,12 +201,20 @@ impl Fixture {
                 node.dag().depth(index)
             })
             .collect();
+        // Any generation the test asks for: past the first, the root follows
+        // this same state, which is enough for a node holding the operations.
+        let author = self.founder.signing_key().key_id();
+        let device = state.device_holding(&author).expect("the founder");
+        let previous = if seq == 1 { Vec::new() } else { vec![state.root()] };
         let body = Snapshot::new(
             seq,
-            state.to_bytes(),
-            heads,
-            depths,
-            self.founder.signing_key().key_id(),
+            previous,
+            state.root(),
+            roster::snapshot::Covering { heads, depths },
+            Vec::new(),
+            state.leaf(&device).expect("a member"),
+            roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            author,
             self.network,
         )
         .expect("well-formed snapshot");
@@ -260,7 +297,7 @@ pub fn orphan(index: u64) -> Vec<u8> {
 /// Derived membership, as a sorted list of device ids, for comparing two nodes.
 pub fn membership(node: &Roster) -> Vec<DeviceId> {
     let state = node.state().expect("derives");
-    let mut devices: Vec<DeviceId> = state.devices.keys().copied().collect();
+    let mut devices: Vec<DeviceId> = state.devices.keys().collect();
     devices.sort_unstable();
     devices
 }

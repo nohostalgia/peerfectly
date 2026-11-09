@@ -35,9 +35,9 @@ in**.
 
 - **Not a privacy VPN.** It doesn't hide where you browse and has no exit nodes. It connects *your*
   devices to each other.
-- **Not finished.** Today it's built for a person or a household with a handful of devices. Access
-  lists per service, sharing between separate people's networks, more than one relay per network,
-  recovery when the only admin is lost, macOS and iOS: none of these exist yet.
+- **Not finished.** It runs a household's handful of devices as it runs a fleet of thousands, but
+  some things don't exist yet: access rules per port or service, sharing between separate people's
+  networks, more than one relay per network, recovery when the only admin is lost, macOS and iOS.
 
 ## How it works, briefly
 
@@ -46,11 +46,18 @@ in**.
   the same LAN find each other by signed announcements and connect directly. Elsewhere a session
   opens through a relay pinned by its key, and moves to a direct path as soon as the two ends find
   one. peerfectly takes convesso from its repository, fixed to one commit in `Cargo.toml`.
-- **The roster.** The membership is a signed, append-only graph of operations (found, admit, revoke,
-  change a setting) that any two devices can merge in any order and get the same result. Snapshots
-  let it be compacted, and attestations let a device tell that its copy is recent.
-- **Admission.** The joining device shows a QR code or a payload. The admin admits it, and both
-  screens show a six-digit code you compare before anything is signed.
+- **The roster.** The membership is a signed graph of operations (found, admit, revoke, change a
+  setting) that any two devices can merge in any order and get the same result. After every admin
+  act a signed root names the state as a Merkle tree, and devices compact beneath it, so what a
+  device keeps follows the network's size, not its history.
+- **Admission.** An admin makes an invite and sends it however they like. The joining device sends
+  a request and returns; the admin's daemon collects it, and the admin approves it when they choose,
+  comparing the device's key fingerprint if they are both there. Nobody has to wait for anybody,
+  and either side may restart in between.
+- **Full and light members.** A full member holds the roster. A light member, such as a phone that
+  shouldn't carry a large network or a microcontroller, holds only its own proof of membership and
+  the latest root, and checks every peer's proof the same way. A fleet is admitted in one signed
+  batch, and anchors (full members an admin names) keep light members in touch.
 - **Addresses and names.** Each device gets an IPv6 address derived from its key, plus an IPv4
   address in the CGNAT range. Names resolve under the network's own suffix, `home.internal` by
   default, and only for that suffix: the rest of your DNS is untouched.
@@ -81,8 +88,8 @@ is unknown: *More info → Run anyway*.
 **Linux.** Unpack the archive and run its install script:
 
 ```sh
-tar xzf peerfectly-0.4.1-linux-x86_64.tar.gz
-sudo ./peerfectly-0.4.1-linux-x86_64/install.sh
+tar xzf peerfectly-0.5.0-linux-x86_64.tar.gz
+sudo ./peerfectly-0.5.0-linux-x86_64/install.sh
 ```
 
 The script checks everything it needs before it writes anything, and tells you which packages are
@@ -97,12 +104,16 @@ built it, from which commit, on which runner. To check that a file came out of t
 release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify peerfectly-0.4.1-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+gh attestation verify peerfectly-0.5.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
 ```
 
 That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
 it won't quiet SmartScreen.
 
+**Coming from 0.4.** This version changes the roster's format, and a network made by 0.4 can't be
+carried over: **every network has to be founded again.** Install the new version on every device,
+found the network again on its admin, and invite each device back. A device that held a 0.4 network
+reports it as one it can't carry; `peerfectly forget <network>` (as administrator) clears it away.
 ### A network in four commands
 
 You need a relay. Run your own with [`deploy/server`](deploy/server/README.md), or use one you trust.
@@ -117,20 +128,30 @@ It asks the relay's host which key its relay has and asks you to confirm it, the
 network's signing key. On Windows that key goes in the TPM, behind Windows Hello. On Linux it goes in the TPM,
 or a sealed file where there is none, behind a passphrase.
 
-On the second device:
+Invite the second device from the admin:
 
 ```sh
-peerfectly join --relay https://relay.example --name nas
+peerfectly invite nas
 ```
 
-It asks the relay's host the same way, with nothing to confirm, since a join signs nothing with it.
-Then it prints a QR code and a payload. Back on the admin:
+It prints a QR code and an invite, open for a day (`--expires 30m|24h|7d`), and returns. On the
+second device:
 
 ```sh
-peerfectly admit peerfectly-join-v1:…
+peerfectly join peerfectly-invite-v1:… --name nas
 ```
 
-Compare the six digits on both screens, confirm on both, and you're in:
+It prints its key's fingerprint and returns. The admin's daemon takes the device's request on its
+own; nobody has to wait for anybody. When you choose, on the admin:
+
+```sh
+peerfectly pending
+peerfectly approve nas
+```
+
+`pending` shows the request with the fingerprint the second device printed — compare them if you
+are both there. Once approved, the device is given the network as soon as it answers, even after
+a restart of either machine; then:
 
 ```sh
 peerfectly up home
@@ -143,8 +164,13 @@ is lowered, so `Laptop` and `laptop` are the same name. Anything else is refused
 would do. Without `--name`, the machine's name is used, made to fit. An admin renames a device with
 `peerfectly rename laptop studio`.
 
-`peerfectly` with no arguments lists every command. On Windows the commands that change the
-machine need an elevated console. On Linux, anything that signs needs `sudo`.
+`peerfectly` with no arguments lists every command. Reading — `status`, `peers`, `revoked`,
+`address`, `exposed`, `pending` — and turning your own networks on and off with `up` and `down`
+need nothing more; everything else needs an elevated console on Windows and `sudo` on Linux.
+
+For many devices at once, such as boards that made their own keys, an admin writes their public
+keys in a batch file and admits them with one consent: `peerfectly admit --batch boards.json
+--light`. `peerfectly set-anchors <name>...` names the full members light members should turn to.
 
 A device talks to another only while something is going between them, so the network costs next to
 nothing when you're not using it. The trade is a short pause, usually well under a second, on the
@@ -172,9 +198,10 @@ The packages are built by the same scripts the release workflow runs:
 
 | Where | What |
 |---|---|
-| `crates/roster` | the signed roster: operations, merge, snapshots, attestations |
+| `crates/roster` | the signed roster: operations, merge, the Merkle state, roots, batches, light members |
+| `crates/member-store` | a full member's state on disk, believed only through a signed root |
 | `crates/identity` | device keys, and how they're stored |
-| `crates/enrollment` | joining: the payload, the code, the exchange |
+| `crates/enrollment` | joining: the invite, the request, the exchange |
 | `crates/transport`, `crates/transport-convesso` | sessions between devices: the interface, and its implementation on [convesso](https://github.com/nohostalgia/convesso) |
 | `crates/tunnel` | the packet path, and the check that a packet comes from who it says |
 | `crates/roster-sync`, `crates/local-discovery` | how devices stay in sync, and find each other on the LAN |

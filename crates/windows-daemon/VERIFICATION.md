@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 55 of 87. Every other result reads `not run`. That is the honest
+**Run so far**: 58 of 90. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2447,3 +2447,176 @@ the other by name.
 - `ping` to the phone's address, and to `phone.prova.internal`: 4 of 4 each, 14 to 118 ms.
 - The PC's icon, from `core/branding`, is on the programs, in the Start menu and in the
   installer's pictures.
+
+## C3. This machine's own key is in the TPM, and a changed folder is not carried
+
+`local-integrity`. Each network's state is believed only through a checkpoint signed by this
+machine's own key, which lives in the TPM with no prompt. Networks founded before this build have
+no checkpoint and are reported as changed outside the program: forget them and found or join them
+again first.
+
+From an elevated console, in `core`:
+
+```powershell
+cargo test -p windows-daemon --test machine_key -- --ignored --test-threads=1
+```
+
+Then with the MSI of this branch installed, found a network, and look:
+
+```powershell
+peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+certutil -csp "Microsoft Platform Crypto Provider" -key
+```
+```powershell
+Get-Content $env:PROGRAMDATA\peerfectly\machine.kind
+```
+```powershell
+Get-ChildItem $env:PROGRAMDATA\peerfectly\networks\prova\checkpoint
+```
+
+Then the folder changed while the daemon is stopped: copy `roster.log` from another network's folder
+over `prova`'s, start the daemon again, and run `peerfectly status`. Put the original back
+afterwards, and start it once more.
+
+**Expect**:
+- the tests: 2 passed, and no dialog shown at any point;
+- `certutil` lists `peerfectly.machine`, ECDSA nistP256, as a machine key;
+- `machine.kind` reads `hardware`, and there is no `machine.key`;
+- `prova` has a `checkpoint`;
+- `certutil` also lists `peerfectly.seal`, RSA 2048, as a machine key, and `prova\identity` begins
+  with `peerfectly wrapped v1`;
+- with the other roster in place, `status` reports `prova` as changed outside the program and does
+  not carry it; with the original back, it is carried again.
+
+**Result**: partly run, 2026-10-25.
+- The tests, from an elevated console: 2 passed, in 4.29 s (reported by the person who ran them).
+- The rest — `certutil`, `machine.kind`, the checkpoint, and the changed folder — not run yet.
+
+## C4. Invites approved later, a batch, and how many dialogs a batch of signatures shows
+
+`scalable-membership` 13.1, 13.4, 14.4, 14.5 and 14.6. The MSI of this branch installed; the phone
+with the app of this branch, to join by invite. Networks founded before this branch are not
+carried: forget them first. First, from a console that is **not** elevated:
+
+```powershell
+peerfectly status
+```
+```powershell
+peerfectly pending
+```
+```powershell
+peerfectly invite telefono --network prova
+```
+
+Then from an elevated console:
+
+```powershell
+peerfectly found prova --relay 204.216.216.139
+```
+```powershell
+peerfectly up prova
+```
+```powershell
+peerfectly invite telefono --network prova --group famiglia --expires 30m
+```
+
+On the phone, join with the invite (scan the code `invite` drew, or paste its text), and note the
+key the phone shows. Wait a minute, then on the PC:
+
+```powershell
+peerfectly pending
+```
+```powershell
+peerfectly approve telefono --network prova
+```
+
+Answer `yes` once the key shown matches the phone's, and confirm Windows' dialog or dialogs.
+
+Then a batch, with a `peerfectly-batch-v1` file of three boards (one was made for this run, from
+the Linux testbed, as `lot-windows.json`):
+
+```powershell
+peerfectly admit --batch lot-windows.json --network prova --light --ipv4-block 100.64.9.0/28
+```
+
+And one invite withdrawn:
+
+```powershell
+peerfectly invite tv --network prova
+```
+```powershell
+peerfectly withdraw tv --network prova
+```
+```powershell
+peerfectly pending
+```
+
+**Expect**:
+- unelevated, `status` and `pending` answer, and `invite` is refused at once with *needs
+  Administrator*, before anything is asked of the daemon;
+- `found` lists 2 acts; `invite` prints the code and the text and returns, saying until when it is
+  open and how to approve;
+- the phone, once joined, shows its key and a page of what waits with its join as *requested*;
+- `pending` shows `telefono` with *a request waits for your approval*, the name it asked for, when
+  it arrived and the same key as the phone; the tray shows nothing of it;
+- `approve` shows the review, lists 2 acts (the admission, and the group the invite chose), signs,
+  and the phone receives the network within seconds and notifies that it is in `prova`; `pending`
+  then shows `telefono` as `used`;
+- the batch review shows 3 devices, `lotto windows`, `light`, the block, `skipped none`, and signs on
+  one consent; `peers prova` lists `scheda-1..3`;
+- `withdraw` says *the invite for tv takes no request now*, and `pending` lists `tv` as
+  `withdrawn`.
+
+**Record** for 13.4, for `found` and for the approval (2 signatures each) and for the batch (1):
+how many Windows dialogs appeared — one for the whole act, or one per signature.
+
+**Result**: run, 2026-10-27/28, by the person, on the MSI of this branch (`peerfectly-0.4.1-windows-x64.msi`, built 2026-10-27, unsigned) and the phone running this branch's debug app (`android/VERIFICATION.md` S3, the same session). Every expectation held, as the person reported them: unelevated, `status` and `pending` answered and `invite` was refused before reaching the daemon; `prova` founded on the VPS's relay; the phone joined by invite, showed its key and no code, and the same key was in `pending`; `approve` signed and the phone was in `prova` within seconds; the batch of `lot-windows.json` (three boards, keys made with `openssl` for this run) was reviewed and signed on one consent; `withdraw` and `pending` as expected.
+
+For 13.4, the dialogs, as the person counted them: `found` showed one to set the key's password, when the key was made, and then **one** for its signatures; the approval (two signatures) and the batch showed one each. One dialog per act, whatever the number of signatures through the handle.
+
+## C5. The phone invites the PC, the PC invites the phone as a light member, and a web page over the network
+
+`scalable-membership` 18.2, on the builds the change ends with: the MSI of this branch installed over
+the one before, and the phone on this branch's debug app (`android/VERIFICATION.md` S4, the same
+session). From an elevated console.
+
+1. On the phone, a network founded (`provatel`) and an invite for `pc`; on the PC:
+
+   ```powershell
+   peerfectly join <the invite's text> --name pc
+   ```
+
+   On the phone, *approve* on the pending page. Then on the PC: `peerfectly status`, `peerfectly
+   peers --network provatel`, and `ping` to the phone's IPv6 and IPv4 addresses there.
+2. On the PC:
+
+   ```powershell
+   peerfectly found provapc
+   ```
+   ```powershell
+   peerfectly invite telefono --network provapc --light
+   ```
+
+   On the phone, join with the invite; on the PC, `peerfectly pending` and `peerfectly approve
+   telefono --network provapc`. Then `ping` to the phone in `provapc`, over IPv6 and IPv4.
+3. A web server on the PC on port 8000 (`python -m http.server 8000 --bind ::`), exposed in
+   `provapc`:
+
+   ```powershell
+   peerfectly expose provapc tcp 8000
+   ```
+
+   and opened in the phone's browser, by the PC's name in the network and by its addresses.
+
+**Expect**: the PC joins the phone's network once approved there, and reaches the phone; the phone
+joins the PC's as a light member once approved, and both reach each other over IPv6 and IPv4; the
+page opens on the phone, by name and by address.
+
+**Result**: run, 2026-11-05, by the person, on `peerfectly-0.4.1-windows-x64.msi` built that day
+from this branch (`deploy/windows/package.ps1`, unsigned; Wintun pinned and its signature valid) and
+the phone's debug app built the same day, installed over wireless adb. Everything worked, as the
+person reported it: the phone invited the PC and the PC joined; the PC invited the phone as a light
+member and the phone joined; both reached each other; the page on port 8000 opened in the phone's
+browser.

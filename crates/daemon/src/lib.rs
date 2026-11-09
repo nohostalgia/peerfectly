@@ -55,9 +55,9 @@
 
 pub mod admitting;
 pub mod attesting;
-pub mod channel;
+pub(crate) mod batches;
+pub mod checkpoint;
 pub(crate) mod clock;
-pub mod confirmations;
 pub mod conflicts;
 pub mod connectivity;
 pub(crate) mod contacts;
@@ -70,11 +70,14 @@ pub mod error;
 pub mod exposing;
 pub mod founding;
 pub mod gateway;
+pub mod invites;
 pub mod joining;
+pub mod joins;
 pub mod keys;
 pub mod lifecycle;
 pub mod limits;
 pub mod logging;
+pub mod lookup;
 pub mod machine;
 pub(crate) mod names;
 pub(crate) mod neighbours;
@@ -89,7 +92,12 @@ pub mod routes;
 pub mod rule;
 pub mod schedule;
 pub(crate) mod service;
+
+// A light member's rules, which a full member's answers follow too.
+pub(crate) use light_node::{channel, seeking};
 pub mod signing;
+#[cfg(test)]
+mod simulator;
 pub mod snapshots;
 pub mod state;
 pub mod views;
@@ -143,8 +151,7 @@ mod surface {
     const OFFERED: &[&str] = &[
         "admitting",
         "attesting",
-        "channel",
-        "confirmations",
+        "checkpoint",
         "conflicts",
         "connectivity",
         "control",
@@ -153,9 +160,12 @@ mod surface {
         "exposing",
         "founding",
         "gateway",
+        "invites",
         "joining",
+        "joins",
         "keys",
         "lifecycle",
+        "lookup",
         "limits",
         "logging",
         "machine",
@@ -242,18 +252,11 @@ mod surface {
         let control = include_str!("control.rs");
 
         assert!(surface.contains("## What a renderer of the report owes"), "the section exists");
-        for field in [
-            "signer_clock",
-            "signed_here",
-            "NoneRecorded",
-            "NotRecorded",
-            "waiting_unlisted",
-            "reason",
-        ] {
+        for field in ["signer_clock", "NoneRecorded", "NotRecorded", "reason"] {
             assert!(surface.contains(field), "SURFACE.md says what to do with `{field}`");
             assert!(control.contains(field), "`{field}` is still a name in control.rs");
         }
-        for owed in ["seen, not obeyed", "never as \"never\"", "not of applying", "short id"] {
+        for owed in ["seen, not obeyed", "never as \"never\"", "short id"] {
             assert!(surface.contains(owed), "SURFACE.md states: {owed}");
         }
     }

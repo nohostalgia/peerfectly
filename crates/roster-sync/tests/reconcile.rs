@@ -184,22 +184,23 @@ fn a_snapshot_is_sent_before_the_operations_that_build_on_it() {
     );
 }
 
+/// An older root from a peer is lighter: kept out, and no fault of the peer.
 #[test]
-fn a_snapshot_that_would_regress_is_refused() {
+fn an_older_snapshot_is_lighter_and_kept_out() {
     let mut fixture = Fixture::found();
     fixture.extend(12);
 
     let earlier = fixture.snapshot_bytes(&fixture.roster(), 1);
     let mut node = fixture.syncer_with_snapshot(4);
-    let before = node.roster().snapshot().map(|snapshot| snapshot.body().seq);
+    let before = node.roster().snapshot().map(|snapshot| snapshot.body().generation);
     assert_eq!(before, Some(4));
 
     let (peer, _) = ids();
     let outcome = node.receive(peer, &Message::Snapshot(earlier).encode());
 
-    assert!(!outcome.is_clean(), "a regression must be refused");
+    assert!(outcome.is_clean(), "a lighter root is not a refusal");
     assert_eq!(
-        node.roster().snapshot().map(|snapshot| snapshot.body().seq),
+        node.roster().snapshot().map(|snapshot| snapshot.body().generation),
         before,
         "the held snapshot is unchanged"
     );
@@ -279,6 +280,9 @@ fn kind_of(message: &Message) -> &'static str {
     match message {
         Message::Snapshot(_) => "snapshot",
         Message::Transfer(_) => "transfer",
+        Message::Pieces(_) => "pieces",
+        Message::StateRequest(_) => "state request",
+        Message::State(_) => "state",
         Message::Offer(_) => "offer",
         Message::Attestation(_) => "attestation",
         Message::Digest(_) => "digest",
@@ -412,6 +416,31 @@ fn a_pending_operation_is_not_forwarded() {
     // It is held rather than discarded — the one you cannot place may be a
     // revocation.
     assert_eq!(node.charged_to(&peer), 1, "it is held, and charged to its sender");
+}
+
+/// **An operation let in by its parent's arrival is reported to be kept.** One
+/// held for want of its parent enters the graph when the parent comes, and was
+/// reported by nothing: a daemon kept only what it was told of, and after a
+/// restart every operation resting on it was one its log could not place.
+#[test]
+fn an_operation_let_in_by_its_parent_is_reported_to_be_kept() {
+    let mut fixture = Fixture::found();
+    fixture.extend(2);
+    let mut node = fixture.syncer_through(1);
+    let (peer, _) = ids();
+
+    let early =
+        node.receive(peer, &Message::Transfer(vec![fixture.operation(2).to_vec()]).encode());
+    assert!(early.accepted.is_empty(), "held for want of its parent");
+
+    let parent = fixture.operation(1).to_vec();
+    let late = node.receive(peer, &Message::Transfer(vec![parent.clone()]).encode());
+    assert_eq!(
+        late.accepted,
+        vec![parent, fixture.operation(2).to_vec()],
+        "the parent, and the operation it let in, as they arrived"
+    );
+    assert_eq!(late.admitted.len(), 2);
 }
 
 #[test]

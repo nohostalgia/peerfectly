@@ -6,9 +6,11 @@
 #   docker compose -f crates/linux-daemon/testbed/compose.yaml down
 #
 # `a` and `b` each have a software TPM; `c` has none, so its keys are files
-# sealed with a passphrase. Each container is its own network namespace: the
-# interfaces, routes and firewall tables are the container's, and nothing here
-# touches the machine running Docker.
+# sealed with a passphrase. `anchor` runs headless: a full member with no
+# packet interface, given neither the TUN device nor `NET_ADMIN`. Each
+# container is its own network namespace: the interfaces, routes and firewall
+# tables are the container's, and nothing here touches the machine running
+# Docker.
 
 name: peerfectly-testbed
 
@@ -41,6 +43,13 @@ services:
   c:
     <<: *node
     hostname: c
+  anchor:
+    image: peerfectly-testbed-node
+    hostname: anchor
+    command: ["--headless"]
+    init: false
+    restart: "no"
+    depends_on: [a]
 
   # The relay container a server runs (`deploy/server`). Its key is in its log:
   #   docker compose -f crates/linux-daemon/testbed/compose.yaml logs relay

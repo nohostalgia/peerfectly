@@ -28,6 +28,7 @@ fn run() -> std::process::ExitCode {
             usage: "  peerfectly tray  (the icon, in your own session; it starts at login)\n",
             privileged: "Administrator",
             after_status: say_what_was_left_behind,
+            administrator: crate::platform::who::this_process_holds_administrators,
         },
     }
     .run()
@@ -73,6 +74,21 @@ struct KeyStore;
 
 #[cfg(windows)]
 impl cli::Custody for KeyStore {
+    /// Whether this console may sign at all: a network's key is the machine's,
+    /// and the machine's key store lets only administrators use it. Asked first,
+    /// so a person is refused before an invite is issued or a code is shown,
+    /// not at the signature.
+    fn may_sign(&self) -> Result<(), String> {
+        if crate::platform::who::this_process_holds_administrators() {
+            Ok(())
+        } else {
+            Err("this act signs with the network's key, which is in this machine's key store \
+                 and only an administrator may use: run it again from an elevated console. \
+                 Nothing changed."
+                .to_owned())
+        }
+    }
+
     /// Makes the signing key the daemon asked for.
     ///
     /// This is where the key store puts its *protect this key* prompt on the screen,

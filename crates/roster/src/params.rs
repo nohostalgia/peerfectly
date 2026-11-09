@@ -13,6 +13,7 @@
 //! one — so naming what was refused is the job of the layer that shows it.
 
 use crate::error::{Error, Result};
+use crate::prelude::*;
 
 /// The only namespace a network suffix may sit under.
 ///
