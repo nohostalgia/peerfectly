@@ -1565,12 +1565,16 @@ async fn asking_about_a_member_that_is_off_waits_no_longer_than_the_bound() {
     assert!(!founder.node.has_session(&fixture.joiner.device_id()).await);
 }
 
-// ---- A failed attempt is not repeated at once ------------------------------------------
+// ---- A failed attempt is tried again by the next packet ------------------------------
 
-/// After a packet fails to reach a member, the next packets for it are dropped
-/// for a while rather than opening another attempt each time it fails.
+/// **A member met before the transport was replaced is reached by the next
+/// packet.** The transport is replaced when the network is brought down and up
+/// or its relay moves, and every session on it ends. Emptying the session table
+/// left the router holding them: the next packet for that member was routed to
+/// a session that was gone, dropped, and opened none, until the member opened
+/// one itself (testbed, 2026-11-09).
 #[tokio::test]
-async fn a_member_a_packet_failed_to_reach_is_rested() {
+async fn a_member_met_before_the_transport_was_replaced_is_reached_by_the_next_packet() {
     let fixture = Fixture::found();
     let fabric = MemoryFabric::new();
     let founder_transport = Arc::new(
@@ -1578,36 +1582,44 @@ async fn a_member_a_packet_failed_to_reach_is_rested() {
     );
     let founder =
         assemble(&fixture, &fixture.founder, founder_transport as Arc<dyn Transport>).await;
+    founder.node.attest_change().await;
+    let joiner_transport = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.joiner), fixture.state.clone()).await,
+    );
+    let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
+    tokio::spawn(Arc::clone(&joiner.node).accept_forever());
+    let peer = fixture.joiner.device_id();
 
-    founder.machine.queue(marked(&fixture, 1)).await;
-    let _ = founder.node.carry_one().await.expect("takes");
-    let mut first = None;
-    for _ in 0..100 {
-        first = founder.node.event().await;
-        if first.as_ref().is_some_and(|event| event.cause.contains("were dropped")) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let first = first.expect("the first attempt failed and said so");
-
-    for mark in 2..6 {
+    let opened = async |mark: u8| {
         founder.machine.queue(marked(&fixture, mark)).await;
         let _ = founder.node.carry_one().await.expect("takes");
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert_eq!(
-        founder.node.event().await.map(|event| event.at),
-        Some(first.at),
-        "no further attempt was made, so nothing further failed"
+        for _ in 0..100 {
+            if founder.node.has_session(&peer).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    };
+    assert!(opened(1).await, "the first packet opened a session");
+
+    let replacing = Arc::new(
+        MemoryTransport::join(&fabric, Arc::clone(&fixture.founder), fixture.state.clone()).await,
     );
+    founder.node.replace_transport(replacing as Arc<dyn Transport>).await;
+    assert!(!founder.node.has_session(&peer).await, "the sessions on the old transport ended");
+
+    assert!(opened(2).await, "the next packet opened a new one, rather than being dropped");
 }
 
-/// **A rested member that announces itself is tried at once.** The rest is for
-/// not hammering a member nothing is known about; an announcement on the local
-/// network is news of where it is, and the next packet opens the session.
+/// **A member that comes back is reached by the next packet.** A failed attempt
+/// earns no wait: two devices that want to talk talk as soon as both are there,
+/// and one that is switched off meets the sender's own timeout, as on any
+/// network. Found with a board on a phone (2026-11-09): a rest of half a minute
+/// up to ten, which nothing the board did could end, kept the phone out for
+/// minutes after every hiccup.
 #[tokio::test]
-async fn a_rested_member_that_announces_itself_is_tried_by_the_next_packet() {
+async fn a_member_that_comes_back_is_reached_by_the_next_packet() {
     let fixture = Fixture::found();
     let fabric = MemoryFabric::new();
     let founder_transport = Arc::new(
@@ -1618,7 +1630,7 @@ async fn a_rested_member_that_announces_itself_is_tried_by_the_next_packet() {
     founder.node.attest_change().await;
     let peer = fixture.joiner.device_id();
 
-    // The joiner is not there: the first packet fails, and rests it.
+    // The joiner is not there: the first packet fails, and says so.
     founder.machine.queue(marked(&fixture, 1)).await;
     let _ = founder.node.carry_one().await.expect("takes");
     let mut failed = false;
@@ -1631,20 +1643,13 @@ async fn a_rested_member_that_announces_itself_is_tried_by_the_next_packet() {
     }
     assert!(failed, "the first attempt failed and said so");
 
-    // It comes up. Packets alone do not reach it while the rest lasts.
+    // It comes up, and announces nothing: the next packet opens the session.
     let joiner_transport = Arc::new(
         MemoryTransport::join(&fabric, Arc::clone(&fixture.joiner), fixture.state.clone()).await,
     );
     let joiner = assemble(&fixture, &fixture.joiner, joiner_transport as Arc<dyn Transport>).await;
     tokio::spawn(Arc::clone(&joiner.node).accept_forever());
     founder.machine.queue(marked(&fixture, 2)).await;
-    let _ = founder.node.carry_one().await.expect("takes");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!founder.node.has_session(&peer).await, "still resting");
-
-    // It announces itself, and the next packet goes.
-    founder.node.announced(peer);
-    founder.machine.queue(marked(&fixture, 3)).await;
     let _ = founder.node.carry_one().await.expect("takes");
     let mut opened = false;
     for _ in 0..100 {
@@ -1654,5 +1659,5 @@ async fn a_rested_member_that_announces_itself_is_tried_by_the_next_packet() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(opened, "the packet after the announcement opened the session");
+    assert!(opened, "the packet after the failure opened the session at once");
 }

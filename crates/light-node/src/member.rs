@@ -28,22 +28,20 @@ use crate::sessions::{DialFailure, Keys, Sessions, To};
 /// The others are reached when there is something to say to them.
 pub const KEPT: usize = 1;
 
-/// How long a peer that did not answer is first rested, in milliseconds.
-pub const FIRST_REST_MS: u64 = 60_000;
+/// How long a full member it keeps in touch with, and did not reach, is first
+/// left before it is called again, in milliseconds.
+///
+/// Only its own calls wait, which nobody asked for: a session the member opens
+/// toward this one is taken whatever the wait, and ends it.
+pub const FIRST_REST_MS: u64 = 10_000;
 
-/// The longest a peer is rested, in milliseconds.
-pub const LONGEST_REST_MS: u64 = 6 * 60 * 60 * 1_000;
-
-/// The longest a peer is rested by a member awaiting admission.
-pub const LONGEST_REST_AWAITING_MS: u64 = 5 * 60 * 1_000;
-
-/// How long a peer is rested by a member awaiting admission in its first
-/// minutes: a board admitted right after it was provisioned joins within one.
-pub const EAGER_REST_MS: u64 = 30_000;
-
-/// How long after it starts a member awaiting admission rests its peers that
-/// little, before the rests grow.
-pub const EAGER_FOR_MS: u64 = 10 * 60 * 1_000;
+/// The longest it is left, in milliseconds: doubled from [`FIRST_REST_MS`] at
+/// each call that fails, up to this, admitted or awaiting admission alike. A
+/// member back after hours is called within a minute; one switched off costs a
+/// call a minute through the relay. Was six hours (five minutes for a board
+/// awaiting admission, after its first ten), and a board left a member that had
+/// come back uncalled for as long.
+pub const LONGEST_REST_MS: u64 = 60_000;
 
 /// What the host is to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +82,15 @@ struct Rest {
     next: u64,
 }
 
+impl Rest {
+    /// A call failed at `now`: left for the next wait, and the one after that
+    /// twice as long, up to [`LONGEST_REST_MS`].
+    fn failed(&mut self, now: u64) {
+        self.until = now.saturating_add(self.next);
+        self.next = self.next.saturating_mul(2).min(LONGEST_REST_MS);
+    }
+}
+
 /// A light member, its engine and its sessions.
 #[derive(Debug)]
 pub struct Member<K: Keys> {
@@ -93,8 +100,6 @@ pub struct Member<K: Keys> {
     tunnel: Option<tunnel::Tunnel>,
     resting: BTreeMap<DeviceId, Rest>,
     out: VecDeque<Action<K::Peer>>,
-    /// When it started, on the host's clock.
-    started: u64,
 }
 
 impl<K: Keys> Member<K> {
@@ -109,7 +114,6 @@ impl<K: Keys> Member<K> {
             tunnel: None,
             resting: BTreeMap::new(),
             out: VecDeque::new(),
-            started: 0,
         };
         built.follow_state();
         built
@@ -217,7 +221,6 @@ impl<K: Keys> Member<K> {
 
     /// A start: the engine's, then whom to keep in touch with dialled.
     pub fn start(&mut self, now: u64, ids: &mut dyn FnMut() -> u64) {
-        self.started = now;
         self.engine.start(now);
         self.drive(now);
         self.keep_in_touch(now, ids);
@@ -319,7 +322,7 @@ impl<K: Keys> Member<K> {
             }
             while let Some(output) = self.engine.poll_output() {
                 moved = true;
-                self.take_from_engine(output);
+                self.take_from_engine(output, now);
             }
             if !moved {
                 return;
@@ -347,9 +350,27 @@ impl<K: Keys> Member<K> {
             }
             Output::Opened { device, .. } => {
                 self.resting.remove(&device);
+                // What was asked of it over an earlier session is asked again
+                // over this one, now: a peer opening a new session closes the
+                // one before here, and what went over that one is not answered.
+                // Left to its deadline, a board just admitted waited five
+                // seconds for its proof (testbed, 2026-11-09). An answer to the
+                // first asking, if one comes, is taken; the second is dropped.
+                self.engine.not_asked(device, now);
                 self.engine.session_opened(device, now);
             }
-            Output::Closed { device, .. } => self.engine.session_closed(&device),
+            Output::Closed { device, .. } => {
+                if self.sessions.with(&device).is_some() {
+                    // Another session with it is still open, as after two
+                    // crossing dials: what was asked over the one that closed
+                    // will not be answered, and is asked again over the other,
+                    // now rather than after the question's five seconds.
+                    self.engine.not_asked(device, now);
+                    self.engine.session_opened(device, now);
+                } else {
+                    self.engine.session_closed(&device);
+                }
+            }
             Output::DialFailed { key, failure } => {
                 if failure == DialFailure::Refused(Reason::NotAMember) {
                     // Refused as a stranger: its proof may rest on a root they
@@ -357,22 +378,11 @@ impl<K: Keys> Member<K> {
                     self.engine.refused_as_a_stranger(now);
                 }
                 if let Some(device) = self.device_of(&key) {
-                    // Awaiting admission, it tries again within minutes: it is
-                    // refused only until the admin admits its batch.
-                    let admitted = self.engine.member().is_admitted();
-                    let longest = if admitted { LONGEST_REST_MS } else { LONGEST_REST_AWAITING_MS };
-                    // In its first minutes, more often still.
-                    let eager = !admitted && now < self.started.saturating_add(EAGER_FOR_MS);
                     let rest = self
                         .resting
                         .entry(device)
                         .or_insert(Rest { until: now, next: FIRST_REST_MS });
-                    if eager {
-                        rest.until = now.saturating_add(EAGER_REST_MS);
-                    } else {
-                        rest.until = now.saturating_add(rest.next);
-                        rest.next = rest.next.saturating_mul(2).min(longest);
-                    }
+                    rest.failed(now);
                     let until = rest.until;
                     self.out.push_back(Action::WakeAt(until));
                 }
@@ -392,13 +402,16 @@ impl<K: Keys> Member<K> {
         }
     }
 
-    fn take_from_engine(&mut self, output: engine::Output) {
+    fn take_from_engine(&mut self, output: engine::Output, now: u64) {
         match output {
             engine::Output::Send { peer, channel, body } => {
                 // Asked of a member a session is open with: the one that
-                // pushed, or one met.
+                // pushed, or one met. With none, the question fails now and the
+                // next member is asked, rather than waited on for nothing.
                 if let Some(id) = self.sessions.with(&peer) {
                     let _sent = self.sessions.send_payload(id, &frame(channel, &body));
+                } else {
+                    self.engine.not_asked(peer, now);
                 }
             }
             engine::Output::Keep => self.out.push_back(Action::Keep),
@@ -431,5 +444,24 @@ impl<K: Keys> Member<K> {
                 })
                 .then_some(device)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FIRST_REST_MS, LONGEST_REST_MS, Rest};
+
+    #[test]
+    fn a_member_not_reached_is_called_again_within_a_minute_however_long_it_was_away() {
+        let mut rest = Rest { until: 0, next: FIRST_REST_MS };
+        let mut now = 0_u64;
+        let mut waits = alloc::vec::Vec::new();
+        for _ in 0..1_000 {
+            rest.failed(now);
+            waits.push(rest.until.saturating_sub(now));
+            now = rest.until;
+        }
+        assert_eq!(waits.get(..5), Some(&[10_000, 20_000, 40_000, 60_000, 60_000][..]));
+        assert!(waits.iter().all(|wait| *wait <= LONGEST_REST_MS), "never longer than a minute");
     }
 }

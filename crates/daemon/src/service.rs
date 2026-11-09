@@ -265,9 +265,11 @@ struct Newcomer {
 
 impl Newcomer {
     /// The first wait after a dial, doubled after each one that brings nothing.
-    const FIRST: Duration = Duration::from_secs(30);
-    /// The longest wait between two dials.
-    const LONGEST: Duration = Duration::from_secs(30 * 60);
+    const FIRST: Duration = Duration::from_secs(10);
+    /// The longest wait between two dials: a device approved while it was off
+    /// is given the network within a minute of coming back. A dial is a relay
+    /// connection opened and closed, a few hundred bytes. Was half an hour.
+    const LONGEST: Duration = Duration::from_secs(60);
 
     /// One to dial now.
     const fn due(now: std::time::Instant) -> Self {
@@ -1814,6 +1816,10 @@ impl Service {
         tracing::info!("the machine's interfaces changed");
         for network in self.all().await {
             let node = Arc::clone(network.node());
+            // A neighbour rested from the network this device left says
+            // nothing about this one: it may have been this device that could
+            // not reach anybody.
+            node.moved();
             if node.transport().await.is_some() {
                 tokio::spawn(async move { node.reconcile_with_neighbours().await });
             }

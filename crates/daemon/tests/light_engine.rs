@@ -398,6 +398,69 @@ fn a_board_provisioned_before_its_admission_joins_once_admitted() {
     assert!(!engine.member().shown().is_empty(), "and shows it from now on");
 }
 
+/// A board whose first renewals go unanswered asks again by itself, within
+/// seconds, with no new session to prompt it: until its proof names one, it
+/// holds no IPv4 address. Found in the testbed (2026-11-09): asked once, too
+/// soon, the renewal was given up, and a board just admitted stayed without
+/// its IPv4 address for a minute or two.
+#[test]
+fn a_renewal_nobody_answered_is_asked_again_by_itself() {
+    let (mut network, _members) = Network::founded(&["sensor"]);
+    let board = NodeIdentity::generate().unwrap();
+    let state = network.roster.state().unwrap();
+    let held = network.roster.snapshot().unwrap().to_bytes();
+    let member = LightMember::awaiting(
+        keys_of(&board),
+        &held,
+        &state.devices.root(),
+        state.params.clone(),
+        DEFAULT_BUDGET,
+    )
+    .unwrap();
+    let mut engine = Engine::new(member);
+    network.act(OperationBody::AddDevice(
+        board.device_spec("board", Role::Member, false, vec![]).unwrap(),
+    ));
+    let newer = network.root();
+
+    // Every question goes unanswered until each one runs out.
+    engine.root_pushed(network.full(), &newer, 0);
+    let mut now = 0;
+    for _ in 0..8 {
+        let outputs = drained(&mut engine);
+        assert!(!outputs.contains(&Output::Renewed), "nobody answered: {outputs:?}");
+        now += LOOKUP_PATIENCE_MS + 1;
+        engine.tick(now);
+    }
+    let _ = drained(&mut engine);
+    assert!(!engine.member().is_admitted());
+    let again = engine.next_deadline().expect("a renewal is asked again");
+    assert!(
+        again <= now + light_node::engine::RENEWAL_AGAIN_LONGEST_MS,
+        "within seconds: at {again}, now {now}"
+    );
+
+    // Asked again at that time, by itself, and answered this time.
+    let mut renewed = false;
+    for _ in 0..8 {
+        let Some(due) = engine.next_deadline() else { break };
+        now = now.max(due);
+        engine.tick(now);
+        let outputs = drained(&mut engine);
+        renewed |= outputs.contains(&Output::Renewed);
+        if renewed {
+            break;
+        }
+        answer_all(&mut engine, &network, &outputs, now);
+        renewed |= drained(&mut engine).contains(&Output::Renewed);
+        if renewed {
+            break;
+        }
+    }
+    assert!(renewed, "given its proof, with no session opened again");
+    assert!(engine.member().is_admitted());
+}
+
 /// A leaf naming the board's device but other keys than it made is not taken
 /// as its own: its transport key would be someone else's.
 #[test]

@@ -339,6 +339,44 @@ async fn a_peer_taking_small_messages_is_sent_a_large_payload_in_parts() {
     assert!(matches!(session.send(&too_large).await, Err(Error::PayloadTooLarge { .. })));
 }
 
+/// **A payload on a session closed here is answered with a `CLOSE`.** As for
+/// one never held: the sender may not have heard the close, and dropped in
+/// silence it went on sending into nothing. Found in the testbed (2026-11-09):
+/// a board that had missed the close asked for its proof over that session
+/// for minutes, unanswered, and held no IPv4 address meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_on_a_session_closed_here_is_answered_with_a_close() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let to_founder = Address::parse(founder_key).unwrap();
+
+    let open = Frame::Open { version: VERSION, id: 9, limits: Limits::LEAST, evidence: Vec::new() };
+    raw.send_message(to_founder, open.encode()).await.unwrap();
+    let Some(Frame::Accept { id: 9, .. }) = next_frame(&mut events).await else {
+        panic!("the open is accepted");
+    };
+    let session = tokio::time::timeout(PATIENCE, founder.accept()).await.unwrap().unwrap();
+    session.close().await.unwrap();
+    assert_eq!(
+        next_frame(&mut events).await,
+        Some(Frame::Close { id: 9, reason: Reason::Ordinary }),
+        "closed here, and told"
+    );
+
+    // As if that close had been lost: the raw node goes on.
+    let stale = Frame::Payload { id: 9, bytes: b"still there?".to_vec() }.encode();
+    raw.send_message(to_founder, stale).await.unwrap();
+    assert_eq!(
+        next_frame(&mut events).await,
+        Some(Frame::Close { id: 9, reason: Reason::Ordinary }),
+        "told again, rather than dropped in silence"
+    );
+}
+
 /// **A session outlives convesso's.** Past its keys' life convesso tells the
 /// session idle and forgets it, and each side ends its reader so that the
 /// channel is forgotten too. The next payload, from either side, opens a new

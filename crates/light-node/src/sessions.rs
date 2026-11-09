@@ -422,11 +422,20 @@ impl<K: Keys> Sessions<K> {
                     });
                 }
             }
-            Some(Frame::Close { id, .. }) => {
+            Some(Frame::Close { id, reason }) => {
                 if self.open.get(&id).is_some_and(|open| open.peer == peer)
                     && let Some(open) = self.open.remove(&id)
                 {
                     self.out.push_back(Output::Closed { id, device: open.device });
+                } else if self.dials.get(&id).is_some_and(|dial| dial.peer == peer)
+                    && let Some(dial) = self.dials.remove(&id)
+                {
+                    // Closed by the peer while it opened: never opened here
+                    // either, or the two ends would hold different sessions.
+                    self.out.push_back(Output::DialFailed {
+                        key: dial.key,
+                        failure: DialFailure::Refused(reason),
+                    });
                 }
             }
             Some(Frame::Payload { id, bytes }) => {
@@ -530,8 +539,11 @@ impl<K: Keys> Sessions<K> {
         let Some(dial) =
             self.dials.get(&id).filter(|dial| dial.peer == peer && dial.catching_up.is_none())
         else {
-            // An accept for a dial given up on, or nobody's: closed.
-            if !self.open.contains_key(&id) {
+            // An accept for a dial given up on, or nobody's: closed. Not one
+            // still catching up: closed here, it was opened all the same once
+            // its roots came, and the peer, told it was closed, dropped what
+            // was then sent over it (testbed, 2026-11-09).
+            if !self.open.contains_key(&id) && !self.dials.contains_key(&id) {
                 self.send(
                     To::Peer(peer),
                     peer,

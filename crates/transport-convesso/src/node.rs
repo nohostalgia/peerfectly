@@ -1143,6 +1143,12 @@ fn session_of(shared: &Shared, id: SessionId, peer: &PeerId) -> Option<Arc<Live>
     sessions.get(&id).filter(|live| live.peer == *peer).cloned()
 }
 
+/// Session `id` with `peer`, where it is still open: one closed here is one
+/// this node does not hold.
+fn open_session(shared: &Shared, id: SessionId, peer: &PeerId) -> Option<Arc<Live>> {
+    session_of(shared, id, peer).filter(|live| live.closure().is_none())
+}
+
 /// Ends every session with `peer`, and every dial to it.
 fn lose_peer(shared: &Shared, peer: &PeerId, dial_error: &Error) {
     shared.wire.forget(peer);
@@ -1517,7 +1523,11 @@ async fn on_message(shared: &Arc<Shared>, peer: PeerId, data: &[u8]) {
                 live.shut(Error::ClosedByPeer);
             }
         }
-        Some(Frame::Payload { id, bytes }) => match session_of(shared, id, &peer) {
+        // A session this node closed is one it does not hold: the sender is
+        // told, as for one it never had. Dropped in silence, a board that had
+        // not heard the close went on asking for its proof over it, unanswered,
+        // and held no IPv4 address for minutes (testbed, 2026-11-09).
+        Some(Frame::Payload { id, bytes }) => match open_session(shared, id, &peer) {
             Some(live) => live.deliver_payload(bytes).await,
             None => unknown_session(shared, peer, id),
         },
@@ -1537,7 +1547,7 @@ fn speaks_to(shared: &Shared, peer: &PeerId) -> bool {
 /// A datagram from `peer`.
 fn on_datagram(shared: &Shared, peer: PeerId, data: &[u8]) {
     if let Some(Frame::Packet { id, fragment }) = Frame::decode(data) {
-        match session_of(shared, id, &peer) {
+        match open_session(shared, id, &peer) {
             Some(live) => live.deliver_fragment(&fragment),
             None => unknown_session(shared, peer, id),
         }
