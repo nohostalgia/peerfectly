@@ -36,6 +36,20 @@ use crate::lookup::{self, Footing, Message, Query};
 /// taken as unanswered.
 pub const LOOKUP_PATIENCE_MS: u64 = 5_000;
 
+/// How long after a renewal nobody answered it is asked again, in
+/// milliseconds, doubled each time up to [`RENEWAL_AGAIN_LONGEST_MS`].
+///
+/// Until it is renewed a member may hold no address but the one its key
+/// derives: a board just admitted has no IPv4 address until its proof names
+/// one. Asked once, a renewal that came too soon (the root admitting it not yet
+/// published, the session it was asked over just closed) was given up, and the
+/// board stayed without its IPv4 address for a minute or two, until something
+/// else asked again (testbed, 2026-11-09).
+pub const RENEWAL_AGAIN_MS: u64 = 2_000;
+
+/// The longest wait between two renewals nobody answered, in milliseconds.
+pub const RENEWAL_AGAIN_LONGEST_MS: u64 = 10_000;
+
 /// What the host is to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
@@ -114,6 +128,10 @@ pub struct Engine {
     adopted_from: Option<DeviceId>,
     /// Whether its proof is to be renewed.
     renewal_owed: bool,
+    /// When a renewal nobody answered is asked again, and how long the wait
+    /// after that one is.
+    renewal_again: Option<u64>,
+    renewal_wait: u64,
     /// Whether the next member met is to be asked for the footing.
     footing_due: bool,
     /// The digest of the footing it last took. In memory only: after a start
@@ -137,6 +155,8 @@ impl Engine {
             chain_owed: None,
             adopted_from: None,
             renewal_owed: false,
+            renewal_again: None,
+            renewal_wait: RENEWAL_AGAIN_MS,
             footing_due: true,
             footing_held: None,
             pending: BTreeMap::new(),
@@ -177,7 +197,7 @@ impl Engine {
     /// The earliest deadline of a question waiting, if any.
     #[must_use]
     pub fn next_deadline(&self) -> Option<u64> {
-        self.pending.values().map(|pending| pending.deadline).min()
+        self.pending.values().map(|pending| pending.deadline).chain(self.renewal_again).min()
     }
 
     /// Whether the upkeep owes or waits for anything.
@@ -296,6 +316,29 @@ impl Engine {
                 self.answered(pending, None, now);
             }
         }
+        if self.renewal_again.is_some_and(|at| at <= now) {
+            self.renewal_again = None;
+            if self.member.needs_renewal() {
+                self.renewal_owed = true;
+            }
+        }
+        self.work(now);
+    }
+
+    /// The host could not ask `peer`: it holds no session with it. What was
+    /// asked of it is taken as unanswered now, rather than waited for.
+    pub fn not_asked(&mut self, peer: DeviceId, now: u64) {
+        let unasked: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.peer == peer)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in unasked {
+            if let Some(pending) = self.pending.remove(&id) {
+                self.answered(pending, None, now);
+            }
+        }
         self.work(now);
     }
 
@@ -391,6 +434,14 @@ impl Engine {
         match asking {
             Asking::Renewal { query, mut rest } => {
                 if rest.is_empty() {
+                    // Nobody answered: asked again shortly, while it is owed.
+                    if self.member.needs_renewal() {
+                        let at = now.saturating_add(self.renewal_wait);
+                        self.renewal_again = Some(at);
+                        self.renewal_wait =
+                            self.renewal_wait.saturating_mul(2).min(RENEWAL_AGAIN_LONGEST_MS);
+                        self.out.push_back(Output::WakeAt(at));
+                    }
                     return;
                 }
                 let peer = rest.remove(0);
@@ -452,6 +503,8 @@ impl Engine {
                     .and_then(|evidence| Evidence::from_bytes(evidence).ok())
                     .is_some_and(|shown| self.member.renew(shown).is_ok());
                 if renewed {
+                    self.renewal_again = None;
+                    self.renewal_wait = RENEWAL_AGAIN_MS;
                     self.out.push_back(Output::Keep);
                     self.out.push_back(Output::Renewed);
                 } else {

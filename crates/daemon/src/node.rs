@@ -245,14 +245,6 @@ pub struct Node {
     activity: std::sync::Mutex<BTreeMap<DeviceId, tokio::time::Instant>>,
     /// Neighbours that did not answer, and until when each is left alone.
     unanswered: std::sync::Mutex<BTreeMap<DeviceId, Rest>>,
-    /// Members a packet failed to open a session to, and until when packets for
-    /// them are dropped rather than opening another attempt.
-    ///
-    /// Without it, something that keeps sending to a member that is switched off
-    /// opens an attempt the moment the last one fails, for as long as it keeps
-    /// sending, and each attempt retries a handshake on every path for half a
-    /// minute.
-    unreached: std::sync::Mutex<BTreeMap<DeviceId, Rest>>,
     /// Raised when something new was admitted that the neighbours should have.
     ///
     /// One permit, however often it is raised: [`Self::spread_forever`] waits
@@ -389,17 +381,20 @@ impl Node {
             waiting: Mutex::new(BTreeMap::new()),
             activity: std::sync::Mutex::new(BTreeMap::new()),
             unanswered: std::sync::Mutex::new(BTreeMap::new()),
-            unreached: std::sync::Mutex::new(BTreeMap::new()),
             spreading: tokio::sync::Notify::new(),
             caught_up: std::sync::Mutex::new(None),
         }
     }
 
-    /// How long a device refused as not a member waits before trying again.
-    pub const NEWCOMER_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How long a device refused as not a member waits before trying again:
+    /// the peer catches up with its neighbours meanwhile, and is tried again as
+    /// soon as it may have.
+    pub const NEWCOMER_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// How many times it tries again before giving up on this attempt.
-    pub const NEWCOMER_ATTEMPTS: usize = 3;
+    /// How many times it tries again before giving up on this attempt: as long
+    /// in all as before, fifteen seconds, tried every second rather than every
+    /// five.
+    pub const NEWCOMER_ATTEMPTS: usize = 15;
 
     /// How long a peer that had no room waits before trying again: it is
     /// there, and one of its sessions falls quiet within seconds.
@@ -408,8 +403,10 @@ impl Node {
     /// How many times a peer that had no room is tried again, in one attempt.
     pub const BUSY_ATTEMPTS: usize = 8;
 
-    /// The least time between two catch-ups caused by refusals.
-    pub const CATCH_UP_AT_MOST: std::time::Duration = std::time::Duration::from_secs(60);
+    /// The least time between two catch-ups caused by refusals: a second
+    /// newcomer within it is not kept waiting long, and a stream of strangers
+    /// costs a round of contact every ten seconds at most. Was a minute.
+    pub const CATCH_UP_AT_MOST: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Reconciles with the neighbours because a refusal suggests this roster
     /// is behind — at most once every [`Self::CATCH_UP_AT_MOST`].
@@ -417,7 +414,7 @@ impl Node {
     /// The refusal may be right: a stranger is a stranger. It may also be a
     /// device admitted moments ago whose admission has not reached this one yet,
     /// and the neighbours are where it would come from. Bounded, so that a stream
-    /// of strangers costs at most one round of contact a minute; and nothing is
+    /// of strangers costs at most one round of contact every ten seconds; and nothing is
     /// accepted from the refused device, which gets nothing it could not get by
     /// waiting.
     fn catch_up(self: &Arc<Self>) {
@@ -1350,12 +1347,26 @@ impl Node {
         self.replaced.notify_one();
     }
 
-    /// Closes every session, leaving the transport.
+    /// Closes every session, leaving the transport, and forgets each as
+    /// [`Self::closed`] does.
+    ///
+    /// Emptying the table alone left the router holding them: a packet for a
+    /// member met before was routed to a session that was gone, dropped, and
+    /// opened none, until that member opened one itself (testbed, 2026-11-09,
+    /// an admin brought down and up again, its board unreached for seconds).
     async fn close_sessions(&self) {
-        let sessions: Vec<Arc<dyn Session>> =
-            self.sessions.lock().await.values().map(Arc::clone).collect();
-        for session in sessions {
+        let sessions: Vec<(DeviceId, Arc<dyn Session>)> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(peer, session)| (*peer, Arc::clone(session)))
+            .collect();
+        for (_, session) in &sessions {
             let _closed = session.close().await;
+        }
+        for (peer, _) in &sessions {
+            self.closed(peer).await;
         }
         self.sessions.lock().await.clear();
     }
@@ -2381,8 +2392,8 @@ impl Node {
     /// Every open session, and every neighbour this device chose, is sent the
     /// digest of what it holds; a neighbour with no open session is contacted for
     /// it. Where the digests agree that is the whole exchange. A neighbour that
-    /// does not answer is rested — a minute, then twice as long each time, up to
-    /// six hours — and its slot moves to the next member meanwhile.
+    /// does not answer is rested — ten seconds, then twice as long each time, up
+    /// to a minute — and its slot moves to the next member meanwhile.
     ///
     /// Nobody else is contacted: a member that is merely in the roster is never
     /// dialled for being there.
@@ -2453,11 +2464,13 @@ impl Node {
         }
     }
 
-    /// Rests a neighbour that did not answer: twice as long as last time, from a
-    /// minute up to six hours.
+    /// Rests a neighbour that did not answer: twice as long as last time, from
+    /// ten seconds up to a minute. Was a minute up to six hours, and a neighbour
+    /// back from a sleep waited as long for what was admitted or revoked
+    /// meanwhile.
     pub(crate) fn rest(&self, device: DeviceId) {
-        const FIRST: std::time::Duration = std::time::Duration::from_secs(60);
-        const LONGEST: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        const FIRST: std::time::Duration = std::time::Duration::from_secs(10);
+        const LONGEST: std::time::Duration = std::time::Duration::from_secs(60);
         let Ok(mut unanswered) = self.unanswered.lock() else { return };
         let now = tokio::time::Instant::now();
         let entry = unanswered.entry(device).or_insert(Rest { interval: FIRST, until: now });
@@ -3012,7 +3025,17 @@ impl Node {
 
         match &departure {
             Departure::To { device, packet } => {
-                self.send_packet_to(*device, packet).await;
+                if self.sessions.lock().await.contains_key(device) {
+                    self.send_packet_to(*device, packet).await;
+                } else {
+                    // The router named a session the table no longer holds:
+                    // forgotten there too, and the packet opens one, as for a
+                    // member with none, rather than being dropped.
+                    self.router.lock().await.closed(device);
+                    if self.hold_for(*device, packet.clone()).await {
+                        tokio::spawn(Arc::clone(self).open_for_waiting(*device));
+                    }
+                }
             }
             // A machine sends link-local, multicast and IPv4 chatter on every
             // adapter it has. The tunnel refusing it is §2.6 working, not a
@@ -3022,13 +3045,14 @@ impl Node {
             Departure::Refused(refusal) => self.record(Severity::Event, "tunnel", refusal).await,
             Departure::Unreachable { destination } => {
                 // A member with no session: the packet waits, and the first one
-                // to wait opens the session. An address no member holds has
+                // to wait opens the session, at once, however the last attempt
+                // went. Packets arriving while one is under way wait for it
+                // rather than open another, so a member that is switched off
+                // costs one attempt at a time, and what sent them meets its own
+                // timeout, as on any network. An address no member holds has
                 // nowhere to go.
                 let member = self.router.lock().await.member_at(*destination);
                 match member {
-                    // A member a packet failed to reach moments ago: dropped
-                    // until the rest is over, not another attempt.
-                    Some(device) if self.resting_after_failure(&device) => {}
                     Some(device) => {
                         if self.hold_for(device, packet.clone()).await {
                             tokio::spawn(Arc::clone(self).open_for_waiting(device));
@@ -3095,11 +3119,6 @@ impl Node {
             }),
         };
         if let Err(cause) = outcome {
-            // A peer with no room is there: the next packet tries again,
-            // rather than wait as for a device that is not.
-            if !matches!(cause, crate::Error::Busy { .. }) {
-                self.rest_after_failure(device);
-            }
             let dropped = self.waiting.lock().await.remove(&device);
             let count =
                 dropped.map_or(0, |queue| queue.packets.len().saturating_add(queue.dropped));
@@ -3119,54 +3138,31 @@ impl Node {
         transport.own_ports().contains(&source)
     }
 
-    /// Whether packets for `device` are being dropped after a failed attempt.
-    pub(crate) fn resting_after_failure(&self, device: &DeviceId) -> bool {
-        let now = tokio::time::Instant::now();
-        self.unreached
-            .lock()
-            .is_ok_and(|unreached| unreached.get(device).is_some_and(|rest| rest.until > now))
-    }
-
-    /// The first rest after a failed on-demand attempt, and the longest.
-    pub const UNREACHED_FIRST: std::time::Duration = std::time::Duration::from_secs(30);
-    /// See [`Self::UNREACHED_FIRST`].
-    pub const UNREACHED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-    /// Ends whatever rest `device` is on, because it has just announced itself
-    /// on the local network: there is news about where it is, and a rest earned
-    /// before it says nothing about now.
+    /// Ends the rest of a neighbour that did not answer, because it has just
+    /// announced itself on the local network: there is news about where it is,
+    /// and a rest earned before it says nothing about now.
     ///
-    /// **Dials nothing.** The next packet for it, or the next round of
-    /// neighbours, tries it again: sessions stay on demand. A member that
-    /// announces itself and still cannot be reached costs one attempt an
-    /// announcement, which on a quiet network is one a minute.
+    /// **Dials nothing.** The next round of neighbours tries it again: sessions
+    /// stay on demand. A neighbour that announces itself and still cannot be
+    /// reached costs one attempt an announcement, which on a quiet network is
+    /// one a minute.
     pub fn announced(&self, device: DeviceId) {
-        if let Ok(mut unreached) = self.unreached.lock() {
-            unreached.remove(&device);
-        }
         if let Ok(mut unanswered) = self.unanswered.lock() {
             unanswered.remove(&device);
         }
     }
 
-    /// Rests a member a packet failed to reach: half a minute, then twice as long
-    /// each time, up to ten minutes. A session opening ends it, and so does the
-    /// member announcing itself ([`Self::announced`]).
-    pub(crate) fn rest_after_failure(&self, device: DeviceId) {
-        let Ok(mut unreached) = self.unreached.lock() else { return };
-        let now = tokio::time::Instant::now();
-        let entry =
-            unreached.entry(device).or_insert(Rest { interval: Self::UNREACHED_FIRST, until: now });
-        entry.until = now.checked_add(entry.interval).unwrap_or(now);
-        entry.interval = entry.interval.saturating_mul(2).min(Self::UNREACHED_LONGEST);
+    /// Ends every neighbour's rest, because this device's own network
+    /// changed: a rest earned from the network it left may say only that it
+    /// could reach nobody from there.
+    pub fn moved(&self) {
+        if let Ok(mut unanswered) = self.unanswered.lock() {
+            unanswered.clear();
+        }
     }
 
     /// Sends what waited for a session that has just opened, in order.
     async fn release_waiting(&self, peer: DeviceId) {
-        // Reached: whatever rest it was on is over.
-        if let Ok(mut unreached) = self.unreached.lock() {
-            unreached.remove(&peer);
-        }
         let Some(queue) = self.waiting.lock().await.remove(&peer) else { return };
         for packet in queue.packets {
             self.send_packet_to(peer, &packet).await;

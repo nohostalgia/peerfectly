@@ -965,7 +965,7 @@ mod over_the_wire {
     /// An announcement from a key the roster does not name is background, not a
     /// peer. Nothing is cached and nothing is handed to the transport.
     #[tokio::test]
-    async fn a_members_newer_announcement_ends_its_rest_and_dials_nothing() {
+    async fn a_neighbours_newer_announcement_ends_its_rest_and_dials_nothing() {
         let (a, b, _scratches) = two_nodes();
         let transport = Arc::new(Speaking {
             mine: Vec::new(),
@@ -990,20 +990,30 @@ mod over_the_wire {
         };
         let peer = b.identity().device_id();
 
-        a.rest_after_failure(peer);
         a.rest(peer);
         discovery.heard(announcing(5)).await;
-        assert!(!a.resting_after_failure(&peer), "a newer announcement ends the rest");
-        assert!(!a.resting_as_a_neighbour(&peer), "both rests");
+        assert!(!a.resting_as_a_neighbour(&peer), "a newer announcement ends the rest");
         assert_eq!(
             0,
             transport.dialled.load(std::sync::atomic::Ordering::SeqCst),
             "and the announcement alone dials nothing"
         );
 
-        a.rest_after_failure(peer);
+        a.rest(peer);
         discovery.heard(announcing(5)).await;
-        assert!(a.resting_after_failure(&peer), "an announcement that is not newer leaves it");
+        assert!(a.resting_as_a_neighbour(&peer), "an announcement that is not newer leaves it");
+    }
+
+    /// A rest earned from the network a device left says nothing about the one
+    /// it is on now: it may have been this device that reached nobody.
+    #[tokio::test]
+    async fn moving_to_another_network_ends_every_neighbours_rest() {
+        let (a, b, _scratches) = two_nodes();
+        let peer = b.identity().device_id();
+        a.rest(peer);
+        assert!(a.resting_as_a_neighbour(&peer));
+        a.moved();
+        assert!(!a.resting_as_a_neighbour(&peer), "tried again at the next round");
     }
 
     #[tokio::test]
