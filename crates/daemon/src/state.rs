@@ -643,19 +643,19 @@ pub fn read_base(
 
 /// Records the snapshot a network has accepted, and when.
 ///
-/// The time is written **after** the bytes, so a write cut in half leaves a
-/// snapshot with no time — which reads as none at all — rather than a time
-/// pointing at a snapshot that is not there.
+/// Each file is written beside itself and moved over the old one, so a reader
+/// finds the old snapshot or the new one, whole, and never none: written in
+/// place, a file is empty for a moment, and an admin delivering the network
+/// while its node kept a new root once read none and signed the device a root
+/// following nothing. The time is moved in **after** the bytes: in between, or
+/// after a write cut in half, the new snapshot carries the old time, which
+/// dates it earlier than it arrived and never later.
 ///
 /// # Errors
 ///
 /// When either file cannot be written.
 pub fn write_snapshot(paths: &Paths, bytes: &[u8], at: u64) -> Result<()> {
-    let path = paths.snapshot();
-    fs::write(&path, bytes).map_err(|cause| Error::State { path, cause: cause.to_string() })?;
-    let path = paths.snapshot_at();
-    fs::write(&path, at.to_string())
-        .map_err(|cause| Error::State { path, cause: cause.to_string() })
+    write_dated(paths.snapshot(), paths.snapshot_at(), bytes, at)
 }
 
 /// The attestation a network has accepted, and when, where both are readable.
@@ -764,9 +764,9 @@ pub fn take_ownership(paths: &Paths, owner: &str) -> Result<()> {
 
 /// Records the attestation a network has accepted, and when.
 ///
-/// The time is written **after** the bytes, for the reason `write_snapshot`
-/// gives: a write cut in half leaves an attestation with no time — which reads
-/// as none at all — rather than a time pointing at one that is not there.
+/// Written as `write_snapshot` writes: each file moved over the old one whole,
+/// and the time **after** the bytes, so a reader never finds none, and a new
+/// attestation caught beside the old time is dated earlier, never later.
 ///
 /// # Errors
 ///
@@ -785,12 +785,11 @@ pub fn write_dating_attestation(paths: &Paths, bytes: &[u8], at: u64) -> Result<
     write_dated(paths.attestation_dating(), paths.attestation_dating_at(), bytes, at)
 }
 
-/// Writes bytes and the time they are dated by.
+/// Writes bytes and the time they are dated by, each moved over the old one
+/// whole, as [`write_snapshot`] says why.
 fn write_dated(bytes_path: PathBuf, at_path: PathBuf, bytes: &[u8], at: u64) -> Result<()> {
-    fs::write(&bytes_path, bytes)
-        .map_err(|cause| Error::State { path: bytes_path, cause: cause.to_string() })?;
-    fs::write(&at_path, at.to_string())
-        .map_err(|cause| Error::State { path: at_path, cause: cause.to_string() })
+    replace_file(&bytes_path, bytes)?;
+    replace_file(&at_path, at.to_string().as_bytes())
 }
 
 /// This device's wall clock in whole seconds, which is the frame a stored
@@ -1017,6 +1016,37 @@ mod tests {
         let path = dir.path().join("choice");
         fs::write(&path, "garbage").expect("writes");
         assert_eq!(Choice::read(&path), Choice::Down, "an unreadable choice is not consent");
+    }
+
+    /// A snapshot being replaced is read whole, the old one or the new one, and
+    /// never as none: an admin delivering the network while its node keeps a
+    /// new root read none once, and signed the device a root following nothing.
+    #[test]
+    fn a_snapshot_being_replaced_is_read_whole() {
+        let dir = scratch();
+        let paths = Paths::under(dir.path());
+        paths.create().expect("creates");
+        let (old, new) = (vec![1_u8; 4096], vec![2_u8; 4096]);
+        write_snapshot(&paths, &old, 1).expect("writes");
+
+        let writer = {
+            let paths = paths.clone();
+            let (old, new) = (old.clone(), new.clone());
+            std::thread::spawn(move || {
+                for round in 0..500_u64 {
+                    let bytes = if round % 2 == 0 { &new } else { &old };
+                    write_snapshot(&paths, bytes, round.saturating_add(2)).expect("writes");
+                }
+            })
+        };
+        let mut reads = 0_u32;
+        while !writer.is_finished() {
+            let (bytes, _at) = read_snapshot(&paths).expect("a snapshot, whole, at every moment");
+            assert!(bytes == old || bytes == new, "one of the two, never a part of one");
+            reads = reads.saturating_add(1);
+        }
+        writer.join().expect("the writer finished");
+        assert!(reads > 0, "read while it was being replaced");
     }
 }
 
