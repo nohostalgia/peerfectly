@@ -34,7 +34,6 @@ fn named(name: Option<&str>, id: &str) -> Named {
 fn report() -> Report {
     let nas = named(Some("nas"), "0a1b-2c3d-4e5f-6a7b");
     let laptop = named(Some("laptop"), "1b2c-3d4e-5f6a-7b8c");
-    let gone = named(None, "2c3d-4e5f-6a7b-8c9d");
     let on = Network {
         label: "home".to_owned(),
         tunnel: Tunnel::Up,
@@ -129,22 +128,8 @@ fn report() -> Report {
         reachable_count: 1,
         peers_after: Some("0a".repeat(32)),
         full_members: vec![nas.clone(), laptop.clone()],
-        revoked: vec![Revoked {
-            device: gone.clone(),
-            revocations: vec![
-                Revocation {
-                    by: nas.clone(),
-                    reason: "stolen on the train".to_owned(),
-                    signer_clock: Signed::At { time: at(1_757_000_000) },
-                },
-                Revocation {
-                    by: laptop.clone(),
-                    reason: "lost".to_owned(),
-                    signer_clock: Signed::NotRecorded,
-                },
-            ],
-            last_contact: Contact::NoneRecorded,
-        }],
+        // Counted: the devices themselves are a page of their own.
+        revoked_count: 1,
         problem: Some(Fault {
             subsystem: "relay".to_owned(),
             cause: "certificate not trusted".to_owned(),
@@ -199,7 +184,7 @@ fn report() -> Report {
         reachable_count: 0,
         peers_after: None,
         full_members: Vec::new(),
-        revoked: Vec::new(),
+        revoked_count: 0,
         problem: None,
     };
     Report {
@@ -244,6 +229,27 @@ fn outcomes() -> Vec<Outcome> {
             network: "home".to_owned(),
             peers: report().networks.first().map(|home| home.peers.clone()).unwrap_or_default(),
             after: Some("0b".repeat(32)),
+        }),
+        // A page of the devices a network holds as revoked.
+        Outcome::Revoked(daemon::control::RevokedPage {
+            network: "home".to_owned(),
+            revoked: vec![Revoked {
+                device: named(None, "2c3d-4e5f-6a7b-8c9d"),
+                revocations: vec![
+                    Revocation {
+                        by: named(Some("nas"), "0a1b-2c3d-4e5f-6a7b"),
+                        reason: "stolen on the train".to_owned(),
+                        signer_clock: Signed::At { time: at(1_757_000_000) },
+                    },
+                    Revocation {
+                        by: named(Some("laptop"), "1b2c-3d4e-5f6a-7b8c"),
+                        reason: "lost".to_owned(),
+                        signer_clock: Signed::NotRecorded,
+                    },
+                ],
+                last_contact: Contact::NoneRecorded,
+            }],
+            after: Some("0c".repeat(32)),
         }),
         // What a production station takes for the boards it provisions.
         Outcome::Provisioning(daemon::control::Provisioning {
@@ -463,6 +469,7 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
         Command::Up { network: casa() },
         Command::Down { network: casa() },
         Command::Pending { network: None },
+        Command::Revoked { network: casa(), after: None },
         Command::Exposed { network: None },
         Command::Invite {
             network: casa(),

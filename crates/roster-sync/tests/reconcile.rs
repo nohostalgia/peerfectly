@@ -418,6 +418,31 @@ fn a_pending_operation_is_not_forwarded() {
     assert_eq!(node.charged_to(&peer), 1, "it is held, and charged to its sender");
 }
 
+/// **An operation let in by its parent's arrival is reported to be kept.** One
+/// held for want of its parent enters the graph when the parent comes, and was
+/// reported by nothing: a daemon kept only what it was told of, and after a
+/// restart every operation resting on it was one its log could not place.
+#[test]
+fn an_operation_let_in_by_its_parent_is_reported_to_be_kept() {
+    let mut fixture = Fixture::found();
+    fixture.extend(2);
+    let mut node = fixture.syncer_through(1);
+    let (peer, _) = ids();
+
+    let early =
+        node.receive(peer, &Message::Transfer(vec![fixture.operation(2).to_vec()]).encode());
+    assert!(early.accepted.is_empty(), "held for want of its parent");
+
+    let parent = fixture.operation(1).to_vec();
+    let late = node.receive(peer, &Message::Transfer(vec![parent.clone()]).encode());
+    assert_eq!(
+        late.accepted,
+        vec![parent, fixture.operation(2).to_vec()],
+        "the parent, and the operation it let in, as they arrived"
+    );
+    assert_eq!(late.admitted.len(), 2);
+}
+
 #[test]
 fn only_the_verified_set_is_offered() {
     let mut fixture = Fixture::found();

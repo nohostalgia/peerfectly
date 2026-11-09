@@ -44,6 +44,27 @@ pub const UNJOINED_SCHEMA: &[&str] = &["root", "device"];
 /// ever reasonably be.
 const MAX_REMEMBERED: usize = 4096;
 
+/// The most bytes the roots a light member remembers may take, on the chain
+/// and set aside each, unless told otherwise: the remembered deltas' share of a
+/// board's control budget. Past it the oldest are forgotten, as past the count,
+/// and a proof against one of them is asked to be renewed. Kept whatever their
+/// size: the current root and the one before it, where a sibling of the current
+/// root (two admins at once) is placed; the root last set aside, which the root
+/// continuing it climbs back by; and every invalidation not yet joined, since
+/// forgetting one would let a revoked device in.
+///
+/// In ordinary use it is never reached: 64 roots of one change each take about
+/// 10 KB. It bounds a member handed roots changing hundreds of devices each.
+pub const DEFAULT_DELTA_BYTES: usize = 16 * 1024;
+
+/// How many roots of the chain are kept whatever their bytes: the current one
+/// and the one before it.
+const KEPT_ON_CHAIN: usize = 2;
+
+/// What a remembered root costs beside its lists: its root, its generation and
+/// the lists' own headers, near enough.
+const REMEMBERED_OVERHEAD: usize = 96;
+
 /// A root as a light member remembers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Remembered {
@@ -66,6 +87,12 @@ impl Remembered {
             delta: snapshot.delta.clone(),
             previous: snapshot.previous.clone(),
         }
+    }
+
+    /// About how many bytes it takes in memory.
+    fn bytes(&self) -> usize {
+        let hashes = self.delta.len().saturating_add(self.previous.len());
+        hashes.saturating_mul(32).saturating_add(REMEMBERED_OVERHEAD)
     }
 
     /// The order siblings are weighed by.
@@ -164,6 +191,9 @@ pub struct LightView {
     chain: VecDeque<Remembered>,
     /// How many roots to remember at most.
     budget: usize,
+    /// How many bytes the roots remembered may take, on the chain and set
+    /// aside each. Not kept with the view: one read back takes the default.
+    bytes: usize,
     /// Invalidations carried by roots not on the chain: the device, and the
     /// root that carried it.
     unjoined: Vec<(DeviceId, Hash)>,
@@ -189,9 +219,19 @@ impl LightView {
             network: root.network,
             chain,
             budget: budget.max(1),
+            bytes: DEFAULT_DELTA_BYTES,
             unjoined: Vec::new(),
             aside: VecDeque::new(),
         }
+    }
+
+    /// The same view, its remembered roots held to `bytes` on the chain and
+    /// set aside each, rather than [`DEFAULT_DELTA_BYTES`].
+    #[must_use]
+    pub fn with_delta_bytes(mut self, bytes: usize) -> Self {
+        self.bytes = bytes;
+        self.keep_to_budget();
+        self
     }
 
     /// The current root.
@@ -375,7 +415,23 @@ impl LightView {
     /// Remembers a root set aside, within budget.
     fn set_aside(&mut self, root: Remembered) {
         self.aside.push_back(root);
-        while self.aside.len() > self.budget {
+        self.keep_to_budget();
+    }
+
+    /// Forgets the oldest roots past the count, and past the bytes all but
+    /// the last two of the chain and the last set aside.
+    fn keep_to_budget(&mut self) {
+        let bytes = |roots: &VecDeque<Remembered>| {
+            roots.iter().fold(0_usize, |sum, root| sum.saturating_add(root.bytes()))
+        };
+        while self.chain.len() > self.budget
+            || (self.chain.len() > KEPT_ON_CHAIN && bytes(&self.chain) > self.bytes)
+        {
+            self.chain.pop_front();
+        }
+        while self.aside.len() > self.budget
+            || (self.aside.len() > 1 && bytes(&self.aside) > self.bytes)
+        {
             self.aside.pop_front();
         }
     }
@@ -483,7 +539,16 @@ impl LightView {
         if chain.is_empty() {
             return Err(Error::InvalidValue("a view remembering no root"));
         }
-        Ok(Self { network, chain, budget: budget.max(1), unjoined, aside })
+        let mut view = Self {
+            network,
+            chain,
+            budget: budget.max(1),
+            bytes: DEFAULT_DELTA_BYTES,
+            unjoined,
+            aside,
+        };
+        view.keep_to_budget();
+        Ok(view)
     }
 
     /// Makes `offered` current, joining what it follows and keeping to budget.
@@ -492,9 +557,7 @@ impl LightView {
         self.unjoined.retain(|(_, carrier)| !follows.contains(carrier));
         self.aside.retain(|aside| !follows.contains(&aside.root));
         self.chain.push_back(offered);
-        while self.chain.len() > self.budget {
-            self.chain.pop_front();
-        }
+        self.keep_to_budget();
     }
 
     /// Where a root sits on the chain, if it is remembered.

@@ -2044,7 +2044,7 @@ impl Service {
                 reachable_count: 0,
                 peers_after: None,
                 full_members: Vec::new(),
-                revoked: Vec::new(),
+                revoked_count: 0,
                 problem: node.problem(std::time::SystemTime::now()).await,
             };
         };
@@ -2113,7 +2113,7 @@ impl Service {
             reachable_count,
             peers_after,
             full_members,
-            revoked: membership.revoked,
+            revoked_count: state.revoked.len(),
             problem: node.problem(std::time::SystemTime::now()).await,
         }
     }
@@ -2210,6 +2210,70 @@ impl Service {
         Outcome::Peers(crate::control::PeersPage {
             network: network.label().to_string(),
             peers,
+            after,
+        })
+    }
+
+    /// Opens a session with the member of `network` whose transport key is
+    /// `transport`, within [`crate::limits::PROBE_WITHIN`], as `peers` does
+    /// with each member it finds without one. Done whether it answered or not:
+    /// the member may not be up yet, and its own attempts follow.
+    async fn reach(network: &Arc<Network>, transport: &str) -> Outcome {
+        let key = hex::decode(transport).ok().and_then(|bytes| {
+            roster::sign::PublicKey::new(roster::types::Algorithm::Ed25519, bytes).ok()
+        });
+        let Some(key) = key else {
+            return Outcome::Failed {
+                message: "that is not a transport key".to_owned(),
+                left_behind: Vec::new(),
+            };
+        };
+        let node = Arc::clone(network.node());
+        let member = node.state().await.is_ok_and(|state| {
+            state
+                .device_for_key_of_purpose(&key.key_id(), roster::types::KeyPurpose::Transport)
+                .is_some_and(|record| !state.revoked.contains(&record.id))
+        });
+        if !member {
+            return Outcome::Failed {
+                message: "no member of that network holds that transport key".to_owned(),
+                left_behind: Vec::new(),
+            };
+        }
+        if node.transport().await.is_some() {
+            let _answered =
+                tokio::time::timeout(crate::limits::PROBE_WITHIN, node.connect(&key)).await;
+        }
+        Outcome::Done
+    }
+
+    /// A page of the devices a network holds as revoked, after `after` (`None`:
+    /// the first), a cursor the page before gave.
+    async fn revoked_after(&self, network: &Arc<Network>, after: Option<&str>) -> Outcome {
+        let cursor = match after {
+            None => None,
+            Some(after) => {
+                let cursor = hex::decode(after)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .map(roster::id::DeviceId::from_bytes);
+                let Some(cursor) = cursor else {
+                    return Outcome::Failed {
+                        message: "that is not where a page of revoked devices begins".to_owned(),
+                        left_behind: Vec::new(),
+                    };
+                };
+                Some(cursor)
+            }
+        };
+        let node = network.node();
+        let (revoked, after) = match node.state().await {
+            Ok(state) => node.revoked_page(&state, cursor).await,
+            Err(_) => (Vec::new(), None),
+        };
+        Outcome::Revoked(crate::control::RevokedPage {
+            network: network.label().to_string(),
+            revoked,
             after,
         })
     }
@@ -3704,6 +3768,30 @@ impl Service {
             },
             Command::Provisioning { network } => match Self::wanted(network) {
                 Ok(label) => self.provisioning(label.as_ref()).await,
+                Err(cause) => Self::said(Err(cause)),
+            },
+            Command::Reach { network, transport } => match Self::wanted(Some(network)) {
+                Ok(Some(label)) => match self.named(&label).await {
+                    Ok(found) => Self::reach(&found, &transport).await,
+                    Err(refusal) => Self::said(Err(refusal)),
+                },
+                Ok(None) => Outcome::Failed {
+                    message: "a member is reached in a network: name it".to_owned(),
+                    left_behind: Vec::new(),
+                },
+                Err(cause) => Self::said(Err(cause)),
+            },
+            // Asked of one network by name: which one a person meant is the
+            // surface's to settle, from what the person may see.
+            Command::Revoked { network, after } => match Self::wanted(network) {
+                Ok(Some(label)) => match self.named(&label).await {
+                    Ok(found) => self.revoked_after(&found, after.as_deref()).await,
+                    Err(refusal) => Self::said(Err(refusal)),
+                },
+                Ok(None) => Outcome::Failed {
+                    message: "the revoked devices are asked of one network: name it".to_owned(),
+                    left_behind: Vec::new(),
+                },
                 Err(cause) => Self::said(Err(cause)),
             },
             Command::Address { network } => match Self::wanted(network) {
@@ -10955,6 +11043,26 @@ mod tests {
         );
     }
 
+    /// A member is reached by its transport key; anything else is refused
+    /// before a dial is tried: a key that is none, and one no member holds.
+    #[tokio::test]
+    async fn only_a_member_is_reached() {
+        let fixture = fixture(None).await;
+        let label = fixture.service.only().await.expect("one network").label().to_string();
+        let stranger = hex::encode(
+            NodeIdentity::generate().expect("generates").transport_key().public_key().as_bytes(),
+        );
+        for (transport, said) in [("zz".to_owned(), "not a transport key"), (stranger, "no member")]
+        {
+            let outcome =
+                fixture.service.handle(Command::Reach { network: label.clone(), transport }).await;
+            match outcome {
+                Outcome::Failed { message, .. } => assert!(message.contains(said), "{message}"),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
     /// Revoking is an administrative action too, and it was the one that did not
     /// do this. It called `admit_without_activating` directly, so a person expelling a stolen
     /// laptop while the tunnel was down signed the revocation and left the
@@ -10985,7 +11093,14 @@ mod tests {
         match outcome {
             Outcome::Reported(report) => {
                 let network = report.only().expect("one network").clone();
-                let revoked = network.revoked.first().expect("the expelled device is listed");
+                assert_eq!(network.revoked_count, 1, "the report counts it");
+                let page = fixture
+                    .service
+                    .handle(Command::Revoked { network: Some(network.label.clone()), after: None })
+                    .await;
+                let Outcome::Revoked(page) = page else { panic!("a page, got {page:?}") };
+                assert_eq!(page.after, None, "one page");
+                let revoked = page.revoked.first().expect("the expelled device is listed");
                 assert_eq!(revoked.device.name.as_deref(), Some("laptop"), "as it was admitted");
                 assert_eq!(revoked.device.id.len(), 19, "with its short id");
                 let revocation = revoked.revocations.first().expect("with the revocation");

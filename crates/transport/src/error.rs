@@ -51,6 +51,12 @@ pub enum Error {
     /// A member, and not a stranger: the policy keeps it from this device, and
     /// the same device may be allowed to others.
     NotAllowed,
+    /// The peer was reached, and has no room for another session now.
+    ///
+    /// A microcontroller holds a handful at once. It is there and may take this
+    /// one in a moment, when one of its own falls quiet: tried again soon, never
+    /// rested on as an unreachable device is.
+    PeerBusy,
     /// The session was closed by the far end, in the ordinary way.
     ClosedByPeer,
     /// The session was closed because its peer stopped being a member.
@@ -110,6 +116,7 @@ impl Error {
             Self::Revoked => "revoked",
             Self::PossessionNotProven => "possession_not_proven",
             Self::NotAllowed => "not_allowed",
+            Self::PeerBusy => "peer_busy",
             Self::ClosedByPeer => "closed_by_peer",
             Self::ClosedOnMembershipLoss => "closed_on_membership_loss",
             Self::SessionClosed => "session_closed",
@@ -129,6 +136,7 @@ impl Error {
         "revoked",
         "possession_not_proven",
         "not_allowed",
+        "peer_busy",
         "closed_by_peer",
         "closed_on_membership_loss",
         "session_closed",
@@ -188,6 +196,7 @@ impl fmt::Display for Error {
             Self::PossessionNotProven => {
                 f.write_str("the peer could not prove it holds the key it presented")
             }
+            Self::PeerBusy => f.write_str("the peer has no room for another session now"),
             Self::ClosedByPeer => f.write_str("the peer closed the session"),
             Self::ClosedOnMembershipLoss => {
                 f.write_str("the session closed because its peer is no longer a member")
@@ -231,6 +240,7 @@ mod tests {
             Error::Revoked,
             Error::PossessionNotProven,
             Error::NotAllowed,
+            Error::PeerBusy,
             Error::ClosedByPeer,
             Error::ClosedOnMembershipLoss,
             Error::SessionClosed,

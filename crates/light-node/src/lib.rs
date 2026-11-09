@@ -15,5 +15,6 @@ pub mod channel;
 pub mod engine;
 pub mod lookup;
 pub mod member;
+pub mod provision;
 pub mod seeking;
 pub mod sessions;

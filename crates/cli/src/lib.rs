@@ -22,6 +22,8 @@
 //! Reading state needs no privilege. Changing it does, and the daemon — not this
 //! — is what runs privileged.
 
+mod board;
+
 use std::io;
 
 use daemon::control::{Command, KeyWanted, Outcome};
@@ -175,6 +177,7 @@ impl Default for Extras {
 /// path of its own in [`Cli::run`]. With [`Command::ALL`], every word a person
 /// can type.
 const WORDS_WITH_ARGUMENTS: &[&str] = &[
+    "board",
     "found",
     "join",
     "invite",
@@ -608,6 +611,19 @@ impl Cli<'_> {
             return runtime.block_on(self.invite_through_the_daemon(command));
         }
 
+        // One board, on its cable: provisioned and admitted.
+        if word == "board" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(cause) => {
+                    eprintln!("could not start: {cause}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return runtime.block_on(self.board(&rest));
+        }
+
         // Admitting a batch file: read here, reviewed, and signed with one consent.
         if word == "admit" {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -820,6 +836,10 @@ impl Cli<'_> {
         // address.
         let asked = command.clone();
         runtime.block_on(async move {
+            // A list of its own, read a page at a time.
+            if let Command::Revoked { network, .. } = &asked {
+                return self.revoked(network.clone()).await;
+            }
             // Through the wrapper, not through `ask`: any command may turn out to
             // need a signature this process must obtain, and keying that on a list
             // of which ones do is how a command added later comes to be the one that
@@ -875,6 +895,57 @@ impl Cli<'_> {
                 }
             }
         }
+    }
+
+    /// Draws the devices a network holds as revoked, a page at a time, until
+    /// the last. Named none, the network is the only one the person holds: the
+    /// daemon is asked of one network by name.
+    async fn revoked(&self, network: Option<String>) -> std::process::ExitCode {
+        use std::process::ExitCode;
+
+        let label = match network {
+            Some(label) => label,
+            None => match self.ask(Command::Status).await {
+                Ok(Outcome::Reported(report)) => match report.networks.as_slice() {
+                    [one] => one.label.clone(),
+                    [] => {
+                        eprintln!("this device holds no network");
+                        return ExitCode::FAILURE;
+                    }
+                    _ => {
+                        eprintln!("this device holds several networks: name one");
+                        eprintln!("  peerfectly revoked <network>");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                other => return self.shown(&Command::Status, other),
+            },
+        };
+        println!(
+            "{}   revoked — the revocations this device holds",
+            daemon::control::shown(&label)
+        );
+        let mut after = None;
+        let mut listed = 0_usize;
+        loop {
+            let asked = Command::Revoked { network: Some(label.clone()), after: after.take() };
+            match self.ask(asked.clone()).await {
+                Ok(Outcome::Revoked(page)) => {
+                    listed = listed.saturating_add(page.revoked.len());
+                    print!("{}", daemon::views::RevokedRows(&page.revoked));
+                    match page.after {
+                        Some(next) => after = Some(next),
+                        None => break,
+                    }
+                }
+                other => return self.shown(&asked, other),
+            }
+        }
+        if listed == 0 {
+            println!();
+            println!("  nothing has been revoked");
+        }
+        ExitCode::SUCCESS
     }
 
     /// Puts the question a revocation that voids acts asks, before anything is
@@ -1345,7 +1416,7 @@ impl Cli<'_> {
     async fn admit_batch(&self, words: &[String]) -> std::process::ExitCode {
         use std::process::ExitCode;
 
-        use daemon::control::{BatchFile, Command, Outcome};
+        use daemon::control::BatchFile;
 
         let asked = match admitting_from(words) {
             Ok(asked) => asked,
@@ -1372,6 +1443,20 @@ impl Cli<'_> {
             eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
+        self.admit_devices(&asked, &file).await
+    }
+
+    /// Hands `file`'s devices to the daemon in parts, shows what admitting
+    /// them would do, and on one yes has it signed: a batch file's, or the one
+    /// board `board` provisioned.
+    async fn admit_devices(
+        &self,
+        asked: &AdmittingAsked,
+        file: &daemon::control::BatchFile,
+    ) -> std::process::ExitCode {
+        use std::process::ExitCode;
+
+        use daemon::control::{Command, Outcome};
 
         // In parts, each well within what one command may carry.
         for part in file.devices.chunks(BATCH_PART) {
@@ -1904,6 +1989,7 @@ fn usage(privileged: &str) -> String {
         Command::WITHDRAW_USAGE,
         "peerfectly cancel [join]",
         ADMIT_USAGE,
+        board::BOARD_USAGE,
         REVOKE_USAGE,
         RENAME_USAGE,
         FORGET_USAGE,

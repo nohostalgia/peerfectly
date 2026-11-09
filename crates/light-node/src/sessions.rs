@@ -17,7 +17,7 @@
 //! answered, as the daemon's light member answers none. Judging is the
 //! engine's (`crate::engine::Engine`), passed in.
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use roster::id::DeviceId;
@@ -42,6 +42,12 @@ pub const MAX_HELD: usize = 2;
 
 /// How many sessions this node does not hold it remembers telling so.
 const MAX_TOLD: usize = 64;
+
+/// How long before the sender of a session this node does not hold is told so
+/// again, while it goes on sending. Once only, the close could be lost as
+/// convesso opened the session again, and the sender then sent into nothing
+/// for good.
+pub const TELL_AGAIN_MS: u64 = 2_000;
 
 /// How a peer is told apart from the keys its leaf names: convesso's peer id
 /// of an Ed25519 transport key, on whatever the platform runs.
@@ -110,6 +116,9 @@ pub enum Output<P> {
     Datagram {
         /// To whom.
         to: P,
+        /// Its Ed25519 transport key: the address to send to, which opens the
+        /// convesso session again where it was forgotten, its keys expired.
+        key: [u8; 32],
         /// A packet's fragment, framed.
         bytes: Vec<u8>,
     },
@@ -203,7 +212,7 @@ pub struct Sessions<K: Keys> {
     open: BTreeMap<SessionId, Open<K::Peer>>,
     dials: BTreeMap<SessionId, Dial<K::Peer>>,
     held: BTreeMap<SessionId, Held<K::Peer>>,
-    told: BTreeSet<SessionId>,
+    told: BTreeMap<SessionId, u64>,
     wires: BTreeMap<K::Peer, Wire>,
     sequence: u32,
     out: VecDeque<Output<K::Peer>>,
@@ -220,7 +229,7 @@ impl<K: Keys> Sessions<K> {
             open: BTreeMap::new(),
             dials: BTreeMap::new(),
             held: BTreeMap::new(),
-            told: BTreeSet::new(),
+            told: BTreeMap::new(),
             wires: BTreeMap::new(),
             sequence: 0,
             out: VecDeque::new(),
@@ -277,12 +286,16 @@ impl<K: Keys> Sessions<K> {
     /// Sends `payload` on session `id`. Whether it was: not where the session
     /// is not open, or the payload is larger than its peer puts back together.
     pub fn send_payload(&mut self, id: SessionId, payload: &[u8]) -> bool {
-        let Some(peer) = self.open.get(&id).map(|open| open.peer) else { return false };
+        let Some((peer, key)) = self.open.get(&id).map(|open| (open.peer, open.key)) else {
+            return false;
+        };
         let frame = Frame::Payload { id, bytes: payload.to_vec() }.encode();
         if frame.len() > self.limits(&peer).frame_len() {
             return false;
         }
-        self.send(To::Peer(peer), peer, frame);
+        // By its key: convesso forgets a session whose keys expired, and only
+        // a send to the address opens it again.
+        self.send(To::Key(key), peer, frame);
         true
     }
 
@@ -293,13 +306,13 @@ impl<K: Keys> Sessions<K> {
         let Some(open) = self.open.get_mut(&id) else { return false };
         let number = open.packets;
         open.packets = open.packets.wrapping_add(1);
-        let peer = open.peer;
+        let (peer, key) = (open.peer, open.key);
         let Some(pieces) = transport_wire::fragment::split(number, packet, FRAGMENT_ROOM) else {
             return false;
         };
         for fragment in pieces {
             let bytes = Frame::Packet { id, fragment }.encode();
-            self.out.push_back(Output::Datagram { to: peer, bytes });
+            self.out.push_back(Output::Datagram { to: peer, key, bytes });
         }
         true
     }
@@ -309,7 +322,7 @@ impl<K: Keys> Sessions<K> {
     pub fn on_datagram(&mut self, peer: K::Peer, datagram: &[u8], now: u64) {
         let Some(Frame::Packet { id, fragment }) = Frame::decode(datagram) else { return };
         let Some(open) = self.open.get_mut(&id).filter(|open| open.peer == peer) else {
-            self.unknown(peer, id);
+            self.unknown(peer, id, now);
             return;
         };
         if let Some(bytes) = open.fragments.accept(&fragment, now) {
@@ -422,7 +435,7 @@ impl<K: Keys> Sessions<K> {
                         let device = open.device;
                         self.out.push_back(Output::Payload { id, device, bytes });
                     }
-                    None => self.unknown(peer, id),
+                    None => self.unknown(peer, id, now),
                 }
             }
             Some(Frame::Roots { id, roots }) => self.roots(engine, peer, id, &roots, now),
@@ -593,12 +606,15 @@ impl<K: Keys> Sessions<K> {
         }
     }
 
-    /// A frame for a session this node does not hold: its sender told, once.
-    fn unknown(&mut self, peer: K::Peer, id: SessionId) {
-        if self.told.len() >= MAX_TOLD {
+    /// A frame for a session this node does not hold: its sender told, and
+    /// told again every [`TELL_AGAIN_MS`] while it goes on sending.
+    fn unknown(&mut self, peer: K::Peer, id: SessionId, now: u64) {
+        if self.told.len() >= MAX_TOLD && !self.told.contains_key(&id) {
             self.told.clear();
         }
-        if self.told.insert(id) {
+        let due = self.told.get(&id).is_none_or(|told| now >= told.saturating_add(TELL_AGAIN_MS));
+        if due {
+            self.told.insert(id, now);
             self.send(To::Peer(peer), peer, Frame::Close { id, reason: Reason::Ordinary }.encode());
         }
     }
@@ -617,6 +633,11 @@ impl<K: Keys> Sessions<K> {
         self.open.values().any(|open| open.peer == *peer)
             || self.dials.values().any(|dial| dial.peer == *peer)
             || self.held.values().any(|held| held.peer == *peer)
+    }
+
+    /// The peer holding Ed25519 transport key `key`, where it is one.
+    pub fn peer_of(&self, key: &[u8; 32]) -> Option<K::Peer> {
+        self.keys.peer_of(key)
     }
 
     /// The Ed25519 transport key `evidence`'s leaf names that `peer` holds.
@@ -667,4 +688,51 @@ fn believed(engine: &Engine, evidence: &[u8], key: &[u8; 32]) -> Option<DeviceId
 #[must_use]
 pub fn largest_payload(limits: Limits) -> usize {
     limits.frame_len().saturating_sub(PAYLOAD_HEADER)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "a test reports failure by panicking"
+)]
+mod tests {
+    use super::*;
+
+    /// A peer is its transport key, as no platform's convesso needs here.
+    struct Bare;
+
+    impl Keys for Bare {
+        type Peer = [u8; 32];
+
+        fn peer_of(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
+            Some(*key)
+        }
+    }
+
+    /// How many closes `sessions` asked to send since last asked.
+    fn closes(sessions: &mut Sessions<Bare>) -> usize {
+        core::iter::from_fn(|| sessions.poll_output())
+            .filter(|output| matches!(output, Output::Message { .. }))
+            .count()
+    }
+
+    /// **The sender of a session this node does not hold is told again while
+    /// it goes on sending.** Told once, the close could be lost as convesso
+    /// opened the session again, and the sender sent into nothing for good: a
+    /// member a board had closed to make room never reached it again.
+    #[test]
+    fn a_sender_into_nothing_is_told_again_while_it_sends() {
+        let mut sessions = Sessions::new(Bare, Limits::LEAST, Vec::new());
+        let peer = [7; 32];
+        let fragment = transport_wire::fragment::split(0, &[1, 2, 3], FRAGMENT_ROOM).unwrap();
+        let packet = Frame::Packet { id: 42, fragment: fragment[0].clone() }.encode();
+
+        sessions.on_datagram(peer, &packet, 0);
+        assert_eq!(closes(&mut sessions), 1, "told at once");
+        sessions.on_datagram(peer, &packet, TELL_AGAIN_MS / 2);
+        assert_eq!(closes(&mut sessions), 0, "not at every packet");
+        sessions.on_datagram(peer, &packet, TELL_AGAIN_MS + 1);
+        assert_eq!(closes(&mut sessions), 1, "told again, while it goes on sending");
+    }
 }

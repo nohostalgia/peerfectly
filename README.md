@@ -88,8 +88,8 @@ is unknown: *More info → Run anyway*.
 **Linux.** Unpack the archive and run its install script:
 
 ```sh
-tar xzf peerfectly-0.4.1-linux-x86_64.tar.gz
-sudo ./peerfectly-0.4.1-linux-x86_64/install.sh
+tar xzf peerfectly-0.5.0-linux-x86_64.tar.gz
+sudo ./peerfectly-0.5.0-linux-x86_64/install.sh
 ```
 
 The script checks everything it needs before it writes anything, and tells you which packages are
@@ -104,7 +104,7 @@ built it, from which commit, on which runner. To check that a file came out of t
 release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify peerfectly-0.4.1-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+gh attestation verify peerfectly-0.5.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
 ```
 
 That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
@@ -164,9 +164,9 @@ is lowered, so `Laptop` and `laptop` are the same name. Anything else is refused
 would do. Without `--name`, the machine's name is used, made to fit. An admin renames a device with
 `peerfectly rename laptop studio`.
 
-`peerfectly` with no arguments lists every command. Reading — `status`, `peers`, `address`,
-`exposed`, `pending` — and turning your own networks on and off with `up` and `down` need nothing
-more; everything else needs an elevated console on Windows and `sudo` on Linux.
+`peerfectly` with no arguments lists every command. Reading — `status`, `peers`, `revoked`,
+`address`, `exposed`, `pending` — and turning your own networks on and off with `up` and `down`
+need nothing more; everything else needs an elevated console on Windows and `sudo` on Linux.
 
 For many devices at once, such as boards that made their own keys, an admin writes their public
 keys in a batch file and admits them with one consent: `peerfectly admit --batch boards.json

@@ -244,6 +244,40 @@ async fn another_version_is_refused_as_such() {
     assert_eq!(answer, Some(Frame::Refuse { id: 42, reason: Reason::Version }));
 }
 
+/// **A refused open leaves no session.** A peer whose `OPEN` is refused passed
+/// the handshake, and the accepting side closes convesso's session with it
+/// once the refusal has had time to reach it: kept, the keys outlived the
+/// refusal on that side alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_open_leaves_no_session() {
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let founder = ConvessoTransport::bind(&network.founder, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, founder.online()).await.unwrap();
+    let (_raw_node, raw, mut events) = raw_member(&network, &relay).await;
+
+    let founder_key: [u8; 32] = founder.transport_key().as_bytes().try_into().unwrap();
+    let open =
+        Frame::Open { version: 99, id: 42, limits: Limits::LEAST, evidence: Vec::new() }.encode();
+    raw.send_message(Address::parse(founder_key).unwrap(), open).await.unwrap();
+
+    let (refusal, closed) = tokio::time::timeout(PATIENCE, async {
+        let mut refusal = None;
+        while let Some(event) = events.next().await {
+            match event {
+                ContextEvent::Message { data, .. } => refusal = Frame::decode(&data),
+                ContextEvent::Closed { by_peer, .. } => return (refusal, Some(by_peer)),
+                _ => {}
+            }
+        }
+        (refusal, None)
+    })
+    .await
+    .expect("the session closes");
+    assert_eq!(refusal, Some(Frame::Refuse { id: 42, reason: Reason::Version }), "refused first");
+    assert_eq!(closed, Some(true), "the accepting side closed it");
+}
+
 /// The next frame `events` delivers as a message.
 async fn next_frame(events: &mut ContextEvents) -> Option<Frame> {
     tokio::time::timeout(PATIENCE, async {

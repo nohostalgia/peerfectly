@@ -185,11 +185,25 @@ fn a_branch_set_aside_that_grows_heavier_is_switched_to() {
     let (onward, onward_state) =
         root_at(&history, "onward", lighter_seed, Some((&lighter, &lighter_state)));
 
+    // Held to no bytes at all too: the root last set aside is kept, or the one
+    // continuing it would ask for the chain, be handed that root, forget it
+    // again, and never be switched to.
+    for bytes in [roster::light::DEFAULT_DELTA_BYTES, 0] {
+        let mut view = LightView::starting_from(&base, 16).with_delta_bytes(bytes);
+        assert_eq!(view.offer(&heavier), RootOutcome::Adopted);
+        assert_eq!(view.offer(&lighter), RootOutcome::KeptAside);
+        assert_eq!(
+            view.offer(&onward),
+            RootOutcome::Switched,
+            "the chain it was handed is enough, held to {bytes} bytes"
+        );
+        assert_eq!(view.current(), Some(onward.root));
+    }
+
     let mut view = LightView::starting_from(&base, 16);
     assert_eq!(view.offer(&heavier), RootOutcome::Adopted);
     assert_eq!(view.offer(&lighter), RootOutcome::KeptAside);
-    assert_eq!(view.offer(&onward), RootOutcome::Switched, "the chain it was handed is enough");
-    assert_eq!(view.current(), Some(onward.root));
+    assert_eq!(view.offer(&onward), RootOutcome::Switched);
 
     // Device 9, whose leaf neither branch changed: one both changed stays
     // refused until a root joins them, as every invalidation not yet joined.
@@ -265,6 +279,51 @@ fn a_proof_older_than_memory_must_be_renewed() {
     assert_eq!(view.remembered(), 2, "memory is bounded");
     assert_eq!(judged(&view, &first_state, 2), ProofVerdict::Renew);
     assert_eq!(judged(&view, &previous.1, 2), ProofVerdict::Accepted);
+}
+
+#[test]
+fn memory_held_to_its_bytes_forgets_the_oldest_roots_not_the_revocations() {
+    let mut history = founded();
+    let (first, first_state) = root_at(&history, "m3", 1, None);
+    // Room for about two roots of one change each, whatever the count allows.
+    let mut view = LightView::starting_from(&first, 64).with_delta_bytes(400);
+    let mut previous = (first.clone(), first_state.clone());
+    let mut parent = "m3".to_owned();
+    for step in 0..4 {
+        let label = format!("r{step}");
+        history.op(
+            &label,
+            1,
+            &[parent.as_str()],
+            OperationBody::Rename { device: device_id(3), name: format!("n{step}") },
+        );
+        let next = root_at(&history, &label, 1, Some((&previous.0, &previous.1)));
+        assert_eq!(view.offer(&next.0), RootOutcome::Adopted);
+        previous = next;
+        parent = label;
+    }
+    assert!(view.remembered() < 5, "the bytes bound memory before the count does");
+    assert_eq!(view.current(), Some(previous.0.root), "the current root is kept");
+    assert_eq!(judged(&view, &first_state, 2), ProofVerdict::Renew);
+    assert_eq!(judged(&view, &previous.1, 2), ProofVerdict::Accepted);
+
+    // A revocation still cuts the device, however little is remembered.
+    history.op(
+        "revoke2",
+        1,
+        &[parent.as_str()],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
+    );
+    let (revoked, _) = root_at(&history, "revoke2", 1, Some((&previous.0, &previous.1)));
+    assert_eq!(view.offer(&revoked), RootOutcome::Adopted);
+    assert_eq!(judged(&view, &previous.1, 2), ProofVerdict::Refused);
+
+    // Held to nothing, it still keeps the current root and the one before it,
+    // where a sibling of the current one is placed.
+    let view = view.with_delta_bytes(0);
+    assert_eq!(view.remembered(), 2);
+    assert_eq!(view.current(), Some(revoked.root));
+    assert_eq!(judged(&view, &previous.1, 2), ProofVerdict::Refused);
 }
 
 #[test]

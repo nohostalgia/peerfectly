@@ -12,6 +12,7 @@
 //! would be true only by coincidence.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use roster::id::{DeviceId, KeyId};
 use roster::roster::Roster;
@@ -27,8 +28,6 @@ use crate::control::{Accused, Act, Branch, Contact, Named, Revocation, Revoked, 
 pub(crate) struct Membership {
     /// How every device is named.
     pub(crate) directory: Directory,
-    /// The devices held as revoked.
-    pub(crate) revoked: Vec<Revoked>,
     /// The devices with evidence against them.
     pub(crate) accused: Vec<Accused>,
     /// When each device was last in contact with this one.
@@ -148,7 +147,9 @@ pub(crate) fn contact(contacts: &LastContacts, device: &DeviceId) -> Contact {
         .map_or(Contact::NoneRecorded, |at| Contact::Recorded { at })
 }
 
-/// Every device the roster holds as revoked, with every valid revocation of it.
+/// A page of the devices the roster holds as revoked, by id, after `after`
+/// (`None`: the first), with every valid revocation of each; and where the next
+/// page begins, while more remain.
 ///
 /// Built from the revoked set, not from the revocations: a roster adopted from a
 /// snapshot can hold a device as revoked with the operation that did it long
@@ -162,10 +163,17 @@ pub(crate) fn revoked(
     state: &RosterState,
     valid: &[&VerifiedOperation],
     contacts: &LastContacts,
-) -> Vec<Revoked> {
-    state
-        .revoked
-        .iter()
+    after: Option<DeviceId>,
+) -> (Vec<Revoked>, Option<String>) {
+    let mut listed = match after {
+        Some(after) => state.revoked.range((Excluded(after), Unbounded)),
+        None => state.revoked.range(..),
+    };
+    let page: Vec<&DeviceId> = listed.by_ref().take(crate::control::PEERS_PAGE).collect();
+    let more = listed.next().is_some();
+    let next = more.then(|| page.last().map(|device| device.to_hex())).flatten();
+    let revoked = page
+        .into_iter()
         .map(|device| Revoked {
             device: directory.named(device),
             revocations: valid
@@ -185,7 +193,8 @@ pub(crate) fn revoked(
                 .collect(),
             last_contact: contact(contacts, device),
         })
-        .collect()
+        .collect();
+    (revoked, next)
 }
 
 /// One pair per accused device, and how many pairs it has.
@@ -496,7 +505,7 @@ mod tests {
         let roster = history.roster(64);
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let revoked = revoked(&directory, &state, &held, &LastContacts::default());
+        let (revoked, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
 
         let laptop = revoked
             .iter()
@@ -541,7 +550,7 @@ mod tests {
         let roster = history.roster(64);
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let listed = revoked(&directory, &state, &held, &LastContacts::default());
+        let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let laptop = listed.first().unwrap();
         let mut by: Vec<Option<&str>> =
             laptop.revocations.iter().map(|entry| name(&entry.by)).collect();
@@ -592,7 +601,7 @@ mod tests {
 
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let listed = revoked(&directory, &state, &held, &LastContacts::default());
+        let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let reasons: Vec<&str> = listed
             .iter()
             .flat_map(|entry| entry.revocations.iter())
@@ -646,7 +655,7 @@ mod tests {
 
         let (state, valid, directory) = view(&roster);
         let held: Vec<&VerifiedOperation> = valid.iter().collect();
-        let listed = revoked(&directory, &state, &held, &LastContacts::default());
+        let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let laptop =
             listed.iter().find(|entry| entry.device.id == crate::control::short_id(&id(2)));
         assert!(laptop.is_none(), "not among the revoked");
@@ -654,6 +663,37 @@ mod tests {
     }
 
     // ---- 5.x equivocation -----------------------------------------------------
+
+    /// The revoked are listed a page at a time, by id: every one once, to the
+    /// last, and the cursor says where the next begins only while more remain.
+    #[test]
+    fn the_revoked_are_listed_a_page_at_a_time() {
+        let roster = History::founded_by(1, "nas").roster(64);
+        let (mut state, valid, directory) = view(&roster);
+        let held: Vec<&VerifiedOperation> = valid.iter().collect();
+        for n in 0..250_u32 {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&n.to_be_bytes());
+            state.revoked.insert(DeviceId::from_bytes(bytes));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut after = None;
+        let mut pages = 0_usize;
+        loop {
+            let (page, next) = revoked(&directory, &state, &held, &LastContacts::default(), after);
+            assert!(page.len() <= crate::control::PEERS_PAGE);
+            for entry in page {
+                assert!(seen.insert(entry.device.id.clone()), "{} listed twice", entry.device.id);
+            }
+            pages = pages.saturating_add(1);
+            let Some(next) = next else { break };
+            let bytes: [u8; 32] = hex::decode(next).unwrap().try_into().unwrap();
+            after = Some(DeviceId::from_bytes(bytes));
+        }
+        assert_eq!(seen.len(), 250, "every one, once");
+        assert_eq!(pages, 3);
+    }
 
     #[test]
     fn an_equivocation_is_described_by_its_branches() {

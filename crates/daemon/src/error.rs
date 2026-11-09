@@ -175,6 +175,13 @@ pub enum Error {
         cause: String,
     },
 
+    /// A peer was reached, and had no room for this device's session each
+    /// time it was tried. It is there: never rested on as an unreachable one.
+    Busy {
+        /// What the transport said.
+        cause: String,
+    },
+
     /// A command needs the tunnel up and it is down.
     NotUp,
 
@@ -234,7 +241,7 @@ impl fmt::Display for Error {
             ),
             Self::Parameters { cause } => write!(f, "the network parameters are unusable: {cause}"),
             Self::Refused { cause } => write!(f, "the operation was not recorded: {cause}"),
-            Self::Unreachable { cause } => f.write_str(cause),
+            Self::Unreachable { cause } | Self::Busy { cause } => f.write_str(cause),
             Self::NotUp => f.write_str("the tunnel is not up"),
             Self::NotRunning => f.write_str("the daemon is not running"),
         }

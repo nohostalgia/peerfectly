@@ -628,11 +628,14 @@ pub struct Network {
     /// turn to, and those an anchor is chosen from. Few in any network.
     #[serde(default)]
     pub full_members: Vec<Named>,
-    /// The devices this device holds as revoked from it.
+    /// How many devices this device holds as revoked from it.
     ///
     /// What this device knows, not an account of the network: a revocation signed
-    /// elsewhere that has not arrived is not here.
-    pub revoked: Vec<Revoked>,
+    /// elsewhere that has not arrived is not counted. The devices themselves are
+    /// asked a page at a time ([`Command::Revoked`]): they only grow, and a
+    /// network's history is not put into every answer.
+    #[serde(default)]
+    pub revoked_count: usize,
     /// What is wrong in it now: the latest fault, if recent.
     ///
     /// One, and no history. The history is the service's log; a surface needs
@@ -821,6 +824,17 @@ pub struct PeersPage {
     pub network: String,
     /// The devices, at most [`PEERS_PAGE`].
     pub peers: Vec<Peer>,
+    /// Where the next page begins, while more remain.
+    pub after: Option<String>,
+}
+
+/// A page of the devices a network holds as revoked, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedPage {
+    /// The network.
+    pub network: String,
+    /// The devices, at most [`PEERS_PAGE`].
+    pub revoked: Vec<Revoked>,
     /// Where the next page begins, while more remain.
     pub after: Option<String>,
 }
@@ -1210,7 +1224,12 @@ impl Command {
         match self {
             // Reading. What comes back is bounded by what the reader may see.
             Self::Status | Self::Waiting => Needs::Nobody,
-            Self::Peers { network, .. } | Self::Address { network } | Self::Pending { network } => {
+            // Opening a session with a member, as `peers` does with each.
+            Self::Reach { network, .. } => Needs::TheOwnerOf(Some(network.clone())),
+            Self::Peers { network, .. }
+            | Self::Revoked { network, .. }
+            | Self::Address { network }
+            | Self::Pending { network } => {
                 match network {
                     // Naming none is asking about everything this person holds,
                     // which is the same question as `Status`.
@@ -1293,6 +1312,25 @@ pub enum Command {
         /// networks carry the first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
+    },
+    /// List the devices a network holds as revoked, with every revocation of
+    /// each.
+    Revoked {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The page after this one, as [`RevokedPage::after`] gave it; `None`
+        /// asks for the first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// Opens a session with the member whose transport key is `transport`,
+    /// now: a board just admitted learns it at once rather than at its next
+    /// attempt.
+    Reach {
+        /// Which network, by name.
+        network: String,
+        /// The member's transport key, hex.
+        transport: String,
     },
     /// Show this device's own overlay address in a network.
     Address {
@@ -1746,6 +1784,7 @@ impl Command {
         ("up", true),
         ("down", true),
         ("peers", true),
+        ("revoked", true),
         ("address", true),
         ("stop", false),
         // How a network survives the account that made it being deleted. A
@@ -2145,6 +2184,7 @@ impl Command {
             "up" => Ok(Self::Up { network }),
             "down" => Ok(Self::Down { network }),
             "peers" => Ok(Self::Peers { network, after: None }),
+            "revoked" => Ok(Self::Revoked { network, after: None }),
             "address" => Ok(Self::Address { network }),
             "stop" => Ok(Self::Stop),
             "takeownership" => Ok(Self::TakeOwnership { network }),
@@ -2183,6 +2223,8 @@ impl Command {
         match self {
             Self::Status
             | Self::Peers { .. }
+            | Self::Revoked { .. }
+            | Self::Reach { .. }
             | Self::Address { .. }
             | Self::Exposed { .. }
             | Self::Pending { .. }
@@ -2266,6 +2308,7 @@ impl Command {
             Self::Up { .. } => "up",
             Self::Down { .. } => "down",
             Self::Peers { .. } => "peers",
+            Self::Revoked { .. } => "revoked",
             Self::Address { .. } => "address",
             Self::Stop => "stop",
             Self::TakeOwnership { .. } => "takeownership",
@@ -2287,6 +2330,8 @@ impl Command {
         let (word, network) = match self {
             Self::Status
             | Self::Peers { .. }
+            | Self::Revoked { .. }
+            | Self::Reach { .. }
             | Self::Address { .. }
             | Self::Waiting
             | Self::Pending { .. }
@@ -2339,6 +2384,7 @@ impl Outcome {
             Self::Done => "done",
             Self::Provisioning(_) => "provisioning",
             Self::Peers(_) => "peers",
+            Self::Revoked(_) => "revoked",
             Self::Invited { .. } => "invited",
             Self::JoinStarted { .. } => "joining",
             Self::Pending(_) => "pending",
@@ -2458,7 +2504,9 @@ pub struct Provisioning {
     pub params: String,
     /// The network's relay, as written in its parameters.
     pub relay: String,
-    /// The evidence of each of the network's anchors, against that root.
+    /// The evidence, against that root, of the full members a board turns to:
+    /// the network's anchors, or where it names none, a few of its full
+    /// members, admins first.
     pub anchors: Vec<String>,
 }
 
@@ -2607,6 +2655,9 @@ pub enum Outcome {
 
     /// A page of a network's other devices, after the one asked.
     Peers(PeersPage),
+
+    /// A page of the devices a network holds as revoked.
+    Revoked(RevokedPage),
 
     /// A join has begun, and waits until it is admitted or cancelled.
     ///
@@ -2905,7 +2956,7 @@ mod tests {
             reachable_count: 0,
             peers_after: None,
             full_members: Vec::new(),
-            revoked: Vec::new(),
+            revoked_count: 0,
             problem: None,
         }
     }
@@ -3732,7 +3783,7 @@ mod tests {
             },
             second: Branch { does: Act::Admits(named(hostile, 3)), depth: None },
         }];
-        network.revoked = vec![Revoked {
+        let revoked = vec![Revoked {
             device: named(hostile, 4),
             revocations: vec![Revocation {
                 by: named(hostile, 5),
@@ -3747,7 +3798,7 @@ mod tests {
             at: SystemTime::UNIX_EPOCH,
         });
 
-        let drawn = report.to_string();
+        let drawn = format!("{report}{}", crate::views::RevokedRows(&revoked));
         assert!(!drawn.contains('\u{1b}'), "an escape reached the terminal: {drawn:?}");
         assert!(!drawn.contains('\u{202e}'), "an override reached the terminal: {drawn:?}");
     }
@@ -3774,8 +3825,7 @@ mod tests {
     #[test]
     fn a_revoked_device_is_listed_as_held_here_with_the_signers_clock() {
         let then = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1_757_000_000)).unwrap();
-        let mut report = report(Standing::Current);
-        the_one(&mut report).revoked = vec![
+        let revoked = vec![
             Revoked {
                 device: named("laptop", 4),
                 revocations: vec![Revocation {
@@ -3792,9 +3842,9 @@ mod tests {
             },
         ];
 
-        let drawn = report.to_string();
+        let drawn = crate::views::RevokedRows(&revoked).to_string();
         let said = said(&drawn);
-        assert!(said.contains("the revocations this device holds"), "{drawn}");
+        assert!(said.contains("laptop"), "{drawn}");
         // 2025-09-04 15:33 UTC: the 4th or the 5th in any zone, never the seconds.
         assert!(said.contains("the revoking device's clock said 2025-09-0"), "{drawn}");
         assert!(!said.contains("1757000000"), "{drawn}");

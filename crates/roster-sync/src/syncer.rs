@@ -312,7 +312,8 @@ impl Syncer {
             }
         }
 
-        match message {
+        let pending = self.pending_now();
+        let mut reception = match message {
             Message::Offer(offer) => self.answer_offer(peer, &offer),
             Message::Transfer(operations) => self.take_operations(peer, &operations),
             Message::Pieces(pieces) => self.take_pieces(peer, &pieces),
@@ -321,6 +322,43 @@ impl Syncer {
             Message::Snapshot(bytes) => self.take_snapshot(peer, &bytes),
             Message::Attestation(bytes) => self.take_attestation(peer, &bytes),
             Message::Digest(digest) => self.answer_digest(peer, digest),
+        };
+        self.report_released(pending, &mut reception);
+        reception
+    }
+
+    /// The operations held pending now, with their bytes as they arrived.
+    fn pending_now(&self) -> Vec<(OperationId, Vec<u8>)> {
+        if self.roster.pending_count() == 0 {
+            return Vec::new();
+        }
+        self.roster
+            .pending_ids()
+            .into_iter()
+            .filter_map(|id| self.roster.pending_bytes(&id).map(|bytes| (id, bytes)))
+            .collect()
+    }
+
+    /// Reports as accepted those of `pending` that entered the verified set
+    /// meanwhile, a parent having arrived: they are kept as the operations a
+    /// message brought are.
+    ///
+    /// Reported by nothing else. An operation let in this way and not kept is
+    /// in the graph only until the next restart, and every operation kept
+    /// after it, resting on it, is then one the log cannot place.
+    fn report_released(&self, pending: Vec<(OperationId, Vec<u8>)>, reception: &mut Reception) {
+        if pending.is_empty() {
+            return;
+        }
+        let waiting = self.roster.waiting_headers();
+        for (id, bytes) in pending {
+            let entered = self.roster.pending_bytes(&id).is_none()
+                && (self.roster.dag().contains(&id)
+                    || waiting.iter().any(|(batch, _)| *batch == id));
+            if entered && !reception.admitted.contains(&id) {
+                reception.admitted.push(id);
+                reception.accepted.push(bytes);
+            }
         }
     }
 

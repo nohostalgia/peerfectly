@@ -25,7 +25,7 @@
 
 use core::fmt;
 
-use crate::control::{Contact, Network, Peer, Report, Signed, shown};
+use crate::control::{Contact, Network, Peer, Report, Revoked, Signed, shown};
 use crate::drawing::Block;
 
 impl Report {
@@ -82,6 +82,36 @@ impl fmt::Display for PeerRows<'_> {
         for peer in self.0 {
             writeln!(f)?;
             write!(f, "{}", entry_for(peer))?;
+        }
+        Ok(())
+    }
+}
+
+/// A page of the devices a network holds as revoked, as `revoked` draws it:
+/// each with every revocation of it, and the revoker's clock presented as the
+/// revoker's claim, never as when it happened.
+#[derive(Debug, Clone, Copy)]
+pub struct RevokedRows<'a>(pub &'a [Revoked]);
+
+impl fmt::Display for RevokedRows<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for revoked in self.0 {
+            writeln!(f)?;
+            writeln!(f, "  {} — {}", revoked.device, revoked.last_contact)?;
+            for revocation in &revoked.revocations {
+                let clock = match revocation.signer_clock {
+                    Signed::At { time } => {
+                        format!("the revoking device's clock said {}", crate::drawing::when(time))
+                    }
+                    _ => "the revoking device recorded no time".to_owned(),
+                };
+                writeln!(
+                    f,
+                    "    by {}: \"{}\" ({clock})",
+                    revocation.by,
+                    shown(&revocation.reason)
+                )?;
+            }
         }
         Ok(())
     }
@@ -301,10 +331,13 @@ fn counted(network: &Network) -> String {
     let others = network.peer_count.max(network.peers.len());
     let devices = others.saturating_add(usize::from(network.name.is_some()));
     let word = if devices == 1 { "device" } else { "devices" };
-    if network.revoked.is_empty() {
-        format!("{devices} {word}")
-    } else {
-        format!("{devices} {word}, {} revoked", network.revoked.len())
+    // Counted, not listed: they only grow, and are a command of their own.
+    match network.revoked_count {
+        0 => format!("{devices} {word}"),
+        revoked => format!(
+            "{devices} {word} · {revoked} revoked: peerfectly revoked {}",
+            shown(&network.label)
+        ),
     }
 }
 
@@ -400,27 +433,6 @@ fn warnings(network: &Network, block: &mut Block) {
         block.plain("  to compare the code and admit it:  peerfectly resume");
     }
 
-    if !network.revoked.is_empty() {
-        block.blank();
-        block.plain("revoked — the revocations this device holds:");
-        for revoked in &network.revoked {
-            block.plain(format!("  {} — {}", revoked.device, revoked.last_contact));
-            for revocation in &revoked.revocations {
-                let clock = match revocation.signer_clock {
-                    Signed::At { time } => {
-                        format!("the revoking device's clock said {}", crate::drawing::when(time))
-                    }
-                    _ => "the revoking device recorded no time".to_owned(),
-                };
-                block.plain(format!(
-                    "    by {}: \"{}\" ({clock})",
-                    revocation.by,
-                    shown(&revocation.reason)
-                ));
-            }
-        }
-    }
-
     // One line, the latest and only while recent. The history is the service's
     // log; a list here kept showing failures long since over.
     if let Some(problem) = &network.problem {
@@ -495,7 +507,7 @@ mod tests {
             reachable_count: 0,
             peers_after: None,
             full_members: Vec::new(),
-            revoked: Vec::new(),
+            revoked_count: 0,
             problem: None,
         }
     }

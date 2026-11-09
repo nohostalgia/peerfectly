@@ -290,17 +290,24 @@ pub fn provisioning(roster: &Roster) -> Option<crate::control::Provisioning> {
             &copied
         }
     };
-    let anchors = state
-        .params
-        .anchors
+    // Whom a board turns to: the network's anchors; where it names none (a
+    // home network), a few of its full members, admins first, since an admin
+    // signs the roots a board holds. Without any, a board admitted has nobody
+    // it knows how to reach.
+    let full = |device: &roster::id::DeviceId| {
+        state.devices.get(device).is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Full)
+    };
+    let turned_to: Vec<roster::id::DeviceId> = if state.params.anchors.is_empty() {
+        let mut fulls = state.devices.full_members();
+        fulls.sort_by_key(|device| !state.is_admin(device));
+        fulls.truncate(light_node::seeking::FULLS_PER_MEMBER);
+        fulls
+    } else {
+        state.params.anchors.iter().copied().filter(|anchor| full(anchor)).collect()
+    };
+    let anchors = turned_to
         .iter()
-        .filter(|anchor| {
-            state
-                .devices
-                .get(anchor)
-                .is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Full)
-        })
-        .map(|anchor| evidence_of(roster, anchor))
+        .map(|device| evidence_of(roster, device))
         .filter(|evidence| !evidence.is_empty())
         .map(hex::encode)
         .collect();
@@ -346,6 +353,44 @@ mod tests {
         let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted(), "the genesis is accepted");
         (roster, founder, bytes)
+    }
+
+    /// A board provisioned for a network with no anchors is given its admin,
+    /// a full member, to turn to: given nobody, it would be admitted and reach
+    /// no one.
+    #[test]
+    fn a_network_without_anchors_gives_a_board_its_admin() {
+        let founder = NodeIdentity::generate().expect("generates");
+        let mut params =
+            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                .expect("valid");
+        params.relay = Some(format!("{}@relay.example:8443", "ab".repeat(32)));
+        let genesis = OperationCore::new(
+            1,
+            founder.signing_key().algorithm(),
+            OperationBody::CreateNetwork {
+                device: founder.device_spec("laptop", Role::Admin, true, vec![]).expect("spec"),
+                params,
+            },
+            vec![],
+            founder.signing_key().key_id(),
+            roster::id::NetworkId::from_bytes([0; 32]),
+        )
+        .expect("well-formed");
+        let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
+        assert!(
+            roster.offer_bytes(&founder.sign_operation(&genesis).expect("signs")).is_accepted()
+        );
+        let bytes = sign_over_heads(&roster, &founder).expect("an admin signs");
+        assert!(roster.offer_snapshot(&bytes).is_accepted());
+
+        let given = provisioning(&roster).expect("a bundle");
+        assert_eq!(given.anchors.len(), 1, "the admin, and nobody else to give");
+        let evidence = roster::membership::Evidence::from_bytes(
+            &hex::decode(given.anchors.first().unwrap()).unwrap(),
+        )
+        .expect("evidence");
+        assert_eq!(evidence.leaf.record.id, founder.device_id());
     }
 
     /// The same, for tests that do not need the bytes.

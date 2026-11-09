@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use convesso_core::handshake::DialError;
+use convesso_core::handshake::{DialError, RefusalCode};
 use convesso_core::identity::{Address, Identity, PeerId};
 use convesso_core::paths::PathKind;
 use convesso_tokio::entropy::OsEntropy;
@@ -39,6 +39,15 @@ pub const CONTEXT: &[u8] = b"peerfectly/transport";
 
 /// The close code sent to convesso when a peer stops being a member.
 const CLOSE_MEMBERSHIP: u16 = 0x0101;
+/// How long before the sender of a session this node does not hold is told so
+/// again, while it goes on sending.
+const TELL_AGAIN: Duration = Duration::from_secs(2);
+/// convesso's close code for a peer whose open was refused, and which holds no
+/// other session here.
+const CLOSE_REFUSED: u16 = 0x0102;
+/// How long a refused peer's session is kept for the refusal to reach it:
+/// less than any dialler rests before it tries again.
+const REFUSED_GRACE: Duration = Duration::from_secs(5);
 
 /// How long after a change of network convesso is told: long enough for
 /// several changes the system reports together (Wi-Fi gone, then mobile data
@@ -190,10 +199,12 @@ struct Shared {
     catch_ups: std::sync::Mutex<HashMap<SessionId, CatchUp>>,
     /// Opens held while their roots are asked for, by session.
     held_opens: std::sync::Mutex<HashMap<SessionId, HeldOpen>>,
+    /// When each peer was last refused, until its session is closed.
+    refusals: std::sync::Mutex<HashMap<PeerId, tokio::time::Instant>>,
     /// Sessions already answered with roots: once each.
     answered: std::sync::Mutex<HashSet<SessionId>>,
-    /// Sessions this node does not hold whose sender was told so: once each.
-    unknown: std::sync::Mutex<HashSet<SessionId>>,
+    /// Sessions this node does not hold whose sender was told so, and when.
+    unknown: std::sync::Mutex<HashMap<SessionId, tokio::time::Instant>>,
     /// The access policy, and the groups it is decided over.
     policy: std::sync::RwLock<Policy>,
     /// This device.
@@ -414,8 +425,9 @@ impl ConvessoTransport {
             roots: std::sync::RwLock::new(None),
             catch_ups: std::sync::Mutex::new(HashMap::new()),
             held_opens: std::sync::Mutex::new(HashMap::new()),
+            refusals: std::sync::Mutex::new(HashMap::new()),
             answered: std::sync::Mutex::new(HashSet::new()),
-            unknown: std::sync::Mutex::new(HashSet::new()),
+            unknown: std::sync::Mutex::new(HashMap::new()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             accepted_from: std::sync::Mutex::new(HashMap::new()),
             dials: std::sync::Mutex::new(HashMap::new()),
@@ -963,6 +975,13 @@ const fn refusal_of(reason: Reason) -> Error {
 /// A failed dial, as the interface says it.
 fn dial_failed(error: &DialError) -> Error {
     match error {
+        // convesso's own codes for a peer with no room now: its handshakes or
+        // its sessions are all taken, or it sheds load.
+        DialError::Refused(code)
+            if *code == RefusalCode::CAPACITY_EXHAUSTED || *code == RefusalCode::BUSY =>
+        {
+            Error::PeerBusy
+        }
         DialError::Refused(code) => crate::members::refusal(code.get())
             .unwrap_or_else(|| Error::PeerUnreachable { cause: Some(error.to_string()) }),
         DialError::UnsupportedVersion(_) => Error::IncompatibleVersion,
@@ -1300,7 +1319,7 @@ fn answer_behind(shared: &Shared, peer: PeerId, id: SessionId, root: [u8; 32]) {
 
 /// Roots that arrived for a dial or an open waiting on them; anything else is
 /// dropped.
-fn roots_arrived(shared: &Shared, peer: PeerId, id: SessionId, roots: Vec<u8>) {
+fn roots_arrived(shared: &Arc<Shared>, peer: PeerId, id: SessionId, roots: Vec<u8>) {
     let waiting = shared.catch_ups.lock().ok().and_then(|mut waiting| {
         if waiting.get(&id).is_some_and(|(from, _)| *from == peer) {
             waiting.remove(&id)
@@ -1325,8 +1344,7 @@ fn roots_arrived(shared: &Shared, peer: PeerId, id: SessionId, roots: Vec<u8>) {
     if taken {
         opened(shared, peer, open.version, id, &open.evidence, false);
     } else {
-        let refuse = Frame::Refuse { id, reason: Reason::NotAMember }.encode();
-        let _ = shared.outbound.send(Out::Reply(peer, refuse));
+        refused(shared, peer, id, Reason::NotAMember);
     }
 }
 
@@ -1349,22 +1367,56 @@ fn key_shown_by(peer: &PeerId, evidence: &[u8]) -> Option<(PublicKey, Address)> 
     })
 }
 
+/// Refuses `peer`'s open `id`, and where this node will not talk to it, closes
+/// convesso's session with it once the refusal has had time to reach it, if
+/// nothing else has been said to it since, nor anything opened with it.
+///
+/// A peer this node will not talk to keeps no session keys here: it passed the
+/// handshake (another version, groups that do not allow it, a revocation since,
+/// or a node holding no roster, which admits every handshake), and left open,
+/// the session would outlive the refusal on this side alone. Closed at once,
+/// the close overtakes the refusal, and the peer is told nothing. A member
+/// refused for want of room keeps its session, and opens again on it.
+fn refused(shared: &Arc<Shared>, peer: PeerId, id: SessionId, reason: Reason) {
+    let _ = shared.outbound.send(Out::Reply(peer, Frame::Refuse { id, reason }.encode()));
+    if reason == Reason::Ordinary {
+        return;
+    }
+    let at = tokio::time::Instant::now();
+    let Ok(mut refusals) = shared.refusals.lock() else { return };
+    refusals.insert(peer, at);
+    drop(refusals);
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        tokio::time::sleep(REFUSED_GRACE).await;
+        // A later refusal closes in its own time.
+        let latest = shared.refusals.lock().is_ok_and(|mut refusals| {
+            let latest = refusals.get(&peer) == Some(&at);
+            if latest {
+                refusals.remove(&peer);
+            }
+            latest
+        });
+        if latest && !speaks_to(&shared, &peer) {
+            let _ = shared.outbound.send(Out::Close(peer, CLOSE_REFUSED));
+        }
+    });
+}
+
 /// A peer opens a session with this node.
 ///
 /// Where this node holds no roster and cannot place the root the evidence
 /// rests on, the open is held while the roots are asked for, unless
 /// `may_catch_up` is false: once they are taken, it is judged again here.
 fn opened(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     peer: PeerId,
     version: u8,
     id: SessionId,
     evidence: &[u8],
     may_catch_up: bool,
 ) {
-    let refuse = |reason: Reason| {
-        let _ = shared.outbound.send(Out::Reply(peer, Frame::Refuse { id, reason }.encode()));
-    };
+    let refuse = |reason: Reason| refused(shared, peer, id, reason);
     if version != VERSION {
         refuse(Reason::Version);
         return;
@@ -1433,7 +1485,7 @@ fn opened(
 }
 
 /// A reliable message from `peer`.
-async fn on_message(shared: &Shared, peer: PeerId, data: &[u8]) {
+async fn on_message(shared: &Arc<Shared>, peer: PeerId, data: &[u8]) {
     // A part waits for the rest of its frame. From a peer this node does not
     // yet speak to, nothing larger than an opening: a node holding no roster
     // admits every handshake, and a stranger would make it hold frames' worth
@@ -1493,21 +1545,28 @@ fn on_datagram(shared: &Shared, peer: PeerId, data: &[u8]) {
 }
 
 /// A frame for a session this node does not hold: one it closed, or one it
-/// lost by restarting. The sender is told, once per session, so that it ends
-/// the session rather than carry on into nothing.
+/// lost by restarting. The sender is told, and told again every
+/// [`TELL_AGAIN`] while it goes on sending, so that it ends the session rather
+/// than carry on into nothing: told once, the close could be lost as convesso
+/// opened the session again.
 ///
 /// convesso tells a restart only when a message was cut half way: a peer that
 /// restarted between messages takes the next one as a new start, silently. A
 /// node that kept a session with it would otherwise send into it until that
 /// session closed on its own, which, held open, is never.
 fn unknown_session(shared: &Shared, peer: PeerId, id: SessionId) {
-    let first = shared.unknown.lock().is_ok_and(|mut told| {
-        if told.len() >= MAX_ANSWERED {
+    let now = tokio::time::Instant::now();
+    let due = shared.unknown.lock().is_ok_and(|mut told| {
+        if told.len() >= MAX_ANSWERED && !told.contains_key(&id) {
             told.clear();
         }
-        told.insert(id)
+        let due = told.get(&id).is_none_or(|at| now.duration_since(*at) >= TELL_AGAIN);
+        if due {
+            told.insert(id, now);
+        }
+        due
     });
-    if first {
+    if due {
         let close = Frame::Close { id, reason: Reason::Ordinary }.encode();
         let _ = shared.outbound.send(Out::Reply(peer, close));
     }
@@ -1536,6 +1595,12 @@ mod tests {
         assert_eq!(dial_failed(&refused(NOT_A_MEMBER)), Error::NotAMember);
         assert_eq!(dial_failed(&refused(REVOKED)), Error::Revoked);
         assert!(matches!(dial_failed(&refused(0x0200)), Error::PeerUnreachable { .. }));
+        // A peer with no room is there, and is tried again soon.
+        assert_eq!(
+            dial_failed(&DialError::Refused(RefusalCode::CAPACITY_EXHAUSTED)),
+            Error::PeerBusy
+        );
+        assert_eq!(dial_failed(&DialError::Refused(RefusalCode::BUSY)), Error::PeerBusy);
         assert!(matches!(dial_failed(&DialError::NoResponse), Error::PeerUnreachable { .. }));
 
         // The same refusal, reaching a reader as a reset before the dial's own

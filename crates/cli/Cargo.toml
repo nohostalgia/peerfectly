@@ -12,6 +12,11 @@ rust-version.workspace = true
 daemon = { path = "../daemon" }
 # Reading what is about to be signed off the bytes themselves.
 roster = { path = "../roster" }
+# `board`: the lines a board is provisioned in, and the anchors it turns to.
+light-node = { path = "../light-node" }
+# `board`: the board's serial port. Without libudev: a port is named, or found
+# among those the system lists.
+serialport = { version = "4.10.1", default-features = false }
 async-trait.workspace = true
 # `signal`: Ctrl+C on a waiting join abandons it in the daemon too.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }

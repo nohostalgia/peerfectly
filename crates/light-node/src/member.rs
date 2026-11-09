@@ -22,7 +22,11 @@ use crate::lookup::Query;
 use crate::sessions::{DialFailure, Keys, Sessions, To};
 
 /// How many full members a light member keeps in touch with.
-pub const KEPT: usize = 2;
+///
+/// One: a microcontroller's convesso holds four sessions, the relay's among
+/// them, and every session kept is one fewer for the members that come to it.
+/// The others are reached when there is something to say to them.
+pub const KEPT: usize = 1;
 
 /// How long a peer that did not answer is first rested, in milliseconds.
 pub const FIRST_REST_MS: u64 = 60_000;
@@ -32,6 +36,14 @@ pub const LONGEST_REST_MS: u64 = 6 * 60 * 60 * 1_000;
 
 /// The longest a peer is rested by a member awaiting admission.
 pub const LONGEST_REST_AWAITING_MS: u64 = 5 * 60 * 1_000;
+
+/// How long a peer is rested by a member awaiting admission in its first
+/// minutes: a board admitted right after it was provisioned joins within one.
+pub const EAGER_REST_MS: u64 = 30_000;
+
+/// How long after it starts a member awaiting admission rests its peers that
+/// little, before the rests grow.
+pub const EAGER_FOR_MS: u64 = 10 * 60 * 1_000;
 
 /// What the host is to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +64,9 @@ pub enum Action<P> {
     Datagram {
         /// To whom.
         to: P,
+        /// Its Ed25519 transport key: the address to send to, which opens the
+        /// convesso session again where it was forgotten, its keys expired.
+        key: [u8; 32],
         /// A packet's fragment, framed.
         bytes: Vec<u8>,
     },
@@ -78,6 +93,8 @@ pub struct Member<K: Keys> {
     tunnel: Option<tunnel::Tunnel>,
     resting: BTreeMap<DeviceId, Rest>,
     out: VecDeque<Action<K::Peer>>,
+    /// When it started, on the host's clock.
+    started: u64,
 }
 
 impl<K: Keys> Member<K> {
@@ -92,6 +109,7 @@ impl<K: Keys> Member<K> {
             tunnel: None,
             resting: BTreeMap::new(),
             out: VecDeque::new(),
+            started: 0,
         };
         built.follow_state();
         built
@@ -199,6 +217,7 @@ impl<K: Keys> Member<K> {
 
     /// A start: the engine's, then whom to keep in touch with dialled.
     pub fn start(&mut self, now: u64, ids: &mut dyn FnMut() -> u64) {
+        self.started = now;
         self.engine.start(now);
         self.drive(now);
         self.keep_in_touch(now, ids);
@@ -248,6 +267,15 @@ impl<K: Keys> Member<K> {
             self.sessions.dial(ids(), key, now);
         }
         self.drive(now);
+    }
+
+    /// Whether `peer` is one of the full members it keeps in touch with: its
+    /// session is held, never closed to make room for another.
+    pub fn keeps(&self, peer: &K::Peer) -> bool {
+        self.chosen()
+            .iter()
+            .filter_map(|device| self.transport_key(device))
+            .any(|key| self.sessions.peer_of(&key).as_ref() == Some(peer))
     }
 
     /// The full members it keeps in touch with, in order: its anchors it
@@ -303,7 +331,9 @@ impl<K: Keys> Member<K> {
         use crate::sessions::Output;
         match output {
             Output::Message { to, bytes } => self.out.push_back(Action::Message { to, bytes }),
-            Output::Datagram { to, bytes } => self.out.push_back(Action::Datagram { to, bytes }),
+            Output::Datagram { to, key, bytes } => {
+                self.out.push_back(Action::Datagram { to, key, bytes });
+            }
             Output::Packet { device, bytes, .. } => {
                 // Its source must be the session's, its destination this
                 // device: anything else a peer lied about, or misdirected.
@@ -329,17 +359,20 @@ impl<K: Keys> Member<K> {
                 if let Some(device) = self.device_of(&key) {
                     // Awaiting admission, it tries again within minutes: it is
                     // refused only until the admin admits its batch.
-                    let longest = if self.engine.member().is_admitted() {
-                        LONGEST_REST_MS
-                    } else {
-                        LONGEST_REST_AWAITING_MS
-                    };
+                    let admitted = self.engine.member().is_admitted();
+                    let longest = if admitted { LONGEST_REST_MS } else { LONGEST_REST_AWAITING_MS };
+                    // In its first minutes, more often still.
+                    let eager = !admitted && now < self.started.saturating_add(EAGER_FOR_MS);
                     let rest = self
                         .resting
                         .entry(device)
                         .or_insert(Rest { until: now, next: FIRST_REST_MS });
-                    rest.until = now.saturating_add(rest.next);
-                    rest.next = rest.next.saturating_mul(2).min(longest);
+                    if eager {
+                        rest.until = now.saturating_add(EAGER_REST_MS);
+                    } else {
+                        rest.until = now.saturating_add(rest.next);
+                        rest.next = rest.next.saturating_mul(2).min(longest);
+                    }
                     let until = rest.until;
                     self.out.push_back(Action::WakeAt(until));
                 }

@@ -104,8 +104,8 @@ impl Board {
                 Output::Message { to: To::Peer(peer), bytes } => {
                     let _ = self.context.send_message_to_peer(peer, bytes).await;
                 }
-                Output::Datagram { to, bytes } => {
-                    let _ = self.context.send_to_peer(to, bytes).await;
+                Output::Datagram { key, bytes, .. } => {
+                    let _ = self.context.send(Address::parse(key).unwrap(), bytes).await;
                 }
                 other => self.seen.push(other),
             }

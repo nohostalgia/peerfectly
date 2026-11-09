@@ -34,6 +34,14 @@
     ],
     [
       {
+        "Revoked": {
+          "network": "casa"
+        }
+      },
+      false
+    ],
+    [
+      {
         "Exposed": {
           "network": null
         }
@@ -396,40 +404,7 @@
                 "secs_since_epoch": 1758300000
               }
             },
-            "revoked": [
-              {
-                "device": {
-                  "id": "2c3d-4e5f-6a7b-8c9d",
-                  "name": null
-                },
-                "last_contact": "NoneRecorded",
-                "revocations": [
-                  {
-                    "by": {
-                      "id": "0a1b-2c3d-4e5f-6a7b",
-                      "name": "nas"
-                    },
-                    "reason": "stolen on the train",
-                    "signer_clock": {
-                      "At": {
-                        "time": {
-                          "nanos_since_epoch": 0,
-                          "secs_since_epoch": 1757000000
-                        }
-                      }
-                    }
-                  },
-                  {
-                    "by": {
-                      "id": "1b2c-3d4e-5f6a-7b8c",
-                      "name": "laptop"
-                    },
-                    "reason": "lost",
-                    "signer_clock": "NotRecorded"
-                  }
-                ]
-              }
-            ],
+            "revoked_count": 1,
             "standing": "Current",
             "tunnel": "Up"
           },
@@ -507,7 +482,7 @@
             "reachable_count": 0,
             "relay": null,
             "relay_leaving": null,
-            "revoked": [],
+            "revoked_count": 0,
             "standing": {
               "LastKnown": {
                 "at": {
@@ -582,6 +557,46 @@
             "path": null,
             "reachable": false,
             "standing": "Current"
+          }
+        ]
+      }
+    },
+    {
+      "Revoked": {
+        "after": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+        "network": "home",
+        "revoked": [
+          {
+            "device": {
+              "id": "2c3d-4e5f-6a7b-8c9d",
+              "name": null
+            },
+            "last_contact": "NoneRecorded",
+            "revocations": [
+              {
+                "by": {
+                  "id": "0a1b-2c3d-4e5f-6a7b",
+                  "name": "nas"
+                },
+                "reason": "stolen on the train",
+                "signer_clock": {
+                  "At": {
+                    "time": {
+                      "nanos_since_epoch": 0,
+                      "secs_since_epoch": 1757000000
+                    }
+                  }
+                }
+              },
+              {
+                "by": {
+                  "id": "1b2c-3d4e-5f6a-7b8c",
+                  "name": "laptop"
+                },
+                "reason": "lost",
+                "signer_clock": "NotRecorded"
+              }
+            ]
           }
         ]
       }

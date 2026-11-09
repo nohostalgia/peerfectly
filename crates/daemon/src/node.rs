@@ -401,6 +401,13 @@ impl Node {
     /// How many times it tries again before giving up on this attempt.
     pub const NEWCOMER_ATTEMPTS: usize = 3;
 
+    /// How long a peer that had no room waits before trying again: it is
+    /// there, and one of its sessions falls quiet within seconds.
+    pub const BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// How many times a peer that had no room is tried again, in one attempt.
+    pub const BUSY_ATTEMPTS: usize = 8;
+
     /// The least time between two catch-ups caused by refusals.
     pub const CATCH_UP_AT_MOST: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -3088,7 +3095,11 @@ impl Node {
             }),
         };
         if let Err(cause) = outcome {
-            self.rest_after_failure(device);
+            // A peer with no room is there: the next packet tries again,
+            // rather than wait as for a device that is not.
+            if !matches!(cause, crate::Error::Busy { .. }) {
+                self.rest_after_failure(device);
+            }
             let dropped = self.waiting.lock().await.remove(&device);
             let count =
                 dropped.map_or(0, |queue| queue.packets.len().saturating_add(queue.dropped));
@@ -3235,29 +3246,28 @@ impl Node {
 
         let syncer = self.syncer.lock().await;
         let roster = syncer.roster();
-        let dag = roster.dag();
-
-        // What the roster counts, not everything that verified. The graph keeps
-        // operations its rules disregarded, and a name or a reason from one of
-        // those is a claim the roster itself refused.
-        let valid: Vec<&roster::sign::VerifiedOperation> = roster::state::derive_with_verdicts(dag)
-            .map_or_else(
-                |_| Vec::new(),
-                |(_, verdicts)| {
-                    dag.operations()
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, _)| verdicts.is_valid(*index))
-                        .map(|(_, operation)| operation)
-                        .collect()
-                },
-            );
+        let valid = valid_operations(roster.dag());
         let directory = crate::describing::Directory::of(state, &valid);
         let accused = crate::describing::accused(&directory, roster);
-        let revoked = crate::describing::revoked(&directory, state, &valid, &contacts);
         drop(syncer);
 
-        crate::describing::Membership { directory, revoked, accused, contacts }
+        crate::describing::Membership { directory, accused, contacts }
+    }
+
+    /// A page of the devices `state` holds as revoked, after `after` (`None`:
+    /// the first), and where the next begins while more remain. Apart from
+    /// [`Self::membership`]: revocations only grow, and a report counts them
+    /// rather than listing them.
+    pub(crate) async fn revoked_page(
+        &self,
+        state: &RosterState,
+        after: Option<DeviceId>,
+    ) -> (Vec<crate::control::Revoked>, Option<String>) {
+        let contacts = self.contacts.lock().await.clone();
+        let syncer = self.syncer.lock().await;
+        let valid = valid_operations(syncer.roster().dag());
+        let directory = crate::describing::Directory::of(state, &valid);
+        crate::describing::revoked(&directory, state, &valid, &contacts, after)
     }
 
     /// Sends this node's digest to every open session.
@@ -3380,9 +3390,20 @@ impl Node {
                 .is_some_and(|record| !state.revoked.contains(&record.id))
         });
         let mut attempt = 0usize;
+        let mut busy = 0usize;
         loop {
             let transport = self.transport.lock().await.clone().ok_or(crate::Error::NotUp)?;
             match transport.connect(peer).await {
+                // A board holds a handful of sessions: one of them makes room
+                // as soon as it falls quiet. Tried again shortly, rather than
+                // rested on as a device that is not there.
+                Err(transport::Error::PeerBusy) if busy < Self::BUSY_ATTEMPTS => {
+                    busy = busy.saturating_add(1);
+                    tokio::time::sleep(Self::BUSY_RETRY).await;
+                }
+                Err(busy @ transport::Error::PeerBusy) => {
+                    return Err(crate::Error::Busy { cause: busy.to_string() });
+                }
                 Ok(session) => {
                     if let Some(session) = self.opened(session, Opening::Dialled).await {
                         tokio::spawn(Arc::clone(self).serving(session));
@@ -3432,6 +3453,23 @@ impl Node {
         tokio::spawn(Arc::clone(self).serve(session, Opening::Accepted));
         Ok(())
     }
+}
+
+/// The operations the roster counts, not everything that verified. The graph
+/// keeps operations its rules disregarded, and a name or a reason from one of
+/// those is a claim the roster itself refused.
+fn valid_operations(dag: &roster::dag::Dag) -> Vec<&roster::sign::VerifiedOperation> {
+    roster::state::derive_with_verdicts(dag).map_or_else(
+        |_| Vec::new(),
+        |(_, verdicts)| {
+            dag.operations()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| verdicts.is_valid(*index))
+                .map(|(_, operation)| operation)
+                .collect()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -3678,8 +3716,8 @@ mod borrowing {
         let valid: Vec<&VerifiedOperation> = valid.iter().collect();
         let directory = crate::describing::Directory::of(&state, &valid);
         let expected_accused = crate::describing::accused(&directory, &roster);
-        let expected_revoked =
-            crate::describing::revoked(&directory, &state, &valid, &LastContacts::default());
+        let (expected_revoked, _) =
+            crate::describing::revoked(&directory, &state, &valid, &LastContacts::default(), None);
 
         // The node, in place.
         let scratch = tempfile::tempdir().unwrap();
@@ -3695,7 +3733,8 @@ mod borrowing {
         let membership = node.membership(&state).await;
 
         assert_eq!(membership.accused, expected_accused);
-        assert_eq!(membership.revoked, expected_revoked);
+        let (revoked, _) = node.revoked_page(&state, None).await;
+        assert_eq!(revoked, expected_revoked);
         assert!(
             expected_revoked.len() >= 10,
             "the fixture really does revoke: {}",
