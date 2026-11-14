@@ -31,19 +31,25 @@ static NEXT: AtomicU16 = AtomicU16::new(23_210);
 struct Swtpm {
     child: Child,
     port: u16,
-    _state: tempfile::TempDir,
+    state: tempfile::TempDir,
 }
 
 impl Swtpm {
     fn start() -> Self {
         let port = NEXT.fetch_add(2, Ordering::SeqCst);
         let state = tempfile::tempdir().unwrap();
+        let child = Self::run(port, state.path());
+        Self { child, port, state }
+    }
+
+    /// `swtpm` on `port`, keeping its state in `state`, once it answers.
+    fn run(port: u16, state: &std::path::Path) -> Child {
         let child = Command::new("swtpm")
             .args([
                 "socket",
                 "--tpm2",
                 "--tpmstate",
-                &format!("dir={}", state.path().display()),
+                &format!("dir={}", state.display()),
                 "--server",
                 &format!("type=tcp,port={port},bindaddr=127.0.0.1"),
                 "--ctrl",
@@ -61,7 +67,15 @@ impl Swtpm {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Self { child, port, _state: state }
+        child
+    }
+
+    /// The power cut and back: killed with no `TPM2_Shutdown`, and started
+    /// again on the same state, as a machine that lost power.
+    fn cut_power(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::run(self.port, self.state.path());
     }
 
     fn name(&self) -> String {
@@ -127,17 +141,7 @@ fn a_wrong_passphrase_signs_nothing_and_says_so() {
 #[ignore = "needs swtpm and tpm2-tools: run in the testbed"]
 fn repeated_wrong_passphrases_reach_the_lockout() {
     let swtpm = Swtpm::start();
-    let lowered = Command::new("tpm2_dictionarylockout")
-        .args([
-            "--setup-parameters",
-            "--max-tries=2",
-            "--recovery-time=600",
-            "--lockout-recovery-time=600",
-        ])
-        .env("TPM2TOOLS_TCTI", swtpm.name())
-        .output()
-        .unwrap();
-    assert!(lowered.status.success(), "{}", String::from_utf8_lossy(&lowered.stderr));
+    lower_the_lockout(&swtpm);
 
     let tpm = swtpm.tpm();
     let stored = tpm.create(b"correct horse").unwrap();
@@ -151,6 +155,75 @@ fn repeated_wrong_passphrases_reach_the_lockout() {
         tpm.sign(&stored, b"correct horse", b"revoke"),
         "even the right one, for now"
     );
+}
+
+/// The TPM's dictionary-attack settings lowered for a test: two tries, and ten
+/// minutes before one is forgiven.
+fn lower_the_lockout(swtpm: &Swtpm) {
+    let lowered = Command::new("tpm2_dictionarylockout")
+        .args([
+            "--setup-parameters",
+            "--max-tries=2",
+            "--recovery-time=600",
+            "--lockout-recovery-time=600",
+        ])
+        .env("TPM2TOOLS_TCTI", swtpm.name())
+        .output()
+        .unwrap();
+    assert!(lowered.status.success(), "{}", String::from_utf8_lossy(&lowered.stderr));
+}
+
+/// **A power cut after the probe costs no guess.** A TPM that loses power
+/// after a key under its dictionary-attack protection was used counts its next
+/// start as a failed authorisation. The probe runs at every start of the
+/// daemon, so its key is exempt: a machine that loses power, or a daemon
+/// killed with its TPM, is not a step nearer the lockout. Signing with a
+/// passphrase is, which shows the count is real.
+#[test]
+#[ignore = "needs swtpm: run in the testbed"]
+fn a_power_cut_after_the_probe_costs_no_guess() {
+    let mut swtpm = Swtpm::start();
+    let tpm = swtpm.tpm();
+    let before = lockout_counter(&swtpm);
+    for _ in 0..3 {
+        tpm.usable().unwrap();
+        swtpm.cut_power();
+    }
+    assert_eq!(before, lockout_counter(&swtpm), "the probe is exempt, however often");
+
+    let stored = tpm.create(b"correct horse").unwrap();
+    tpm.sign(&stored, b"correct horse", b"revoke").unwrap();
+    swtpm.cut_power();
+    assert!(lockout_counter(&swtpm) > before, "where a key behind a passphrase is not");
+}
+
+/// **A lockout stops guesses, and nothing that needs nobody.** With the TPM
+/// locked out by wrong passphrases, the probe still passes — the machine keeps
+/// its TPM custody and makes no key in a file — and this machine's own key
+/// still signs, and the transport keys' file key still opens.
+#[test]
+#[ignore = "needs swtpm and tpm2-tools: run in the testbed"]
+fn a_locked_out_tpm_still_holds_what_needs_nobody() {
+    let swtpm = Swtpm::start();
+    lower_the_lockout(&swtpm);
+    let tpm = swtpm.tpm();
+    let machine = tpm.create_unattended().unwrap();
+    let sealed = tpm.seal_secret(&[7; 32]).unwrap();
+    let stored = tpm.create(b"correct horse").unwrap();
+    for _ in 0..4 {
+        let _refused = tpm.sign(&stored, b"wrong guess", b"revoke");
+    }
+    assert_eq!(
+        Err(LOCKED_OUT.to_owned()),
+        tpm.sign(&stored, b"correct horse", b"revoke"),
+        "locked out"
+    );
+
+    tpm.usable().expect("the probe still passes, so keys are still made in the TPM");
+    let public = tpm.load_check(&machine).unwrap();
+    let signature = tpm.sign_unattended(&machine, b"a checkpoint").expect("the machine key signs");
+    PublicKey::new(Algorithm::P256, public).unwrap().verify(b"a checkpoint", &signature).unwrap();
+    assert_eq!(tpm.unseal_secret(&sealed).unwrap().as_slice(), &[7; 32], "the file key opens");
 }
 
 /// **Useless on another TPM**: its storage key is another seed's.

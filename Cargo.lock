@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "daemon",
@@ -470,7 +470,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 [[package]]
 name = "convesso-core"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
+source = "git+https://github.com/nohostalgia/convesso?rev=1745cd6a20fd7228d307724288fdcce59ec8b9d3#1745cd6a20fd7228d307724288fdcce59ec8b9d3"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "convesso-relay"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
+source = "git+https://github.com/nohostalgia/convesso?rev=1745cd6a20fd7228d307724288fdcce59ec8b9d3#1745cd6a20fd7228d307724288fdcce59ec8b9d3"
 dependencies = [
  "convesso-core",
 ]
@@ -492,7 +492,7 @@ dependencies = [
 [[package]]
 name = "convesso-stream"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
+source = "git+https://github.com/nohostalgia/convesso?rev=1745cd6a20fd7228d307724288fdcce59ec8b9d3#1745cd6a20fd7228d307724288fdcce59ec8b9d3"
 dependencies = [
  "convesso-core",
 ]
@@ -500,7 +500,7 @@ dependencies = [
 [[package]]
 name = "convesso-tokio"
 version = "0.0.0"
-source = "git+https://github.com/nohostalgia/convesso?rev=f55e0a18d08938cbc2de657d19baf2b6702fd87a#f55e0a18d08938cbc2de657d19baf2b6702fd87a"
+source = "git+https://github.com/nohostalgia/convesso?rev=1745cd6a20fd7228d307724288fdcce59ec8b9d3#1745cd6a20fd7228d307724288fdcce59ec8b9d3"
 dependencies = [
  "convesso-core",
  "convesso-relay",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "enrollment"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "getrandom 0.4.3",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "identity"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "light-node"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "identity",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "linux-daemon"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "cli",
@@ -1762,7 +1762,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "local-discovery"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "member-store"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "redb",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "programs"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "linux-daemon",
  "windows-daemon",
@@ -2580,7 +2580,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay-server"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "convesso-tokio",
  "daemon",
@@ -2619,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "roster"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "roster-sync"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "identity",
@@ -3318,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "identity",
@@ -3330,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "transport-convesso"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "convesso-core",
@@ -3355,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "transport-wire"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "proptest",
 ]
@@ -3416,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "tunnel"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3643,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "windows-daemon"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "blake3",

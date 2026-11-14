@@ -1018,8 +1018,8 @@ In the testbed, with the `relay` service built from the convesso repository besi
 relay printed its key on its first start:
 
 ```powershell
-docker compose -f crates\linux-daemon	estbed\compose.yaml up -d relay a b
-docker compose -f crates\linux-daemon	estbed\compose.yaml logs relay
+docker compose -f crates\linux-daemon\testbed\compose.yaml up -d relay a b
+docker compose -f crates\linux-daemon\testbed\compose.yaml logs relay
 ```
 
 Then, with `<key>` that key:
@@ -1485,3 +1485,35 @@ identity begins with `peerfectly wrapped v1`; the boot asks for no passphrase; w
 back it is carried.
 
 **Result**: not run.
+
+## S7. A power cut does not lock the TPM out, and a lockout keeps the machine's own key
+
+The probe of the TPM at every start, now with a key exempt from dictionary-attack protection. In
+the testbed:
+
+```powershell
+docker compose -f crates\linux-daemon\testbed\compose.yaml run --build --rm tests
+```
+
+and the scenario of `mcu/arduino/posix/reach-while-down.sh` with, after the board's admission,
+`a`'s container killed (`docker kill -s KILL`, so neither the daemon nor its `swtpm` stops cleanly),
+40 s down, and started again, three times in a row.
+
+**Expect**: in `tests/tpm.rs`, `a_power_cut_after_the_probe_costs_no_guess` (three probes, each
+followed by a power cut, leave the lockout counter where it was; a signature with a passphrase
+followed by one moves it) and `a_locked_out_tpm_still_holds_what_needs_nobody` (locked out by wrong
+passphrases, the probe passes, the machine key signs, the sealed file key opens) pass. In the
+scenario, `a` finds its TPM usable at every start and reaches the board after each kill.
+
+**Result**: run, 2026-11-13, in the testbed, passed.
+- Found on 2026-11-10: in the same scenario the third kill left `swtpm` locked out (its default is
+  three tries), the protected probe failed, the daemon took the machine for one with no TPM, and
+  refused the network saying its key was gone and every network must be joined again.
+- On the probe as it was, both new tests fail: the counter moves after the probes, and the locked
+  out probe fails with "DA lockout mode".
+- `tests/tpm.rs`: 12 passed; the library 64, and the other suites. `cargo clippy -p linux-daemon
+  --all-targets -- -D warnings` and `-p daemon`: clean.
+- The scenario: after each of the three kills `a` reached the board in 1 s and `b` in 0-2 s; the
+  log says "the TPM can hold signing keys" at each start. Seen in the same run and not about the
+  TPM: once, after the first kill and a minute of quiet, `a` took 19 s to reach the board (0-1 s
+  the other times).
