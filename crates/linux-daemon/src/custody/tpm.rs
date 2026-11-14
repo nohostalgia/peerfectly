@@ -264,6 +264,15 @@ impl Tpm {
     /// A TPM 1.2, a TPM without P-256, and an owner hierarchy with a password
     /// all fail here, and the reason is kept for the log.
     ///
+    /// **The probe's key is exempt from dictionary-attack protection**, as every
+    /// key used with nobody present is. It runs at every start of the daemon,
+    /// and a TPM that loses power after a protected key was used counts its
+    /// next start as a failed authorisation: a probe under the protection made
+    /// each power cut, or each daemon killed with the TPM, a step towards the
+    /// lockout. And a lockout refuses only protected keys, so this one still
+    /// passes during one — where the protected probe failed, the machine was
+    /// taken for one without a TPM, and its own key, sealed there, for lost.
+    ///
     /// # Errors
     ///
     /// When it cannot, with why.
@@ -274,7 +283,7 @@ impl Tpm {
         let result = (|| {
             let made = context
                 .execute_with_session(Some(session), |context| {
-                    context.create(parent, signing_template()?, None, None, None, None)
+                    context.create(parent, signing_template_with(true)?, None, None, None, None)
                 })
                 .map_err(|cause| format!("making a P-256 key: {cause}"))?;
             let key = context

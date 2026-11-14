@@ -108,7 +108,8 @@ pub trait HardwareKeys {
 /// - Hardware that holds none, where a hardware key was made before: lost — the
 ///   TPM was cleared or the hardware replaced — and said so.
 /// - Hardware that holds none, never made before: made now.
-/// - No hardware, where a hardware key was made before: lost, likewise.
+/// - No usable hardware, where a hardware key was made before: refused, as
+///   either unreachable for now or gone, which cannot be told apart here.
 /// - No hardware: the software key, made if there is none.
 ///
 /// # Errors
@@ -125,6 +126,19 @@ pub fn machine_key(
         failed(
             "this machine's own key is gone: its TPM was cleared, or the hardware changed. \
              Nothing it vouched for can be believed; each network must be joined again."
+                .to_owned(),
+        )
+    };
+    // No usable TPM now, where one held the key: refused all the same, since
+    // nothing it vouched for can be checked without it. Whether the key is gone
+    // or the TPM is only unreachable for now cannot be told from here, so both
+    // are said, the one a restart mends first.
+    let unreachable = || {
+        failed(
+            "this machine's own key is in its TPM, and the TPM cannot be used now, so nothing \
+             it vouched for can be checked; nothing has been removed. If the TPM answers again, \
+             start the daemon again. If it was cleared, or the hardware changed, the key is \
+             gone and each network must be joined again."
                 .to_owned(),
         )
     };
@@ -150,7 +164,7 @@ pub fn machine_key(
         }
         None => {
             if kind.as_deref() == Some("hardware") {
-                return Err(lost());
+                return Err(unreachable());
             }
             let (key, made) = SoftwareKey::at(home)?;
             note("software")?;
@@ -898,8 +912,12 @@ mod tests {
         let cleared = Chip::new();
         let lost = machine_key(scratch.path(), Some(&cleared)).err().expect("lost");
         assert!(lost.to_string().contains("joined again"), "{lost}");
-        // And no TPM at all now.
-        assert!(machine_key(scratch.path(), None).is_err(), "no quiet fall back to software");
+        // And no usable TPM now: refused all the same, said as what it may be.
+        let refused =
+            machine_key(scratch.path(), None).err().expect("no quiet fall back to software");
+        let said = refused.to_string();
+        assert!(said.contains("cannot be used now") && said.contains("start the daemon again"));
+        assert!(said.contains("joined again"), "and what it means if it was cleared: {said}");
         assert!(!scratch.path().join(KEY_FILE).exists(), "and no software key was made");
     }
 
