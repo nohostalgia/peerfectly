@@ -280,6 +280,44 @@ async fn a_board_member_keeps_in_touch_with_the_admin_whose_root_it_holds() {
     drop(node);
 }
 
+/// A board that reaches nobody calls the admin again after each rest, and while
+/// a call waits it is woken for that call's deadline, never for the rest it
+/// has served: a rest left past was a deadline always due, and on a C3 started
+/// with no full member up its loop woke at once round after round, starving
+/// the relay link and the tunnel (2026-11-15).
+#[tokio::test]
+async fn a_board_reaching_nobody_is_never_woken_for_a_time_already_past() {
+    use light_node::member::Member;
+
+    let relay = TestRelay::start().await;
+    let network = Network::on(&relay);
+    let own = network.evidence.get(&network.joiner.device_id()).unwrap().clone();
+    let shown = Shown::from_bytes(&own).unwrap();
+    let joiner = LightMember::new(
+        Evidence { leaf: shown.leaf, proof: shown.proof, root: network.root.clone() },
+        network.state.params.clone(),
+        DEFAULT_BUDGET,
+    )
+    .unwrap();
+    let mut member = Member::new(joiner, ConvessoKeys, Limits::LEAST);
+    let mut next_id = 0_u64;
+    let mut ids = || {
+        next_id += 1;
+        next_id
+    };
+    let mut now = 0_u64;
+    member.start(now, &mut ids);
+    // Nothing is answered: every call runs to its deadline, rest after rest.
+    for _ in 0..20 {
+        while member.poll_action().is_some() {}
+        let at = member.next_deadline().expect("a board reaching nobody keeps calling");
+        assert!(at > now, "woken at {now} for {at}, a time already past");
+        now = at;
+        member.tick(now, &mut ids);
+    }
+    assert!(now > 5 * 60_000, "the calls went on, a minute apart at most: {now}");
+}
+
 /// A tunnel packet crosses a board's session both ways, larger than one
 /// datagram on the way in, so in two fragments put back together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
