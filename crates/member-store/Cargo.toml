@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 roster = { path = "../roster" }
-redb = "=4.4.0"
+redb = "=4.5.0"
 
 [dev-dependencies]
 tempfile.workspace = true
