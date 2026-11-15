@@ -1311,6 +1311,12 @@ impl Node {
     /// Takes a started transport, which is what makes the node reachable.
     pub async fn started(&self, transport: Arc<dyn Transport>) {
         *self.transport.lock().await = Some(transport);
+        // What it shows a board, from the start: a transport starts showing
+        // nothing, and was told only at the next change to the roster. A phone
+        // brought up with no other full member to sync with opened sessions
+        // showing nothing, and a board, holding no roster, refused every one
+        // until the computer came up (C3, 2026-11-15).
+        self.refresh_evidence().await;
         // The root it holds may already say it is light: a device invited as
         // light is delivered the root over its own admission, and nothing
         // arrives after to make it look again. Left full, it was answered with
@@ -1340,6 +1346,8 @@ impl Node {
             }
             *held = Some(transport);
         }
+        // The new one starts showing nothing, as at the start.
+        self.refresh_evidence().await;
         self.close_sessions().await;
         // `notify_one`, not `notify_waiters`: if the loop is between two waits
         // the permit is kept for it, rather than lost while it parks on the old
@@ -4245,6 +4253,66 @@ mod light {
         let root = crate::snapshots::sign_over_heads(&roster, founder).unwrap();
         assert!(roster.offer_snapshot(&root).is_accepted());
         (roster, network)
+    }
+
+    /// A transport that keeps what it is told this device shows.
+    #[derive(Default)]
+    struct Showing {
+        shown: std::sync::Mutex<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl transport::Transport for Showing {
+        async fn connect(
+            &self,
+            _peer: &roster::sign::PublicKey,
+        ) -> transport::Result<Box<dyn transport::Session>> {
+            core::future::pending().await
+        }
+
+        async fn accept(&self) -> transport::Result<Box<dyn transport::Session>> {
+            core::future::pending().await
+        }
+
+        fn update_evidence(&self, evidence: Vec<u8>) {
+            *self.shown.lock().unwrap() = evidence;
+        }
+    }
+
+    /// A full member shows its evidence on a transport from the moment it is
+    /// given one, and on the one that replaces it, with nothing changed in its
+    /// roster: a board holds no roster, and refuses a peer showing nothing. A
+    /// phone brought up alone was refused by every board until another full
+    /// member came up and it synced (C3, 2026-11-15).
+    #[tokio::test]
+    async fn a_full_member_shows_its_evidence_on_every_transport_it_is_given() {
+        let founder = Arc::new(NodeIdentity::generate().unwrap());
+        let sensor = NodeIdentity::generate().unwrap();
+        let (roster, _) = founded(&founder, &sensor);
+        let expected = crate::snapshots::shown_of(&roster, &founder.device_id());
+        assert!(!expected.is_empty());
+        let state = roster.state().unwrap();
+        let prefix = tunnel::Prefix::from_parameter(&state.params.ula).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let full = Node::new(
+            Arc::clone(&founder),
+            roster_sync::Syncer::new(roster),
+            Arc::new(crate::gateway::Gateway::new(tunnel::Tunnel::new(
+                prefix,
+                founder.device_id(),
+            ))),
+            crate::router::Router::new(prefix),
+            crate::state::Log::at(scratch.path().join("roster.log")),
+            crate::schedule::Schedule::provisional(),
+        );
+
+        let first = Arc::new(Showing::default());
+        full.started(Arc::clone(&first) as Arc<dyn transport::Transport>).await;
+        assert_eq!(*first.shown.lock().unwrap(), expected, "shown from the start");
+
+        let moved = Arc::new(Showing::default());
+        full.replace_transport(Arc::clone(&moved) as Arc<dyn transport::Transport>).await;
+        assert_eq!(*moved.shown.lock().unwrap(), expected, "and on the one after a relay moved");
     }
 
     /// A full member on the root the light member holds is believed by its

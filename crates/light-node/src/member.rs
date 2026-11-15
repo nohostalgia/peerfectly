@@ -78,16 +78,22 @@ pub enum Action<P> {
 /// A peer not reached: until when it is left alone, and for how long next.
 #[derive(Debug, Clone, Copy)]
 struct Rest {
-    until: u64,
+    /// None once the wait is over: the call that follows has its own deadline,
+    /// and a wait left past would be a deadline always due, the board's loop
+    /// woken at once round after round (C3, 2026-11-15: no other task ran, the
+    /// relay link and the tunnel with them, for as long as the call waited).
+    until: Option<u64>,
     next: u64,
 }
 
 impl Rest {
     /// A call failed at `now`: left for the next wait, and the one after that
-    /// twice as long, up to [`LONGEST_REST_MS`].
-    fn failed(&mut self, now: u64) {
-        self.until = now.saturating_add(self.next);
+    /// twice as long, up to [`LONGEST_REST_MS`]. When the wait ends.
+    fn failed(&mut self, now: u64) -> u64 {
+        let until = now.saturating_add(self.next);
+        self.until = Some(until);
         self.next = self.next.saturating_mul(2).min(LONGEST_REST_MS);
+        until
     }
 }
 
@@ -211,7 +217,7 @@ impl<K: Keys> Member<K> {
     /// The earliest time something waits for, if anything does.
     #[must_use]
     pub fn next_deadline(&self) -> Option<u64> {
-        let rested = self.resting.values().map(|rest| rest.until);
+        let rested = self.resting.values().filter_map(|rest| rest.until);
         [self.engine.next_deadline(), self.sessions.next_deadline()]
             .into_iter()
             .flatten()
@@ -259,7 +265,10 @@ impl<K: Keys> Member<K> {
     fn keep_in_touch(&mut self, now: u64, ids: &mut dyn FnMut() -> u64) {
         for device in self.chosen() {
             if self.sessions.with(&device).is_some()
-                || self.resting.get(&device).is_some_and(|rest| rest.until > now)
+                || self
+                    .resting
+                    .get(&device)
+                    .is_some_and(|rest| rest.until.is_some_and(|until| until > now))
             {
                 continue;
             }
@@ -268,6 +277,14 @@ impl<K: Keys> Member<K> {
                 continue;
             }
             self.sessions.dial(ids(), key, now);
+        }
+        // Waits over, of a member called again just now or of one no longer
+        // chosen: nothing is woken for them any more. How long the next lasts
+        // is kept.
+        for rest in self.resting.values_mut() {
+            if rest.until.is_some_and(|until| until <= now) {
+                rest.until = None;
+            }
         }
         self.drive(now);
     }
@@ -378,12 +395,11 @@ impl<K: Keys> Member<K> {
                     self.engine.refused_as_a_stranger(now);
                 }
                 if let Some(device) = self.device_of(&key) {
-                    let rest = self
+                    let until = self
                         .resting
                         .entry(device)
-                        .or_insert(Rest { until: now, next: FIRST_REST_MS });
-                    rest.failed(now);
-                    let until = rest.until;
+                        .or_insert(Rest { until: None, next: FIRST_REST_MS })
+                        .failed(now);
                     self.out.push_back(Action::WakeAt(until));
                 }
             }
@@ -453,13 +469,13 @@ mod tests {
 
     #[test]
     fn a_member_not_reached_is_called_again_within_a_minute_however_long_it_was_away() {
-        let mut rest = Rest { until: 0, next: FIRST_REST_MS };
+        let mut rest = Rest { until: None, next: FIRST_REST_MS };
         let mut now = 0_u64;
         let mut waits = alloc::vec::Vec::new();
         for _ in 0..1_000 {
-            rest.failed(now);
-            waits.push(rest.until.saturating_sub(now));
-            now = rest.until;
+            let until = rest.failed(now);
+            waits.push(until.saturating_sub(now));
+            now = until;
         }
         assert_eq!(waits.get(..5), Some(&[10_000, 20_000, 40_000, 60_000, 60_000][..]));
         assert!(waits.iter().all(|wait| *wait <= LONGEST_REST_MS), "never longer than a minute");
