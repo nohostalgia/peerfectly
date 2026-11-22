@@ -62,6 +62,7 @@ pub mod conflicts;
 pub mod connectivity;
 pub(crate) mod contacts;
 pub mod control;
+pub(crate) mod demoting;
 pub(crate) mod describing;
 pub(crate) mod discovery;
 pub mod drawing;

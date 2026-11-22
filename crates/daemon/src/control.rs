@@ -439,6 +439,10 @@ pub struct Peer {
     pub standing: Standing,
     /// When this device last had a session with it that spoke.
     pub last_contact: Contact,
+    /// Whether the roster makes it an admin: what an admin is offered to
+    /// demote. Written only when it is one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 /// A device this device holds as revoked.
@@ -522,6 +526,10 @@ pub enum Custody {
     /// the report must be able to tell that from a key that never leaves the
     /// hardware.
     Passphrase,
+    /// Nowhere: this device is a member of the network, and keeps only the
+    /// public half of its signing key, from which its id derives. The private
+    /// half signed the join's proof and was cleared.
+    None,
 }
 
 impl fmt::Display for Custody {
@@ -530,6 +538,7 @@ impl fmt::Display for Custody {
             Self::KeyStore => f.write_str("in this machine's key store"),
             Self::HeldHere => f.write_str("in a file on this device"),
             Self::Passphrase => f.write_str("in a file sealed with a passphrase"),
+            Self::None => f.write_str("none: this device is a member, and holds no signing key"),
         }
     }
 }
@@ -578,6 +587,11 @@ pub struct Network {
     pub admin: bool,
     /// Where this device keeps this network's signing key.
     pub custody: Custody,
+    /// Whether that key is one this device keeps only until its demotion is
+    /// settled: it was an admin, is a member now, and destroys the key once the
+    /// demotion is beneath the roster's base, where nothing can void it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_until_settled: bool,
     /// Whether this network was taken from somebody rather than always this
     /// person's.
     ///
@@ -1270,6 +1284,7 @@ impl Command {
             | Self::StageBatch { network, .. }
             | Self::AdmitBatch { network, .. }
             | Self::Rename { network, .. }
+            | Self::Demote { network, .. }
             | Self::SetAnchors { network, .. }
             | Self::SetIpv4Block { network, .. }
             | Self::GiveIpv4 { network, .. }
@@ -1449,6 +1464,15 @@ pub enum Command {
         invite: String,
         /// The name this device proposes for itself. The admin's record decides.
         name: String,
+        /// Whether the person joins this device as an admin. Without it the
+        /// device joins as a member: it makes its signing key in memory, proves
+        /// it, and clears it, and asks nobody for anything. With it the key is
+        /// made in the custody this platform gives an admin's. The invite must
+        /// make the same role, or the admin's daemon refuses the request.
+        ///
+        /// Written only when set, so that a member's join reads as it always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        admin: bool,
     },
 
     /// Confirm whatever is waiting on this device's own person: a **founding**
@@ -1606,6 +1630,21 @@ pub enum Command {
         target: Target,
         /// As [`Command::Revoke`]'s.
         reason: String,
+    },
+
+    /// Make an admin of the network a member.
+    ///
+    /// Named as [`Command::Revoke`] names it, exactly, by name or by id. Nothing
+    /// is signed for a device that is already a member, or for the network's
+    /// only admin, this device included; whether this admin may demote that one
+    /// (a founder) is the roster's, and refused in its words. The device keeps
+    /// its signing key until the demotion is settled beneath the roster's base,
+    /// and then destroys it.
+    Demote {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The admin, by the name it answers to or by its id.
+        target: Target,
     },
 
     /// Give a device a new name.
@@ -1826,6 +1865,11 @@ impl Command {
     /// as revoking: it takes arguments.
     pub const RENAME_USAGE: &'static str = "peerfectly rename <name> <new name> [--network N]\n       \
                                              peerfectly rename --id <id> <new name> [--network N]";
+
+    /// The usage line for demoting, listed with the commands for the same
+    /// reason as revoking: it takes arguments.
+    pub const DEMOTE_USAGE: &'static str = "peerfectly demote <name> [--network N]\n       \
+                                             peerfectly demote --id <id> [--network N]";
 
     /// The usage line for withdrawing an invite.
     pub const WITHDRAW_USAGE: &'static str = "peerfectly withdraw <name> [--network N]";
@@ -2188,6 +2232,30 @@ impl Command {
         Ok(Self::Rename { network, target, name: (*name).clone() })
     }
 
+    /// Reads a demotion from the words after `demote`.
+    ///
+    /// # Errors
+    ///
+    /// When no device is named, when `--id` is given nothing, or when anything
+    /// else is said beside the device and the network.
+    pub fn demotion(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::DEMOTE_USAGE);
+        let (target, after) = match words.first().map(String::as_str) {
+            Some("--id") => {
+                let id = words.get(1).ok_or_else(usage)?;
+                (Target::Id(id.clone()), 2)
+            }
+            Some(name) if !name.starts_with("--") => (Target::Name(name.to_owned()), 1),
+            _ => return Err(usage()),
+        };
+        let network = match words.get(after..).unwrap_or(&[]) {
+            [] => None,
+            [flag, network] if flag == "--network" => Some(network.clone()),
+            _ => return Err(usage()),
+        };
+        Ok(Self::Demote { network, target })
+    }
+
     /// Reads a command name.
     ///
     /// # Errors
@@ -2263,6 +2331,7 @@ impl Command {
             | Self::AdmitBatch { .. }
             | Self::RevokeVoiding { .. }
             | Self::Rename { .. }
+            | Self::Demote { .. }
             | Self::SetAnchors { .. }
             | Self::SetIpv4Block { .. }
             | Self::GiveIpv4 { .. }
@@ -2372,6 +2441,7 @@ impl Command {
             Self::StageBatch { network, .. } => ("stage batch", network.as_deref()),
             Self::AdmitBatch { network, .. } => ("admit batch", network.as_deref()),
             Self::Rename { network, .. } => ("rename", network.as_deref()),
+            Self::Demote { network, .. } => ("demote", network.as_deref()),
             Self::SetAnchors { network, .. } => ("set-anchors", network.as_deref()),
             Self::SetIpv4Block { network, .. } => ("ipv4 block", network.as_deref()),
             Self::GiveIpv4 { network, .. } => ("ipv4 give", network.as_deref()),
@@ -2597,6 +2667,22 @@ pub struct InviteLine {
     /// The request that arrived through it, if one has.
     #[serde(default)]
     pub request: Option<RequestLine>,
+    /// Requests that arrived asking the role this invite does not make, and
+    /// were refused without using it: each device was told which role the
+    /// invite makes. Newest last, and only the last few.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<RefusedLine>,
+}
+
+/// A request an invite refused for asking the other role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedLine {
+    /// The fingerprint of the signing key it presented, which its screen shows.
+    pub fingerprint: String,
+    /// What the device was told: `invite-makes-admin` or `invite-makes-member`.
+    pub word: String,
+    /// When it was last refused, in seconds since the epoch.
+    pub at: u64,
 }
 
 /// A request that arrived through an invite: what a person reviews before
@@ -2949,6 +3035,7 @@ mod tests {
             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
             admin: true,
             custody: Custody::HeldHere,
+            key_until_settled: false,
             owner_taken: false,
             confirmation: None,
             arrived: None,
@@ -2967,6 +3054,7 @@ mod tests {
                 path: Some(Path::Relay),
                 standing,
                 last_contact: Contact::NoneRecorded,
+                admin: false,
             }],
             peer_count: 0,
             reachable_count: 0,
@@ -3272,7 +3360,7 @@ mod tests {
             Command::Stop,
             Command::TakeOwnership { network: None },
             Command::Forget { label: "casa".to_owned(), last_admin: false },
-            Command::Join { invite: String::new(), name: "laptop".to_owned() },
+            Command::Join { invite: String::new(), name: "laptop".to_owned(), admin: false },
             Command::Approve { network: None, name: "laptop".to_owned(), replace: false },
             Command::Reject { network: None, name: "laptop".to_owned() },
             Command::Withdraw { network: None, name: "laptop".to_owned() },
@@ -3420,6 +3508,7 @@ mod tests {
             Command::Join {
                 invite: "peerfectly-invite-v1:abcdef".to_owned(),
                 name: "board".to_owned(),
+                admin: false,
             },
             Command::Confirm,
             Command::Abandon,
@@ -3481,6 +3570,11 @@ mod tests {
                     }),
                     conflicts: Vec::new(),
                 }),
+                refused: vec![RefusedLine {
+                    fingerprint: "9F00-1E2D-3C4B-5A69-7887".to_owned(),
+                    word: "invite-makes-admin".to_owned(),
+                    at: 1_799_985_000,
+                }],
             }],
             joins: vec![JoinLine {
                 label: "network".to_owned(),
@@ -4114,6 +4208,28 @@ mod tests {
         assert!(Command::renaming(&words("laptop my laptop")).is_err(), "a name of two words");
         assert!(Command::renaming(&words("--id")).is_err(), "an id flag with nothing after it");
         assert!(Command::renaming(&[]).is_err());
+    }
+
+    #[test]
+    fn a_demotion_is_read_by_name_or_by_id_and_nothing_else() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+
+        assert_eq!(
+            Command::demotion(&words("desk --network casa")).unwrap(),
+            Command::Demote {
+                network: Some("casa".to_owned()),
+                target: Target::Name("desk".to_owned()),
+            }
+        );
+        assert_eq!(
+            Command::demotion(&words("--id 0a1b-2c3d-4e5f-6a7b")).unwrap(),
+            Command::Demote { network: None, target: Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()) }
+        );
+        assert!(Command::demotion(&words("desk now")).is_err(), "nothing beside the device");
+        assert!(Command::demotion(&words("--id")).is_err(), "an id flag with nothing after it");
+        assert!(Command::demotion(&words("--network casa")).is_err(), "no device");
+        assert!(Command::demotion(&[]).is_err());
+        assert!(Command::word_needs_an_administrator("demote"), "an act that signs");
     }
 
     /// A rename waiting to reach every device is listed after it is in force

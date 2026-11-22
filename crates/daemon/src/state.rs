@@ -127,6 +127,23 @@ impl Paths {
         self.root.join("pieces.log")
     }
 
+    /// Present once this daemon has seen this device an admin of the network
+    /// while holding its signing key: what tells a device that was demoted —
+    /// whose key goes once the demotion is settled — from a member that joined
+    /// keeping one before members stopped keeping one, whose key stays.
+    #[must_use]
+    pub fn was_admin(&self) -> PathBuf {
+        self.root.join("was-admin")
+    }
+
+    /// The name of the signing key being destroyed after a demotion, written
+    /// before the identity stops naming it, and removed once the key is gone:
+    /// a stop in between is finished by the next pass.
+    #[must_use]
+    pub fn settling_key(&self) -> PathBuf {
+        self.root.join("settling-key")
+    }
+
     /// The endpoints last known to work.
     #[must_use]
     pub fn endpoints(&self) -> PathBuf {

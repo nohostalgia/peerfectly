@@ -343,6 +343,11 @@ impl MachineKeys {
         if path.exists() {
             let held = identity::store::load_with(&path, &self.sealer(), self).map_err(failed)?;
 
+            // A member's holds no signing key, in a file or anywhere else.
+            if held.signing_key().is_public_only() {
+                return Ok(Some(held));
+            }
+
             // A network whose signing key is a file, on a machine that can
             // protect one. It is refused rather than carried: a device that can
             // sign as an admin with a key any process running as the person can
@@ -393,16 +398,22 @@ impl Keys for MachineKeys {
         })
     }
 
+    /// A member's identity, sealed to the machine as the identity's other two
+    /// keys are on this platform; nothing goes to the key store.
+    fn keep_member(&self, path: &std::path::Path, identity: &NodeIdentity) -> Result<()> {
+        identity::store::save_with(identity, path, &self.sealer())
+            .map_err(|cause| Error::State { path: path.to_path_buf(), cause: cause.to_string() })
+    }
+
     /// Deletes the network's signing key from the machine's key store.
     ///
     /// The daemon runs as the machine, which may: a machine key admits `SYSTEM`
     /// and administrators. The name is the one the identity records; a key
     /// already gone is fine.
-    fn forget(&self, paths: &Paths) -> Result<()> {
-        let Some(name) = daemon::keys::signing_key_named_in(paths) else { return Ok(()) };
+    fn forget_named(&self, paths: &Paths, name: &str) -> Result<()> {
         let failed = |cause: String| Error::State { path: paths.identity(), cause };
         let store = crate::platform::custody::Store::open().map_err(failed)?;
-        match store.remove(&name) {
+        match store.remove(name) {
             Ok(()) => {
                 tracing::info!(key = %name, "the network's key was deleted from the key store");
                 Ok(())

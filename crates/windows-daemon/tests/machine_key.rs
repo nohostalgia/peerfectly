@@ -60,3 +60,23 @@ fn identities_are_sealed_under_a_key_the_tpm_wraps() {
     let before = identity::store::PlatformSealer.seal(b"written before").unwrap();
     assert_eq!(sealer.unseal(&before).unwrap(), b"written before");
 }
+
+/// **A member's identity loads on a machine whose key store could hold a
+/// signing key**: it holds none, so it is not "a signing key held in a file",
+/// and the report says it holds none.
+#[test]
+#[ignore = "needs a TPM and an elevated console: run by hand, recorded in VERIFICATION.md"]
+fn a_members_identity_is_not_a_file_held_key() {
+    use daemon::keys::Keys as _;
+
+    let keys = MachineKeys::open().expect("this machine's TPM can hold a key");
+    let home = tempfile::tempdir().unwrap();
+    let paths = daemon::state::Paths::under(home.path().join("casa"));
+    paths.create().unwrap();
+    let member = identity::NodeIdentity::generate().unwrap().without_signing_key();
+    keys.keep_member(&paths.identity(), &member).unwrap();
+
+    let loaded = keys.identity(&paths).expect("a member's identity is not refused");
+    assert_eq!(member.device_id(), loaded.device_id());
+    assert_eq!(daemon::control::Custody::None, keys.custody_of(&loaded));
+}

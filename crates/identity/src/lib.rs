@@ -47,7 +47,9 @@ pub mod store;
 pub mod wrapped;
 
 pub use error::{Error, Result};
-pub use identity::{CustodianKey, NodeIdentity, PrivateKey, SigningKey, fresh_key_name};
+pub use identity::{
+    CustodianKey, NodeIdentity, PrivateKey, PublicOnlyKey, SigningKey, fresh_key_name,
+};
 pub use secret::SecretBytes;
 
 // The roster types a caller needs on the ordinary path, so a daemon depends on

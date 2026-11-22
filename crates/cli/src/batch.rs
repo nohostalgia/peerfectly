@@ -388,10 +388,22 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
             ),
             consequence: "it will be able to admit and revoke devices".to_owned(),
         },
-        OperationBody::Demote { device } => Described {
-            act: format!("make {} a member", short(device)),
-            consequence: "it will no longer be able to admit or revoke devices".to_owned(),
-        },
+        OperationBody::Demote { device } => {
+            // The name the person typed, as with a revocation: the bytes carry
+            // the device's id only.
+            let named = match asked {
+                Command::Demote { target: daemon::control::Target::Name(name), .. } => {
+                    format!("`{}` ", daemon::control::shown(name))
+                }
+                _ => String::new(),
+            };
+            Described {
+                act: format!("make {named}({}) a member", short(device)),
+                consequence: "it will no longer be able to admit or revoke devices; it destroys \
+                              its signing key once the demotion is settled"
+                    .to_owned(),
+            }
+        }
         OperationBody::Rename { device, name } => {
             // The name the person typed, as with a revocation: the bytes carry
             // the device's id and the new name, not the old one.

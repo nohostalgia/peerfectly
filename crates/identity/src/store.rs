@@ -63,6 +63,16 @@ pub const STORED_VERSION: u64 = 3;
 /// key to a device that already exists.
 pub const CUSTODIAN_VERSION: u64 = 4;
 
+/// The stored format for a member's identity, which holds its signing key's
+/// public half and nothing else of it.
+///
+/// `[version, [algorithm tag, public key], transport algorithm tag, transport
+/// material, attestation algorithm tag, attestation material]`. Unlike
+/// [`CUSTODIAN_VERSION`] it names no custodian, so loading it asks no key store,
+/// TPM or file for a key, and reports none missing: the file itself says that no
+/// private half exists anywhere.
+pub const PUBLIC_ONLY_VERSION: u64 = 5;
+
 /// Protects stored bytes, the way a platform does.
 ///
 /// The daemon on a desktop uses [`PlatformSealer`], which is what [`save`] and
@@ -194,7 +204,42 @@ fn encode_custodian(identity: &NodeIdentity) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decodes a stored identity of either version.
+/// Encodes a member's identity, which holds its signing key's public half only.
+///
+/// There is nowhere in the shape for a private signing key.
+fn encode_public_only(identity: &NodeIdentity) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = minicbor::Encoder::new(&mut out);
+    let _ = encoder.array(6);
+    let _ = encoder.u64(PUBLIC_ONLY_VERSION);
+    let _ = encoder.array(2);
+    let _ = encoder.u8(algorithm_tag(identity.signing_key().algorithm()));
+    let _ = encoder.bytes(identity.signing_key().public_key().as_bytes());
+    let _ = encoder.u8(algorithm_tag(identity.transport_key().algorithm()));
+    let _ = encoder.bytes(identity.transport_key().material().expose());
+    let _ = encoder.u8(algorithm_tag(identity.attestation_key().algorithm()));
+    let _ = encoder.bytes(identity.attestation_key().material().expose());
+    out
+}
+
+/// The rest of a member's identity, after its version.
+fn decode_public_only(bytes: &[u8], decoder: &mut minicbor::Decoder<'_>) -> Result<NodeIdentity> {
+    if decoder.array().map_err(|_| Error::CorruptIdentity)? != Some(2) {
+        return Err(Error::CorruptIdentity);
+    }
+    let algorithm = algorithm_from_tag(decoder.u8().map_err(|_| Error::CorruptIdentity)?)?;
+    let public =
+        PublicKey::new(algorithm, decoder.bytes().map_err(|_| Error::CorruptIdentity)?.to_vec())
+            .map_err(|_| Error::CorruptIdentity)?;
+    let transport = read_key(decoder)?;
+    let attestation = read_key(decoder)?;
+    if decoder.position() != bytes.len() {
+        return Err(Error::CorruptIdentity);
+    }
+    NodeIdentity::public_only(public, transport, attestation)
+}
+
+/// Decodes a stored identity of any version this build reads.
 fn decode_with(bytes: &[u8], custodians: &dyn Custodians) -> Result<NodeIdentity> {
     let mut decoder = minicbor::Decoder::new(bytes);
     let fields = decoder.array().map_err(|_| Error::CorruptIdentity)?;
@@ -202,7 +247,10 @@ fn decode_with(bytes: &[u8], custodians: &dyn Custodians) -> Result<NodeIdentity
     match (version, fields) {
         (STORED_VERSION, Some(7)) => {}
         (CUSTODIAN_VERSION, Some(6)) => return decode_custodian(bytes, &mut decoder, custodians),
-        (STORED_VERSION | CUSTODIAN_VERSION, _) => return Err(Error::CorruptIdentity),
+        (PUBLIC_ONLY_VERSION, Some(6)) => return decode_public_only(bytes, &mut decoder),
+        (STORED_VERSION | CUSTODIAN_VERSION | PUBLIC_ONLY_VERSION, _) => {
+            return Err(Error::CorruptIdentity);
+        }
         (found, _) => return Err(Error::UnknownStoredVersion { found }),
     }
 
@@ -307,10 +355,12 @@ pub fn save(identity: &NodeIdentity, path: &Path) -> Result<()> {
 
 /// Writes an identity, protected by the given sealer.
 ///
-/// An identity whose signing key is held here is written as version 1, exactly
-/// as [`save`] always wrote it. One whose signing key a custodian holds is
-/// written as version 2, which records the key's name and public half and has no
-/// place for its private half.
+/// An identity whose signing key is held here is written as [`STORED_VERSION`],
+/// exactly as [`save`] always wrote it. One whose signing key a custodian holds
+/// is written as [`CUSTODIAN_VERSION`], which records the key's name and public
+/// half and has no place for its private half. A member's, which holds the
+/// public half alone, is written as [`PUBLIC_ONLY_VERSION`], which names no
+/// custodian either.
 ///
 /// The bytes are sealed before the file exists, so nothing unprotected ever
 /// reaches it.
@@ -322,6 +372,7 @@ pub fn save_with(identity: &NodeIdentity, path: &Path, sealer: &dyn Sealer) -> R
     let plain = match identity.signing_key() {
         SigningKey::Held(_) => encode(identity),
         SigningKey::Custodian(_) => encode_custodian(identity)?,
+        SigningKey::PublicOnly(_) => encode_public_only(identity),
     };
     let protected = sealer.seal(&plain)?;
     let mut file = create_protected(path)?;
@@ -593,6 +644,72 @@ mod tests {
             matches!(refused, Err(Error::PermissiveKeyFile { mode }) if mode & 0o077 == 0o044),
             "expected a refusal naming the permissions, got {refused:?}"
         );
+    }
+
+    /// **A member's identity round trips with no key behind it**: the same
+    /// device, the public half only, and no custodian asked for or reported
+    /// missing.
+    #[test]
+    fn a_public_only_identity_round_trips_and_names_no_custodian() {
+        use super::{Custodians, PUBLIC_ONLY_VERSION, PlatformSealer, load_with, save_with};
+
+        /// Fails the test if anything asks it for a key.
+        struct Unasked;
+        impl Custodians for Unasked {
+            fn find(
+                &self,
+                reference: &str,
+            ) -> crate::Result<
+                Option<std::sync::Arc<dyn crate::detached::KeyCustodian + Send + Sync>>,
+            > {
+                Err(crate::Error::CustodianFailed {
+                    detail: format!("a member's identity asked for the key `{reference}`"),
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("identity");
+        let member = NodeIdentity::generate().expect("generates").without_signing_key();
+        save_with(&member, &path, &PlatformSealer).expect("saves");
+
+        let plain = crate::seal::unseal(&std::fs::read(&path).expect("reads")).expect("unseals");
+        assert_eq!(plain.get(1).copied(), u8::try_from(PUBLIC_ONLY_VERSION).ok(), "version 5");
+        let loaded = load_with(&path, &PlatformSealer, &Unasked).expect("loads asking nobody");
+        assert_eq!(loaded.device_id(), member.device_id());
+        assert!(loaded.signing_key().is_public_only());
+        assert_eq!(loaded.transport_key().public_key(), member.transport_key().public_key());
+        assert_eq!(loaded.attestation_key().public_key(), member.attestation_key().public_key());
+        assert_eq!(
+            loaded.sign_request(&crate::detached::prepare_possession(
+                b"x",
+                &loaded.signing_key().public_key()
+            )),
+            Err(Error::NoSigningKey)
+        );
+    }
+
+    /// A member's file whose public key was changed is refused, as any
+    /// identity's damaged file is; and one cut short or lengthened too.
+    #[test]
+    fn a_damaged_public_only_identity_is_refused() {
+        use super::encode_public_only;
+        let member = NodeIdentity::generate().expect("generates").without_signing_key();
+        let bytes = encode_public_only(&member);
+        assert!(decode(&bytes).is_ok(), "the intact one reads");
+
+        // Layout: array(6), 5, array(2), tag, then `0x58 0x20` and the key's 32
+        // bytes. A public key of another length is no key.
+        assert_eq!((bytes.get(4), bytes.get(5)), (Some(&0x58), Some(&0x20)), "the layout");
+        let mut tampered = bytes.clone();
+        if let Some(slot) = tampered.get_mut(5) {
+            *slot = 0x10;
+        }
+        assert_eq!(decode(&tampered).map(|_| ()), Err(Error::CorruptIdentity));
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(decode(&longer).map(|_| ()), Err(Error::CorruptIdentity));
+        assert!(decode(bytes.get(..bytes.len() / 2).unwrap_or_default()).is_err());
     }
 
     #[test]

@@ -86,6 +86,10 @@ pub enum Error {
     /// A key sealed with a passphrase names stretching parameters below the
     /// floor or above the ceiling, and was refused before anything was derived.
     UnacceptableStretch,
+    /// This identity holds only the public half of its signing key, because the
+    /// device is a member: there is nothing to sign with, and nothing is made in
+    /// its place.
+    NoSigningKey,
     /// A roster check refused the value.
     Roster(roster::Error),
 }
@@ -110,6 +114,7 @@ impl Error {
             Self::CustodianKeyMismatch { .. } => "custodian_key_mismatch",
             Self::WrongPassphraseOrAltered => "wrong_passphrase_or_altered",
             Self::UnacceptableStretch => "unacceptable_stretch",
+            Self::NoSigningKey => "no_signing_key",
             Self::Roster(_) => "roster",
         }
     }
@@ -131,6 +136,7 @@ impl Error {
         "custodian_key_mismatch",
         "wrong_passphrase_or_altered",
         "unacceptable_stretch",
+        "no_signing_key",
         "roster",
     ];
 
@@ -193,6 +199,9 @@ impl fmt::Display for Error {
             Self::UnacceptableStretch => f.write_str(
                 "the stored key names stretching parameters outside what is accepted, and was                  refused before anything was derived",
             ),
+            Self::NoSigningKey => {
+                f.write_str("this device holds no signing key: it is a member of this network")
+            }
             Self::Roster(inner) => write!(f, "roster: {inner}"),
         }
     }
@@ -227,6 +236,7 @@ mod tests {
             Error::CustodianKeyMismatch { reference: "sample".to_owned() },
             Error::WrongPassphraseOrAltered,
             Error::UnacceptableStretch,
+            Error::NoSigningKey,
             Error::Roster(roster::Error::InvalidKey),
         ];
         let unique: BTreeSet<&str> = samples.iter().map(Error::kind).collect();

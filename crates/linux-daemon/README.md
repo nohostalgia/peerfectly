@@ -151,8 +151,17 @@ admin. Deleting `/var/lib/peerfectly` by hand removes every network at once, wit
 
 - **Anybody** may connect and ask for `status`; what they are shown is what is theirs.
 - **The owner of a network** brings it up and down with no `sudo`.
-- **Acts that sign** — founding, joining, admitting, revoking, changing settings — need the
-  network's key, which only root can reach, so they run with `sudo`, and ask for the passphrase.
+- **Joining as a member asks for nothing**: `sudo peerfectly join <invite>` makes the device's
+  signing key in memory, signs the join's proof of possession with it, and clears it before
+  anything is written. A member never signs with that key again, so it keeps only the public half,
+  from which its id and address derive, and `status` says it holds none. No passphrase, no TPM, no
+  terminal: a script or a container can join. `sudo peerfectly join <invite> --admin` joins as an
+  admin, with the key in the TPM or a sealed file as below; the invite must have been made with
+  `invite --admin`. A join that asks for the other role is refused by the admin's daemon, which
+  keeps the invite open, and the join's `pending` line says which role to ask for.
+- **Acts that sign** — founding, joining as an admin, admitting, revoking, demoting, changing
+  settings — need the network's key, which only root can reach, so they run with `sudo`, and ask
+  for the passphrase.
   **Once per act**: everything an act signs — a revocation and the admission replacing it, an act
   and the snapshot the network is then owed — arrives as one batch, is listed with what each part
   does and what follows from it, and is signed with one entry of the passphrase. The prompt names
@@ -163,6 +172,13 @@ admin. Deleting `/var/lib/peerfectly` by hand removes every network at once, wit
   Under `sudo` the act is the person's who typed it, so a network founded with
   `sudo peerfectly found` belongs to them.
 - **Exposing a port and stopping the daemon** are acts on the machine, so they need `sudo`.
+- **Demoting an admin**, `sudo peerfectly demote <device>`, makes it a member. Nothing is signed for
+  a device that is already a member or for the network's only admin; a founder can be demoted only
+  by itself, and the roster's refusal is said. A demoted device keeps its signing key until the
+  demotion is **settled** — beneath the roster's base, where nothing can void it — and then
+  destroys it; `status` says so meanwhile. A member wanted as an admin is invited again with
+  `invite --admin` and approved with `--replace`: a member keeps no key that could be made an
+  admin's, so promoting one is not offered.
 
 ## What each custody defends against
 

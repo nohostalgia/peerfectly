@@ -72,12 +72,14 @@ fn joining(
         started_at: 1,
         requested_at: None,
         conflicts: Vec::new(),
+        admin: false,
+        refused: None,
     };
     let (underway, reporting) = Underway::new(Progress::Registering);
     let paths = paths.clone();
     let task = tokio::spawn(async move {
         let identity = daemon::keys::PlatformKeys.identity(&paths).unwrap();
-        daemon::joining::run(&paths, &join, &identity, &reporting, |_| {}).await
+        daemon::joining::run(&paths, &join, &identity, &reporting, |_| {}, |_| {}).await
     });
     (identity, underway, task)
 }
@@ -87,7 +89,9 @@ fn joining(
 async fn requested(record: &Record) -> Applicant {
     tokio::time::timeout(A_STEP, async {
         loop {
-            if let Ok(applicant) = admitting::collect(&record.invite).await {
+            if let Ok(admitting::Collected::Request(applicant)) =
+                admitting::collect(&record.invite, record.invited.role).await
+            {
                 return applicant;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;

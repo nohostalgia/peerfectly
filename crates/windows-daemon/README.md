@@ -243,6 +243,30 @@ machine — which is the property being bought. The daemon knows which networks
 device in one network is a device in another, because such a record on a stolen
 machine hands over exactly the map the separation exists to deny.
 
+## A member holds no signing key
+
+A device joins as a **member** unless the person passes `--admin`: `peerfectly join <invite>`
+makes the signing key in memory, signs the join's proof of possession with it, and clears it
+before anything is written. Nothing goes to the key store and no dialog appears. A member never
+signs with that key again — sessions, sync, renewals and attestations use other keys — so it keeps
+only the public half, from which its id and address derive, and the report says it holds none.
+
+`peerfectly join <invite> --admin` makes the key in the key store, as founding does, and needs an
+invite made with `invite --admin`. A machine whose key store cannot protect a key refuses `--admin`
+before anything is made, and joins as a member. A join asking for the role the invite does not make
+is refused by the admin's daemon, which keeps the invite open; the request is listed as refused on
+the admin's side, and the join's line says which role to ask for on the device's.
+
+`peerfectly demote <device>` makes an admin a member: one batch, one consent. Nothing is signed for
+a member or for the network's only admin, and a founder can be demoted only by itself. The demoted
+device destroys its key in the key store once the demotion is settled beneath the roster's base,
+and says until then that it still holds it. A member wanted as an admin is invited again with
+`--admin` and approved with `--replace`.
+
+Update the admins' machines first: an admin's daemon from before this release admits a new member
+as it always did, but cannot take a request from a device joining as an admin. An identity written
+by this release for a member cannot be read by an older one.
+
 ## One act, one batch, one look before Windows asks
 
 An act that signs more than once — founding (the network and its first

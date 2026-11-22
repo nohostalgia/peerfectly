@@ -1544,3 +1544,46 @@ on its own and `a` reached; with `/data` group-writable, the daemon does not sta
 - Before: `cargo clippy -p linux-daemon --all-targets -- -D warnings` clean on Linux and, with
   `daemon`, `cli` and `windows-daemon`, on Windows; the library's tests on Linux, 67 passed, the new
   `home` and `command_line` ones among them, then `home` again with the test on the disk, 7 passed.
+
+## S9. A member keeps no signing key; demoting an admin (`members-hold-no-signing-key`)
+
+`members-hold-no-signing-key` 5.1. In the testbed, rebuilt from this code: `a` (TPM) founds `casa` on
+`https://relay:8444` and invites `phone` as a member; on `b`, `peerfectly join <invite>` run with no
+terminal (`docker compose exec -T`, stdin empty); `a` approves. Then `a` invites `desk` with
+`--admin`, and `c` (no TPM) joins it first without `--admin`, then cancels and joins with `--admin`;
+`a` approves. `a` demotes `desk`; then signs 80 renames, so the roster compacts past the demotion.
+
+**Expect**: `b` asked nothing, a member holding no signing key after a restart, its keys directory
+empty; the wrong role refused on both sides with the invite left open; `c` an admin with a sealed
+key; after the demotion `c` a member that still holds its key and says until when; once compacted,
+the key gone and `status` saying none; demoting the only admin, and a member, signing nothing.
+
+**Result**: run, 2026-11-22, in the testbed, passed.
+- `b`: the join printed `this device joins as a member: it keeps no signing key, and nothing is
+  asked`, and asked nothing. Admitted as `phone.casa.internal [0553-a2f3-0b11-ffd7]`, member,
+  `100.89.0.2`; `signing key  none: this device is a member, and holds no signing key`;
+  `/var/lib/peerfectly/keys` empty. Ping to `a` 0% loss. The same after the container restarted.
+- `c` without `--admin`: on `a`, `desk (casa): open … refused …: the key 49AF-816D-2EC4-B159-B640
+  asked to join as a member, and this invite makes an admin`; on `c`, `last: the admin's daemon says
+  this invite makes an admin, and this device is joining as a member. Cancel this join and join
+  again with --admin. Until then it goes on waiting.`
+- `c` with `--admin`: a passphrase chosen twice and the proof signed with the key just made;
+  admitted as `desk.casa.internal [5d4d-e29d-a63e-457c]`, admin, `signing key  in a file sealed with
+  a passphrase`, the file `keys/peerfectly.joining.<…>.signing.sealed`; `was-admin` noted.
+- `sudo peerfectly demote desk` on `a`: one act, `make 5d4d-e29d-a63e-457c a member`, one TPM
+  passphrase. On `c`: `member`, the key file still there, and `kept until this device's demotion is
+  settled, and then destroyed`.
+- `peerfectly demote a`: `a [a4c4-0a0d-e0f0-436a] is this network's only admin: … Nothing was
+  signed.`; `peerfectly demote phone`: `… is already a member. Nothing was signed.`
+- After the 80 renames: `c` held `base.redb` and `base.snapshot`, logged `this device was demoted,
+  and the demotion is settled: its signing key for this network was destroyed, and it holds none, as
+  a member`; `keys` empty, `was-admin` gone, `signing key  none`. After a restart the same, and a
+  ping to `a` 0% loss.
+- Seen on `a` during the renames, one every four seconds, and not about this change: `[state]
+  …/snapshot: No such file or directory (os error 2)` from the fourth on, and once
+  `snapshot_sequence_regressed`. Both writers of `snapshot` and `snapshot_at` go through
+  `state::replace_file`, whose temporary is always `<file>.new`, so two at once can move each
+  other's away; the files are there and the network ran throughout. Reported separately.
+- Before: on Windows `cargo clippy` with `-D warnings` clean for `identity`, `enrollment`, `daemon`,
+  `cli` and `windows-daemon`, and their tests passing; on Linux `linux-daemon`'s clippy clean and its
+  library's tests, 69, passing, the member's identity test among them.

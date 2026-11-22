@@ -428,8 +428,12 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("an admin") && text.contains("admit and revoke"), "{text}");
 
     let demote = admin.core(OperationBody::Demote { device }, Vec::new());
-    let text = said(&Read::Operation(Box::new(demote)), &Command::Confirm);
+    let text = said(&Read::Operation(Box::new(demote.clone())), &Command::Confirm);
     assert!(text.contains("a member") && text.contains("no longer"), "{text}");
+    assert!(text.contains("once the demotion is settled"), "{text}");
+    let asked = Command::Demote { network: None, target: Target::Name("desk".to_owned()) };
+    let text = said(&Read::Operation(Box::new(demote)), &asked);
+    assert!(text.contains("make `desk` ("), "the name the person typed: {text}");
 
     let rename = admin.core(OperationBody::Rename { device, name: "desk".to_owned() }, Vec::new());
     let text = said(&Read::Operation(Box::new(rename)), &Command::Confirm);

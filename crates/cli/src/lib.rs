@@ -200,6 +200,7 @@ const WORDS_WITH_ARGUMENTS: &[&str] = &[
     "ipv4",
     "route",
     "rename",
+    "demote",
 ];
 
 /// The command line, with what the platform gave it.
@@ -429,6 +430,16 @@ impl Cli<'_> {
     async fn join(&self, command: Command) -> std::process::ExitCode {
         use std::process::ExitCode;
 
+        // Said before anything is made: which of the two this join is, and
+        // what each asks of the person.
+        if matches!(command, Command::Join { admin: true, .. }) {
+            println!("this device joins as an admin: the invite must be one made with --admin.");
+            println!("Its signing key is made now and kept, behind what this machine protects it");
+            println!("with, and asked for again when this device proves it holds it.");
+        } else {
+            println!("this device joins as a member: it keeps no signing key, and nothing is");
+            println!("asked. An invite made with --admin needs --admin here.");
+        }
         match self.ask_and_sign(command).await {
             Ok(Outcome::JoinStarted { label, fingerprint, conflicts }) => {
                 println!();
@@ -470,6 +481,10 @@ impl Cli<'_> {
     async fn invite_through_the_daemon(&self, command: Command) -> std::process::ExitCode {
         use std::process::ExitCode;
 
+        // The device's person must say the same role when joining, so the line
+        // to run says it.
+        let as_admin =
+            if matches!(command, Command::Invite { admin: true, .. }) { " --admin" } else { "" };
         // Before anything is issued: a request this process cannot sign for is a
         // person's time and an approval that cannot happen.
         if let Err(refusal) = self.custody.may_sign() {
@@ -483,8 +498,15 @@ impl Cli<'_> {
                 println!("{scannable}");
                 println!("an invite for {name}. On that device, run:");
                 println!();
-                println!("  peerfectly join {invite}");
+                println!("  peerfectly join {invite}{as_admin}");
                 println!();
+                if !as_admin.is_empty() {
+                    println!(
+                        "It makes an admin: joined without --admin, the request is refused and"
+                    );
+                    println!("the invite stays open.");
+                    println!();
+                }
                 println!("or scan the code above. It is open {}.", open_for(expires_at));
                 println!();
                 println!(
@@ -800,6 +822,15 @@ impl Cli<'_> {
         } else if word == "rename" {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             match daemon::control::Command::renaming(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "demote" {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match daemon::control::Command::demotion(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
                     eprintln!("{refusal}");
@@ -1669,7 +1700,8 @@ fn joining_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         .filter(|word| !word.starts_with("--"))
         .cloned()
         .ok_or_else(|| format!("usage: {JOIN_USAGE}"))?;
-    Ok(daemon::control::Command::Join { invite, name: device_name(rest)? })
+    let admin = rest.iter().any(|word| word == "--admin");
+    Ok(daemon::control::Command::Join { invite, name: device_name(rest)?, admin })
 }
 
 /// Builds the inviting command from what a person typed.
@@ -1826,7 +1858,7 @@ fn machine_name() -> Option<String> {
 }
 
 /// How `join` is spelled, in one place so the usage and the refusal agree.
-const JOIN_USAGE: &str = "peerfectly join <the invite an admin sent> [--name NAME]";
+const JOIN_USAGE: &str = "peerfectly join <the invite an admin sent> [--name NAME] [--admin]";
 
 /// How many devices of a batch file one command carries: well within what a
 /// command may hold, at a few hundred bytes a device.
@@ -1921,6 +1953,20 @@ fn pending_listed(list: &daemon::control::PendingList) -> String {
             )),
             (standing, _) => out.push_str(&format!("{name} ({network}): {standing}\n")),
         }
+        // Requests for the other role: refused, the invite left open. Told in
+        // these words, from the fixed word the record keeps.
+        for refused in &line.refused {
+            let (makes, asked) = match refused.word.as_str() {
+                "invite-makes-admin" => ("an admin", "a member"),
+                "invite-makes-member" => ("a member", "an admin"),
+                _ => continue,
+            };
+            out.push_str(&format!(
+                "  refused {}: the key {} asked to join as {asked}, and this invite makes {makes}\n",
+                when(refused.at),
+                daemon::control::shown(&refused.fingerprint)
+            ));
+        }
         out.push('\n');
     }
     for join in &list.joins {
@@ -1997,6 +2043,7 @@ fn usage(privileged: &str) -> String {
         board::BOARD_USAGE,
         REVOKE_USAGE,
         RENAME_USAGE,
+        Command::DEMOTE_USAGE,
         FORGET_USAGE,
         Command::RELAY_USAGE,
         Command::SET_ANCHORS_USAGE,
@@ -2168,6 +2215,7 @@ mod tests {
                         }),
                         conflicts: vec!["100.83.0.0/16 overlaps 100.83.4.0/24".to_owned()],
                     }),
+                    refused: Vec::new(),
                 },
                 InviteLine {
                     network: "casa".to_owned(),
@@ -2175,6 +2223,11 @@ mod tests {
                     standing: "used".to_owned(),
                     expires_at: 0,
                     request: None,
+                    refused: vec![daemon::control::RefusedLine {
+                        fingerprint: "1111-2222-3333-4444-5555".to_owned(),
+                        word: "invite-makes-admin".to_owned(),
+                        at: 1_800_000_000,
+                    }],
                 },
             ],
             joins: vec![JoinLine {
@@ -2194,6 +2247,12 @@ mod tests {
         assert!(shown.contains("0b0b-0b0b-0b0b-0b0b"), "the device holding the name: {shown}");
         assert!(shown.contains("its IPv4: 100.83.0.0/16 overlaps"), "what the device saw: {shown}");
         assert!(shown.contains("sensor (casa): used"), "{shown}");
+        assert!(
+            shown.contains(
+                "1111-2222-3333-4444-5555 asked to join as a member, and this invite makes an admin"
+            ),
+            "a request refused for its role: {shown}"
+        );
         assert!(shown.contains("9F00-1E2D-3C4B-5A69-7887"), "{shown}");
         assert!(shown.contains("peerfectly cancel joining"), "{shown}");
         assert_eq!(
@@ -2266,7 +2325,7 @@ mod tests {
         assert!(super::inviting_from(&words("--light")).is_err(), "a name first");
         assert!(super::inviting_from(&words("sensor --expires many")).is_err());
 
-        let Ok(Command::Join { invite, name }) =
+        let Ok(Command::Join { invite, name, admin: false }) =
             super::joining_from(&words("peerfectly-invite-v1:00 --name board"))
         else {
             panic!("a join");
@@ -2274,6 +2333,13 @@ mod tests {
         assert_eq!(invite, "peerfectly-invite-v1:00");
         assert_eq!(name, "board");
         assert!(super::joining_from(&words("--name board")).is_err(), "an invite first");
+        assert!(
+            matches!(
+                super::joining_from(&words("peerfectly-invite-v1:00 --name board --admin")),
+                Ok(Command::Join { admin: true, .. })
+            ),
+            "--admin asks to join as an admin"
+        );
     }
 
     #[test]
@@ -2476,7 +2542,11 @@ mod custody {
         ]);
         let custody = Willing::default();
         let cli = Cli { channel: &daemon, custody: &custody, extras: Extras::default() };
-        let joining = Command::Join { invite: "an invite".to_owned(), name: "laptop".to_owned() };
+        let joining = Command::Join {
+            invite: "an invite".to_owned(),
+            name: "laptop".to_owned(),
+            admin: false,
+        };
         assert_eq!(std::process::ExitCode::FAILURE, cli.join(joining).await);
         let sent = daemon.sent();
         assert!(
@@ -2725,7 +2795,11 @@ mod custody {
         let custody = Willing { unlocks: true, ..Willing::default() };
         let cli = Cli { channel: &daemon, custody: &custody, extras: Extras::default() };
 
-        let joining = Command::Join { invite: "an invite".to_owned(), name: "laptop".to_owned() };
+        let joining = Command::Join {
+            invite: "an invite".to_owned(),
+            name: "laptop".to_owned(),
+            admin: false,
+        };
         let outcome = cli.ask_and_sign(joining).await.unwrap();
 
         assert_eq!(

@@ -214,12 +214,46 @@ impl Signer for RefusingSigner {
     }
 }
 
-/// The key an identity signs with: held here, or held by a custodian.
+/// A signer that answers every request with "this device holds no signing
+/// key": what stands in for the key of a member, whose private half was cleared
+/// once its join had proved it.
+struct AbsentSigner {
+    /// The public half, which is all there is.
+    public: PublicKey,
+}
+
+impl Signer for AbsentSigner {
+    fn algorithm(&self) -> Algorithm {
+        self.public.algorithm()
+    }
+
+    fn public_key(&self) -> PublicKey {
+        self.public.clone()
+    }
+
+    fn sign(&self, _message: &[u8]) -> roster::Result<Vec<u8>> {
+        Err(roster::Error::InvalidValue(
+            "this device holds no signing key: it is a member of this network",
+        ))
+    }
+}
+
+/// The key an identity signs with: held here, held by a custodian, or — for a
+/// member — not held anywhere, only its public half kept.
 pub enum SigningKey {
     /// Material this process holds.
     Held(PrivateKey),
     /// A key only a custodian can use.
     Custodian(CustodianKey),
+    /// The public half alone. Nothing can sign with it, and nothing ever will:
+    /// there is no way back from this to a key that signs.
+    PublicOnly(PublicOnlyKey),
+}
+
+/// The public half of a member's signing key, which is all a member keeps.
+pub struct PublicOnlyKey {
+    /// What [`SigningKey::signer`] hands out, and the public half it carries.
+    absent: AbsentSigner,
 }
 
 impl SigningKey {
@@ -229,6 +263,7 @@ impl SigningKey {
         match self {
             Self::Held(key) => key.algorithm(),
             Self::Custodian(key) => key.public.algorithm(),
+            Self::PublicOnly(key) => key.absent.public.algorithm(),
         }
     }
 
@@ -238,6 +273,7 @@ impl SigningKey {
         match self {
             Self::Held(key) => key.public_key(),
             Self::Custodian(key) => key.public.clone(),
+            Self::PublicOnly(key) => key.absent.public.clone(),
         }
     }
 
@@ -250,12 +286,14 @@ impl SigningKey {
     /// The synchronous signer.
     ///
     /// For a custodian's key this refuses every signature; see
-    /// [`NodeIdentity::sign_operation`].
+    /// [`NodeIdentity::sign_operation`]. For a member's, which is no key at
+    /// all, it refuses every signature too, and says why.
     #[must_use]
     pub fn signer(&self) -> &dyn Signer {
         match self {
             Self::Held(key) => key.signer(),
             Self::Custodian(key) => &key.refusing,
+            Self::PublicOnly(key) => &key.absent,
         }
     }
 
@@ -264,7 +302,7 @@ impl SigningKey {
     pub const fn material(&self) -> Option<&SecretBytes> {
         match self {
             Self::Held(key) => Some(key.material()),
-            Self::Custodian(_) => None,
+            Self::Custodian(_) | Self::PublicOnly(_) => None,
         }
     }
 
@@ -272,9 +310,16 @@ impl SigningKey {
     #[must_use]
     pub const fn custodian(&self) -> Option<&CustodianKey> {
         match self {
-            Self::Held(_) => None,
+            Self::Held(_) | Self::PublicOnly(_) => None,
             Self::Custodian(key) => Some(key),
         }
+    }
+
+    /// Whether only the public half is here: a member's key, which nothing can
+    /// sign with.
+    #[must_use]
+    pub const fn is_public_only(&self) -> bool {
+        matches!(self, Self::PublicOnly(_))
     }
 
     /// A key entry declaring this key for a purpose.
@@ -289,13 +334,17 @@ impl SigningKey {
     /// key is somewhere this process cannot reach at all, and a caller must then
     /// prepare the request and have it signed where the key is.
     ///
+    /// True for a member's public half as well: there is nowhere else to send
+    /// the request, and asking here is what answers [`Error::NoSigningKey`]
+    /// rather than sending somebody a request nothing can sign.
+    ///
     /// Asked **before** signing. [`Self::sign_request`] refuses rather than
     /// blocking on something that will never answer, but that refusal is a net
     /// under a caller that forgot, not the way to find out.
     #[must_use]
     pub fn answers_here(&self) -> bool {
         match self {
-            Self::Held(_) => true,
+            Self::Held(_) | Self::PublicOnly(_) => true,
             Self::Custodian(key) => key.custodian.answers_here(),
         }
     }
@@ -312,6 +361,7 @@ impl SigningKey {
                 }
                 sign_with_custodian(request, key.custodian.as_ref())
             }
+            Self::PublicOnly(_) => Err(Error::NoSigningKey),
         }
     }
 }
@@ -325,6 +375,9 @@ impl fmt::Debug for SigningKey {
                 .field("reference", &key.reference)
                 .field("key_id", &key.public.key_id())
                 .finish(),
+            Self::PublicOnly(key) => {
+                f.debug_struct("PublicOnly").field("key_id", &key.absent.public.key_id()).finish()
+            }
         }
     }
 }
@@ -431,6 +484,69 @@ impl NodeIdentity {
         Ok(Self { signing, transport, attestation })
     }
 
+    /// An identity that holds its signing key's public half alone: a member's,
+    /// read back from its file.
+    ///
+    /// # Errors
+    ///
+    /// When the public key is not one the roster accepts, or when two of the
+    /// three keys are the same value.
+    pub fn public_only(
+        signing: PublicKey,
+        transport: PrivateKey,
+        attestation: PrivateKey,
+    ) -> Result<Self> {
+        let public = PublicKey::new(signing.algorithm(), signing.as_bytes().to_vec())?;
+        if public.as_bytes() == transport.public_key().as_bytes()
+            || public.as_bytes() == attestation.public_key().as_bytes()
+            || transport.public_key().as_bytes() == attestation.public_key().as_bytes()
+        {
+            return Err(Error::KeyReuse);
+        }
+        let signing = SigningKey::PublicOnly(PublicOnlyKey { absent: AbsentSigner { public } });
+        Ok(Self { signing, transport, attestation })
+    }
+
+    /// This identity with its signing key's private half gone and its public
+    /// half kept: what a member is once its join has proved the key.
+    ///
+    /// Consumes the identity, so nothing is left holding the key: a key held
+    /// here is cleared as it is dropped, and a custodian's is no longer reached
+    /// through this identity (removing it from the custodian is the caller's,
+    /// who knows where it is). The device id, and the addresses that follow from
+    /// it, are unchanged, because they follow from the public half.
+    #[must_use]
+    pub fn without_signing_key(self) -> Self {
+        let public = self.signing.public_key();
+        let Self { signing, transport, attestation } = self;
+        drop(signing);
+        let signing = SigningKey::PublicOnly(PublicOnlyKey { absent: AbsentSigner { public } });
+        Self { signing, transport, attestation }
+    }
+
+    /// The same device as a member keeps it: this identity's signing key's
+    /// public half, beside its own transport and attestation keys.
+    ///
+    /// For a device whose signing key is to go while the identity still in use
+    /// holds it — an admin demoted — so the member's identity can be written
+    /// before the key is removed.
+    ///
+    /// # Errors
+    ///
+    /// When a key does not rebuild, which a key this identity holds always does.
+    pub fn to_public_only(&self) -> Result<Self> {
+        let again = |key: &PrivateKey| {
+            let mut material = [0u8; 32];
+            material.copy_from_slice(key.material().expose());
+            PrivateKey::from_material(key.algorithm(), material)
+        };
+        Self::public_only(
+            self.signing.public_key(),
+            again(&self.transport)?,
+            again(&self.attestation)?,
+        )
+    }
+
     /// Signs an operation, through the path this identity's key takes.
     ///
     /// A key held here signs synchronously. A custodian's key signs through the
@@ -451,6 +567,7 @@ impl NodeIdentity {
                 let request = prepare_operation(core, &self.signing.public_key());
                 self.signing.sign_request(&request)
             }
+            SigningKey::PublicOnly(_) => Err(Error::NoSigningKey),
         }
     }
 
@@ -474,6 +591,7 @@ impl NodeIdentity {
                 let request = crate::detached::prepare_snapshot(body, &self.signing.public_key());
                 self.signing.sign_request(&request)
             }
+            SigningKey::PublicOnly(_) => Err(Error::NoSigningKey),
         }
     }
 
@@ -526,6 +644,12 @@ impl NodeIdentity {
     ///
     /// The keys in it are the keys this node holds, so a node cannot claim a
     /// key it can neither sign nor establish sessions with.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSigningKey`] for a member's identity, which holds only its
+    /// signing key's public half and so presents no specification: one would
+    /// claim a key it can no longer sign with.
     pub fn device_spec(
         &self,
         name: impl Into<String>,
@@ -533,6 +657,9 @@ impl NodeIdentity {
         founder: bool,
         capabilities: Vec<Capability>,
     ) -> Result<DeviceSpec> {
+        if self.signing.is_public_only() {
+            return Err(Error::NoSigningKey);
+        }
         let mut keys = vec![
             self.signing.entry(KeyPurpose::Signing)?,
             self.transport.entry(KeyPurpose::Transport)?,
@@ -619,5 +746,45 @@ mod tests {
         let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
         assert!(!rendered.contains(&hex), "private material must not be printed");
         assert!(rendered.contains("device_id"));
+    }
+
+    /// **Dropping the private half keeps the device**: the same id, the same
+    /// public key, and signing refused with its own reason, through every path.
+    #[test]
+    fn a_member_keeps_its_device_and_signs_nothing() {
+        let identity = NodeIdentity::generate().expect("generates");
+        let (id, public) = (identity.device_id(), identity.signing_key().public_key());
+        let secret = identity.signing_key().material().expect("held").expose().to_vec();
+
+        let member = identity.without_signing_key();
+
+        assert_eq!(id, member.device_id(), "the id follows from the public half");
+        assert_eq!(public, member.signing_key().public_key());
+        assert!(member.signing_key().is_public_only());
+        assert!(member.signing_key().material().is_none());
+        assert!(member.signer().sign(b"anything").is_err(), "the synchronous path refuses");
+        let request = crate::detached::prepare_possession(b"anything", &public);
+        assert_eq!(member.sign_request(&request), Err(Error::NoSigningKey));
+        assert_eq!(
+            member.device_spec("laptop", roster::types::Role::Member, false, vec![]).map(|_| ()),
+            Err(Error::NoSigningKey),
+            "no specification claims a key it cannot sign with"
+        );
+        let rendered = format!("{member:?}");
+        let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert!(!rendered.contains(&hex), "{rendered}");
+        assert!(rendered.contains("PublicOnly"), "{rendered}");
+    }
+
+    /// A member's identity read back is refused when two of its keys are one.
+    #[test]
+    fn a_public_only_identity_refuses_a_reused_key() {
+        let key = |bytes| PrivateKey::from_material(Algorithm::Ed25519, bytes).expect("valid");
+        let transport = key([5; 32]);
+        let public = transport.public_key();
+        assert_eq!(
+            NodeIdentity::public_only(public, transport, key([6; 32])).map(|_| ()),
+            Err(Error::KeyReuse)
+        );
     }
 }

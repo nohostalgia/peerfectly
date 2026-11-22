@@ -725,6 +725,25 @@ impl Node {
         true
     }
 
+    /// Why the roster gives the operation in `bytes` no effect, if it holds it
+    /// and gives it none: an act whose author may not make it is still held in
+    /// the graph, judged invalid there, and changes nothing.
+    pub async fn without_effect(&self, bytes: &[u8]) -> Option<roster::state::Invalidity> {
+        let id = roster::sign::RawOperation::decode(bytes).ok()?.id();
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        let index = dag.position(&id)?;
+        let (_, verdicts) = roster::state::derive_with_verdicts(dag).ok()?;
+        verdicts.reason(index)
+    }
+
+    /// Whether `device` is a member in the roster's base, where nothing still
+    /// held can change it (`crate::demoting::settled_member`).
+    pub async fn settled_member(&self, device: &DeviceId) -> bool {
+        let syncer = self.syncer.lock().await;
+        crate::demoting::settled_member(syncer.roster().dag().base_state(), device)
+    }
+
     /// The base this roster rests on: the root beneath its window and the
     /// state it commits to.
     pub async fn base(

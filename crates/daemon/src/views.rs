@@ -290,6 +290,12 @@ fn status_of(network: &Network) -> Block {
     // Where **this** device keeps the key that signs for this network. Never
     // said about a peer: this device cannot see how somebody else holds theirs.
     block.line("signing key", network.custody);
+    if network.key_until_settled {
+        block.line(
+            "",
+            "kept until this device's demotion is settled, and then destroyed: it is a member now",
+        );
+    }
 
     warnings(network, &mut block);
     block
@@ -489,6 +495,7 @@ mod tests {
             path: reachable.then_some(Path::Relay),
             standing: Standing::Current,
             last_contact: Contact::NoneRecorded,
+            admin: false,
         }
     }
 
@@ -503,6 +510,7 @@ mod tests {
             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
             admin: true,
             custody: crate::control::Custody::HeldHere,
+            key_until_settled: false,
             owner_taken: false,
             confirmation: None,
             arrived: None,
@@ -755,6 +763,30 @@ mod tests {
         .to_string();
 
         assert!(!drawn.contains("tray"), "{drawn}");
+    }
+
+    /// A member holds no signing key, and a demoted device says its key goes
+    /// once the demotion is settled.
+    #[test]
+    fn a_members_key_and_a_demoted_ones_are_said() {
+        let report = |custody, key_until_settled| Report {
+            networks: vec![Network { custody, key_until_settled, ..network("casa", Vec::new()) }],
+            unusable: Vec::new(),
+            note: None,
+            admin_refusal: None,
+            state_directory: None,
+            waiting_on: None,
+            elsewhere: 0,
+            may_stop_the_daemon: true,
+            could_stop_the_daemon: false,
+        };
+        let member = report(crate::control::Custody::None, false).to_string();
+        assert!(member.contains("none: this device is a member"), "{member}");
+        let demoted = report(crate::control::Custody::KeyStore, true).to_string();
+        assert!(demoted.contains("in this machine's key store"), "{demoted}");
+        assert!(demoted.contains("kept until this device's demotion is settled"), "{demoted}");
+        let admin = report(crate::control::Custody::KeyStore, false).to_string();
+        assert!(!admin.contains("demotion"), "{admin}");
     }
 
     /// Where the state is, said only when somebody chose it.

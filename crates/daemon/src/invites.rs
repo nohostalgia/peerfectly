@@ -99,6 +99,22 @@ impl Request {
     }
 }
 
+/// How many refused requests one invite keeps: the newest. Anyone holding the
+/// invite can make the same refusal happen as often as they are dialled, so
+/// what is kept is bounded, and a refusal already kept is not kept twice.
+pub const MOST_REFUSALS_KEPT: usize = 4;
+
+/// A request refused for asking the role an invite does not make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The fingerprint of the signing key it presented, and proved.
+    pub fingerprint: String,
+    /// What the device was told the invite makes.
+    pub mismatch: enrollment::exchange::Mismatch,
+    /// When it was last refused, in seconds since the epoch.
+    pub at: u64,
+}
+
 /// One invite and what it is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -113,6 +129,8 @@ pub struct Record {
     pub request: Option<Request>,
     /// Whether the admin withdrew it.
     pub withdrawn: bool,
+    /// Requests refused for asking the other role, newest last.
+    pub refused: Vec<Refused>,
 }
 
 /// Where an invite stands.
@@ -184,6 +202,7 @@ impl Record {
             expires_at: now.saturating_add(lifetime),
             request: None,
             withdrawn: false,
+            refused: Vec::new(),
         })
     }
 
@@ -270,6 +289,37 @@ impl Invites {
             return false;
         }
         record.request = Some(Request { applicant, arrived_at: now, decision: Decision::Waiting });
+        true
+    }
+
+    /// Records that a request asking the other role arrived through the open
+    /// invite with `secret`, and was refused. The invite stays open, and no
+    /// request is kept.
+    ///
+    /// Whether it is new: the same device refused for the same reason again
+    /// only has its time moved on.
+    pub fn refused(
+        &mut self,
+        secret: &[u8; enrollment::invite::SECRET_LEN],
+        fingerprint: String,
+        mismatch: enrollment::exchange::Mismatch,
+        now: u64,
+    ) -> bool {
+        let Some(record) = self.with_secret(secret) else { return false };
+        if record.standing(now) != Standing::Open {
+            return false;
+        }
+        if let Some(seen) = record
+            .refused
+            .iter_mut()
+            .find(|seen| seen.fingerprint == fingerprint && seen.mismatch == mismatch)
+        {
+            seen.at = now;
+            return false;
+        }
+        record.refused.push(Refused { fingerprint, mismatch, at: now });
+        let excess = record.refused.len().saturating_sub(MOST_REFUSALS_KEPT);
+        record.refused.drain(..excess);
         true
     }
 
@@ -376,6 +426,17 @@ struct Kept {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<KeptRequest>,
     withdrawn: bool,
+    /// Written only once one was refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused: Vec<KeptRefused>,
+}
+
+/// A refused request as the file keeps it.
+#[derive(Debug, Serialize, Deserialize)]
+struct KeptRefused {
+    fingerprint: String,
+    word: String,
+    at: u64,
 }
 
 /// A request as the file keeps it.
@@ -501,12 +562,26 @@ impl InviteFile {
                 .map(KeptRequest::read)
                 .transpose()
                 .map_err(|cause| self.failure(cause))?;
+            let refused = one
+                .refused
+                .into_iter()
+                .map(|seen| {
+                    enrollment::exchange::Mismatch::parse(&seen.word)
+                        .map(|mismatch| Refused {
+                            fingerprint: seen.fingerprint,
+                            mismatch,
+                            at: seen.at,
+                        })
+                        .map_err(|_| self.failure("a refused request whose word does not read"))
+                })
+                .collect::<Result<Vec<_>>>()?;
             records.push(Record {
                 invite,
                 invited: Invited { name: one.name, role, mode, groups, ipv4 },
                 expires_at: one.expires_at,
                 request,
                 withdrawn: one.withdrawn,
+                refused,
             });
         }
         Ok(Invites { records })
@@ -561,6 +636,15 @@ impl InviteFile {
                 expires_at: record.expires_at,
                 request: record.request.as_ref().map(KeptRequest::of),
                 withdrawn: record.withdrawn,
+                refused: record
+                    .refused
+                    .iter()
+                    .map(|seen| KeptRefused {
+                        fingerprint: seen.fingerprint.clone(),
+                        word: seen.mismatch.as_str().to_owned(),
+                        at: seen.at,
+                    })
+                    .collect(),
             })
             .collect();
         serde_json::to_vec_pretty(&kept).map_err(|cause| self.failure(&cause.to_string()))

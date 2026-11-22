@@ -93,8 +93,12 @@ out of turn ends the exchange rather than being acted on.
 
 ```text
 joiner -> admin   introduce { alg, kind, name, sign, proof, trans, attest, tproof, conflicts }
+                  (or introduce-admin, the same fields, from a device joining as an admin)
 
-then, before a person has approved the request:
+then, when the request's role is not the one the invite makes:
+admin  -> joiner  refused   { kind, word }                   (the exchange ends)
+
+or, before a person has approved the request:
 admin  -> joiner  received  { kind }                         (the exchange ends)
 
 or, once a person has approved it:
@@ -115,6 +119,20 @@ name it proposes; the admin's record of the invite decides
 the name, role, mode, groups and address it is admitted with, and an admission
 whose record chose any of the last four is followed, in the same delivery, by the
 `set_device` that sets them.
+
+A device joining as a **member** sends `introduce`, and keeps no signing key: it
+made the key for the join, signed `proof` with it, and cleared it. A device
+joining as an **admin** sends `introduce-admin`, the same nine fields in the same
+order with `kind` set to `introduce-admin`, and keeps its key. They are two kinds
+rather than a field so that a member's request is byte for byte what it was before
+there were two, and an admitting side that does not know `introduce-admin`
+refuses it as it refuses any kind it does not speak.
+
+The admitting side compares the kind with the role its record of the invite
+holds. When they differ it answers `refused`, keeps nothing, and leaves the invite
+unused. `word` is exactly `invite-makes-admin` or `invite-makes-member`; any other
+value is refused. Like `received`, it proves nothing — anyone holding the invite
+could send it — so the joining device shows it and goes on waiting.
 
 `received` carries **nothing but its kind**, and proves nothing: whoever holds the
 invite can send it. It tells the joining device that its request is kept and that

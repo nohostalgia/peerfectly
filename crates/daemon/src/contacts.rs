@@ -272,6 +272,7 @@ mod tests {
             ("clock.rs", include_str!("clock.rs")),
             ("conflicts.rs", include_str!("conflicts.rs")),
             ("connectivity.rs", include_str!("connectivity.rs")),
+            ("demoting.rs", include_str!("demoting.rs")),
             ("discovery.rs", include_str!("discovery.rs")),
             ("drawing.rs", include_str!("drawing.rs")),
             ("endpoints.rs", include_str!("endpoints.rs")),

@@ -247,6 +247,12 @@ impl LinuxKeys {
         let held =
             identity::store::load_with(&path, self.sealer().as_ref(), self).map_err(failed)?;
 
+        // A member's: no signing key at all, so none held in a plain file and
+        // none a passphrase file holds where the TPM could.
+        if held.signing_key().is_public_only() {
+            return Ok(Some(held));
+        }
+
         // A signing key in a plain file: nothing on Linux makes one, and a
         // device that can sign as an admin with a key any root process can read
         // is what this custody exists to prevent. Refused, and left alone.
@@ -382,10 +388,9 @@ impl Keys for LinuxKeys {
     ///
     /// Deleting unlinks the file; a copy taken before — a backup, an image of
     /// the disk — is out of reach, and the README says so.
-    fn forget(&self, paths: &Paths) -> Result<()> {
-        let Some(name) = daemon::keys::signing_key_named_in(paths) else { return Ok(()) };
+    fn forget_named(&self, _paths: &Paths, name: &str) -> Result<()> {
         for kind in [Kind::Tpm, Kind::Sealed] {
-            let path = file_for(&self.keys, &name, kind)
+            let path = file_for(&self.keys, name, kind)
                 .map_err(|cause| Error::State { path: self.keys.clone(), cause })?;
             match std::fs::remove_file(&path) {
                 Ok(()) => tracing::info!(key = %name, "the network's key file was deleted"),
@@ -402,7 +407,15 @@ impl Keys for LinuxKeys {
         self.keys.to_str().map(str::to_owned)
     }
 
+    fn keep_member(&self, path: &Path, identity: &NodeIdentity) -> Result<()> {
+        identity::store::save_with(identity, path, self.sealer().as_ref())
+            .map_err(|cause| Error::State { path: path.to_path_buf(), cause: cause.to_string() })
+    }
+
     fn custody_of(&self, identity: &NodeIdentity) -> daemon::control::Custody {
+        if identity.signing_key().is_public_only() {
+            return daemon::control::Custody::None;
+        }
         let Some(custodian) = identity.signing_key().custodian() else {
             return daemon::control::Custody::HeldHere;
         };
@@ -575,6 +588,25 @@ mod tests {
             std::fs::read_dir(scratch.path().join("keys")).unwrap().count(),
             "no key was made"
         );
+    }
+
+    /// **A member's identity is neither a plain file nor a passphrase file**:
+    /// it loads with no key file anywhere, and is reported as holding no key.
+    #[test]
+    fn a_members_identity_loads_with_no_key_and_is_said_to_hold_none() {
+        let (scratch, machine, paths, _made) = sealed_machine();
+        paths.create().unwrap();
+        let before: Vec<_> = std::fs::read_dir(scratch.path().join("keys")).unwrap().collect();
+        let member = identity::NodeIdentity::generate().unwrap().without_signing_key();
+        machine.keep_member(&paths.identity(), &member).unwrap();
+
+        let loaded = machine.identity(&paths).unwrap();
+        assert_eq!(member.device_id(), loaded.device_id());
+        assert!(loaded.signing_key().is_public_only());
+        assert_eq!(daemon::control::Custody::None, machine.custody_of(&loaded));
+        assert!(daemon::keys::signing_key_named_in(&paths).is_none(), "it names no key file");
+        let after = std::fs::read_dir(scratch.path().join("keys")).unwrap().count();
+        assert_eq!(before.len(), after, "nothing was made in the keys directory");
     }
 
     /// The daemon never signs: whatever asks, the custodian says the signature

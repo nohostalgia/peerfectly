@@ -32,7 +32,7 @@ use enrollment::limits;
 use identity::NodeIdentity;
 use roster::sign::PublicKey;
 use roster::state::RosterState;
-use roster::types::{OperationBody, OperationCore};
+use roster::types::{OperationBody, OperationCore, Role};
 use transport_convesso::enrolment::{Admitting, Channel};
 
 /// Why an admission did not happen.
@@ -90,38 +90,74 @@ pub struct Taken {
 /// channel. The device is then told its request was received, and the exchange
 /// ends.
 ///
+/// The device is told whether its request was kept: received, or refused for
+/// asking a role the invite does not make (`role`, as the invite's record
+/// holds it). A refused request is not kept, and the invite stays open.
+///
 /// # Errors
 ///
 /// When the device cannot be reached, says something other than an
 /// introduction, or does not prove the keys it presents.
-pub async fn collect(invite: &enrollment::Invite) -> Result<Applicant, Refusal> {
+pub async fn collect(invite: &enrollment::Invite, role: Role) -> Result<Collected, Refusal> {
     let endpoint = Admitting::dialling().await.map_err(|cause| cause.to_string())?;
-    let outcome = take_request(&endpoint, invite).await;
+    let outcome = take_request(&endpoint, invite, role).await;
     endpoint.close().await;
     outcome
+}
+
+/// What one dial of an open invite brought.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Collected {
+    /// A request asking the role the invite makes, its keys proved.
+    Request(Applicant),
+    /// A request, its keys proved, asking the other role: refused, with the
+    /// word the device was told.
+    Refused {
+        /// The fingerprint of the signing key it presented.
+        fingerprint: String,
+        /// What the device was told the invite makes.
+        mismatch: enrollment::exchange::Mismatch,
+    },
 }
 
 async fn take_request(
     endpoint: &Admitting,
     invite: &enrollment::Invite,
-) -> Result<Applicant, Refusal> {
+    role: Role,
+) -> Result<Collected, Refusal> {
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let rendezvous = transport_convesso::enrolment::rendezvous_key(&invite.rendezvous_seed())
         .map_err(|cause| cause.to_string())?;
     let mut channel = reach(endpoint, &rendezvous, &invite.relay).await?;
     let material = channel.material().map_err(|cause| cause.to_string())?;
-    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
-        return Err("the device said something other than its request".to_owned());
+    let (introduction, asks_admin) = match receive(&mut channel, deadline).await? {
+        Message::Introduce(introduction) => (introduction, false),
+        Message::IntroduceAdmin(introduction) => (introduction, true),
+        _ => return Err("the device said something other than its request".to_owned()),
     };
+    // The proofs first: a refusal is recorded against a key the device showed
+    // it holds, never against one it only named.
     introduction
         .verify(&material, &invite.network, &rendezvous)
         .map_err(|cause| cause.to_string())?;
-    send(&mut channel, &Message::Received, deadline).await?;
+    let mismatch = match (role, asks_admin) {
+        (Role::Admin, false) => Some(enrollment::exchange::Mismatch::InviteMakesAdmin),
+        (Role::Member, true) => Some(enrollment::exchange::Mismatch::InviteMakesMember),
+        _ => None,
+    };
+    let answer = mismatch.map_or(Message::Received, Message::Refused);
+    send(&mut channel, &answer, deadline).await?;
     // Held open until the device has read it and gone, or a few seconds:
     // closed at once, the endpoint took the message with it, and the device
     // went on believing nobody had its request.
     let _gone = receive(&mut channel, RECEIVED_LINGER).await;
-    Ok(Applicant::from(&introduction))
+    Ok(match mismatch {
+        Some(mismatch) => Collected::Refused {
+            fingerprint: crate::joining::fingerprint(&introduction.signing),
+            mismatch,
+        },
+        None => Collected::Request(Applicant::from(&introduction)),
+    })
 }
 
 /// How long the exchange is held open after saying a request was received.
@@ -183,7 +219,11 @@ async fn bring(
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let mut channel = reach(endpoint, &destination.dialled, destination.relay).await?;
     let material = channel.material().map_err(|cause| cause.to_string())?;
-    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
+    // Either kind: what is checked is that it is the device admitted, and the
+    // role was settled when its request was taken.
+    let (Message::Introduce(introduction) | Message::IntroduceAdmin(introduction)) =
+        receive(&mut channel, deadline).await?
+    else {
         return Err("the device said something other than an introduction".to_owned());
     };
     if introduction.transport != *destination.transport

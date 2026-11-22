@@ -44,6 +44,7 @@ fn report() -> Report {
         id: "3d4e-5f6a-7b8c-9d0e".to_owned(),
         admin: true,
         custody: daemon::control::Custody::KeyStore,
+        key_until_settled: false,
         owner_taken: false,
         // A network confirmed within the time it allows.
         confirmation: None,
@@ -107,6 +108,7 @@ fn report() -> Report {
                 path: Some(daemon::control::Path::Relay),
                 standing: Standing::Current,
                 last_contact: Contact::Recorded { at: at(1_757_700_000) },
+                admin: true,
             },
             Peer {
                 name: "laptop.home.internal".to_owned(),
@@ -121,6 +123,7 @@ fn report() -> Report {
                 path: None,
                 standing: Standing::Current,
                 last_contact: Contact::NoneRecorded,
+                admin: false,
             },
         ],
         // A page of a larger network: the rest are asked after the cursor.
@@ -146,6 +149,7 @@ fn report() -> Report {
         id: "4e5f-6a7b-8c9d-0e1f".to_owned(),
         admin: false,
         custody: daemon::control::Custody::KeyStore,
+        key_until_settled: false,
         owner_taken: false,
         // And one this device has not been able to confirm, so a renderer of
         // the report has both to draw.
@@ -179,6 +183,7 @@ fn report() -> Report {
             path: Some(daemon::control::Path::Direct),
             standing: Standing::LastKnown { at: at(1_757_600_000) },
             last_contact: Contact::Recorded { at: at(1_757_600_000) },
+            admin: false,
         }],
         peer_count: 1,
         reachable_count: 0,
@@ -286,6 +291,7 @@ fn outcomes() -> Vec<Outcome> {
                     standing: "open".to_owned(),
                     expires_at: 1_758_300_000,
                     request: None,
+                    refused: Vec::new(),
                 },
                 daemon::control::InviteLine {
                     network: "casa".to_owned(),
@@ -305,6 +311,7 @@ fn outcomes() -> Vec<Outcome> {
                                 .to_owned(),
                         ],
                     }),
+                    refused: Vec::new(),
                 },
             ],
             joins: vec![daemon::control::JoinLine {
@@ -487,7 +494,11 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
         Command::Withdraw { network: casa(), name: "tv".to_owned() },
         Command::Approve { network: casa(), name: "tv".to_owned(), replace: false },
         Command::Reject { network: casa(), name: "tv".to_owned() },
-        Command::Join { invite: "peerfectly-invite-v1:abc".to_owned(), name: "phone".to_owned() },
+        Command::Join {
+            invite: "peerfectly-invite-v1:abc".to_owned(),
+            name: "phone".to_owned(),
+            admin: false,
+        },
         Command::CancelJoin { label: "joining".to_owned() },
         Command::Confirm,
         Command::Abandon,
@@ -516,6 +527,10 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
             anchors: vec![daemon::control::Target::Name("nas".to_owned())],
         },
         Command::ChangeRelay { network: casa(), relay: "r.example".to_owned(), immediately: false },
+        Command::Demote {
+            network: casa(),
+            target: daemon::control::Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()),
+        },
     ]
     .into_iter()
     .map(|command| {

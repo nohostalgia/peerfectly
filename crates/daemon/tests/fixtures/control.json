@@ -184,6 +184,17 @@
         }
       },
       true
+    ],
+    [
+      {
+        "Demote": {
+          "network": "casa",
+          "target": {
+            "Id": "0a1b-2c3d-4e5f-6a7b"
+          }
+        }
+      },
+      true
     ]
   ],
   "outcomes": [
@@ -351,6 +362,7 @@
             "peers": [
               {
                 "address": "fd00::2",
+                "admin": true,
                 "id": "0a1b-2c3d-4e5f-6a7b",
                 "ipv4": {
                   "Held": "100.64.0.2"
@@ -524,6 +536,7 @@
         "peers": [
           {
             "address": "fd00::2",
+            "admin": true,
             "id": "0a1b-2c3d-4e5f-6a7b",
             "ipv4": {
               "Held": "100.64.0.2"
