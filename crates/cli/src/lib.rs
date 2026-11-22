@@ -98,6 +98,10 @@ pub struct Asking<'a> {
     pub summary: &'a str,
     /// What to sign, in order.
     pub messages: &'a [&'a [u8]],
+    /// Where the daemon keeps the key, where its platform keeps keys in a
+    /// directory of the daemon's ([`daemon::control::SignaturesWanted::keys`]).
+    /// Judged by the platform before it is used.
+    pub keys: Option<&'a str>,
 }
 
 /// A key just made.
@@ -1189,6 +1193,7 @@ impl Cli<'_> {
                         network: &wanted.network,
                         summary: &summary,
                         messages: &messages,
+                        keys: wanted.keys.as_deref(),
                     })
                 }
             };
@@ -2427,6 +2432,7 @@ mod custody {
             key: key.to_owned(),
             network: "casa".to_owned(),
             items,
+            keys: None,
         })
     }
 
@@ -2464,6 +2470,7 @@ mod custody {
                     message: vec![7; 32],
                     payload: Vec::new(),
                 }],
+                keys: None,
             }),
             Outcome::Failed { message: "stop here".to_owned(), left_behind: Vec::new() },
         ]);
@@ -2491,6 +2498,7 @@ mod custody {
                 message: vec![1, 2, 3],
                 payload: Vec::new(),
             }],
+            keys: None,
         })]);
         let cli = Cli { channel: &daemon, custody: &NoCustody, extras: Extras::default() };
 
@@ -2632,6 +2640,7 @@ mod custody {
                 id: "k1".to_owned(),
                 name: "peerfectly.casa.signing".to_owned(),
                 network: "casa".to_owned(),
+                keys: None,
             }),
             wanted("peerfectly.casa.signing", vec![operation(&genesis), snapshot]),
             Outcome::Done,
@@ -2705,6 +2714,7 @@ mod custody {
                 id: "k1".to_owned(),
                 name: "peerfectly.casa.signing".to_owned(),
                 network: "casa".to_owned(),
+                keys: None,
             }),
             Outcome::JoinStarted {
                 label: "joining".to_owned(),
@@ -2746,6 +2756,7 @@ mod custody {
                 id: "k1".to_owned(),
                 name: "peerfectly.casa.signing".to_owned(),
                 network: "casa".to_owned(),
+                keys: None,
             }),
             wanted("peerfectly.other.signing", vec![operation(&revocation)]),
             Outcome::Done,
@@ -2801,6 +2812,7 @@ mod custody {
             id: "8".to_owned(),
             name: "peerfectly.casa.signing".to_owned(),
             network: "casa".to_owned(),
+            keys: None,
         })]);
         let cli = Cli { channel: &daemon, custody: &NoCustody, extras: Extras::default() };
 

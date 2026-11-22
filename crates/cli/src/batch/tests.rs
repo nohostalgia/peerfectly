@@ -86,6 +86,7 @@ fn batch(network: &str, items: Vec<ToSign>) -> SignaturesWanted {
         key: "k".to_owned(),
         network: network.to_owned(),
         items,
+        keys: None,
     }
 }
 

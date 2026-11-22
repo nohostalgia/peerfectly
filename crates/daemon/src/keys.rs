@@ -113,6 +113,16 @@ pub trait Keys: Send + Sync {
         None
     }
 
+    /// Where the command line is to keep and find this machine's signing keys,
+    /// where the platform keeps them in a directory of the daemon's. Sent with
+    /// every request for a key or a signature, so the two can never look in
+    /// different places; the command line judges it before using it.
+    ///
+    /// `None` where keys live in a key store, or in the platform's default place.
+    fn keys_directory(&self) -> Option<String> {
+        None
+    }
+
     /// How this platform holds the signing key of the identity it gave.
     ///
     /// Read off the identity by default — a key somebody else holds is in a key

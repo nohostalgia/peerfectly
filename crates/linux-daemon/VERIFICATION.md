@@ -1517,3 +1517,30 @@ scenario, `a` finds its TPM usable at every start and reaches the board after ea
   log says "the TPM can hold signing keys" at each start. Seen in the same run and not about the
   TPM: once, after the first kill and a minute of quiet, `a` took 19 s to reach the board (0-1 s
   the other times).
+
+## S8. The state kept in a directory somebody chose (`--state`)
+
+`linux-state-directory` 3.1. In the testbed: `a` and the relay from compose, and a node `d` started
+by hand from the node image with a volume at `/data` (root, 755) and `peerfectlyd --state
+/data/peerfectly`. `a` founds `casa` on `https://relay:8444`, invites `d`; on `d`, `peerfectly join
+<invite>` (no TPM, so a sealed key); `a` approves. Then `d`'s container is removed and made again on
+the same volume, and last `/data` is made `root:users 775` and `d` restarted.
+
+**Expect**: `d` makes `/data/peerfectly` with mode 700 and nothing under `/var/lib/peerfectly`; the
+command line makes the key under `/data/peerfectly/keys`; `status` shows `kept in
+/data/peerfectly`; after the new container, the same machine key, identity and device id, `casa` up
+on its own and `a` reached; with `/data` group-writable, the daemon does not start and names it.
+
+**Result**: run, 2026-11-22, in the testbed, passed.
+- `/data/peerfectly` `drwx------ root root`; `/var/lib/peerfectly` absent throughout.
+- The key: `/data/peerfectly/keys/peerfectly.joining.<…>.signing.sealed`, `0600`.
+- `d` admitted as `d.casa.internal [d938-7eaf-0701-6acb]`, member, `100.84.0.2`; ping to `a` 0%
+  loss. After the container was removed and made again: `machine.key` and `networks/casa/identity`
+  with the same SHA-256 as before, the same device id, `casa   up (now)`, ping to `a` 0% loss.
+- With `/data` `root:users 775`: `ERROR could not start cause=/data/peerfectly: its group can write
+  /data`, exit 1. Put back to 755, it started.
+- Seen once at the restart and not about this change: `the roster refused it:
+  snapshot_sequence_regressed` from `roster-sync`, the network up and reached regardless.
+- Before: `cargo clippy -p linux-daemon --all-targets -- -D warnings` clean on Linux and, with
+  `daemon`, `cli` and `windows-daemon`, on Windows; the library's tests on Linux, 67 passed, the new
+  `home` and `command_line` ones among them, then `home` again with the test on the disk, 7 passed.

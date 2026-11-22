@@ -62,6 +62,33 @@ impl LinuxCustody {
     fn as_root() -> Result<(), String> {
         if rustix::process::geteuid().is_root() { Ok(()) } else { Err(USE_SUDO.to_owned()) }
     }
+
+    /// The keys directory a request names, once judged: this custody's own
+    /// when it names none or names that one, which is judged as it always was;
+    /// otherwise `keys` under a state directory the daemon was given, which must
+    /// pass [`crate::home::judge_existing_state`] first.
+    ///
+    /// **Not believed for having been named.** The daemon is root and was found
+    /// to be; the checks are what establish that nobody else can have prepared
+    /// the directory a key is about to be read from or written to.
+    fn keys_for(&self, named: Option<&str>) -> Result<PathBuf, String> {
+        let Some(named) = named else { return Ok(self.keys.clone()) };
+        let path = PathBuf::from(named);
+        if path == self.keys {
+            return Ok(path);
+        }
+        let nothing = |cause: String| {
+            format!(
+                "the keys directory the daemon named, {named}, cannot be used: {cause}. Nothing was signed."
+            )
+        };
+        let state = match (path.file_name(), path.parent()) {
+            (Some(last), Some(state)) if last == super::KEYS => state,
+            _ => return Err(nothing(format!("it is not a `{}` directory", super::KEYS))),
+        };
+        crate::home::judge_existing_state(state).map_err(nothing)?;
+        Ok(path)
+    }
 }
 
 /// A TPM key made a moment ago, with the authorisation it was made under.
@@ -117,9 +144,10 @@ impl cli::Custody for LinuxCustody {
 
     fn make_key(&self, wanted: &KeyWanted) -> Result<MadeKey, String> {
         Self::as_root()?;
+        let keys = self.keys_for(wanted.keys.as_deref())?;
         let tpm = self.tpm.clone();
         let kind = super::kind_for(tpm.usable().is_ok());
-        let path = file_for(&self.keys, &wanted.name, kind)?;
+        let path = file_for(&keys, &wanted.name, kind)?;
 
         println!();
         println!("{}", super::before_choosing(kind, &wanted.network));
@@ -147,7 +175,7 @@ impl cli::Custody for LinuxCustody {
 
         // Never over a key that is there: a name is fresh every time, and a
         // file already under it is somebody's, or a key a network depends on.
-        super::keys::make_private_directory(&self.keys).map_err(|cause| cause.to_string())?;
+        super::keys::make_private_directory(&keys).map_err(|cause| cause.to_string())?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -160,7 +188,8 @@ impl cli::Custody for LinuxCustody {
 
     fn sign_all(&self, asking: &Asking<'_>) -> Result<Vec<Vec<u8>>, String> {
         Self::as_root()?;
-        let Some((path, kind)) = find(&self.keys, asking.key)? else {
+        let keys = self.keys_for(asking.keys)?;
+        let Some((path, kind)) = find(&keys, asking.key)? else {
             return Err(format!(
                 "the key `{}` is not on this machine, so nothing was signed",
                 asking.key
@@ -229,6 +258,38 @@ mod tests {
 
         let refused = opened(&sealed, b"correct horse batterY").map(|_| ()).unwrap_err();
         assert!(refused.contains("nothing was signed"), "{refused}");
+    }
+
+    /// **The keys directory a request names is judged before it is used**: this
+    /// custody's own passes as it always did; one under a directory others can
+    /// write, one not called `keys`, and one spelled crookedly are refused, and
+    /// the refusal says nothing was signed.
+    #[test]
+    fn a_keys_directory_the_daemon_names_is_judged_first() {
+        let own = tempfile::tempdir().unwrap();
+        let keys = own.path().join(super::super::KEYS);
+        let custody =
+            super::LinuxCustody::with(keys.clone(), super::Tpm::of_this_machine(), |_| {
+                Ok(zeroize::Zeroizing::new(String::new()))
+            });
+
+        assert_eq!(keys, custody.keys_for(None).unwrap(), "none named: its own");
+        assert_eq!(keys, custody.keys_for(keys.to_str()).unwrap(), "its own named");
+
+        // `/tmp` is world-writable, sticky or not: whoever can write there can
+        // put a directory of their own where the path leads.
+        let shared = tempfile::tempdir_in("/tmp").unwrap();
+        let state = shared.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        for named in [
+            state.join("keys").to_str().unwrap().to_owned(),
+            "/data/peerfectly/elsewhere".to_owned(),
+            "data/peerfectly/keys".to_owned(),
+            "/data/../etc/keys".to_owned(),
+        ] {
+            let refused = custody.keys_for(Some(&named)).unwrap_err();
+            assert!(refused.contains("Nothing was signed"), "{named}: {refused}");
+        }
     }
 
     /// A key made a moment ago signs its batch without being opened again.

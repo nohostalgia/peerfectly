@@ -457,6 +457,9 @@ pub struct Service {
     /// Where a port opened to one network is written: the machine's firewall,
     /// or nowhere on a platform that has none.
     exposing: Arc<dyn crate::exposing::Exposing>,
+    /// Where the state is kept, when the platform was told somewhere other than
+    /// its default; for the report.
+    state_named: Option<String>,
     /// The one thing waiting for a person to look at something.
     ///
     /// Held here rather than passed back and forth because a person stands in the
@@ -746,6 +749,7 @@ impl Service {
             keys: Arc::new(crate::keys::PlatformKeys),
             interfaces: Arc::new(crate::connectivity::SystemInterfaces),
             exposing: Arc::new(crate::exposing::Nowhere),
+            state_named: None,
             pending: Mutex::new(None),
             staged: Mutex::new((None, Vec::new())),
             unsigned: Mutex::new(crate::signing::Waiting::default()),
@@ -780,6 +784,14 @@ impl Service {
     #[must_use]
     pub fn with_exposing(mut self, exposing: Arc<dyn crate::exposing::Exposing>) -> Self {
         self.exposing = exposing;
+        self
+    }
+
+    /// The same service, saying in its report that its state is kept at `state`
+    /// — for a platform told to keep it somewhere other than its default.
+    #[must_use]
+    pub fn with_state_named(mut self, state: String) -> Self {
+        self.state_named = Some(state);
         self
     }
 
@@ -1944,6 +1956,7 @@ impl Service {
             unusable,
             note,
             admin_refusal: self.keys.admin_refusal(),
+            state_directory: self.state_named.clone(),
             // Only to whoever may cancel it: what somebody else began on this
             // machine is not this person's to read.
             waiting_on: if self.may_ask(&asking, &Command::Abandon).await.is_ok() {
@@ -3407,6 +3420,7 @@ impl Service {
             key: reference_of(identity),
             network: label.to_string(),
             items,
+            keys: self.keys.keys_directory(),
         })
     }
 
@@ -3684,7 +3698,12 @@ impl Service {
             name: asked.name.clone(),
             then,
         });
-        Some(Outcome::NeedsKey(crate::control::KeyWanted { id, name: asked.name, network }))
+        Some(Outcome::NeedsKey(crate::control::KeyWanted {
+            id,
+            name: asked.name,
+            network,
+            keys: self.keys.keys_directory(),
+        }))
     }
 
     /// Takes up an act that was waiting for its key.
@@ -5299,6 +5318,7 @@ impl Service {
                     message: request.message().to_vec(),
                     payload: Vec::new(),
                 }],
+                keys: self.keys.keys_directory(),
             });
         }
         let proof = match crate::joining::prove_here(&read, &identity) {

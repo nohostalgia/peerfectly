@@ -194,6 +194,7 @@ fn report() -> Report {
             cause: daemon::control::Trouble::IdentityWillNotOpen,
         }],
         admin_refusal: None,
+        state_directory: None,
         waiting_on: None,
         note: Some("the other machine confirmed the relay".to_owned()),
         elsewhere: 0,
@@ -211,6 +212,7 @@ fn outcomes() -> Vec<Outcome> {
             unusable: Vec::new(),
             note: Some("one network on this machine belongs to somebody else, and none to you".to_owned()),
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             // What the second person on a desktop is shown. Zero on a phone,
             // which has one person — and in the fixture precisely because the
@@ -343,6 +345,7 @@ fn outcomes() -> Vec<Outcome> {
                     payload: vec![0xa2],
                 },
             ],
+            keys: None,
         }),
         // A key the daemon cannot make, because making it asks a person and the
         // daemon has no desktop. Never produced on a phone, and mirrored for the
@@ -351,6 +354,7 @@ fn outcomes() -> Vec<Outcome> {
             id: "k18f3a".to_owned(),
             name: "peerfectly.casa.signing".to_owned(),
             network: "casa".to_owned(),
+            keys: None,
         }),
         // Somebody else's, on a machine that holds networks for two people.
         // Never produced on a phone, and mirrored for the same reason as above.

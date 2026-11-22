@@ -23,7 +23,7 @@ wrongly even if it works.
 | `machine` | `daemon::Machine`, from the four above |
 | `socket` | the control socket `/run/peerfectly/control.sock`, and the lock that makes this the only daemon |
 | `who` | who is calling, from the kernel, and the person behind `sudo` from the process tree |
-| `home` | `/var/lib/peerfectly`, root's and closed, and the check that the program runs from where only root writes |
+| `home` | `/var/lib/peerfectly` or the directory `--state` names, root's and closed, and the check that the program runs from where only root writes |
 | `custody` | signing keys: in the TPM behind a passphrase, or a file sealed with one |
 | `log` | standard error, where systemd puts it in the journal |
 | `quiet` | the TSS library kept off the terminal |
@@ -73,6 +73,21 @@ On Debian 12 the package names end in `-0` and `0` instead of `t64`.
 keeps two capabilities and nothing else. The programs belong somewhere only root can write, such
 as `/usr/local/bin`: the daemon refuses to start otherwise, and `--allow-unsafe-location` is for a
 build directory, warned every time.
+
+**Elsewhere than `/var/lib/peerfectly`.** `peerfectlyd --state <directory>` keeps the state there
+instead — for a container that keeps only one directory across restarts, such as a Home Assistant
+add-on's `/data` (`--state /data/peerfectly`). A directory somebody chose is judged more strictly
+than the default, and the daemon does not start unless:
+
+- the path is absolute and plain: no `.`, no `..`, and no symbolic link anywhere on it;
+- every directory above it, up to `/`, is root's and writable by nobody else — a sticky
+  world-writable one included — and can be read;
+- its parent exists: only the directory itself is made, with mode `0700`.
+
+The command line does not assume the directory: the daemon names it in every request for a key or a
+signature, and the command line judges it the same way before it reads or writes a key there. Both
+programs come from one release; a command line from an older one would look for keys under
+`/var/lib/peerfectly`. `peerfectly status` says where the state is when it is not the default.
 
 ## Installing it
 

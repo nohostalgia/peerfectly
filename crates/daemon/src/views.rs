@@ -201,6 +201,15 @@ impl fmt::Display for Report {
             );
             write!(f, "{block}")?;
         }
+
+        // Said only when somebody chose it: at the platform's default there is
+        // nothing a person would look for.
+        if let Some(state) = &self.state_directory {
+            writeln!(f)?;
+            let mut block = Block::headed("state".to_owned());
+            block.plain(format!("kept in {state}, as the daemon was told to."));
+            write!(f, "{block}")?;
+        }
         Ok(())
     }
 }
@@ -568,6 +577,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -736,6 +746,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -746,6 +757,26 @@ mod tests {
         assert!(!drawn.contains("tray"), "{drawn}");
     }
 
+    /// Where the state is, said only when somebody chose it.
+    #[test]
+    fn a_chosen_state_directory_is_said_and_the_default_is_not() {
+        let report = |state_directory: Option<String>| Report {
+            networks: Vec::new(),
+            unusable: Vec::new(),
+            note: None,
+            admin_refusal: None,
+            state_directory,
+            waiting_on: None,
+            elsewhere: 0,
+            may_stop_the_daemon: true,
+            could_stop_the_daemon: false,
+        };
+        let chosen = report(Some("/data/peerfectly".to_owned())).to_string();
+        assert!(chosen.contains("kept in /data/peerfectly"), "{chosen}");
+        let default = report(None).to_string();
+        assert!(!default.contains("kept in"), "{default}");
+    }
+
     /// A device holding nothing is a state with a remedy, not an empty report.
     #[test]
     fn a_device_with_no_network_is_told_so_by_every_view() {
@@ -754,6 +785,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -780,6 +812,7 @@ mod tests {
                 unusable: Vec::new(),
                 note: None,
                 admin_refusal: None,
+                state_directory: None,
                 waiting_on: None,
                 elsewhere: 0,
                 may_stop_the_daemon: true,
@@ -801,6 +834,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,

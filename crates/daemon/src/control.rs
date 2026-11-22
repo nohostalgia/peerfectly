@@ -905,6 +905,11 @@ pub struct Report {
     /// was refused.
     pub admin_refusal: Option<String>,
 
+    /// Where the daemon keeps its state, when it was told to keep it somewhere
+    /// other than its platform's default. `None` at the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_directory: Option<String>,
+
     /// What this daemon holds waiting on this person, in words: a founding or a
     /// move stopped on a relay's key, a join, an admission at the code. `None`
     /// when nothing waits, or when what waits is somebody else's.
@@ -968,6 +973,12 @@ pub struct KeyWanted {
     /// The network it is for, which is what a person will be shown — empty
     /// while it is being joined, when it has no name here yet.
     pub network: String,
+
+    /// Where the key is to be kept, where the platform keeps keys in a
+    /// directory of the daemon's: the command line uses this one and no other,
+    /// after judging it. `None` is the platform's default place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
 }
 
 /// Everything one act needs signed by a key held outside this process.
@@ -1013,6 +1024,10 @@ pub struct SignaturesWanted {
     pub network: String,
     /// What is to be signed, in the order it takes effect.
     pub items: Vec<ToSign>,
+
+    /// Where the key is kept, as in [`KeyWanted::keys`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
 }
 
 /// The most items one batch may hold.
@@ -2915,6 +2930,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -3500,6 +3516,7 @@ mod tests {
                 },
                 ToSign { kind: SigningKind::Snapshot, message: vec![0x01], payload: vec![0xa2] },
             ],
+            keys: None,
         });
 
         let bytes = serde_json::to_vec(&sent).expect("encodes");
@@ -3522,6 +3539,35 @@ mod tests {
             wanted.items.get(1).expect("two").kind,
             "in the order they take effect"
         );
+    }
+
+    /// **Where the keys are travels with every request for one, and a request
+    /// from a daemon that never said is the default place**: a command line and
+    /// a daemon from releases either side of the field still agree.
+    #[test]
+    fn where_the_keys_are_travels_and_its_absence_is_the_default() {
+        let wanted = KeyWanted {
+            id: "7".to_owned(),
+            name: "peerfectly.home.signing".to_owned(),
+            network: String::new(),
+            keys: Some("/data/peerfectly/keys".to_owned()),
+        };
+        let bytes = serde_json::to_vec(&Outcome::NeedsKey(wanted.clone())).expect("encodes");
+        let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
+        assert_eq!(Outcome::NeedsKey(wanted), back);
+
+        let older = KeyWanted {
+            id: "8".to_owned(),
+            name: "peerfectly.home.signing".to_owned(),
+            network: String::new(),
+            keys: None,
+        };
+        let written = serde_json::to_string(&Outcome::NeedsKey(older)).expect("encodes");
+        assert!(!written.contains("keys"), "absent, as an older daemon writes it: {written}");
+        let Outcome::NeedsKey(read) = serde_json::from_str(&written).expect("decodes") else {
+            panic!("the shape must survive")
+        };
+        assert_eq!(None, read.keys);
     }
 
     /// The fields a struct in this file declares, in order.
@@ -3558,6 +3604,12 @@ mod tests {
     /// passphrase is wanted — and says nothing of what is being signed. A daemon
     /// lying about it can make a person type another network's passphrase, which
     /// unlocks nothing; it cannot make an act look like another act.
+    ///
+    /// **`keys` is not shown to anybody.** It is where the key is kept, which the
+    /// command line judges as a directory before it uses it (`linux-daemon`'s
+    /// `judge_existing_state`): a daemon lying about it can point at a directory
+    /// that is root's alone or at nothing, and either way signs nothing it was
+    /// not asked to.
     #[test]
     fn a_wanted_batch_describes_itself_only_by_its_bytes() {
         assert_eq!(
@@ -3572,6 +3624,7 @@ mod tests {
                 "pub key: String,",
                 "pub network: String,",
                 "pub items: Vec<ToSign>,",
+                "pub keys: Option<String>,",
             ],
             fields_of("SignaturesWanted"),
             "a batch carries its items, whose key, and which network that key is for — \

@@ -324,7 +324,13 @@ fn an_empty_entry_refuses_without_costing_a_guess() {
     });
     let messages: [&[u8]; 1] = [b"revoke the laptop"];
     let refused = custody
-        .sign_all(&cli::Asking { key: name, network: "casa", summary: "", messages: &messages })
+        .sign_all(&cli::Asking {
+            key: name,
+            network: "casa",
+            summary: "",
+            messages: &messages,
+            keys: None,
+        })
         .unwrap_err();
     assert_eq!(linux_daemon::custody::REFUSED, refused);
     assert_eq!(before, lockout_counter(&swtpm), "an empty entry is not a guess");

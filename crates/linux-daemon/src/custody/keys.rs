@@ -396,6 +396,12 @@ impl Keys for LinuxKeys {
         Ok(())
     }
 
+    /// Always named, the default included: the command line keeps keys where
+    /// this daemon reads them, and no assumption of its own can differ.
+    fn keys_directory(&self) -> Option<String> {
+        self.keys.to_str().map(str::to_owned)
+    }
+
     fn custody_of(&self, identity: &NodeIdentity) -> daemon::control::Custody {
         let Some(custodian) = identity.signing_key().custodian() else {
             return daemon::control::Custody::HeldHere;

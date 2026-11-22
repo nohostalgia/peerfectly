@@ -20,6 +20,12 @@ pub const ALLOW_UNSAFE_LOCATION: &str = "--allow-unsafe-location";
 /// needs neither `/dev/net/tun` nor `CAP_NET_ADMIN`.
 pub const HEADLESS: &str = "--headless";
 
+/// The flag that names where the daemon keeps its state, instead of
+/// [`home::STATE`]: `--state <directory>`. A directory somebody chose is judged
+/// more strictly than the default (`home::home_at`); the command line learns it
+/// from the daemon, in every request for a key or a signature.
+pub const STATE_DIRECTORY: &str = "--state";
+
 pub mod custody;
 pub mod firewall;
 pub mod home;
