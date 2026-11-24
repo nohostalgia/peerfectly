@@ -240,6 +240,18 @@ pub enum Frame {
         /// The roots, as the answering side's source gives them.
         roots: Vec<u8>,
     },
+    /// A revocation of the device it is sent to, and nothing else
+    /// (offline-founder design §16): sent outside any session, by a member
+    /// refusing a device it holds as revoked, or pushed to that device under a
+    /// key made for the one dial. The receiver acts on it only once its
+    /// signature checks, against what it holds; a node that does not know the
+    /// kind ignores it.
+    Notice {
+        /// The revocation operation, as signed.
+        revocation: Vec<u8>,
+    },
+    /// A notice was read: the sender may stop pushing it.
+    Noticed,
 }
 
 pub(crate) const OPEN: u8 = 1;
@@ -252,6 +264,8 @@ const BEHIND: u8 = 7;
 const ROOTS: u8 = 8;
 /// A piece of a frame too large for one message (`crate::parts`).
 pub(crate) const PART: u8 = 9;
+const NOTICE: u8 = 10;
+const NOTICED: u8 = 11;
 
 impl Frame {
     /// The frame's bytes.
@@ -304,6 +318,11 @@ impl Frame {
                 out.extend_from_slice(&id.to_be_bytes());
                 out.extend_from_slice(roots);
             }
+            Self::Notice { revocation } => {
+                out.push(NOTICE);
+                out.extend_from_slice(revocation);
+            }
+            Self::Noticed => out.push(NOTICED),
         }
         out
     }
@@ -363,6 +382,8 @@ impl Frame {
                 let (id, roots) = id_and_rest(rest)?;
                 Some(Self::Roots { id, roots: roots.to_vec() })
             }
+            NOTICE if !rest.is_empty() => Some(Self::Notice { revocation: rest.to_vec() }),
+            NOTICED if rest.is_empty() => Some(Self::Noticed),
             _ => None,
         }
     }
@@ -410,6 +431,8 @@ mod tests {
             Frame::Behind { id: 5, root: [6; 32] },
             Frame::Roots { id: 6, roots: vec![1, 2, 3] },
             Frame::Roots { id: 6, roots: Vec::new() },
+            Frame::Notice { revocation: vec![7; 200] },
+            Frame::Noticed,
         ]
     }
 
@@ -432,6 +455,8 @@ mod tests {
                 Frame::Accept { .. } => 17,
                 Frame::Packet { .. } => PACKET_HEADER.saturating_add(1),
                 Frame::Roots { .. } => 9,
+                // The revocation is its tail, and a cut one fails its signature.
+                Frame::Notice { .. } => 2,
                 _ => bytes.len(),
             };
             for cut in 0..header {
@@ -443,7 +468,10 @@ mod tests {
     #[test]
     fn an_unknown_kind_is_refused() {
         assert_eq!(Frame::decode(&[0, 0, 0, 0, 0, 0, 0, 0, 0]), None);
-        assert_eq!(Frame::decode(&[10, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(Frame::decode(&[12, 0, 0, 0, 0, 0, 0, 0, 0]), None);
+        // A notice carries something; an acknowledgement nothing.
+        assert_eq!(Frame::decode(&[10]), None);
+        assert_eq!(Frame::decode(&[11, 0]), None);
         // A part is put back together before it is a frame, never read as one.
         assert_eq!(Frame::decode(&[PART, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), None);
     }

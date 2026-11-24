@@ -55,6 +55,55 @@ pub fn sign_over_heads(roster: &Roster, identity: &NodeIdentity) -> Result<Vec<u
         .map_err(|cause| cause.to_string())
 }
 
+/// The root the founder signs over this roster's heads: the founder act just
+/// carried, for the light members who learn of it only from a root.
+///
+/// The signer is the founder's key the root it follows names, proved by the
+/// `founder` leaf there; where no verified root is held, by the leaf of this
+/// root itself, as a first root proves its signer.
+///
+/// # Errors
+///
+/// When the roster has no heads, the root it holds was never verified here, or
+/// the body is not one the roster would accept.
+pub fn founder_body_over_heads(roster: &Roster) -> Result<Snapshot, String> {
+    let state = roster.state().map_err(|cause| cause.to_string())?;
+    let heads = roster.heads();
+    if heads.is_empty() {
+        return Err("that roster has no heads, so there is nothing to attest to".to_owned());
+    }
+    let dag = roster.dag();
+    let mut depths = Vec::with_capacity(heads.len());
+    for head in &heads {
+        let index = dag
+            .position(head)
+            .ok_or_else(|| "a head of this roster is not in its own graph".to_owned())?;
+        depths.push(dag.depth(index));
+    }
+    let previous = match roster.snapshot() {
+        None => None,
+        Some(held) => {
+            let Some(held_state) = roster.held_root_state() else {
+                return Err("this device does not hold what the root this network holds \
+                            covers, so the founder cannot be proved in it"
+                    .to_owned());
+            };
+            Some((held.body(), held_state))
+        }
+    };
+    let author = previous
+        .as_ref()
+        .map_or(state.params.founder, |(_, held)| held.params.founder)
+        .signing_id();
+    roster::snapshot::Snapshot::over(
+        &state,
+        roster::snapshot::Covering { heads, depths },
+        author,
+        previous.as_ref().map(|(body, held)| (*body, held)),
+    )
+    .map_err(|cause| cause.to_string())
+}
+
 /// The snapshot this node would sign, up to but not including its signature.
 ///
 /// Separate from [`sign_over_heads`] because on some devices the act stops here:
@@ -333,14 +382,18 @@ mod tests {
     /// was founded with — so a second roster can be built from the same history.
     fn founded_with_bytes() -> (Roster, NodeIdentity, Vec<u8>) {
         let founder = NodeIdentity::generate().expect("generates");
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .expect("valid");
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("laptop", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("laptop", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -361,15 +414,19 @@ mod tests {
     #[test]
     fn a_network_without_anchors_gives_a_board_its_admin() {
         let founder = NodeIdentity::generate().expect("generates");
-        let mut params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .expect("valid");
+        let mut params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
         params.relay = Some(format!("{}@relay.example:8443", "ab".repeat(32)));
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("laptop", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("laptop", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -473,7 +530,7 @@ mod tests {
             2,
             founder.signing_key().algorithm(),
             roster::types::OperationBody::AddDevice(
-                member.device_spec("laptop", Role::Member, false, vec![]).expect("spec"),
+                member.device_spec("laptop", Role::Member, vec![]).expect("spec"),
             ),
             roster.heads(),
             founder.signing_key().key_id(),
@@ -516,9 +573,7 @@ mod tests {
             2,
             founder.signing_key().algorithm(),
             roster::types::OperationBody::AddDevice(
-                member
-                    .device_spec("laptop", roster::types::Role::Member, false, vec![])
-                    .expect("spec"),
+                member.device_spec("laptop", roster::types::Role::Member, vec![]).expect("spec"),
             ),
             roster.heads(),
             founder.signing_key().key_id(),

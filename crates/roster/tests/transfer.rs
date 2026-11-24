@@ -45,7 +45,7 @@ fn state_of(count: u32) -> RosterState {
             .unwrap(),
         ];
         keys.sort_by_key(KeyEntry::order_key);
-        let record = DeviceSpec::new(keys, format!("sensor-{index}"), Role::Member, false, vec![])
+        let record = DeviceSpec::new(keys, format!("sensor-{index}"), Role::Member, vec![])
             .unwrap()
             .into_record(OperationId::from_bytes([1; 32]))
             .unwrap();

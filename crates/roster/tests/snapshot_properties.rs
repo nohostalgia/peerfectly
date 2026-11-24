@@ -71,8 +71,11 @@ fn build(steps: &[Step]) -> History {
     // snapshots.
     let mut present: Vec<u8> = Vec::new();
     let mut revoked: Vec<u8> = Vec::new();
+    // Which of them are admins: acts on those are the founder key's to sign.
+    let mut admins: Vec<u8> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         let label = format!("s{index}");
+        let mut founders = false;
         let known = |seed: u8, present: &Vec<u8>, revoked: &Vec<u8>| {
             present.contains(&seed) && !revoked.contains(&seed)
         };
@@ -82,24 +85,31 @@ fn build(steps: &[Step]) -> History {
                     continue;
                 }
                 present.push(seed);
-                OperationBody::AddDevice(device(seed, "member", Role::Member, false))
+                OperationBody::AddDevice(device(seed, "member", Role::Member))
             }
             Step::Rename(seed, tag) => {
                 if !known(seed, &present, &revoked) {
                     continue;
                 }
+                founders = admins.contains(&seed);
                 OperationBody::Rename { device: device_id(seed), name: format!("n{tag}") }
             }
             Step::Promote(seed) => {
                 if !known(seed, &present, &revoked) {
                     continue;
                 }
-                OperationBody::Promote { device: device_id(seed), founder: false }
+                founders = true;
+                if !admins.contains(&seed) {
+                    admins.push(seed);
+                }
+                OperationBody::Promote { device: device_id(seed) }
             }
             Step::Demote(seed) => {
                 if !known(seed, &present, &revoked) {
                     continue;
                 }
+                founders = true;
+                admins.retain(|admin| *admin != seed);
                 OperationBody::Demote { device: device_id(seed) }
             }
             Step::Revoke(seed) => {
@@ -107,6 +117,8 @@ fn build(steps: &[Step]) -> History {
                     continue;
                 }
                 revoked.push(seed);
+                founders = admins.contains(&seed);
+                admins.retain(|admin| *admin != seed);
                 OperationBody::RevokeDevice {
                     device: device_id(seed),
                     reason: "generated".to_owned(),
@@ -120,6 +132,7 @@ fn build(steps: &[Step]) -> History {
                     ipv4: Some(Some([100, 70, 0, address.saturating_add(3)])),
                     ..SettingsChange::default()
                 };
+                founders = admins.contains(&seed);
                 OperationBody::SetDevice { device: device_id(seed), change }
             }
             Step::Unassign(seed) => {
@@ -127,10 +140,15 @@ fn build(steps: &[Step]) -> History {
                     continue;
                 }
                 let change = SettingsChange { ipv4: Some(None), ..SettingsChange::default() };
+                founders = admins.contains(&seed);
                 OperationBody::SetDevice { device: device_id(seed), change }
             }
         };
-        history.op(&label, 1, &[previous.as_str()], body);
+        if founders {
+            history.founder_op(&label, &[previous.as_str()], body);
+        } else {
+            history.op(&label, 1, &[previous.as_str()], body);
+        }
         previous = label;
     }
     history
@@ -191,10 +209,10 @@ proptest! {
             .unwrap_or_else(|| "g".to_owned());
         let tip = labels.last().cloned().unwrap_or_else(|| "g".to_owned());
 
-        // One more operation after the snapshot point, on the tip.
-        history.op(
+        // One more operation after the snapshot point, on the tip: the
+        // founder's, since device 2 may be an admin by then.
+        history.founder_op(
             "later",
-            1,
             &[tip.as_str()],
             OperationBody::Rename { device: device_id(2), name: "final".to_owned() },
         );

@@ -34,8 +34,8 @@ const BOARDS: u8 = 8;
 /// A board's keys, from its seed: seeds clear of the admins'.
 fn board_spec(board: u8) -> DeviceSpec {
     let seed = board.wrapping_add(40);
-    let keys = device(seed, "board", Role::Member, false).keys;
-    DeviceSpec::new(keys, format!("board-{board}"), Role::Member, false, Vec::new()).unwrap()
+    let keys = device(seed, "board", Role::Member).keys;
+    DeviceSpec::new(keys, format!("board-{board}"), Role::Member, Vec::new()).unwrap()
 }
 
 fn board_id(board: u8) -> DeviceId {
@@ -201,7 +201,7 @@ fn play(steps: &[Step]) {
 fn play_in(steps: &[Step], stored: bool) {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
     let mut roster = Roster::with_staleness_depth(STALENESS);
     let mut compacted = Roster::with_staleness_depth(STALENESS);
     let stores = [
@@ -313,7 +313,7 @@ fn play_in(steps: &[Step], stored: bool) {
             ),
             Act::Role(board, up) => {
                 if *up {
-                    OperationBody::Promote { device: board_id(*board), founder: false }
+                    OperationBody::Promote { device: board_id(*board) }
                 } else {
                     OperationBody::Demote { device: board_id(*board) }
                 }

@@ -40,8 +40,8 @@ use crate::limits;
 
 /// The version tag every announcement signature is bound to.
 ///
-/// Distinct from every other signing context in the system — `roster/v1`,
-/// `roster-snapshot/v1`, `transport-session/v1` — so an announcement cannot be
+/// Distinct from every other signing context in the system — `roster/v2`,
+/// `roster-snapshot/v2`, `transport-session/v1` — so an announcement cannot be
 /// presented as any of them.
 pub const DOMAIN_TAG: &str = "local-announce/v1";
 
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn the_tag_is_distinct_from_every_other_context() {
-        for other in ["roster/v1", "roster-snapshot/v1", "transport-session/v1"] {
+        for other in ["roster/v2", "roster-snapshot/v2", "transport-session/v1"] {
             assert_ne!(DOMAIN_TAG, other);
         }
         assert_eq!(DOMAIN_TAG, "local-announce/v1");

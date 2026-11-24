@@ -237,6 +237,22 @@ fn ed25519(seed: u8) -> Ed25519Signer {
     Ed25519Signer::from_seed([seed; 32])
 }
 
+/// The founder of the vector networks: a seed no `[seed; 32]` device key can
+/// be, so it collides with none.
+fn founder() -> Ed25519Signer {
+    Ed25519Signer::from_seed(*b"the vectors' founder signs here.")
+}
+
+/// The founder's keys of the vector networks.
+fn founder_keys() -> roster::types::FounderKeys {
+    let transport = Ed25519Signer::from_seed(*b"the vectors' founder talks here.");
+    roster::types::FounderKeys::new(
+        founder().public_key().as_bytes().try_into().expect("32 bytes"),
+        transport.public_key().as_bytes().try_into().expect("32 bytes"),
+    )
+    .expect("two keys")
+}
+
 /// A deterministic P-256 signer.
 fn p256(seed: u8) -> P256Signer {
     let mut scalar = [0x11; 32];
@@ -247,7 +263,7 @@ fn p256(seed: u8) -> P256Signer {
 }
 
 /// A device with a signing key and a distinct transport key.
-fn device(seed: u8, name: &str, role: Role, founder: bool) -> DeviceSpec {
+fn device(seed: u8, name: &str, role: Role) -> DeviceSpec {
     let signing = KeyEntry::new(
         Algorithm::Ed25519,
         KeyPurpose::Signing,
@@ -270,7 +286,6 @@ fn device(seed: u8, name: &str, role: Role, founder: bool) -> DeviceSpec {
         sorted(vec![signing, transport, attestation]),
         name,
         role,
-        founder,
         vec![Capability::new("serves").expect("short")],
     )
     .expect("well-formed device")
@@ -286,6 +301,7 @@ fn sorted(mut keys: Vec<KeyEntry>) -> Vec<KeyEntry> {
 /// Fixture network parameters.
 fn params() -> NetworkParams {
     NetworkParams::new(
+        founder_keys(),
         vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         "example.internal",
         2_592_000,
@@ -295,21 +311,19 @@ fn params() -> NetworkParams {
 
 /// A well-formed body of each type.
 fn body_of(op_type: OperationType) -> OperationBody {
-    let target = device(2, "laptop", Role::Member, false)
+    let target = device(2, "laptop", Role::Member)
         .device_id()
         .expect("the fixture device has a signing key");
     match op_type {
         OperationType::CreateNetwork => OperationBody::CreateNetwork {
-            device: device(1, "phone", Role::Admin, true),
+            device: device(1, "phone", Role::Admin),
             params: params(),
         },
-        OperationType::AddDevice => {
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false))
-        }
+        OperationType::AddDevice => OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         OperationType::RevokeDevice => {
             OperationBody::RevokeDevice { device: target, reason: "lost on a train".to_owned() }
         }
-        OperationType::Promote => OperationBody::Promote { device: target, founder: false },
+        OperationType::Promote => OperationBody::Promote { device: target },
         OperationType::Demote => OperationBody::Demote { device: target },
         OperationType::Rename => {
             OperationBody::Rename { device: target, name: "workstation".to_owned() }
@@ -390,7 +404,7 @@ fn build_positives() -> Vec<Positive> {
     let ranged = params().in_ipv4_range("10.42.0.0/16".parse::<Ipv4Range>().expect("allowed"));
     for body in [
         OperationBody::CreateNetwork {
-            device: device(1, "phone", Role::Admin, true),
+            device: device(1, "phone", Role::Admin),
             params: ranged.clone(),
         },
         OperationBody::SetNetwork(ranged),
@@ -422,6 +436,7 @@ fn build_positives() -> Vec<Positive> {
     // A network moving relay: the second optional key, present.
     {
         let moving = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             Some("https://relay-b.example:443"),
             "example.internal",
@@ -957,7 +972,7 @@ impl Chain {
             1_735_689_600_000,
             Algorithm::Ed25519,
             OperationBody::CreateNetwork {
-                device: device(seed, "phone", Role::Admin, true),
+                device: device(seed, "phone", Role::Admin),
                 params: params(),
             },
             vec![],
@@ -967,6 +982,24 @@ impl Chain {
         .expect("well-formed genesis");
         let bytes = sign_operation(&core, &ed25519(seed)).expect("signs");
         self.net = Some(NetworkId::from_bytes(*core.id().as_bytes()));
+        self.entries.push((label.to_owned(), core.id(), bytes));
+    }
+
+    /// Adds an operation the founder signed, hanging off the labelled parents.
+    fn founder_op(&mut self, label: &str, parents: &[&str], body: OperationBody) {
+        let net = self.net.expect("genesis first");
+        let parent_ids: Vec<OperationId> = parents.iter().map(|name| self.id(name)).collect();
+        self.nonce = self.nonce.wrapping_add(1);
+        let core = OperationCore::new(
+            1_735_689_600_000_u64.wrapping_add(self.nonce),
+            Algorithm::Ed25519,
+            body,
+            parent_ids,
+            founder().key_id(),
+            net,
+        )
+        .expect("well-formed core");
+        let bytes = sign_operation(&core, &founder()).expect("signs");
         self.entries.push((label.to_owned(), core.id(), bytes));
     }
 
@@ -1022,9 +1055,9 @@ impl Chain {
                 let raw = roster::sign::RawOperation::decode(bytes)
                     .unwrap_or_else(|error| panic!("`{label}` decodes: {error:?}"));
                 let mut found = None;
-                for seed in 0u8..=255 {
-                    if ed25519(seed).key_id() == raw.core().author {
-                        found = raw.verify(&ed25519(seed).public_key()).ok();
+                for candidate in (0u8..=255).map(ed25519).chain([founder()]) {
+                    if candidate.key_id() == raw.core().author {
+                        found = raw.verify(&candidate.public_key()).ok();
                         break;
                     }
                 }
@@ -1036,7 +1069,7 @@ impl Chain {
 
 /// The device id of the fixture device with a given seed.
 fn seed_device_id(seed: u8) -> DeviceId {
-    device(seed, "fixture", Role::Member, false).device_id().expect("has a signing key")
+    device(seed, "fixture", Role::Member).device_id().expect("has a signing key")
 }
 
 /// Turns a built history into a vector, deriving the state it must produce.
@@ -1103,23 +1136,17 @@ fn build_merges() -> Vec<Merge> {
     // Rule 1: revocation wins over a concurrent promotion.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    chain.op(
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    chain.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     // Two admins. Concurrency between different authors is what these rules are
     // about; one admin signing both branches is a fork, which is judged before
     // any merge rule is reached and would make this vector describe something
     // other than what it names.
-    chain.op(
-        "promote",
-        1,
-        &["add9"],
-        OperationBody::Promote { device: seed_device_id(2), founder: false },
-    );
+    chain.founder_op("promote", &["add9"], OperationBody::Promote { device: seed_device_id(2) });
     chain.op(
         "revoke",
         9,
@@ -1132,7 +1159,7 @@ fn build_merges() -> Vec<Merge> {
     // act, and admits the device again.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     chain.op(
         "revoke",
         1,
@@ -1143,37 +1170,26 @@ fn build_merges() -> Vec<Merge> {
         "readd",
         1,
         &["revoke"],
-        OperationBody::AddDevice(device(2, "laptop-again", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop-again", Role::Member)),
     );
     out.push(merge_vector("a later admission admits again", "revocation-wins", &chain));
 
     // Rule 1: an admission concurrent with a revocation of the same device loses.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op(
+    chain.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
-    chain.op(
-        "add2",
-        1,
-        &["add9"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    chain.op("add2", 1, &["add9"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     chain.op(
         "revoke",
         1,
         &["add2"],
         OperationBody::RevokeDevice { device: seed_device_id(2), reason: "stolen".to_owned() },
     );
-    chain.op(
-        "readd",
-        9,
-        &["add2"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    chain.op("readd", 9, &["add2"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     out.push(merge_vector(
         "an admission concurrent with a revocation loses",
         "revocation-wins",
@@ -1184,18 +1200,12 @@ fn build_merges() -> Vec<Merge> {
     // both stand.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op(
+    chain.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
-    chain.op(
-        "add2",
-        1,
-        &["add9"],
-        OperationBody::AddDevice(device(2, "sensor", Role::Member, false)),
-    );
+    chain.op("add2", 1, &["add9"], OperationBody::AddDevice(device(2, "sensor", Role::Member)));
     chain.op(
         "ipv4",
         1,
@@ -1230,11 +1240,10 @@ fn build_merges() -> Vec<Merge> {
     // stand.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op(
+    chain.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     let mut anchored = params();
     anchored.anchors = vec![seed_device_id(9)];
@@ -1254,7 +1263,7 @@ fn build_merges() -> Vec<Merge> {
     // Admins are full: promoting a light device has no effect.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "sensor", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "sensor", Role::Member)));
     chain.op(
         "light",
         1,
@@ -1267,55 +1276,43 @@ fn build_merges() -> Vec<Merge> {
             },
         },
     );
-    chain.op(
-        "promote",
-        1,
-        &["light"],
-        OperationBody::Promote { device: seed_device_id(2), founder: false },
-    );
+    chain.founder_op("promote", &["light"], OperationBody::Promote { device: seed_device_id(2) });
     out.push(merge_vector("a light device is not made an admin", "admins-are-full", &chain));
 
-    // Rule 2: concurrent demote beats promote.
+    // Rule 2 can now arise only from the founder key, whose concurrent demote
+    // and promote are a fork: neither stands.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
-    chain.op(
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    chain.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
-    chain.op("demote", 1, &["add9"], OperationBody::Demote { device: seed_device_id(2) });
-    chain.op(
-        "promote",
-        9,
-        &["add9"],
-        OperationBody::Promote { device: seed_device_id(2), founder: false },
-    );
-    out.push(merge_vector("concurrent demote beats promote", "demote-beats-promote", &chain));
+    chain.founder_op("demote", &["add9"], OperationBody::Demote { device: seed_device_id(2) });
+    chain.founder_op("promote", &["add9"], OperationBody::Promote { device: seed_device_id(2) });
+    out.push(merge_vector(
+        "the founder's concurrent demote and promote are a fork",
+        "demote-beats-promote",
+        &chain,
+    ));
 
     // Rule 2: a causally later promote re-promotes.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
-    chain.op("demote", 1, &["add2"], OperationBody::Demote { device: seed_device_id(2) });
-    chain.op(
-        "promote",
-        1,
-        &["demote"],
-        OperationBody::Promote { device: seed_device_id(2), founder: false },
-    );
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    chain.founder_op("demote", &["add2"], OperationBody::Demote { device: seed_device_id(2) });
+    chain.founder_op("promote", &["demote"], OperationBody::Promote { device: seed_device_id(2) });
     out.push(merge_vector("a later promote re-promotes", "demote-beats-promote", &chain));
 
     // Rule 3: last-writer-wins on rename, broken by id at equal depth.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    chain.op(
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    chain.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     chain.op(
         "left",
@@ -1334,11 +1331,10 @@ fn build_merges() -> Vec<Merge> {
     // Rule 3 on network parameters.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op(
+    chain.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     chain.op("left", 1, &["add9"], OperationBody::SetNetwork(params_named("left.internal")));
     chain.op("right", 9, &["add9"], OperationBody::SetNetwork(params_named("right.internal")));
@@ -1351,11 +1347,10 @@ fn build_merges() -> Vec<Merge> {
     };
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op(
+    chain.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     chain.op("left", 1, &["add9"], OperationBody::SetNetwork(ranged("10.1.0.0/16")));
     chain.op("right", 9, &["add9"], OperationBody::SetNetwork(ranged("192.168.7.0/24")));
@@ -1368,8 +1363,8 @@ fn build_merges() -> Vec<Merge> {
     // Ancestor-relative validity: a member authors nothing.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    chain.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    chain.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     out.push(merge_vector("a member cannot author", "ancestor-relative-validity", &chain));
 
     // Admission: an operation naming a device its own ancestors do not know can
@@ -1378,7 +1373,7 @@ fn build_merges() -> Vec<Merge> {
     // revocations of devices nobody ever added.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     chain.op(
         "revoke9",
         1,
@@ -1390,7 +1385,7 @@ fn build_merges() -> Vec<Merge> {
     // Admission: the second revocation says nothing the first did not.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     chain.op(
         "revoke2",
         1,
@@ -1408,9 +1403,9 @@ fn build_merges() -> Vec<Merge> {
     // Ancestor-relative validity: work done while an admin survives demotion.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
-    chain.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
-    chain.op("demote2", 1, &["add3"], OperationBody::Demote { device: seed_device_id(2) });
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    chain.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
+    chain.founder_op("demote2", &["add3"], OperationBody::Demote { device: seed_device_id(2) });
     out.push(merge_vector(
         "work done while an admin survives demotion",
         "ancestor-relative-validity",
@@ -1420,13 +1415,13 @@ fn build_merges() -> Vec<Merge> {
     // The causal authorship rule: a backdated operation from a demoted admin.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
-    chain.op("demote2", 1, &["add2"], OperationBody::Demote { device: seed_device_id(2) });
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    chain.founder_op("demote2", &["add2"], OperationBody::Demote { device: seed_device_id(2) });
     chain.op(
         "backdated",
         2,
         &["add2"],
-        OperationBody::AddDevice(device(9, "backdoor", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "backdoor", Role::Member)),
     );
     out.push(merge_vector(
         "a backdated operation from a demoted admin is void",
@@ -1434,17 +1429,54 @@ fn build_merges() -> Vec<Merge> {
         &chain,
     ));
 
-    // Founder protection.
+    // Only the founder key governs admins: an admin's revocation of the admin
+    // that founded the network is without authority.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     chain.op(
-        "coup",
+        "revoke1",
         2,
         &["add2"],
-        OperationBody::RevokeDevice { device: seed_device_id(1), reason: "coup".to_owned() },
+        OperationBody::RevokeDevice { device: seed_device_id(1), reason: "stolen".to_owned() },
     );
-    out.push(merge_vector("an admin cannot revoke a founder", "founder-protection", &chain));
+    out.push(merge_vector(
+        "an admin's revocation of another admin is without authority",
+        "founder-governs-admins",
+        &chain,
+    ));
+
+    // The founder key: its revocation of an admin stands, and that admin's
+    // concurrent revocation of a member is void.
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "phone", Role::Member)));
+    chain.founder_op("add3", &["add2"], OperationBody::AddDevice(device(3, "laptop", Role::Admin)));
+    chain.op(
+        "thief",
+        3,
+        &["add3"],
+        OperationBody::RevokeDevice { device: seed_device_id(2), reason: "mine".to_owned() },
+    );
+    chain.founder_op(
+        "founder",
+        &["add3"],
+        OperationBody::RevokeDevice { device: seed_device_id(3), reason: "stolen".to_owned() },
+    );
+    out.push(merge_vector(
+        "the founder key revokes an admin whatever that admin does at once",
+        "founder-key",
+        &chain,
+    ));
+
+    // The founder key: an admin cannot change it, and its other change stands.
+    let mut chain = Chain::new();
+    chain.genesis("g", 1);
+    let mut theirs = params();
+    theirs.founder = roster::types::FounderKeys::held_by_nobody();
+    theirs.suffix = "other.internal".to_owned();
+    chain.op("takeover", 1, &["g"], OperationBody::SetNetwork(theirs));
+    out.push(merge_vector("an admin cannot change the founder key", "founder-key", &chain));
 
     // Equivocation: one author, two histories. Neither branch takes effect, and
     // the work a *different* author anchored to one of them survives — which is
@@ -1452,29 +1484,23 @@ fn build_merges() -> Vec<Merge> {
     // one late sibling.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op(
+    chain.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
-    chain.op(
-        "fork-left",
-        1,
-        &["add9"],
-        OperationBody::AddDevice(device(2, "left", Role::Member, false)),
-    );
+    chain.op("fork-left", 1, &["add9"], OperationBody::AddDevice(device(2, "left", Role::Member)));
     chain.op(
         "fork-right",
         1,
         &["add9"],
-        OperationBody::AddDevice(device(3, "right", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "right", Role::Member)),
     );
     chain.op(
         "theirs",
         9,
         &["fork-left"],
-        OperationBody::AddDevice(device(4, "theirs", Role::Member, false)),
+        OperationBody::AddDevice(device(4, "theirs", Role::Member)),
     );
     out.push(merge_vector(
         "one author's two concurrent operations take no effect",
@@ -1482,17 +1508,17 @@ fn build_merges() -> Vec<Merge> {
         &chain,
     ));
 
-    // Founder protection: a founder may retire itself.
+    // An admin cannot retire itself: that too is an act on an admin.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     chain.op(
         "retire",
         1,
         &["add2"],
         OperationBody::RevokeDevice { device: seed_device_id(1), reason: "handover".to_owned() },
     );
-    out.push(merge_vector("a founder may retire itself", "founder-protection", &chain));
+    out.push(merge_vector("an admin cannot retire itself", "founder-governs-admins", &chain));
 
     // Set-level failures.
     let mut chain = Chain::new();
@@ -1501,10 +1527,7 @@ fn build_merges() -> Vec<Merge> {
         "second",
         1,
         &["g"],
-        OperationBody::CreateNetwork {
-            device: device(2, "other", Role::Admin, true),
-            params: params(),
-        },
+        OperationBody::CreateNetwork { device: device(2, "other", Role::Admin), params: params() },
     );
     out.push(set_error_vector("a second create_network", "genesis", &chain, "duplicate_genesis"));
 
@@ -1514,7 +1537,7 @@ fn build_merges() -> Vec<Merge> {
         "foreign",
         1,
         &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         NetworkId::from_bytes([0x99; 32]),
     );
     out.push(set_error_vector(
@@ -1530,7 +1553,7 @@ fn build_merges() -> Vec<Merge> {
         "orphan",
         1,
         &[],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         NetworkId::from_bytes([0; 32]),
     );
     out.push(set_error_vector(
@@ -1543,7 +1566,7 @@ fn build_merges() -> Vec<Merge> {
     // A set with no genesis at all.
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     chain.op(
         "rename2",
         1,
@@ -1574,7 +1597,7 @@ fn build_merges() -> Vec<Merge> {
 /// rest stand.
 fn batch_skip_vector() -> Merge {
     let entry = |seed: u8| roster::batch::BatchEntry {
-        keys: device(seed, "fixture", Role::Member, false).keys,
+        keys: device(seed, "fixture", Role::Member).keys,
         name: format!("sensor-{seed}"),
         serial: format!("SN{seed:04}").into_bytes(),
         ipv4: Some([0, 0, 0, seed]),
@@ -1591,14 +1614,9 @@ fn batch_skip_vector() -> Merge {
 
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
+    chain.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     // Device 20 is admitted on its own first.
-    chain.op(
-        "single",
-        1,
-        &["add2"],
-        OperationBody::AddDevice(device(20, "fixture", Role::Member, false)),
-    );
+    chain.op("single", 1, &["add2"], OperationBody::AddDevice(device(20, "fixture", Role::Member)));
     // And device 2 is given the offset entry 22 was given.
     chain.op(
         "address",
@@ -1637,8 +1655,13 @@ fn set_error_vector(name: &str, rule: &'static str, chain: &Chain, kind: &'stati
 
 /// Network parameters with a chosen suffix.
 fn params_named(suffix: &str) -> NetworkParams {
-    NetworkParams::new(vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], suffix, 2_592_000)
-        .expect("well-formed")
+    NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        suffix,
+        2_592_000,
+    )
+    .expect("well-formed")
 }
 
 // ---------------------------------------------------------------------------
@@ -1664,8 +1687,17 @@ fn snapshot_body(
     let signer = state.leaf(&device).expect("a member");
     let proof = roster::membership::MembershipProof::of(state, &device).expect("proves");
     let previous = if generation == 1 { Vec::new() } else { vec![state.root()] };
-    Snapshot::new(generation, previous, root, covering, Vec::new(), signer, proof, author, network)
-        .expect("well-formed snapshot")
+    Snapshot::new(
+        generation,
+        previous,
+        root,
+        covering,
+        Vec::new(),
+        roster::snapshot::RootSigner::Device { leaf: signer, proof },
+        author,
+        network,
+    )
+    .expect("well-formed snapshot")
 }
 
 /// Builds a snapshot over the operations a chain's labelled head covers.
@@ -1684,7 +1716,7 @@ fn snapshot_over(chain: &Chain, seq: u64, seed: u8, head: &str, network: Network
 fn snapshot_chain() -> Chain {
     let mut chain = Chain::new();
     chain.genesis("g", 1);
-    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    chain.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     chain.op(
         "rename2",
         1,
@@ -1733,11 +1765,10 @@ fn build_snapshots() -> Vec<SnapshotVector> {
     let liar = {
         let mut fabricated = Chain::new();
         fabricated.genesis("g", 1);
-        fabricated.op(
+        fabricated.founder_op(
             "add9",
-            1,
             &["g"],
-            OperationBody::AddDevice(device(9, "ghost", Role::Admin, false)),
+            OperationBody::AddDevice(device(9, "ghost", Role::Admin)),
         );
         let dag = Dag::from_operations(fabricated.verified()).expect("places");
         derive(&dag).expect("derives").root()
@@ -1813,7 +1844,8 @@ fn build_snapshots() -> Vec<SnapshotVector> {
 /// the encoder would never produce.
 fn params_map(fields: usize, relay: &[u8], misordered: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(0xa0 | u8::try_from(fields).expect("a small map"));
+    // One more than asked for: the founder's keys, always there.
+    out.push(0xa0 | u8::try_from(fields.saturating_add(1)).expect("a small map"));
     push_text(&mut out, "ula");
     push_bytes(&mut out, &[0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     if !misordered {
@@ -1826,6 +1858,7 @@ fn params_map(fields: usize, relay: &[u8], misordered: bool) -> Vec<u8> {
         // which puts a five-byte key before a six-byte one.
         out.extend_from_slice(relay);
     }
+    push_founder(&mut out);
     push_text(&mut out, "snapshot_window");
     out.push(0x01);
     out
@@ -1836,7 +1869,7 @@ fn params_map(fields: usize, relay: &[u8], misordered: bool) -> Vec<u8> {
 /// Each entry is written as the key `ipv4` and a byte string, after `ula`, or
 /// after `relay` when `after_relay`. `entries` is the declared map size.
 fn params_map_with_ipv4(entries: u8, ipv4: &[&[u8]], after_relay: bool) -> Vec<u8> {
-    let mut out = vec![0xa0 | entries];
+    let mut out = vec![0xa0 | entries.saturating_add(1)];
     push_text(&mut out, "ula");
     push_bytes(&mut out, &[0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     let ranges = |out: &mut Vec<u8>| {
@@ -1854,6 +1887,7 @@ fn params_map_with_ipv4(entries: u8, ipv4: &[&[u8]], after_relay: bool) -> Vec<u
     }
     push_text(&mut out, "suffix");
     push_text(&mut out, "example.internal");
+    push_founder(&mut out);
     push_text(&mut out, "snapshot_window");
     out.push(0x01);
     out
@@ -1868,15 +1902,27 @@ const ULA: [u8; 8] = [0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 /// thing a case built from this can be refused for is the prefix or the suffix.
 fn params_map_bounded(ula: &[u8], suffix: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(0xa4);
+    out.push(0xa5);
     push_text(&mut out, "ula");
     push_bytes(&mut out, ula);
     out.extend_from_slice(&relay_field(&[]));
     push_text(&mut out, "suffix");
     push_text(&mut out, suffix);
+    push_founder(&mut out);
     push_text(&mut out, "snapshot_window");
     out.push(0x01);
     out
+}
+
+/// The `founder` key and the vector networks' founder keys, by hand.
+fn push_founder(out: &mut Vec<u8>) {
+    let keys = founder_keys();
+    push_text(out, "founder");
+    out.push(0xa2);
+    push_text(out, "signing");
+    push_bytes(out, keys.signing());
+    push_text(out, "transport");
+    push_bytes(out, keys.transport());
 }
 
 /// An encoded `relay` key whose value is an array of the given addresses.
@@ -2087,7 +2133,7 @@ fn add_device_body_without_attestation_key() -> Vec<u8> {
 /// Builds a device-specification body by hand.
 fn device_body(keys: &[(&Vec<u8>, &str)], role: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(0xa5);
+    out.push(0xa4);
     push_text(&mut out, "keys");
     out.push(0x80 | u8::try_from(keys.len()).expect("a handful"));
     for (value, purpose) in keys {
@@ -2103,8 +2149,6 @@ fn device_body(keys: &[(&Vec<u8>, &str)], role: &str) -> Vec<u8> {
     push_text(&mut out, "laptop");
     push_text(&mut out, "role");
     push_text(&mut out, role);
-    push_text(&mut out, "founder");
-    out.push(0xf4);
     push_text(&mut out, "capabilities");
     out.push(0x80);
     out
@@ -2118,7 +2162,7 @@ fn device_body(keys: &[(&Vec<u8>, &str)], role: &str) -> Vec<u8> {
 fn render_positive(vectors: &[Positive]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
-    let _ = writeln!(out, "  \"format\": \"roster/v1\",");
+    let _ = writeln!(out, "  \"format\": \"roster/v2\",");
     let _ = writeln!(out, "  \"kind\": \"positive\",");
     let _ = writeln!(
         out,
@@ -2147,7 +2191,7 @@ fn render_positive(vectors: &[Positive]) -> String {
 fn render_negative(vectors: &[Negative]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
-    let _ = writeln!(out, "  \"format\": \"roster/v1\",");
+    let _ = writeln!(out, "  \"format\": \"roster/v2\",");
     let _ = writeln!(out, "  \"kind\": \"negative\",");
     let _ = writeln!(
         out,
@@ -2176,7 +2220,7 @@ fn render_negative(vectors: &[Negative]) -> String {
 fn render_merge(vectors: &[Merge]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
-    let _ = writeln!(out, "  \"format\": \"roster/v1\",");
+    let _ = writeln!(out, "  \"format\": \"roster/v2\",");
     let _ = writeln!(out, "  \"kind\": \"merge\",");
     let _ = writeln!(
         out,
@@ -2248,7 +2292,7 @@ fn render_merge(vectors: &[Merge]) -> String {
 fn render_snapshots(vectors: &[SnapshotVector]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
-    let _ = writeln!(out, "  \"format\": \"roster/v1\",");
+    let _ = writeln!(out, "  \"format\": \"roster/v2\",");
     let _ = writeln!(out, "  \"kind\": \"snapshot\",");
     let _ = writeln!(
         out,

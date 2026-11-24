@@ -172,13 +172,39 @@ admin. Deleting `/var/lib/peerfectly` by hand removes every network at once, wit
   Under `sudo` the act is the person's who typed it, so a network founded with
   `sudo peerfectly found` belongs to them.
 - **Exposing a port and stopping the daemon** are acts on the machine, so they need `sudo`.
-- **Demoting an admin**, `sudo peerfectly demote <device>`, makes it a member. Nothing is signed for
-  a device that is already a member or for the network's only admin; a founder can be demoted only
-  by itself, and the roster's refusal is said. A demoted device keeps its signing key until the
-  demotion is **settled** — beneath the roster's base, where nothing can void it — and then
-  destroys it; `status` says so meanwhile. A member wanted as an admin is invited again with
-  `invite --admin` and approved with `--replace`: a member keeps no key that could be made an
-  admin's, so promoting one is not offered.
+- **Only the founder's words act on an admin.** Admitting an admin, demoting, revoking, renaming or
+  setting one takes `--founder`; an admin's own key governs members only, and the command says so
+  before anything is signed. `sudo peerfectly demote <device> --founder` makes an admin a member,
+  and the demoted device destroys its signing key at once. Nothing is signed for a device that is
+  already a member or for the network's only admin. A member wanted as an admin is invited again
+  with `invite --admin` and approved with `approve <name> --replace --founder`: a member keeps no
+  key that could be made an admin's, so promoting one is not offered.
+- **Revoking a stolen admin**, `sudo peerfectly revoke <admin> <reason> --founder`, lists its acts
+  still held and asks from which to void them: what it admitted leaves, what it revoked comes back,
+  what it renamed has its name again. Other admins' acts stand. The devices that come back are
+  listed, and any of them can be revoked again in the same act, for good.
+- **A revoked device is told.** The member it was talking to sends it its revocation as it closes
+  their session, any member it dials answers with it, and the device where the founder's words
+  revoked it sends it at the act's end. Nothing waits on a timer. `status` then says "revoked by …",
+  it invites nobody, and an admin destroys its signing key.
+- **A revoked device listens.** Up, it runs with no tunnel and no address, and carries the roster
+  alone, dialling the members it knew when it starts and when the machine changes network. If the
+  founder voids the revocation, a member brings it the news and it is a member again by itself,
+  tunnel and address included. A revocation the founder's words signed is final: to come back, the
+  device is invited again, and its old keys go then. One that knows nobody left is refused by
+  everybody, and told nothing.
+
+## The founder's words
+
+`sudo peerfectly found` shows the founder's 12 words once, asks for three of them, and clears the
+terminal and its scrollback. Nothing keeps them. They sign with no passphrase — the words are the
+key — typed on one line, separated by spaces, each in full or by its first four letters (24 words,
+from a network founded before, are read too). They are shown as typed and the terminal is cleared
+once the line is read; never from arguments or the environment: `sudo peerfectly <act> --founder`,
+`sudo peerfectly recover <network> --revoke <admin>`, `sudo peerfectly founder replace <network>`.
+`peerfectly history <network>` lists who signed what and needs no `sudo`. Whoever holds the words
+controls the network's admins; lost, they cannot be recovered, and no admin can be added or removed
+again. The command line turns a terminal's echo back on where an interrupted prompt left it off.
 
 ## What each custody defends against
 

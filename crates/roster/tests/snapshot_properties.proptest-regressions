@@ -9,3 +9,4 @@ cc f061cb64a8f230c4ceec9648ab0eab47a312cb670eab55d0c9997fdbf33341bf # shrinks to
 cc 9037ca21a9bdaa6b61bb4cf695905e37a211f931297228f0c71b23a17997aa20 # shrinks to steps = [AddMember(2), AddMember(2), AddMember(2), AddMember(2), AddMember(2), AddMember(2)], cut = 0
 cc e362a597f6a22c5f68bc1c579831c3e96a97e46d44734bfdd33a8ffe8d361f1a # shrinks to steps = [AddMember(2), AddMember(2), AddMember(2), AddMember(2), AddMember(2), AddMember(2)], cut = 0
 cc 362e44c2bb1b0932f01cac5fdf8015cb87b06395bb31ed6deb1efe402bdb265b # shrinks to steps = [AddMember(4), Assign(4, 0), AddMember(5), Assign(5, 0), AddMember(2), Revoke(5)], cut = 0
+cc a7f59d53e7d67e91e51836c5c7d75df10afd020c7b95d845b5c87f374f7087eb # shrinks to steps = [Rename(2, 0), AddMember(2), Promote(2)], cut = 2

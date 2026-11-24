@@ -93,7 +93,7 @@ fn lot(count: usize) -> (Vec<BatchEntry>, BatchHeader) {
     let entries: Vec<BatchEntry> = (0..count)
         .map(|index| {
             let board = NodeIdentity::generate().expect("generates");
-            let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+            let spec = board.device_spec("board", Role::Member, vec![]).expect("spec");
             BatchEntry {
                 keys: spec.keys,
                 name: format!("board-{index}"),

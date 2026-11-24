@@ -66,6 +66,9 @@ struct Known {
     present: Vec<u8>,
     /// Device seeds this branch has revoked.
     revoked: Vec<u8>,
+    /// Device seeds that are admins on this branch: acts on them are the
+    /// founder's to sign.
+    admins: Vec<u8>,
 }
 
 impl Known {
@@ -77,8 +80,9 @@ impl Known {
 
 /// A generated history: a genesis, then steps applied in a chain.
 ///
-/// Every step is authored by the founder, which is always an admin, and every
-/// step names a device the branch it sits on already has — so the generated
+/// Every step is authored by device 1, the founding admin, or, where it gives
+/// the admin role or names an admin, by the founder key; and every step names a
+/// device the branch it sits on already has — so the generated
 /// history is one an honest network could produce. A step that names anything
 /// else is dropped rather than emitted. Adversarial shapes are covered by the
 /// fixed tests, which can aim precisely.
@@ -127,37 +131,48 @@ fn build_history(steps: &[Step], branch_at: Option<usize>) -> History {
         };
 
         let label = format!("s{index}");
+        // Whether the step governs an admin, which only the founder key may.
+        let mut founders = false;
         let body = match *step {
             Step::AddMember(seed) => {
                 if known.present.contains(&seed) || known.revoked.contains(&seed) {
                     continue;
                 }
                 known.present.push(seed);
-                OperationBody::AddDevice(device(seed, "member", Role::Member, false))
+                OperationBody::AddDevice(device(seed, "member", Role::Member))
             }
             Step::AddAdmin(seed) => {
                 if known.present.contains(&seed) || known.revoked.contains(&seed) {
                     continue;
                 }
                 known.present.push(seed);
-                OperationBody::AddDevice(device(seed, "admin", Role::Admin, false))
+                known.admins.push(seed);
+                founders = true;
+                OperationBody::AddDevice(device(seed, "admin", Role::Admin))
             }
             Step::Rename(seed, tag) => {
                 if !known.can_act_on(seed) {
                     continue;
                 }
+                founders = known.admins.contains(&seed);
                 OperationBody::Rename { device: device_id(seed), name: format!("n{tag}") }
             }
             Step::Promote(seed) => {
                 if !known.can_act_on(seed) {
                     continue;
                 }
-                OperationBody::Promote { device: device_id(seed), founder: false }
+                founders = true;
+                if !known.admins.contains(&seed) {
+                    known.admins.push(seed);
+                }
+                OperationBody::Promote { device: device_id(seed) }
             }
             Step::Demote(seed) => {
                 if !known.can_act_on(seed) {
                     continue;
                 }
+                founders = true;
+                known.admins.retain(|admin| *admin != seed);
                 OperationBody::Demote { device: device_id(seed) }
             }
             Step::Revoke(seed) => {
@@ -165,6 +180,8 @@ fn build_history(steps: &[Step], branch_at: Option<usize>) -> History {
                     continue;
                 }
                 known.revoked.push(seed);
+                founders = known.admins.contains(&seed);
+                known.admins.retain(|admin| *admin != seed);
                 OperationBody::RevokeDevice {
                     device: device_id(seed),
                     reason: "generated".to_owned(),
@@ -175,7 +192,11 @@ fn build_history(steps: &[Step], branch_at: Option<usize>) -> History {
             }
         };
 
-        history.op(&label, 1, &[parent.as_str()], body);
+        if founders {
+            history.founder_op(&label, &[parent.as_str()], body);
+        } else {
+            history.op(&label, 1, &[parent.as_str()], body);
+        }
 
         if on_branch {
             branch_previous = Some(label);

@@ -22,14 +22,19 @@ use transport::{DirectFabric, DirectTransport, MemoryFabric, MemoryTransport};
 
 /// Builds a two-device roster: a founder and a joiner, both real identities.
 fn two_device_state(founder: &NodeIdentity, joiner: &NodeIdentity) -> RosterState {
-    let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-        .expect("valid");
+    let params = NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "example.internal",
+        2_592_000,
+    )
+    .expect("valid");
 
     let genesis = OperationCore::new(
         1,
         founder.signing_key().algorithm(),
         OperationBody::CreateNetwork {
-            device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+            device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
             params,
         },
         vec![],
@@ -43,9 +48,7 @@ fn two_device_state(founder: &NodeIdentity, joiner: &NodeIdentity) -> RosterStat
     let add = OperationCore::new(
         2,
         founder.signing_key().algorithm(),
-        OperationBody::AddDevice(
-            joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
-        ),
+        OperationBody::AddDevice(joiner.device_spec("joiner", Role::Member, vec![]).expect("spec")),
         vec![genesis.id()],
         founder.signing_key().key_id(),
         network,

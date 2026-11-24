@@ -117,10 +117,45 @@ pub fn signer(seed: u8) -> Ed25519Signer {
     Ed25519Signer::from_seed([seed; 32])
 }
 
+/// The founder's signing key of the fixture networks: from a seed no device's
+/// `[seed; 32]` can be, so it never collides with a device key.
+#[must_use]
+pub fn founder_signer() -> Ed25519Signer {
+    Ed25519Signer::from_seed(*b"the fixture founder signs here..")
+}
+
+/// The founder's keys of the fixture networks.
+#[must_use]
+pub fn founder_keys() -> roster::types::FounderKeys {
+    let transport = Ed25519Signer::from_seed(*b"the fixture founder talks here..");
+    roster::types::FounderKeys::new(
+        founder_signer().public_key().as_bytes().try_into().expect("32 bytes"),
+        transport.public_key().as_bytes().try_into().expect("32 bytes"),
+    )
+    .expect("two keys")
+}
+
+/// A second founder, for a founder key being replaced.
+#[must_use]
+pub fn next_founder_signer() -> Ed25519Signer {
+    Ed25519Signer::from_seed(*b"the next founder signs here.....")
+}
+
+/// The second founder's keys.
+#[must_use]
+pub fn next_founder_keys() -> roster::types::FounderKeys {
+    let transport = Ed25519Signer::from_seed(*b"the next founder talks here.....");
+    roster::types::FounderKeys::new(
+        next_founder_signer().public_key().as_bytes().try_into().expect("32 bytes"),
+        transport.public_key().as_bytes().try_into().expect("32 bytes"),
+    )
+    .expect("two keys")
+}
+
 /// A device specification built from one seed, with a distinct key for each of
 /// the three purposes.
 #[must_use]
-pub fn device(seed: u8, name: &str, role: Role, founder: bool) -> DeviceSpec {
+pub fn device(seed: u8, name: &str, role: Role) -> DeviceSpec {
     let signing = KeyEntry::new(
         Algorithm::Ed25519,
         KeyPurpose::Signing,
@@ -143,7 +178,6 @@ pub fn device(seed: u8, name: &str, role: Role, founder: bool) -> DeviceSpec {
         sorted(vec![signing, transport, attestation]),
         name,
         role,
-        founder,
         vec![Capability::new("serves").expect("short capability")],
     )
     .expect("well-formed device")
@@ -160,13 +194,14 @@ pub fn sorted(mut keys: Vec<KeyEntry>) -> Vec<KeyEntry> {
 /// The device id of the fixture device with a given seed.
 #[must_use]
 pub fn device_id(seed: u8) -> DeviceId {
-    device(seed, "fixture", Role::Member, false).device_id().expect("has a signing key")
+    device(seed, "fixture", Role::Member).device_id().expect("has a signing key")
 }
 
 /// Fixture network parameters.
 #[must_use]
 pub fn params() -> NetworkParams {
     NetworkParams::new(
+        founder_keys(),
         vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         "example.internal",
         2_592_000,
@@ -178,8 +213,13 @@ pub fn params() -> NetworkParams {
 /// `set_network` operations apart.
 #[must_use]
 pub fn params_with(suffix: &str) -> NetworkParams {
-    NetworkParams::new(vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], suffix, 2_592_000)
-        .expect("well-formed parameters")
+    NetworkParams::new(
+        founder_keys(),
+        vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        suffix,
+        2_592_000,
+    )
+    .expect("well-formed parameters")
 }
 
 /// One operation in a built history.
@@ -219,7 +259,7 @@ impl History {
     /// The founding operation carries the zero network id: a network *is* its
     /// genesis, so the genesis cannot name a value derived from itself.
     pub fn genesis(&mut self, label: &str, seed: u8) -> OperationId {
-        self.genesis_with(label, seed, device(seed, "phone", Role::Admin, true), params())
+        self.genesis_with(label, seed, device(seed, "phone", Role::Admin), params())
     }
 
     /// Creates the network with an explicit founding device and parameters.
@@ -256,6 +296,67 @@ impl History {
     ) -> OperationId {
         let network = self.network.expect("the genesis must come first");
         self.op_in(label, author_seed, parents, body, network)
+    }
+
+    /// Adds an operation the founder signed, hanging off the labelled parents.
+    pub fn founder_op(
+        &mut self,
+        label: &str,
+        parents: &[&str],
+        body: OperationBody,
+    ) -> OperationId {
+        self.signed_op(label, &founder_signer(), parents, body)
+    }
+
+    /// Adds an operation the founder signed, on parents given by their ids.
+    pub fn founder_op_on(
+        &mut self,
+        label: &str,
+        parents: &[OperationId],
+        body: OperationBody,
+    ) -> OperationId {
+        let network = self.network.expect("the genesis must come first");
+        self.nonce = self.nonce.wrapping_add(1);
+        let by = founder_signer();
+        let core = OperationCore::new(
+            1_735_689_600_000_u64.wrapping_add(self.nonce),
+            Algorithm::Ed25519,
+            body,
+            parents.to_vec(),
+            by.key_id(),
+            network,
+        )
+        .expect("well-formed core");
+        let bytes = sign_operation(&core, &by).expect("signs");
+        let id = core.id();
+        self.record(label, id, bytes);
+        id
+    }
+
+    /// Adds an operation signed by `by`, whoever that is.
+    pub fn signed_op(
+        &mut self,
+        label: &str,
+        by: &Ed25519Signer,
+        parents: &[&str],
+        body: OperationBody,
+    ) -> OperationId {
+        let network = self.network.expect("the genesis must come first");
+        let parent_ids: Vec<OperationId> = parents.iter().map(|name| self.id(name)).collect();
+        self.nonce = self.nonce.wrapping_add(1);
+        let core = OperationCore::new(
+            1_735_689_600_000_u64.wrapping_add(self.nonce),
+            Algorithm::Ed25519,
+            body,
+            parent_ids,
+            by.key_id(),
+            network,
+        )
+        .expect("well-formed core");
+        let bytes = sign_operation(&core, by).expect("signs");
+        let id = core.id();
+        self.record(label, id, bytes);
+        id
     }
 
     /// Adds an operation naming an explicit network, for cross-network tests.
@@ -330,8 +431,8 @@ impl History {
     /// Verifies an operation against the fixture signer its author names.
     #[must_use]
     pub fn verify(&self, raw: &RawOperation<'_>) -> VerifiedOperation {
-        for seed in 0u8..=255 {
-            let candidate = signer(seed);
+        let founders = [founder_signer(), next_founder_signer()];
+        for candidate in (0u8..=255).map(signer).chain(founders) {
             if candidate.key_id() == raw.core().author {
                 return raw.verify(&candidate.public_key()).expect("fixture signature verifies");
             }
@@ -414,13 +515,32 @@ impl History {
             root,
             roster::snapshot::Covering { heads, depths },
             Vec::new(),
-            leaf,
-            proof,
+            roster::snapshot::RootSigner::Device { leaf, proof },
             author,
             self.network(),
         )
         .expect("well-formed snapshot");
         sign_snapshot(&body, &signer(signer_seed)).expect("signs")
+    }
+
+    /// Builds a first snapshot over the labelled heads, signed by the founder.
+    #[must_use]
+    pub fn founder_snapshot_at(&self, head_labels: &[&str]) -> Vec<u8> {
+        let covered = self.covered_dag(head_labels);
+        let state = derive(&covered).expect("the covered sub-graph derives");
+        let heads: Vec<_> = head_labels.iter().map(|label| self.id(label)).collect();
+        let depths: Vec<u64> = head_labels
+            .iter()
+            .map(|label| covered.depth(covered.position(&self.id(label)).expect("covered")))
+            .collect();
+        let body = Snapshot::over(
+            &state,
+            roster::snapshot::Covering { heads, depths },
+            founder_signer().key_id(),
+            None,
+        )
+        .expect("well-formed snapshot");
+        sign_snapshot(&body, &founder_signer()).expect("signs")
     }
 
     /// Builds an attestation over the labelled heads.

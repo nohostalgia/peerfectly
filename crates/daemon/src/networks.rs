@@ -523,6 +523,27 @@ impl Home {
                         .filter(|other| *other != label);
                     if let Some(other) = &superseded {
                         let old = self.paths_for(other);
+                        // Never on the arriving roster's word alone: the held
+                        // one may hold the revocation that voids it.
+                        let proof = match keys.identity(&paths) {
+                            Ok(joined) => supersede_with_proof(&paths, &old, &joined.device_id()),
+                            Err(cause) => Err(cause.to_string()),
+                        };
+                        if let Err(why) = proof {
+                            let _forgotten = keys.forget(&paths);
+                            std::fs::remove_dir_all(paths.root()).map_err(|cause| {
+                                Error::State {
+                                    path: paths.root().to_path_buf(),
+                                    cause: cause.to_string(),
+                                }
+                            })?;
+                            done.push(Recovered::Refused(label, why));
+                            continue;
+                        }
+                        // The old identity's keys first, where the platform keeps
+                        // them outside the directory: an identity replaced keeps
+                        // no key (offline-founder design §21).
+                        let _forgotten = keys.forget(&old);
                         let _gone = std::fs::remove_dir_all(old.root());
                     }
                     let wanted = superseded.or_else(|| {
@@ -638,6 +659,102 @@ pub enum Recovered {
     /// It holds no checkpoint this machine signed, so it was neither carried
     /// nor removed, and why.
     Untrusted(Label, String),
+    /// It would have replaced a membership held in the same network, and what
+    /// was held voids it ([`supersede_with_proof`]): removed, the held one
+    /// kept, and why.
+    Refused(Label, String),
+}
+
+/// Whether the membership that has just arrived at `arriving` may take the
+/// place of the one this device holds at `held`, in the same network — and,
+/// where it may, every signed operation the held one had and the arriving one
+/// lacks, carried into it.
+///
+/// # Why a replacement must be proved
+///
+/// The held directory is this device's whole knowledge of the network: among
+/// it, revocations that may be nowhere else. A revoked device never hears its
+/// own revocation, so it can go on inviting as if it were an admin; were the
+/// held directory simply removed, accepting its invite would erase the very
+/// revocation that says not to — found on a real PC, which joined back into its
+/// network from the phone the founder had just revoked from that PC.
+///
+/// So nothing held is thrown away on the word of what arrived. The two are
+/// merged, every operation verified as any off the wire, and the arriving
+/// membership stands only if, counting everything this device held:
+///
+/// - the device it admits is a member, which a revoked admin's admission is
+///   not — the roster voids an operation concurrent with its author's removal;
+/// - every device held here as revoked is revoked there too.
+///
+/// # Errors
+///
+/// Why it may not, as a sentence; nothing is carried then.
+pub fn supersede_with_proof(
+    arriving: &Paths,
+    held: &Paths,
+    joined: &roster::id::DeviceId,
+) -> core::result::Result<(), String> {
+    let refused = |why: &str| {
+        format!(
+            "this device already holds this network, and {why}. Nothing was replaced: the \
+             network stays as this device held it, and the invite should not be trusted."
+        )
+    };
+    let held_state = crate::node::replayed(held)
+        .and_then(|roster| roster.state().ok())
+        .ok_or_else(|| refused("what it holds of it does not read, so nothing could be proved"))?;
+    let held_operations =
+        crate::state::Log::at(held.roster()).read().map_err(|cause| cause.to_string())?;
+    let held_pieces = crate::state::Log::at(held.pieces()).read().unwrap_or_default();
+
+    let mut merged = crate::node::replayed(arriving)
+        .ok_or_else(|| refused("the network that arrived does not read"))?;
+    let mut carried = Vec::new();
+    for operation in held_operations {
+        match merged.offer_bytes(&operation) {
+            roster::roster::Admission::AlreadyHeld(_)
+            | roster::roster::Admission::Refused { .. } => {}
+            _ => carried.push(operation),
+        }
+    }
+    for piece in &held_pieces {
+        let _taken = merged.offer_piece(piece);
+    }
+    let state =
+        merged.state().map_err(|_| refused("the two together do not read as one network"))?;
+    drop(merged);
+
+    if state.revoked.contains(joined) || !state.devices.contains_key(joined) {
+        return Err(refused(
+            "counting what it holds, the admission that arrived has no effect: the device \
+             that signed it is revoked here",
+        ));
+    }
+    let returned: Vec<String> = held_state
+        .revoked
+        .iter()
+        .filter(|device| !state.revoked.contains(device))
+        .map(|device| device.to_hex())
+        .collect();
+    if !returned.is_empty() {
+        return Err(refused(&format!(
+            "the network that arrived lacks revocations held here ({})",
+            returned.join(", ")
+        )));
+    }
+
+    let log = crate::state::Log::at(arriving.roster());
+    for operation in &carried {
+        log.append(operation).map_err(|cause| cause.to_string())?;
+    }
+    let pieces = crate::state::Log::at(arriving.pieces());
+    let had: std::collections::BTreeSet<Vec<u8>> =
+        pieces.read().unwrap_or_default().into_iter().collect();
+    for piece in held_pieces.iter().filter(|piece| !had.contains(*piece)) {
+        pieces.append(piece).map_err(|cause| cause.to_string())?;
+    }
+    Ok(())
 }
 
 /// The network a set of paths holds, if its roster proves one.
@@ -822,6 +939,7 @@ mod tests {
 
         let founder = identity::NodeIdentity::generate().expect("generates");
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "casa.internal",
             2_592_000,
@@ -832,7 +950,7 @@ mod tests {
             founder.signing_key().algorithm(),
             roster::types::OperationBody::CreateNetwork {
                 device: founder
-                    .device_spec("nas", roster::types::Role::Admin, true, vec![])
+                    .device_spec("nas", roster::types::Role::Admin, vec![])
                     .expect("spec"),
                 params,
             },
@@ -852,9 +970,7 @@ mod tests {
             2,
             founder.signing_key().algorithm(),
             roster::types::OperationBody::AddDevice(
-                joiner
-                    .device_spec("telefono", roster::types::Role::Member, false, vec![])
-                    .expect("spec"),
+                joiner.device_spec("telefono", roster::types::Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             founder.signing_key().key_id(),
@@ -867,6 +983,131 @@ mod tests {
         log.append(&genesis_bytes).expect("writes");
         log.append(&add_bytes).expect("writes");
         paths
+    }
+
+    /// Signs `body` by `key` and `signer` after `parents`, in `network`.
+    fn signed(
+        network: roster::id::NetworkId,
+        parents: Vec<roster::id::OperationId>,
+        key: roster::id::KeyId,
+        signer: &dyn roster::sign::Signer,
+        body: roster::types::OperationBody,
+    ) -> (roster::id::OperationId, Vec<u8>) {
+        let core = roster::types::OperationCore::new(
+            3,
+            roster::types::Algorithm::Ed25519,
+            body,
+            parents,
+            key,
+            network,
+        )
+        .expect("well-formed");
+        (core.id(), roster::sign::sign_operation(&core, signer).expect("signs"))
+    }
+
+    /// A join stopped before its record, resumed at the next start, is held to
+    /// the same proof as one finished at once: where the membership it would
+    /// replace holds the revocation of the admin that admitted it, it is
+    /// removed and the held one kept, revocation and all.
+    #[test]
+    fn a_resumed_join_admitted_by_an_admin_revoked_here_is_refused() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let home = Home::under(scratch.path());
+        home.create().expect("creates");
+        let words = identity::founder::FounderKey::from_text(
+            "legal winner thank year wave sausage worth useful legal winner thank year wave \
+             sausage worth useful legal winner thank year wave sausage worth title",
+        )
+        .expect("the words");
+
+        // `casa`, held: founded by `nas`, which admitted this device and was
+        // then revoked by the founder here.
+        let nas = identity::NodeIdentity::generate().expect("generates");
+        let params = roster::types::NetworkParams::new(
+            words.keys(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "casa.internal",
+            2_592_000,
+        )
+        .expect("valid");
+        let genesis = roster::types::OperationCore::new(
+            1,
+            nas.signing_key().algorithm(),
+            roster::types::OperationBody::CreateNetwork {
+                device: nas.device_spec("nas", roster::types::Role::Admin, vec![]).expect("spec"),
+                params,
+            },
+            vec![],
+            nas.signing_key().key_id(),
+            roster::id::NetworkId::from_bytes([0; 32]),
+        )
+        .expect("well-formed");
+        let network = roster::id::NetworkId::from_bytes(*genesis.id().as_bytes());
+        let genesis_bytes = nas.sign_operation(&genesis).expect("signs");
+
+        let held = home.paths_for(&label("casa"));
+        held.create().expect("creates");
+        let this = crate::keys::Keys::identity(&crate::keys::PlatformKeys, &held).expect("made");
+        let (added, add) = signed(
+            network,
+            vec![genesis.id()],
+            nas.signing_key().key_id(),
+            nas.signer(),
+            roster::types::OperationBody::AddDevice(
+                this.device_spec("pc", roster::types::Role::Member, vec![]).expect("spec"),
+            ),
+        );
+        let (_, revoke) = signed(
+            network,
+            vec![added],
+            words.keys().signing_id(),
+            words.signer(),
+            roster::types::OperationBody::RevokeDevice {
+                device: nas.device_id(),
+                reason: "lost device".to_owned(),
+            },
+        );
+        let log = crate::state::Log::at(held.roster());
+        for operation in [&genesis_bytes, &add, &revoke] {
+            log.append(operation).expect("writes");
+        }
+        Record { label: label("casa"), network }.write(&held).expect("writes");
+
+        // What `nas`, never having heard, admitted again: a join stopped
+        // before its record.
+        let provisional = label("network");
+        let arriving = home.paths_for(&provisional);
+        arriving.create().expect("creates");
+        let again =
+            crate::keys::Keys::identity(&crate::keys::PlatformKeys, &arriving).expect("made");
+        let (_, readmit) = signed(
+            network,
+            vec![added],
+            nas.signing_key().key_id(),
+            nas.signer(),
+            roster::types::OperationBody::AddDevice(
+                again.device_spec("pc2", roster::types::Role::Member, vec![]).expect("spec"),
+            ),
+        );
+        let log = crate::state::Log::at(arriving.roster());
+        for operation in [&genesis_bytes, &add, &readmit] {
+            log.append(operation).expect("writes");
+        }
+
+        let done =
+            home.recover_every_unrecorded(&crate::keys::PlatformKeys, None).expect("recovers");
+
+        let [Recovered::Refused(refused, why)] = done.as_slice() else {
+            panic!("refused: {done:?}")
+        };
+        assert_eq!(provisional, *refused);
+        assert!(why.contains("revoked here"), "{why}");
+        assert!(!arriving.root().exists(), "what arrived is removed");
+        assert_eq!(
+            3,
+            crate::state::Log::at(held.roster()).read().expect("reads").len(),
+            "and the network held is kept, the revocation in it"
+        );
     }
 
     /// A network is kept under a name taken from its own suffix, which is the
@@ -946,7 +1187,7 @@ mod tests {
         assert!(home.paths_for(&from).root().exists(), "and nothing moved");
     }
 
-    /// The case found on a real phone, twice: a membership confirmed on two    /// The case found on a real phone, twice: a membership confirmed on two
+    /// The case found on a real phone, twice: a membership confirmed on two
     /// screens, thrown away in practice because nothing could complete it and
     /// nothing could remove it.
     #[test]

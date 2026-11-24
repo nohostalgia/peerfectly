@@ -51,10 +51,12 @@ pub const CORE_SCHEMA: &[&str] = &["ts", "alg", "body", "type", "author", "netwo
 /// Field names of a key entry, in canonical order.
 pub const KEY_ENTRY_SCHEMA: &[&str] = &["alg", "value", "purpose"];
 /// Field names of a device specification, in canonical order.
-pub const DEVICE_SPEC_SCHEMA: &[&str] = &["keys", "name", "role", "founder", "capabilities"];
+pub const DEVICE_SPEC_SCHEMA: &[&str] = &["keys", "name", "role", "capabilities"];
 /// Field names of a derived device record, in canonical order.
 pub const DEVICE_RECORD_SCHEMA: &[&str] =
-    &["id", "keys", "name", "role", "founder", "added_by", "capabilities"];
+    &["id", "keys", "name", "role", "added_by", "capabilities"];
+/// Field names of the founder's keys, in canonical order.
+pub const FOUNDER_SCHEMA: &[&str] = &["signing", "transport"];
 /// Field names of the network parameters, in canonical order.
 ///
 /// `ipv4`, `policy`, `anchors`, `leaving` and `excluded` may be absent: see
@@ -66,6 +68,7 @@ pub const NETWORK_PARAMS_SCHEMA: &[&str] = &[
     "policy",
     "suffix",
     "anchors",
+    "founder",
     "leaving",
     "excluded",
     "snapshot_window",
@@ -168,7 +171,7 @@ pub const CREATE_NETWORK_SCHEMA: &[&str] = &["device", "params"];
 /// Field names of a `revoke_device` body, in canonical order.
 pub const REVOKE_DEVICE_SCHEMA: &[&str] = &["device", "reason"];
 /// Field names of a `promote` body, in canonical order.
-pub const PROMOTE_SCHEMA: &[&str] = &["device", "founder"];
+pub const PROMOTE_SCHEMA: &[&str] = &["device"];
 /// Field names of a `demote` body, in canonical order.
 pub const DEMOTE_SCHEMA: &[&str] = &["device"];
 /// Field names of a `rename` body, in canonical order.
@@ -184,6 +187,7 @@ pub const ALL_SCHEMAS: &[&[&str]] = &[
     KEY_ENTRY_SCHEMA,
     DEVICE_SPEC_SCHEMA,
     DEVICE_RECORD_SCHEMA,
+    FOUNDER_SCHEMA,
     NETWORK_PARAMS_SCHEMA,
     LEAVING_SCHEMA,
     CREATE_NETWORK_SCHEMA,
@@ -556,12 +560,6 @@ pub struct DeviceSpec {
     pub name: String,
     /// Authority in the network.
     pub role: Role,
-    /// Whether this device is a founder.
-    ///
-    /// A founder may be revoked or demoted only by itself. The rule is
-    /// enforced where authority is derived, not here: this crate has no
-    /// roster state and so cannot know whether a target is a founder.
-    pub founder: bool,
     /// Declared capabilities.
     pub capabilities: Vec<Capability>,
 }
@@ -572,7 +570,6 @@ impl DeviceSpec {
         keys: Vec<KeyEntry>,
         name: impl Into<String>,
         role: Role,
-        founder: bool,
         capabilities: Vec<Capability>,
     ) -> Result<Self> {
         let name = name.into();
@@ -583,7 +580,17 @@ impl DeviceSpec {
         if capabilities.len() > limits::MAX_CAPABILITIES {
             return Err(Error::LimitExceeded("capability count"));
         }
-        Ok(Self { keys, name, role, founder, capabilities })
+        Ok(Self { keys, name, role, capabilities })
+    }
+
+    /// Whether any of this device's keys is one of the founder's.
+    ///
+    /// The founder's keys open a founder session and sign as the founder. A
+    /// device carrying one would be a device the network could neither revoke
+    /// nor tell apart from the founder, so such a device is refused as key reuse.
+    #[must_use]
+    pub fn reuses(&self, founder: &FounderKeys) -> bool {
+        self.keys.iter().any(|entry| founder.holds(&entry.value))
     }
 
     /// The device's id, derived from its identifying signing key.
@@ -599,7 +606,6 @@ impl DeviceSpec {
             keys: self.keys,
             name: self.name,
             role: self.role,
-            founder: self.founder,
             added_by,
             capabilities: self.capabilities,
         })
@@ -607,14 +613,13 @@ impl DeviceSpec {
 
     /// Writes the specification.
     pub(crate) fn encode(&self, writer: &mut Writer) {
-        writer.map(5);
+        writer.map(4);
         writer.key("keys").array(self.keys.len() as u64);
         for entry in &self.keys {
             entry.encode(writer);
         }
         writer.key("name").str(&self.name);
         writer.key("role").str(self.role.as_str());
-        writer.key("founder").bool(self.founder);
         writer.key("capabilities").array(self.capabilities.len() as u64);
         for capability in &self.capabilities {
             writer.str(capability.as_str());
@@ -627,10 +632,9 @@ impl DeviceSpec {
         let keys = decode_keys(map.key("keys")?)?;
         let name = map.key("name")?.str(limits::MAX_NAME_LEN, "device name length")?.to_owned();
         let role = Role::parse(map.key("role")?.str(limits::MAX_MAP_KEY_LEN, "role")?)?;
-        let founder = map.key("founder")?.bool()?;
         let capabilities = decode_capabilities(map.key("capabilities")?)?;
         map.finish()?;
-        Self::new(keys, name, role, founder, capabilities)
+        Self::new(keys, name, role, capabilities)
     }
 }
 
@@ -667,8 +671,6 @@ pub struct DeviceRecord {
     pub name: String,
     /// Authority in the network.
     pub role: Role,
-    /// Whether this device is a founder.
-    pub founder: bool,
     /// The operation that added this device.
     pub added_by: OperationId,
     /// Declared capabilities.
@@ -697,7 +699,7 @@ impl DeviceRecord {
 
     /// Writes the record.
     pub(crate) fn encode(&self, writer: &mut Writer) {
-        writer.map(7);
+        writer.map(6);
         writer.key("id");
         self.id.encode(writer);
         writer.key("keys").array(self.keys.len() as u64);
@@ -706,7 +708,6 @@ impl DeviceRecord {
         }
         writer.key("name").str(&self.name);
         writer.key("role").str(self.role.as_str());
-        writer.key("founder").bool(self.founder);
         writer.key("added_by");
         self.added_by.encode(writer);
         writer.key("capabilities").array(self.capabilities.len() as u64);
@@ -722,7 +723,6 @@ impl DeviceRecord {
         let keys = decode_keys(map.key("keys")?)?;
         let name = map.key("name")?.str(limits::MAX_NAME_LEN, "device name length")?.to_owned();
         let role = Role::parse(map.key("role")?.str(limits::MAX_MAP_KEY_LEN, "role")?)?;
-        let founder = map.key("founder")?.bool()?;
         let added_by = OperationId::decode(map.key("added_by")?)?;
         let capabilities = decode_capabilities(map.key("capabilities")?)?;
         map.finish()?;
@@ -737,8 +737,118 @@ impl DeviceRecord {
         if DeviceId::of_signing_key(&identifying_key(&keys)?.value) != id {
             return Err(Error::IdMismatch);
         }
-        Ok(Self { id, keys, name, role, founder, added_by, capabilities })
+        Ok(Self { id, keys, name, role, added_by, capabilities })
     }
+}
+
+// ---------------------------------------------------------------------------
+// The founder
+// ---------------------------------------------------------------------------
+
+/// The founder's two public keys, both derived from the words a person keeps.
+///
+/// The founder is not a device: it has no record, no address and no role, and
+/// no operation adds, revokes, demotes or promotes it. Its **signing** key
+/// authors operations and roots with an authority nothing in the network can
+/// take away; its **transport** key opens a founder session, which carries the
+/// roster and nothing else. Both are Ed25519 — the transport key because convesso
+/// takes every endpoint's identity as one — and they are distinct by
+/// construction, so one never stands in for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FounderKeys {
+    signing: [u8; 32],
+    transport: [u8; 32],
+}
+
+impl FounderKeys {
+    /// The founder's keys, refusing two equal values.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyReuse`] when the two keys are the same value.
+    pub fn new(signing: [u8; 32], transport: [u8; 32]) -> Result<Self> {
+        if signing == transport {
+            return Err(Error::KeyReuse);
+        }
+        Ok(Self { signing, transport })
+    }
+
+    /// Keys whose private halves nobody holds: two hashes, not keys anybody
+    /// made.
+    ///
+    /// For fixtures and tests that do not exercise the founder. A network
+    /// founded with them is one whose founder's words are lost from the start:
+    /// it works as any other, and it can never be repaired. Nobody gains
+    /// anything from it, which is why it may exist in the library at all.
+    #[must_use]
+    pub fn held_by_nobody() -> Self {
+        Self {
+            signing: blake3::derive_key("peerfectly founder held by nobody v1", b"signing"),
+            transport: blake3::derive_key("peerfectly founder held by nobody v1", b"transport"),
+        }
+    }
+
+    /// The signing key's bytes.
+    #[must_use]
+    pub const fn signing(&self) -> &[u8; 32] {
+        &self.signing
+    }
+
+    /// The transport key's bytes.
+    #[must_use]
+    pub const fn transport(&self) -> &[u8; 32] {
+        &self.transport
+    }
+
+    /// The id an operation or a root signed by the founder names as its author.
+    #[must_use]
+    pub fn signing_id(&self) -> KeyId {
+        KeyId::of_public_key(&self.signing)
+    }
+
+    /// The id of the transport key, as a session's handshake names it.
+    #[must_use]
+    pub fn transport_id(&self) -> KeyId {
+        KeyId::of_public_key(&self.transport)
+    }
+
+    /// The signing key as a key entry, for verification.
+    #[must_use]
+    pub fn signing_entry(&self) -> KeyEntry {
+        KeyEntry {
+            alg: Algorithm::Ed25519,
+            value: self.signing.to_vec(),
+            purpose: KeyPurpose::Signing,
+        }
+    }
+
+    /// Whether `value` is one of the founder's two keys.
+    #[must_use]
+    pub fn holds(&self, value: &[u8]) -> bool {
+        value == self.signing.as_slice() || value == self.transport.as_slice()
+    }
+
+    /// Writes the keys.
+    pub(crate) fn encode(&self, writer: &mut Writer) {
+        writer.map(2);
+        writer.key("signing").bytes(&self.signing);
+        writer.key("transport").bytes(&self.transport);
+    }
+
+    /// Reads the keys.
+    pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Self> {
+        let mut map = reader.map(FOUNDER_SCHEMA)?;
+        let signing = key_bytes(map.key("signing")?)?;
+        let transport = key_bytes(map.key("transport")?)?;
+        map.finish()?;
+        Self::new(signing, transport)
+    }
+}
+
+/// Reads one 32-byte public key.
+fn key_bytes(reader: &mut Reader<'_>) -> Result<[u8; 32]> {
+    let bytes = reader.bytes(33, "public key length")?;
+    <[u8; 32]>::try_from(bytes).map_err(|_| Error::IdentifierLength)
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +1049,9 @@ pub struct Leaving {
 /// certificate and every installed client at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkParams {
+    /// The founder's keys. Always present: a network without them would be one
+    /// nobody could repair once its admins were lost.
+    pub founder: FounderKeys,
     /// The IPv6 ULA prefix bytes.
     pub ula: Vec<u8>,
     /// The IPv4 range devices derive their IPv4 addresses in, if the network
@@ -997,8 +1110,13 @@ pub struct NetworkParams {
 
 impl NetworkParams {
     /// Builds parameters with no relay, checking every bound.
-    pub fn new(ula: Vec<u8>, suffix: impl Into<String>, snapshot_window: u64) -> Result<Self> {
-        Self::with_relay(ula, None::<String>, suffix, snapshot_window)
+    pub fn new(
+        founder: FounderKeys,
+        ula: Vec<u8>,
+        suffix: impl Into<String>,
+        snapshot_window: u64,
+    ) -> Result<Self> {
+        Self::with_relay(founder, ula, None::<String>, suffix, snapshot_window)
     }
 
     /// Builds parameters, checking every bound.
@@ -1007,6 +1125,7 @@ impl NetworkParams {
     /// already has an encoding, and a second spelling of the same thing would
     /// mean two byte strings decoding to one value.
     pub fn with_relay(
+        founder: FounderKeys,
         ula: Vec<u8>,
         relay: Option<impl Into<String>>,
         suffix: impl Into<String>,
@@ -1034,6 +1153,7 @@ impl NetworkParams {
             _ => {}
         }
         Ok(Self {
+            founder,
             ula,
             ipv4: None,
             relay,
@@ -1089,8 +1209,13 @@ impl NetworkParams {
             .clone()
             .map(|current| Leaving { relay: current, until: issued.saturating_add(window_ms) });
 
-        let mut moved =
-            Self::with_relay(self.ula.clone(), Some(relay), &*self.suffix, self.snapshot_window)?;
+        let mut moved = Self::with_relay(
+            self.founder,
+            self.ula.clone(),
+            Some(relay),
+            &*self.suffix,
+            self.snapshot_window,
+        )?;
         moved.ipv4 = self.ipv4;
         moved.anchors.clone_from(&self.anchors);
         moved.policy.clone_from(&self.policy);
@@ -1115,6 +1240,7 @@ impl NetworkParams {
     /// When the new relay is outside its bound.
     pub fn switching_to(&self, relay: impl Into<String>) -> Result<Self> {
         let mut moved = Self::with_relay(
+            self.founder,
             self.ula.clone(),
             Some(relay.into()),
             &*self.suffix,
@@ -1228,7 +1354,7 @@ impl NetworkParams {
     /// one encoding. The IPv4 range is instead left out when absent, so that
     /// parameters without one encode exactly as they did before it existed.
     pub(crate) fn encode(&self, writer: &mut Writer) {
-        let present = 3_u64
+        let present = 4_u64
             .saturating_add(u64::from(self.snapshot_window != 0))
             .saturating_add(u64::from(self.ipv4.is_some()))
             .saturating_add(u64::from(!self.policy.is_empty()))
@@ -1259,6 +1385,8 @@ impl NetworkParams {
             writer.key("anchors");
             crate::parameters::write_anchors(writer, &self.anchors);
         }
+        writer.key("founder");
+        self.founder.encode(writer);
         if let Some(leaving) = &self.leaving {
             writer.key("leaving").map(2);
             writer.key("relay").str(&leaving.relay);
@@ -1317,6 +1445,7 @@ impl NetworkParams {
             }
             None => Vec::new(),
         };
+        let founder = FounderKeys::decode(map.key("founder")?)?;
         // One key holding both, so a relay being left without an end, or an end
         // without a relay, is not something the encoding can say at all.
         let leaving = match map.optional_key("leaving")? {
@@ -1352,7 +1481,7 @@ impl NetworkParams {
         };
         map.finish()?;
 
-        let mut params = Self::with_relay(ula, relay, suffix, snapshot_window)?;
+        let mut params = Self::with_relay(founder, ula, relay, suffix, snapshot_window)?;
         params.anchors = anchors;
         params.policy = policy;
         params.excluded = excluded;
@@ -1377,7 +1506,7 @@ impl NetworkParams {
 /// cannot be read where another type's body is expected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationBody {
-    /// Establishes the network with its founding admin, who is a founder.
+    /// Establishes the network with its founding admin and its founder's keys.
     CreateNetwork {
         /// The founding admin device.
         device: DeviceSpec,
@@ -1393,12 +1522,10 @@ pub enum OperationBody {
         /// Why, for the person who has to decide what to do next.
         reason: String,
     },
-    /// Raises a device to admin, optionally granting founder status.
+    /// Raises a device to admin.
     Promote {
         /// The device being promoted.
         device: DeviceId,
-        /// Whether the promotion also grants founder status.
-        founder: bool,
     },
     /// Lowers a device to member.
     Demote {
@@ -1467,11 +1594,10 @@ impl OperationBody {
                 device.encode(writer);
                 writer.key("reason").str(reason);
             }
-            Self::Promote { device, founder } => {
-                writer.map(2);
+            Self::Promote { device } => {
+                writer.map(1);
                 writer.key("device");
                 device.encode(writer);
-                writer.key("founder").bool(*founder);
             }
             Self::Demote { device } => {
                 writer.map(1);
@@ -1518,6 +1644,11 @@ impl OperationBody {
                 let device = DeviceSpec::decode(map.key("device")?)?;
                 let params = NetworkParams::decode(map.key("params")?)?;
                 map.finish()?;
+                // Both are in this one body, so the rule that no device carries
+                // a founder key is checked where it is read.
+                if device.reuses(&params.founder) {
+                    return Err(Error::KeyReuse);
+                }
                 Self::CreateNetwork { device, params }
             }
             OperationType::AddDevice => Self::AddDevice(DeviceSpec::decode(&mut reader)?),
@@ -1532,9 +1663,8 @@ impl OperationBody {
             OperationType::Promote => {
                 let mut map = reader.map(PROMOTE_SCHEMA)?;
                 let device = DeviceId::decode(map.key("device")?)?;
-                let founder = map.key("founder")?.bool()?;
                 map.finish()?;
-                Self::Promote { device, founder }
+                Self::Promote { device }
             }
             OperationType::Demote => {
                 let mut map = reader.map(DEMOTE_SCHEMA)?;
@@ -1705,6 +1835,7 @@ mod tests {
 
     fn on(relay: &str) -> NetworkParams {
         NetworkParams::with_relay(
+            crate::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             Some(relay),
             "casa.internal",
@@ -1780,8 +1911,13 @@ mod tests {
     /// A network with no relay is given one, with nothing to leave.
     #[test]
     fn a_first_relay_is_not_a_move() {
-        let none = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 604_800)
-            .expect("well-formed");
+        let none = NetworkParams::new(
+            crate::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "casa.internal",
+            604_800,
+        )
+        .expect("well-formed");
         let given = none.moving_to("https://a.example:443", 1).expect("given one");
         assert_eq!(Some("https://a.example:443"), given.relay.as_deref());
         assert!(given.leaving.is_none(), "there was nothing to leave");
@@ -1806,9 +1942,14 @@ mod tests {
         let same = on("https://a.example:443").leaving(leaving("https://a.example:443"));
         assert_eq!(Err(Error::InvalidValue("the relay being left is the relay")), same);
 
-        let nowhere = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 604_800)
-            .expect("well-formed")
-            .leaving(leaving("https://a.example:443"));
+        let nowhere = NetworkParams::new(
+            crate::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "casa.internal",
+            604_800,
+        )
+        .expect("well-formed")
+        .leaving(leaving("https://a.example:443"));
         assert_eq!(
             Err(Error::InvalidValue("a relay being left with no relay to move to")),
             nowhere
@@ -1824,10 +1965,12 @@ mod tests {
     #[test]
     fn a_partial_group_does_not_decode() {
         let mut writer = cbor::Writer::new();
-        writer.map(5);
+        writer.map(6);
         writer.key("ula").bytes(&[0xfd, 0, 0, 0, 0, 0, 0, 0]);
         writer.key("relay").array(1).str("https://b.example:443");
         writer.key("suffix").str("casa.internal");
+        writer.key("founder");
+        FounderKeys::held_by_nobody().encode(&mut writer);
         writer.key("leaving").map(1);
         writer.key("relay").str("https://a.example:443");
         writer.key("snapshot_window").u64(604_800);
@@ -1841,8 +1984,13 @@ mod tests {
     /// a second spelling of it, refused.
     #[test]
     fn no_window_is_the_key_left_out_and_zero_is_refused() {
-        let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 0)
-            .expect("well-formed");
+        let params = NetworkParams::new(
+            crate::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "casa.internal",
+            0,
+        )
+        .expect("well-formed");
         let mut writer = cbor::Writer::new();
         params.encode(&mut writer);
         let bytes = writer.finish();
@@ -1850,10 +1998,12 @@ mod tests {
         assert_eq!(NetworkParams::decode(&mut cbor::Reader::new(&bytes)), Ok(params));
 
         let mut writer = cbor::Writer::new();
-        writer.map(4);
+        writer.map(5);
         writer.key("ula").bytes(&[0xfd, 0, 0, 0, 0, 0, 0, 0]);
         writer.key("relay").array(0);
         writer.key("suffix").str("casa.internal");
+        writer.key("founder");
+        FounderKeys::held_by_nobody().encode(&mut writer);
         writer.key("snapshot_window").u64(0);
         let zero = writer.finish();
         assert_eq!(NetworkParams::decode(&mut cbor::Reader::new(&zero)), Err(Error::NonCanonical));
@@ -1896,7 +2046,7 @@ mod tests {
             .expect("well-formed");
         let mut keys = vec![signing, attestation];
         keys.sort_by_key(KeyEntry::order_key);
-        let spec = DeviceSpec::new(keys, "nas", Role::Member, false, vec![]).expect("well-formed");
+        let spec = DeviceSpec::new(keys, "nas", Role::Member, vec![]).expect("well-formed");
         let record =
             spec.into_record(OperationId::from_bytes([1u8; 32])).expect("has a signing key");
 
@@ -1964,8 +2114,21 @@ mod tests {
 
     /// The parameters map as it was written before the range existed, by hand,
     /// with room to place an `ipv4` entry after `ula`.
+    /// The founder's keys, by hand, as the parameters map carries them.
+    fn founder(out: &mut Vec<u8>) {
+        let keys = FounderKeys::held_by_nobody();
+        text(out, "founder");
+        out.push(0xa2);
+        text(out, "signing");
+        bytes(out, keys.signing());
+        text(out, "transport");
+        bytes(out, keys.transport());
+    }
+
+    /// The parameters map by hand, `entries` counting every key but the
+    /// founder's, which is always there.
     fn hand_built(entries: u8, ipv4: &[&[u8]]) -> Vec<u8> {
-        let mut out = vec![0xa0 | entries];
+        let mut out = vec![0xa0 | entries.saturating_add(1)];
         text(&mut out, "ula");
         bytes(&mut out, &[0xfd, 0, 0, 0, 0, 0, 0, 0]);
         for value in ipv4 {
@@ -1976,6 +2139,7 @@ mod tests {
         out.push(0x80);
         text(&mut out, "suffix");
         text(&mut out, "example.internal");
+        founder(&mut out);
         text(&mut out, "snapshot_window");
         out.push(0x01);
         out
@@ -1984,13 +2148,14 @@ mod tests {
     /// The parameters map by hand with a chosen prefix and suffix, so a decoder
     /// can be offered values no encoder here would produce.
     fn hand_built_with(ula: &[u8], suffix: &str) -> Vec<u8> {
-        let mut out = vec![0xa4];
+        let mut out = vec![0xa5];
         text(&mut out, "ula");
         bytes(&mut out, ula);
         text(&mut out, "relay");
         out.push(0x80);
         text(&mut out, "suffix");
         text(&mut out, suffix);
+        founder(&mut out);
         text(&mut out, "snapshot_window");
         out.push(0x01);
         out
@@ -2017,8 +2182,13 @@ mod tests {
     }
 
     fn plain() -> NetworkParams {
-        NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 1)
-            .unwrap_or_else(|_| unreachable!("well-formed"))
+        NetworkParams::new(
+            crate::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            1,
+        )
+        .unwrap_or_else(|_| unreachable!("well-formed"))
     }
 
     fn encoded(params: &NetworkParams) -> Vec<u8> {

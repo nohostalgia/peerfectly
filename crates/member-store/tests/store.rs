@@ -34,7 +34,6 @@ fn leaf(n: u32) -> DeviceLeaf {
         keys,
         name: format!("d{n}"),
         role: Role::Member,
-        founder: false,
         added_by: OperationId::from_bytes([1; 32]),
         capabilities: Vec::new(),
     };
@@ -47,8 +46,13 @@ fn leaf(n: u32) -> DeviceLeaf {
 }
 
 fn skeleton() -> RosterState {
-    let params =
-        NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0).unwrap();
+    let params = NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "example.internal",
+        0,
+    )
+    .unwrap();
     RosterState::empty(NetworkId::from_bytes([7; 32]), params)
 }
 

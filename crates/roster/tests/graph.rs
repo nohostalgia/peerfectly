@@ -10,6 +10,7 @@ mod support;
 use roster::Error;
 use roster::dag::Dag;
 use roster::id::{NetworkId, OperationId};
+use roster::roster::Roster;
 use roster::state::{Invalidity, derive, derive_with_verdicts};
 use roster::types::{OperationBody, Role};
 use support::{History, device, device_id, params, params_with, signer};
@@ -48,10 +49,7 @@ fn a_founding_operation_naming_a_non_zero_network_is_rejected() {
         "fake_genesis",
         3,
         &[],
-        OperationBody::CreateNetwork {
-            device: device(3, "phone", Role::Admin, true),
-            params: params(),
-        },
+        OperationBody::CreateNetwork { device: device(3, "phone", Role::Admin), params: params() },
         bogus_network,
     );
     let _ = id;
@@ -68,10 +66,7 @@ fn a_second_create_network_is_rejected() {
         "second",
         1,
         &["g"],
-        OperationBody::CreateNetwork {
-            device: device(2, "other", Role::Admin, true),
-            params: params(),
-        },
+        OperationBody::CreateNetwork { device: device(2, "other", Role::Admin), params: params() },
     );
 
     let mut dag = Dag::new();
@@ -90,7 +85,7 @@ fn an_operation_from_another_network_is_rejected() {
         "foreign",
         1,
         &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         foreign,
     );
 
@@ -107,7 +102,7 @@ fn a_parentless_non_genesis_operation_is_rejected() {
         "orphan",
         1,
         &[],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         NetworkId::from_bytes([0; 32]),
     );
 
@@ -120,7 +115,7 @@ fn a_parentless_non_genesis_operation_is_rejected() {
 fn a_genesis_whose_author_is_not_its_declared_admin_is_rejected() {
     let mut history = History::new();
     // Device 1's keys, but authored by signer 2.
-    history.genesis_with("g", 2, device(1, "phone", Role::Admin, true), params());
+    history.genesis_with("g", 2, device(1, "phone", Role::Admin), params());
     let dag = history.dag();
     assert!(matches!(derive(&dag), Err(Error::MissingGenesis)));
 }
@@ -128,7 +123,7 @@ fn a_genesis_whose_author_is_not_its_declared_admin_is_rejected() {
 #[test]
 fn a_genesis_declaring_a_member_is_rejected() {
     let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "phone", Role::Member, false), params());
+    history.genesis_with("g", 1, device(1, "phone", Role::Member), params());
     let dag = history.dag();
     assert!(matches!(derive(&dag), Err(Error::MissingGenesis)));
 }
@@ -141,8 +136,8 @@ fn a_genesis_declaring_a_member_is_rejected() {
 fn forked_history() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     history.op(
         "d",
         1,
@@ -156,8 +151,8 @@ fn forked_history() -> History {
 fn ancestry_is_transitive() {
     let mut history = History::new();
     history.genesis("a", 1);
-    history.op("b", 1, &["a"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("b", 1, &["a"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     let dag = history.dag();
 
     let (a, b, c) =
@@ -223,8 +218,8 @@ fn depth_follows_the_longest_path() {
     let mut history = History::new();
     history.genesis("g", 1);
     // A short branch and a long one, then a merge.
-    history.op("short", 1, &["g"], OperationBody::AddDevice(device(2, "a", Role::Member, false)));
-    history.op("l1", 1, &["g"], OperationBody::AddDevice(device(3, "b", Role::Member, false)));
+    history.op("short", 1, &["g"], OperationBody::AddDevice(device(2, "a", Role::Member)));
+    history.op("l1", 1, &["g"], OperationBody::AddDevice(device(3, "b", Role::Member)));
     history.op("l2", 1, &["l1"], OperationBody::Rename { device: device_id(3), name: "b2".into() });
     history.op("l3", 1, &["l2"], OperationBody::Rename { device: device_id(3), name: "b3".into() });
     history.op(
@@ -278,8 +273,8 @@ fn depth_ignores_timestamps() {
 fn a_linear_chain_has_exactly_one_head() {
     let mut history = History::new();
     history.genesis("a", 1);
-    history.op("b", 1, &["a"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("b", 1, &["a"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     let dag = history.dag();
     assert_eq!(dag.heads(), vec![history.id("c")]);
 }
@@ -293,8 +288,8 @@ fn a_linear_chain_has_exactly_one_head() {
 fn an_unplaceable_operation_set_terminates_with_an_error() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
 
     // Offer `c` without `b`: its parent is absent from the input entirely.
     let orphaned = vec![history.verified("g"), history.verified("c")];
@@ -347,21 +342,11 @@ fn work_done_while_an_admin_survives_that_admins_demotion() {
     let mut history = History::new();
     history.genesis("g", 1);
     // The founder promotes device 2 to admin.
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     // Device 2 adds device 3.
-    history.op(
-        "add3",
-        2,
-        &["add2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
-    );
+    history.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     // The founder later demotes device 2, causally after the add.
-    history.op("demote2", 1, &["add3"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("demote2", &["add3"], OperationBody::Demote { device: device_id(2) });
 
     let state = derive(&history.dag()).expect("derives");
     assert!(state.devices.contains_key(&device_id(3)), "the added device stays");
@@ -376,19 +361,9 @@ fn work_done_while_an_admin_survives_that_admins_demotion() {
 fn a_member_cannot_author_operations() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     // Device 2 is a member, and tries to add a device anyway.
-    history.op(
-        "add3",
-        2,
-        &["add2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
-    );
+    history.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
 
     let dag = history.dag();
     let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
@@ -403,20 +378,10 @@ fn a_member_cannot_author_operations() {
 fn an_operation_descended_from_its_authors_demotion_is_invalid() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op("demote2", 1, &["add2"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("demote2", &["add2"], OperationBody::Demote { device: device_id(2) });
     // Device 2 authors an operation that names its own demotion as an ancestor.
-    history.op(
-        "late",
-        2,
-        &["demote2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
-    );
+    history.op("late", 2, &["demote2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
 
     let dag = history.dag();
     let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
@@ -438,19 +403,14 @@ fn an_operation_descended_from_its_authors_demotion_is_invalid() {
 fn a_backdated_operation_from_a_demoted_admin_is_void() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op("demote2", 1, &["add2"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("demote2", &["add2"], OperationBody::Demote { device: device_id(2) });
     // Anchored to `add2`, not to the demotion: concurrent with it.
     history.op(
         "backdated",
         2,
         &["add2"],
-        OperationBody::AddDevice(device(9, "backdoor", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "backdoor", Role::Member)),
     );
 
     let dag = history.dag();
@@ -469,18 +429,13 @@ fn a_backdated_operation_from_a_demoted_admin_is_void() {
 fn a_lagging_node_self_heals_when_the_demotion_arrives() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op("demote2", 1, &["add2"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("demote2", &["add2"], OperationBody::Demote { device: device_id(2) });
     history.op(
         "backdated",
         2,
         &["add2"],
-        OperationBody::AddDevice(device(9, "backdoor", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "backdoor", Role::Member)),
     );
 
     // Before the demotion is known, the forgery looks entirely legitimate.
@@ -498,22 +453,11 @@ fn a_lagging_node_self_heals_when_the_demotion_arrives() {
 fn legitimate_work_before_a_revocation_survives_it() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op(
-        "add3",
-        2,
-        &["add2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
-    );
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.op("add3", 2, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     // The revocation has the add among its ancestors: the revoker saw it.
-    history.op(
+    history.founder_op(
         "revoke2",
-        1,
         &["add3"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
     );
@@ -527,22 +471,16 @@ fn legitimate_work_before_a_revocation_survives_it() {
 fn an_in_flight_operation_concurrent_with_a_revocation_is_void() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     // Device 2's add never reached the founder, who revokes concurrently.
     history.op(
         "inflight",
         2,
         &["add2"],
-        OperationBody::AddDevice(device(4, "tablet", Role::Member, false)),
+        OperationBody::AddDevice(device(4, "tablet", Role::Member)),
     );
-    history.op(
+    history.founder_op(
         "revoke2",
-        1,
         &["add2"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
     );
@@ -559,18 +497,8 @@ fn an_in_flight_operation_concurrent_with_a_revocation_is_void() {
 fn concurrent_promote_and_revoke_resolves_to_revoked() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
-    history.op(
-        "promote",
-        1,
-        &["add2"],
-        OperationBody::Promote { device: device_id(2), founder: false },
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.founder_op("promote", &["add2"], OperationBody::Promote { device: device_id(2) });
     history.op(
         "revoke",
         1,
@@ -589,12 +517,7 @@ fn concurrent_promote_and_revoke_resolves_to_revoked() {
 fn a_causally_later_add_admits_a_revoked_device_again() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history.op(
         "revoke",
         1,
@@ -606,7 +529,7 @@ fn a_causally_later_add_admits_a_revoked_device_again() {
         "readd",
         1,
         &["revoke"],
-        OperationBody::AddDevice(device(2, "laptop-new", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop-new", Role::Member)),
     );
 
     let state = derive(&history.dag()).expect("derives");
@@ -624,13 +547,8 @@ fn a_causally_later_add_admits_a_revoked_device_again() {
 fn an_add_concurrent_with_a_revocation_loses_in_either_order() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin3", 1, &["g"], OperationBody::AddDevice(device(3, "pc", Role::Admin, false)));
-    history.op(
-        "add2",
-        1,
-        &["admin3"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.founder_op("admin3", &["g"], OperationBody::AddDevice(device(3, "pc", Role::Admin)));
+    history.op("add2", 1, &["admin3"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     // Admin 1 revokes the laptop; admin 3, not having seen that, admits it again.
     history.op(
         "revoke",
@@ -638,12 +556,7 @@ fn an_add_concurrent_with_a_revocation_loses_in_either_order() {
         &["add2"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
     );
-    history.op(
-        "readd",
-        3,
-        &["add2"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("readd", 3, &["add2"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
 
     let forward = derive(&history.dag()).expect("derives");
     assert!(!forward.devices.contains_key(&device_id(2)), "the revocation wins");
@@ -662,24 +575,14 @@ fn an_add_concurrent_with_a_revocation_loses_in_either_order() {
 fn a_revoked_device_cannot_be_promoted() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history.op(
         "revoke",
         1,
         &["add2"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
     );
-    history.op(
-        "promote",
-        1,
-        &["revoke"],
-        OperationBody::Promote { device: device_id(2), founder: false },
-    );
+    history.founder_op("promote", &["revoke"], OperationBody::Promote { device: device_id(2) });
 
     let state = derive(&history.dag()).expect("derives");
     assert!(!state.devices.contains_key(&device_id(2)));
@@ -691,41 +594,22 @@ fn a_revoked_device_cannot_be_promoted() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn concurrent_promote_and_demote_resolves_to_member() {
+fn concurrent_promote_and_demote_by_the_founder_are_a_fork() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    // Two admins, because that is the shape this rule is about: the scenario in
-    // the spec is "an admin unaware of the demotion concurrently promotes it".
-    // One admin writing both would be signing two histories, which is a fork and
-    // is judged before these rules are reached.
-    history.op(
-        "add9",
-        1,
-        &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
-    );
-    history.op("demote", 1, &["add9"], OperationBody::Demote { device: device_id(2) });
-    history.op(
-        "promote",
-        9,
-        &["add9"],
-        OperationBody::Promote { device: device_id(2), founder: false },
-    );
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    // Only the founder key promotes or demotes, so the race this rule was about,
+    // "an admin unaware of the demotion concurrently promotes it", can now only
+    // be the founder signing two histories: a fork, and neither stands.
+    history.founder_op("demote", &["add2"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("promote", &["add2"], OperationBody::Promote { device: device_id(2) });
 
-    for order in
-        [["g", "add2", "add9", "demote", "promote"], ["g", "add2", "add9", "promote", "demote"]]
-    {
+    for order in [["g", "add2", "demote", "promote"], ["g", "add2", "promote", "demote"]] {
         let state = derive(&history.dag_of(&order)).expect("derives");
         assert_eq!(
             state.devices.get(&device_id(2)).map(|record| record.role),
-            Some(Role::Member),
-            "a race resolves downwards, in {order:?}"
+            Some(Role::Admin),
+            "neither branch of the fork stands, in {order:?}"
         );
     }
 }
@@ -734,20 +618,10 @@ fn concurrent_promote_and_demote_resolves_to_member() {
 fn a_causally_later_promote_re_promotes() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op("demote", 1, &["add2"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("demote", &["add2"], OperationBody::Demote { device: device_id(2) });
     // The promote descends from the demote: a deliberate re-promotion.
-    history.op(
-        "promote",
-        1,
-        &["demote"],
-        OperationBody::Promote { device: device_id(2), founder: false },
-    );
+    history.founder_op("promote", &["demote"], OperationBody::Promote { device: device_id(2) });
 
     let state = derive(&history.dag()).expect("derives");
     assert_eq!(
@@ -765,17 +639,11 @@ fn a_causally_later_promote_re_promotes() {
 fn the_deeper_rename_wins() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
-    history.op(
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     history.op(
         "shallow",
@@ -806,17 +674,11 @@ fn the_deeper_rename_wins() {
 fn equal_depth_renames_are_broken_by_operation_id_and_agree_in_both_orders() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
-    history.op(
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     // One rename from each admin: concurrent, equal depth, different authors.
     history.op(
@@ -857,62 +719,119 @@ fn concurrent_network_parameter_changes_resolve_identically() {
 }
 
 // ---------------------------------------------------------------------------
-// Founder enforcement
+// Only the founder key governs admins; admins govern members
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_admin_cannot_revoke_a_founder() {
+fn an_admins_revocation_of_another_admin_is_without_authority() {
     let mut history = History::new();
     history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    // Device 2, a plain admin, tries to expel the founder.
-    history.op(
-        "coup",
+        "revoke1",
         2,
         &["add2"],
-        OperationBody::RevokeDevice { device: device_id(1), reason: "power grab".into() },
+        OperationBody::RevokeDevice { device: device_id(1), reason: "stolen".into() },
     );
 
     let dag = history.dag();
     let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
-    assert_eq!(verdicts.reason(index(&dag, &history, "coup")), Some(Invalidity::FounderProtected));
-    assert!(state.devices.contains_key(&device_id(1)), "the owner keeps their place");
-    assert!(!state.revoked.contains(&device_id(1)));
+    assert_eq!(
+        verdicts.reason(index(&dag, &history, "revoke1")),
+        Some(Invalidity::UnauthorizedAuthor)
+    );
+    assert!(state.is_admin(&device_id(1)), "the other admin keeps its role");
 }
 
 #[test]
-fn an_admin_cannot_demote_a_founder() {
+fn the_founder_key_revokes_the_admin_that_founded_the_network() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op(
+        "revoke1",
+        &["add2"],
+        OperationBody::RevokeDevice { device: device_id(1), reason: "stolen".into() },
     );
-    history.op("coup", 2, &["add2"], OperationBody::Demote { device: device_id(1) });
+
+    let state = derive(&history.dag()).expect("derives");
+    assert!(state.revoked.contains(&device_id(1)), "no admin is protected from the founder");
+}
+
+#[test]
+fn an_admin_cannot_admit_an_admin_or_act_on_one() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.op("admit", 1, &["add2"], OperationBody::AddDevice(device(3, "pc", Role::Admin)));
+    history.op(
+        "rename",
+        1,
+        &["admit"],
+        OperationBody::Rename { device: device_id(2), name: "mine".into() },
+    );
+    history.op("demote", 1, &["rename"], OperationBody::Demote { device: device_id(2) });
 
     let dag = history.dag();
     let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
-    assert_eq!(verdicts.reason(index(&dag, &history, "coup")), Some(Invalidity::FounderProtected));
-    assert!(state.is_admin(&device_id(1)));
+    for act in ["admit", "rename", "demote"] {
+        assert_eq!(
+            verdicts.reason(index(&dag, &history, act)),
+            Some(Invalidity::UnauthorizedAuthor),
+            "{act}"
+        );
+    }
+    assert!(!state.devices.contains_key(&device_id(3)));
+    assert!(state.is_admin(&device_id(2)));
+    assert_eq!(
+        state.devices.get(&device_id(2)).map(|record| record.name.clone()).as_deref(),
+        Some("laptop")
+    );
 }
 
 #[test]
-fn a_founder_can_revoke_itself() {
+fn an_admin_governs_members() {
     let mut history = History::new();
     history.genesis("g", 1);
+    history.op("admit", 1, &["g"], OperationBody::AddDevice(device(3, "tv", Role::Member)));
     history.op(
-        "add2",
+        "rename",
         1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
+        &["admit"],
+        OperationBody::Rename { device: device_id(3), name: "telly".into() },
     );
+    history.op(
+        "revoke",
+        1,
+        &["rename"],
+        OperationBody::RevokeDevice { device: device_id(3), reason: "sold".into() },
+    );
+
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    for act in ["admit", "rename", "revoke"] {
+        assert_eq!(verdicts.reason(index(&dag, &history, act)), None, "{act}");
+    }
+    assert!(state.revoked.contains(&device_id(3)));
+}
+
+#[test]
+fn the_founder_key_demotes_the_admin_that_founded_the_network() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("demote1", &["add2"], OperationBody::Demote { device: device_id(1) });
+
+    let state = derive(&history.dag()).expect("derives");
+    assert!(!state.is_admin(&device_id(1)));
+    assert!(state.is_admin(&device_id(2)));
+}
+
+#[test]
+fn an_admin_cannot_revoke_itself() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     history.op(
         "retire",
         1,
@@ -920,75 +839,208 @@ fn a_founder_can_revoke_itself() {
         OperationBody::RevokeDevice { device: device_id(1), reason: "handover".into() },
     );
 
-    let state = derive(&history.dag()).expect("derives");
-    assert!(state.revoked.contains(&device_id(1)), "a founder may retire its own key");
-    assert!(!state.devices.contains_key(&device_id(1)));
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    assert_eq!(
+        verdicts.reason(index(&dag, &history, "retire")),
+        Some(Invalidity::UnauthorizedAuthor),
+        "an admin governs members only; forgetting the network is how a device lets go"
+    );
+    assert!(state.is_admin(&device_id(1)));
+}
+
+/// What used to be a deadlock, two admins revoking each other at once, is now
+/// two acts without authority: neither is an admin's to sign.
+#[test]
+fn two_admins_cannot_revoke_each_other() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.op(
+        "a_revokes_b",
+        1,
+        &["add2"],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "thief".into() },
+    );
+    history.op(
+        "b_revokes_a",
+        2,
+        &["add2"],
+        OperationBody::RevokeDevice { device: device_id(1), reason: "thief".into() },
+    );
+
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    for act in ["a_revokes_b", "b_revokes_a"] {
+        assert_eq!(
+            verdicts.reason(index(&dag, &history, act)),
+            Some(Invalidity::UnauthorizedAuthor),
+            "{act}"
+        );
+    }
+    assert!(state.is_admin(&device_id(1)) && state.is_admin(&device_id(2)));
+    assert!(state.revoked.is_empty());
 }
 
 #[test]
-fn founder_status_is_granted_through_add_device_and_promote() {
+fn the_founder_key_revokes_an_admin_whatever_that_admin_does_at_once() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "recovery", Role::Admin, true)),
-    );
-    history.op(
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "phone", Role::Member)));
+    history.founder_op(
         "add3",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(3, "spare", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "laptop", Role::Admin)),
     );
+    // The stolen laptop revokes the phone; the founder, concurrently, revokes
+    // the laptop.
     history.op(
-        "promote3",
-        1,
+        "laptop_revokes_phone",
+        3,
         &["add3"],
-        OperationBody::Promote { device: device_id(3), founder: true },
+        OperationBody::RevokeDevice { device: device_id(2), reason: "mine".into() },
+    );
+    history.founder_op(
+        "founder_revokes_laptop",
+        &["add3"],
+        OperationBody::RevokeDevice { device: device_id(3), reason: "stolen".into() },
+    );
+
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    assert_eq!(verdicts.reason(index(&dag, &history, "founder_revokes_laptop")), None);
+    assert_eq!(
+        verdicts.reason(index(&dag, &history, "laptop_revokes_phone")),
+        Some(Invalidity::ConcurrentWithAuthorRemoval)
+    );
+    assert!(state.revoked.contains(&device_id(3)), "the laptop is revoked");
+    assert!(state.devices.contains_key(&device_id(2)), "and the phone is still a member");
+}
+
+/// The founder key is not a device, so no revocation of a device voids it.
+#[test]
+fn the_founder_keys_work_is_never_voided() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.op(
+        "revoke1",
+        2,
+        &["add2"],
+        OperationBody::RevokeDevice { device: device_id(1), reason: "x".into() },
+    );
+    history.founder_op(
+        "founder_adds",
+        &["add2"],
+        OperationBody::AddDevice(device(4, "spare", Role::Admin)),
     );
 
     let state = derive(&history.dag()).expect("derives");
-    assert!(state.is_founder(&device_id(1)), "the founding admin");
-    assert!(state.is_founder(&device_id(2)), "granted at add time");
-    assert!(state.is_founder(&device_id(3)), "granted by promote");
-
-    // And all three are protected by the same rule.
-    assert!(state.is_admin(&device_id(3)));
+    assert!(state.is_admin(&device_id(4)), "the founder's admission stands");
 }
 
-// ---------------------------------------------------------------------------
-// State assembly
-// ---------------------------------------------------------------------------
+#[test]
+fn an_admin_cannot_change_the_founder_key() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let mut theirs = support::params_with("other.internal");
+    theirs.founder = support::next_founder_keys();
+    history.op("takeover", 1, &["g"], OperationBody::SetNetwork(theirs));
+
+    let state = derive(&history.dag()).expect("derives");
+    assert_eq!(state.params.founder, support::founder_keys(), "the founder's keys are unchanged");
+    assert_eq!(state.params.suffix, "other.internal", "and the admin's other change stands");
+}
+
+#[test]
+fn the_founder_key_replaces_itself() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let mut next = support::params();
+    next.founder = support::next_founder_keys();
+    history.founder_op("replace", &["g"], OperationBody::SetNetwork(next));
+    history.signed_op(
+        "new_key_acts",
+        &support::next_founder_signer(),
+        &["replace"],
+        OperationBody::AddDevice(device(5, "new", Role::Member)),
+    );
+    history.founder_op(
+        "old_key_acts",
+        &["replace"],
+        OperationBody::AddDevice(device(6, "old", Role::Member)),
+    );
+
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    assert_eq!(state.params.founder, support::next_founder_keys());
+    assert!(state.devices.contains_key(&device_id(5)), "the new key is the founder's");
+    assert_eq!(
+        verdicts.reason(index(&dag, &history, "old_key_acts")),
+        Some(Invalidity::UnauthorizedAuthor),
+        "the old key, after its replacement, is nobody's"
+    );
+}
+
+#[test]
+fn a_device_carrying_a_founder_key_is_refused() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    let mut spec = device(7, "impostor", Role::Member);
+    let founder = support::founder_keys();
+    spec.keys.retain(|entry| entry.purpose != roster::types::KeyPurpose::Transport);
+    spec.keys.push(
+        roster::types::KeyEntry::new(
+            roster::types::Algorithm::Ed25519,
+            roster::types::KeyPurpose::Transport,
+            founder.transport().to_vec(),
+        )
+        .expect("a key"),
+    );
+    spec.keys.sort_by_key(roster::types::KeyEntry::order_key);
+    history.op("impostor", 1, &["g"], OperationBody::AddDevice(spec));
+
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    assert_eq!(
+        verdicts.reason(index(&dag, &history, "impostor")),
+        Some(Invalidity::FounderKeyReused)
+    );
+    assert!(!state.devices.contains_key(&device_id(7)));
+}
+
+/// The words used on two devices at once: neither branch takes effect, except a
+/// revocation, which holds.
+#[test]
+fn a_founder_key_used_twice_at_once_keeps_only_its_revocations() {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("here", &["add2"], OperationBody::AddDevice(device(8, "mine", Role::Admin)));
+    history.founder_op(
+        "there",
+        &["add2"],
+        OperationBody::RevokeDevice { device: device_id(2), reason: "theirs".into() },
+    );
+
+    let state = derive(&history.dag()).expect("derives");
+    assert!(!state.devices.contains_key(&device_id(8)), "the equivocated admission is void");
+    assert!(state.revoked.contains(&device_id(2)), "the revocation holds");
+}
 
 #[test]
 fn revoked_devices_are_absent_and_survivors_keep_their_resolved_fields() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
-    history.op(
-        "add3",
-        1,
-        &["add2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     history.op(
         "rename3",
         1,
         &["add3"],
         OperationBody::Rename { device: device_id(3), name: "storage".into() },
     );
-    history.op(
-        "promote3",
-        1,
-        &["rename3"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
+    history.founder_op("promote3", &["rename3"], OperationBody::Promote { device: device_id(3) });
     history.op(
         "revoke2",
         1,
@@ -1003,7 +1055,6 @@ fn revoked_devices_are_absent_and_survivors_keep_their_resolved_fields() {
     let nas = state.devices.get(&device_id(3)).expect("survives");
     assert_eq!(nas.name, "storage", "the rename applied");
     assert_eq!(nas.role, Role::Admin, "the promotion applied");
-    assert!(!nas.founder);
     assert_eq!(nas.id, device_id(3));
 }
 
@@ -1023,52 +1074,25 @@ fn an_author_key_resolves_to_its_device() {
 /// author was entitled to make. That is what makes them cancel: an authorised
 /// removal voids the work concurrent with it, and here each is the other's.
 #[test]
-fn mutual_concurrent_demotion_cancels_out() {
+fn mutual_demotion_by_admins_is_without_authority() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op(
-        "add3",
-        1,
-        &["add2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Admin, false)),
-    );
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
+    history.founder_op("add3", &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Admin)));
     history.op("b_demotes_c", 2, &["add3"], OperationBody::Demote { device: device_id(3) });
     history.op("c_demotes_b", 3, &["add3"], OperationBody::Demote { device: device_id(2) });
 
-    let state = derive(&history.dag()).expect("derives");
+    let dag = history.dag();
+    let (state, verdicts) = derive_with_verdicts(&dag).expect("derives");
+    for act in ["b_demotes_c", "c_demotes_b"] {
+        assert_eq!(
+            verdicts.reason(index(&dag, &history, act)),
+            Some(Invalidity::UnauthorizedAuthor),
+            "{act}: neither is an admin's to sign"
+        );
+    }
     assert!(state.is_admin(&device_id(2)), "neither demotion takes effect");
     assert!(state.is_admin(&device_id(3)));
-}
-
-/// The same shape, but one of the two is the founder — so the two acts are not
-/// symmetric at all. Founder protection refuses the admin's demotion of the
-/// founder, and an act nobody was entitled to make removes nothing: the
-/// founder's own demotion, which was entirely legitimate, stands.
-///
-/// It used to cancel out here too, which meant a co-admin could protect itself
-/// from a demotion by signing one the rules already refuse.
-#[test]
-fn a_demotion_founder_protection_refuses_does_not_void_the_founders_own() {
-    let mut history = History::new();
-    history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)),
-    );
-    history.op("a_demotes_b", 1, &["add2"], OperationBody::Demote { device: device_id(2) });
-    history.op("b_demotes_a", 2, &["add2"], OperationBody::Demote { device: device_id(1) });
-
-    let state = derive(&history.dag()).expect("derives");
-    assert!(state.is_admin(&device_id(1)), "the founder keeps the role founder protection defends");
-    assert!(!state.is_admin(&device_id(2)), "and the founder's own demotion takes effect");
 }
 
 /// An operation cannot act on a device that does not exist yet.
@@ -1082,32 +1106,30 @@ fn a_demotion_founder_protection_refuses_does_not_void_the_founders_own() {
 fn an_operation_preceding_its_targets_add_has_no_effect() {
     let mut history = History::new();
     history.genesis("g", 1);
-    // Rename, promote and grant founder to a device that does not exist yet.
+    // Rename and promote a device that does not exist yet.
     history.op(
         "early_rename",
         1,
         &["g"],
         OperationBody::Rename { device: device_id(2), name: "ghost".into() },
     );
-    history.op(
+    history.founder_op(
         "early_promote",
-        1,
         &["early_rename"],
-        OperationBody::Promote { device: device_id(2), founder: true },
+        OperationBody::Promote { device: device_id(2) },
     );
     // Only now is the device added.
     history.op(
         "add2",
         1,
         &["early_promote"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(2, "laptop", Role::Member)),
     );
 
     let state = derive(&history.dag()).expect("derives");
     let record = state.devices.get(&device_id(2)).expect("the device is added");
     assert_eq!(record.name, "laptop", "the earlier rename does not apply retroactively");
     assert_eq!(record.role, Role::Member, "nor the earlier promotion");
-    assert!(!record.founder, "nor the founder grant that came with it");
 }
 
 /// The same operations, in the order that makes sense, do apply.
@@ -1115,30 +1137,19 @@ fn an_operation_preceding_its_targets_add_has_no_effect() {
 fn an_operation_following_its_targets_add_applies_normally() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history.op(
         "rename",
         1,
         &["add2"],
         OperationBody::Rename { device: device_id(2), name: "work".into() },
     );
-    history.op(
-        "promote",
-        1,
-        &["rename"],
-        OperationBody::Promote { device: device_id(2), founder: true },
-    );
+    history.founder_op("promote", &["rename"], OperationBody::Promote { device: device_id(2) });
 
     let state = derive(&history.dag()).expect("derives");
     let record = state.devices.get(&device_id(2)).expect("present");
     assert_eq!(record.name, "work");
     assert_eq!(record.role, Role::Admin);
-    assert!(record.founder);
 }
 
 /// The index of a labelled operation in a graph.
@@ -1217,8 +1228,8 @@ fn two_concurrent_operations_by_one_author_are_a_fork() {
     history.genesis("g", 1);
     // One author, two operations, both anchored to the genesis and neither to
     // the other.
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
 
     let dag = history.dag();
     let forks = dag.forks();
@@ -1236,9 +1247,9 @@ fn two_concurrent_operations_by_one_author_are_a_fork() {
 fn a_chained_history_is_not_a_fork() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "a", Role::Member, false)));
-    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "b", Role::Member, false)));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(4, "c", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "a", Role::Member)));
+    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "b", Role::Member)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(4, "c", Role::Member)));
 
     assert!(history.dag().forks().is_empty(), "a chain is what an honest device writes");
 }
@@ -1250,7 +1261,7 @@ fn a_chained_history_is_not_a_fork() {
 fn two_authors_writing_from_one_parent_is_not_a_fork() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("promote", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
+    history.founder_op("promote", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
     // Two different authors, both anchored to the same parent.
     history.op(
         "x",
@@ -1280,7 +1291,7 @@ fn two_authors_writing_from_one_parent_is_not_a_fork() {
 fn the_founding_operation_is_not_part_of_a_fork() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
 
     let dag = history.dag();
     let genesis = dag.genesis().expect("a genesis");
@@ -1297,8 +1308,8 @@ fn the_founding_operation_is_not_part_of_a_fork() {
 fn a_later_merge_by_the_author_does_not_erase_the_fork() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
     history.op(
         "merge",
         1,
@@ -1317,8 +1328,8 @@ fn a_later_merge_by_the_author_does_not_erase_the_fork() {
 fn the_verdict_does_not_depend_on_arrival_order() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
     history.op(
         "d",
         2,
@@ -1364,12 +1375,12 @@ fn the_verdict_does_not_depend_on_arrival_order() {
 fn a_fork_found_later_is_found_just_the_same() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
 
     // One branch only: nothing to see.
     assert!(history.dag_of(&["g", "b"]).forks().is_empty());
 
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
 
     // The other arrives, and the fork is there.
     assert_eq!(history.dag_of(&["g", "b", "c"]).forks().len(), 1);
@@ -1392,19 +1403,14 @@ fn another_authors_work_anchored_to_a_fork_survives_it() {
     let mut history = History::new();
     history.genesis("g", 1);
     // A second admin, added before the fork, so its authority is not in question.
-    history.op("admin", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
+    history.founder_op("admin", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
 
     // Author 1 forks: two concurrent operations of its own.
-    history.op("x", 1, &["admin"], OperationBody::AddDevice(device(3, "x", Role::Member, false)));
-    history.op("y", 1, &["admin"], OperationBody::AddDevice(device(4, "y", Role::Member, false)));
+    history.op("x", 1, &["admin"], OperationBody::AddDevice(device(3, "x", Role::Member)));
+    history.op("y", 1, &["admin"], OperationBody::AddDevice(device(4, "y", Role::Member)));
 
     // Author 2 builds on one branch — a month of work, in miniature.
-    history.op(
-        "theirs",
-        2,
-        &["x"],
-        OperationBody::AddDevice(device(5, "theirs", Role::Member, false)),
-    );
+    history.op("theirs", 2, &["x"], OperationBody::AddDevice(device(5, "theirs", Role::Member)));
 
     let dag = history.dag();
     assert_eq!(dag.forks().len(), 1, "author 1 forked");
@@ -1415,5 +1421,127 @@ fn another_authors_work_anchored_to_a_fork_survives_it() {
         state.devices.contains_key(&device_id(5)),
         "the second author's device must survive a fork it merely anchored to: voiding it \
          would let an equivocator erase other people's work by signing one late sibling"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A founder revocation voids a stolen admin's acts from the one chosen
+// ---------------------------------------------------------------------------
+
+/// A network in which a stolen admin, `laptop`, signed one act still trusted
+/// and then three that are not, with an honest admin's admission in between.
+fn a_stolen_admins_evening() -> (History, Roster) {
+    let mut history = History::new();
+    history.genesis("g", 1);
+    history.op("tv", 1, &["g"], OperationBody::AddDevice(device(3, "tv", Role::Member)));
+    history.op("nas", 1, &["tv"], OperationBody::AddDevice(device(4, "nas", Role::Member)));
+    history.founder_op(
+        "thief",
+        &["nas"],
+        OperationBody::AddDevice(device(2, "laptop", Role::Admin)),
+    );
+    history.op(
+        "before",
+        2,
+        &["thief"],
+        OperationBody::AddDevice(device(6, "printer", Role::Member)),
+    );
+    history.op(
+        "smuggled",
+        2,
+        &["before"],
+        OperationBody::AddDevice(device(9, "smuggled", Role::Member)),
+    );
+    history.op(
+        "phone",
+        1,
+        &["smuggled"],
+        OperationBody::AddDevice(device(5, "phone", Role::Member)),
+    );
+    history.op(
+        "out",
+        2,
+        &["phone"],
+        OperationBody::RevokeDevice { device: device_id(3), reason: "mine".into() },
+    );
+    history.op(
+        "renamed",
+        2,
+        &["out"],
+        OperationBody::Rename { device: device_id(4), name: "mine".into() },
+    );
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    (history, roster)
+}
+
+#[test]
+fn a_founder_revocation_voids_a_stolen_admins_acts_from_the_chosen_one() {
+    let (mut history, mut roster) = a_stolen_admins_evening();
+    let anchor = roster.voiding_anchor(&device_id(2), &history.id("smuggled")).expect("an anchor");
+    let mut voided: Vec<_> = anchor.voided.iter().map(|(id, _)| *id).collect();
+    voided.sort_unstable();
+    let mut expected = vec![history.id("smuggled"), history.id("out"), history.id("renamed")];
+    expected.sort_unstable();
+    assert_eq!(voided, expected, "the chosen act and every later one of the stolen admin");
+
+    history.founder_op_on(
+        "revoke",
+        &anchor.heads,
+        OperationBody::RevokeDevice { device: device_id(2), reason: "stolen".into() },
+    );
+    let revocation = history.entries().last().expect("the revocation").bytes.clone();
+    assert!(roster.offer_bytes(&revocation).is_accepted());
+
+    let state = roster.state().expect("derives");
+    assert!(state.revoked.contains(&device_id(2)), "the stolen admin is out");
+    assert!(!state.devices.contains_key(&device_id(9)), "what it admitted leaves");
+    assert!(state.devices.contains_key(&device_id(3)), "what it revoked is back");
+    assert_eq!(
+        state.devices.get(&device_id(4)).map(|record| record.name.clone()).as_deref(),
+        Some("nas"),
+        "what it renamed has its name again"
+    );
+    assert!(state.devices.contains_key(&device_id(6)), "its act before the chosen one stands");
+    assert!(state.devices.contains_key(&device_id(5)), "another admin's act in between stands");
+}
+
+/// A founder act resting on what would be voided would be concurrent with the
+/// revocation, and the founder's two concurrent acts keep only revocations: the
+/// anchor is refused, naming it, and a later act may be chosen instead.
+#[test]
+fn voiding_from_beneath_a_founder_act_is_refused() {
+    let (mut history, _) = a_stolen_admins_evening();
+    history.founder_op(
+        "founders",
+        &["renamed"],
+        OperationBody::AddDevice(device(7, "pc", Role::Member)),
+    );
+    history.op(
+        "after",
+        2,
+        &["founders"],
+        OperationBody::AddDevice(device(8, "tablet", Role::Member)),
+    );
+    let mut roster = Roster::new();
+    for entry in history.entries() {
+        assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
+    }
+    assert_eq!(
+        roster.voiding_anchor(&device_id(2), &history.id("smuggled")),
+        Err(roster::roster::VoidingRefused::FounderRestsOn(history.id("founders")))
+    );
+    let later = roster.voiding_anchor(&device_id(2), &history.id("after")).expect("an anchor");
+    assert_eq!(later.voided.len(), 1, "only the act after the founder's");
+}
+
+#[test]
+fn voiding_from_another_devices_act_is_refused() {
+    let (history, roster) = a_stolen_admins_evening();
+    assert_eq!(
+        roster.voiding_anchor(&device_id(2), &history.id("tv")),
+        Err(roster::roster::VoidingRefused::NotItsAct)
     );
 }

@@ -376,6 +376,7 @@ mod tests {
         RosterState::from_parts(
             NetworkId::from_bytes([1; 32]),
             NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "example.internal",
                 2_592_000,
@@ -454,6 +455,7 @@ mod tests {
         RosterState::from_parts(
             roster::id::NetworkId::from_bytes([2; 32]),
             roster::types::NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "lavoro.internal",
                 2_592_000,

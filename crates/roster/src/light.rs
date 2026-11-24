@@ -283,12 +283,15 @@ impl LightView {
         else {
             return self.continue_aside(root);
         };
-        let signer = root.signer.record.id;
-        let after = self.chain.iter().skip(follows_at.saturating_add(1));
-        if after.flat_map(|remembered| remembered.delta.iter()).any(|named| *named == signer)
-            || self.invalidated(&signer)
-        {
-            return RootOutcome::Refused(RootRefusal::SignerInvalidated);
+        // The founder is not a device: no delta can name it, so nothing after
+        // the root it follows invalidates it.
+        if let Some(signer) = root.signer_device() {
+            let after = self.chain.iter().skip(follows_at.saturating_add(1));
+            if after.flat_map(|remembered| remembered.delta.iter()).any(|named| *named == signer)
+                || self.invalidated(&signer)
+            {
+                return RootOutcome::Refused(RootRefusal::SignerInvalidated);
+            }
         }
 
         let offered = Remembered::of(root);
@@ -336,18 +339,19 @@ impl LightView {
         if heavier && let Some((fork, branch)) = self.branch_back(&offered.previous) {
             // Its signer may be named by nothing on the chain it leaves, nor
             // by an invalidation from anywhere but the branch it continues.
-            let signer = root.signer.record.id;
-            let named_on_chain = self
-                .chain
-                .iter()
-                .skip(fork.saturating_add(1))
-                .any(|remembered| remembered.delta.contains(&signer));
-            let named_elsewhere = self
-                .unjoined
-                .iter()
-                .any(|(device, carrier)| *device == signer && !branch.contains(carrier));
-            if named_on_chain || named_elsewhere {
-                return RootOutcome::Refused(RootRefusal::SignerInvalidated);
+            if let Some(signer) = root.signer_device() {
+                let named_on_chain = self
+                    .chain
+                    .iter()
+                    .skip(fork.saturating_add(1))
+                    .any(|remembered| remembered.delta.contains(&signer));
+                let named_elsewhere = self
+                    .unjoined
+                    .iter()
+                    .any(|(device, carrier)| *device == signer && !branch.contains(carrier));
+                if named_on_chain || named_elsewhere {
+                    return RootOutcome::Refused(RootRefusal::SignerInvalidated);
+                }
             }
             while self.chain.len() > fork.saturating_add(1) {
                 if let Some(dropped) = self.chain.pop_back() {

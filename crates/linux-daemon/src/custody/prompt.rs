@@ -24,6 +24,25 @@ impl Drop for Restore<'_> {
     }
 }
 
+/// Turns the terminal's echo back on where it reads lines and shows nothing.
+///
+/// A prompt killed while it hid what was typed leaves the terminal so, and
+/// every answer typed after it — a `yes` or a `no` included — unseen. Asked at
+/// every start, so such a terminal repairs itself. Quiet where there is no
+/// controlling terminal.
+pub fn echo_back_on() {
+    let Ok(terminal) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        return;
+    };
+    let Ok(mut settings) = tcgetattr(&terminal) else { return };
+    if settings.local_modes.contains(LocalModes::ICANON)
+        && !settings.local_modes.contains(LocalModes::ECHO)
+    {
+        settings.local_modes.insert(LocalModes::ECHO);
+        let _ = tcsetattr(&terminal, OptionalActions::Now, &settings);
+    }
+}
+
 /// Asks for a passphrase.
 ///
 /// # Errors

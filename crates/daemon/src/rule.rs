@@ -189,6 +189,7 @@ mod tests {
     /// build's parameters, or one assembled in memory.
     fn state(suffix: &str) -> RosterState {
         let mut params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "example.internal",
             2_592_000,

@@ -1,24 +1,24 @@
 //! Making an admin a member again.
 //!
-//! The roster has always carried a signed demotion, with its rules: an admin
-//! may not demote a founder other than itself, a demotion beats a promotion it
-//! is concurrent with, and what the demoted admin signed concurrently with it is
-//! voided. Nothing a person could type produced one.
+//! Only the founder key demotes an admin (offline-founder design §14): the
+//! service refuses one this device's own key would sign, before anything is
+//! signed, and the roster would hold it without authority. What the demoted
+//! admin signed concurrently with the demotion is voided.
 //!
 //! # This module decides nothing the roster decides
 //!
-//! Whether this admin may demote that one is the roster's, and a refusal comes
-//! back in its words. What happens here is: find the device a person named, the
-//! way `revoke` finds it, and refuse two things before anything is signed — a
-//! device that is already a member, and the network's only admin. A network with
-//! no admin can never sign anything again, and no person demoting a device means
-//! that.
+//! What happens here is: find the device a person named, the way `revoke` finds
+//! it, and refuse two things before anything is signed — a device that is
+//! already a member, and the network's only admin. A network with no admin can
+//! sign nothing for its members until the founder admits one, and no person
+//! demoting a device means that.
 //!
 //! # The key it leaves behind
 //!
-//! A demoted device keeps its signing key until the demotion is **settled**:
-//! beneath the roster's base, where nothing can void it. See
-//! [`settled_member`].
+//! A demoted device destroys its signing key as soon as it sees itself a
+//! member. Nothing but the founder's own words used on two devices at once can
+//! void a founder's demotion; should that happen, the device is an admin again
+//! holding no key, which the founder repairs, and nothing is exposed.
 
 use identity::NodeIdentity;
 use roster::id::DeviceId;
@@ -73,16 +73,16 @@ pub fn resolve(state: &RosterState, target: &Target) -> Result<Demotion, String>
 /// When the operation cannot be built.
 pub fn core(
     demotion: &Demotion,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
 ) -> Result<OperationCore, String> {
     OperationCore::new(
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::Demote { device: demotion.device },
         heads,
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map_err(|cause| cause.to_string())
@@ -99,22 +99,8 @@ pub fn sign(
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
 ) -> Result<Vec<u8>, String> {
-    let core = core(demotion, identity, state, heads)?;
+    let core = core(demotion, &crate::signing::Author::of(identity), state, heads)?;
     identity.sign_operation(&core).map_err(|cause| crate::control::declined(&cause))
-}
-
-/// Whether `device` is a member in the roster's **base**: the state beneath the
-/// window, which nothing still held can change.
-///
-/// What decides when a demoted device's signing key may go. Seen in the derived
-/// state, a demotion may still be voided — one signed by an admin whose
-/// revocation was concurrent with it is no demotion — and a key destroyed then
-/// could never be had back. Beneath the base, nothing anchoring into the
-/// compacted region is accepted any more, so the role is final.
-#[must_use]
-pub fn settled_member(base: Option<&RosterState>, device: &DeviceId) -> bool {
-    base.and_then(|state| state.devices.get(device))
-        .is_some_and(|record| record.role == Role::Member)
 }
 
 #[cfg(test)]
@@ -129,7 +115,10 @@ mod tests {
     /// founder's identity.
     fn network(role: Role) -> (RosterState, std::sync::Arc<NodeIdentity>) {
         let founder = std::sync::Arc::new(NodeIdentity::generate().expect("generates"));
+        // The founder's words, which alone admit a second admin.
+        let words = identity::founder::FounderKey::generate().expect("words");
         let params = NetworkParams::with_relay(
+            words.keys(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             None::<String>,
             "example.internal",
@@ -140,7 +129,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -158,20 +147,23 @@ mod tests {
         );
         let net = NetworkId::from_bytes(*genesis.id().as_bytes());
         let device = NodeIdentity::generate().expect("generates");
+        let (author, signer): (_, &dyn roster::sign::Signer) = if role == Role::Admin {
+            (words.keys().signing_id(), words.signer())
+        } else {
+            (founder.signing_key().key_id(), founder.signer())
+        };
         let add = OperationCore::new(
             2,
             founder.signing_key().algorithm(),
-            OperationBody::AddDevice(
-                device.device_spec("laptop", role, false, vec![]).expect("spec"),
-            ),
+            OperationBody::AddDevice(device.device_spec("laptop", role, vec![]).expect("spec")),
             vec![genesis.id()],
-            founder.signing_key().key_id(),
+            author,
             net,
         )
         .expect("well-formed");
         assert!(
             roster
-                .offer_bytes(&roster::sign::sign_operation(&add, founder.signer()).expect("signs"))
+                .offer_bytes(&roster::sign::sign_operation(&add, signer).expect("signs"))
                 .is_accepted()
         );
         (roster.state().expect("a network"), founder)
@@ -212,24 +204,13 @@ mod tests {
         );
     }
 
-    /// With another admin present, an admin may demote itself: the founder
-    /// rule, which this module does not judge, is the roster's.
+    /// With another admin present, either admin may be named: that only the
+    /// founder demotes is the service's refusal and the roster's rule, not this
+    /// module's.
     #[test]
     fn with_two_admins_either_may_be_named() {
         let (state, founder) = network(Role::Admin);
         let itself = resolve(&state, &Target::Name("nas".to_owned())).expect("resolves");
         assert_eq!(itself.device, founder.device_id());
-    }
-
-    /// A key goes only once the base says member; derived state alone, or a
-    /// base that still says admin, keeps it.
-    #[test]
-    fn only_a_base_that_says_member_settles_a_demotion() {
-        let (as_member, _) = network(Role::Member);
-        let (as_admin, _) = network(Role::Admin);
-        let laptop = id_of(&as_member, "laptop");
-        assert!(settled_member(Some(&as_member), &laptop));
-        assert!(!settled_member(Some(&as_admin), &id_of(&as_admin, "laptop")));
-        assert!(!settled_member(None, &laptop), "no base, nothing settled");
     }
 }

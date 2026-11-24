@@ -100,9 +100,6 @@ pub enum Error {
     /// authority. Work done before losing authority stays valid; work that
     /// surfaces afterwards does not.
     ConcurrentWithAuthorRemoval,
-    /// A `revoke_device` or `demote` targeted a founder, and its author was not
-    /// that founder.
-    FounderProtected,
     /// The operation's author signed two causally concurrent operations: one
     /// identity, two histories. Neither branch is granted effect, because
     /// choosing between them would be letting the author choose — it decided
@@ -165,7 +162,6 @@ impl Error {
             Self::UnauthorizedAuthor => "unauthorized_author",
             Self::UnknownTarget => "unknown_target",
             Self::ConcurrentWithAuthorRemoval => "concurrent_with_author_removal",
-            Self::FounderProtected => "founder_protected",
             Self::Equivocated => "equivocated",
             Self::StaleOperation => "stale_operation",
             Self::SnapshotSequenceRegressed => "snapshot_sequence_regressed",
@@ -211,7 +207,6 @@ impl Error {
         "unauthorized_author",
         "unknown_target",
         "concurrent_with_author_removal",
-        "founder_protected",
         "equivocated",
         "stale_operation",
         "snapshot_sequence_regressed",
@@ -291,7 +286,6 @@ mod tests {
             Error::UnauthorizedAuthor,
             Error::UnknownTarget,
             Error::ConcurrentWithAuthorRemoval,
-            Error::FounderProtected,
             Error::Equivocated,
             Error::StaleOperation,
             Error::SnapshotSequenceRegressed,

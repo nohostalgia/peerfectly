@@ -577,10 +577,8 @@ mod tests {
         assert_eq!(loaded.signing_key().public_key(), identity.signing_key().public_key());
         assert_eq!(loaded.transport_key().public_key(), identity.transport_key().public_key());
         assert_eq!(
-            loaded.device_spec("laptop", roster::types::Role::Member, false, vec![]).expect("spec"),
-            identity
-                .device_spec("laptop", roster::types::Role::Member, false, vec![])
-                .expect("spec")
+            loaded.device_spec("laptop", roster::types::Role::Member, vec![]).expect("spec"),
+            identity.device_spec("laptop", roster::types::Role::Member, vec![]).expect("spec")
         );
     }
 

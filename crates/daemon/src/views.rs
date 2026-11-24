@@ -105,12 +105,11 @@ impl fmt::Display for RevokedRows<'_> {
                     }
                     _ => "the revoking device recorded no time".to_owned(),
                 };
-                writeln!(
-                    f,
-                    "    by {}: \"{}\" ({clock})",
-                    revocation.by,
-                    shown(&revocation.reason)
-                )?;
+                let by = revocation
+                    .by
+                    .as_ref()
+                    .map_or_else(|| "the founder".to_owned(), ToString::to_string);
+                writeln!(f, "    by {by}: \"{}\" ({clock})", shown(&revocation.reason))?;
             }
         }
         Ok(())
@@ -294,6 +293,16 @@ fn status_of(network: &Network) -> Block {
         block.line(
             "",
             "kept until this device's demotion is settled, and then destroyed: it is a member now",
+        );
+    }
+    if let Some(by) = &network.revoked_by {
+        block.line(
+            "revoked",
+            format!(
+                "by {by}: no device of the network accepts this one any more. Up, it listens: \
+                 it comes back by itself if the founder voids that revocation, otherwise by an \
+                 invite"
+            ),
         );
     }
 
@@ -511,6 +520,7 @@ mod tests {
             admin: true,
             custody: crate::control::Custody::HeldHere,
             key_until_settled: false,
+            revoked_by: None,
             owner_taken: false,
             confirmation: None,
             arrived: None,

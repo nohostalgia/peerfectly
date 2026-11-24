@@ -212,8 +212,13 @@ mod tests {
     use super::*;
 
     fn params(ipv4: Option<roster::types::Ipv4Range>) -> NetworkParams {
-        let mut params =
-            NetworkParams::new(vec![0xfd, 1, 2, 3, 4, 5, 6, 7], "casa.internal", 600).unwrap();
+        let mut params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 1, 2, 3, 4, 5, 6, 7],
+            "casa.internal",
+            600,
+        )
+        .unwrap();
         params.ipv4 = ipv4;
         params
     }

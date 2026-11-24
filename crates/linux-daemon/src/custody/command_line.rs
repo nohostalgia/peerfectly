@@ -142,6 +142,12 @@ impl cli::Custody for LinuxCustody {
         Self::as_root()
     }
 
+    /// A word of the founder's, read at the terminal with echo off, the way a
+    /// passphrase is.
+    fn read_hidden(&self, prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
+        (self.asks)(prompt).map_err(|cause| cause.to_string())
+    }
+
     fn make_key(&self, wanted: &KeyWanted) -> Result<MadeKey, String> {
         Self::as_root()?;
         let keys = self.keys_for(wanted.keys.as_deref())?;

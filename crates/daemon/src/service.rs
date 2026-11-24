@@ -87,6 +87,23 @@ enum Pending {
 /// batch was built, and a batch whose roster has moved since is not applied.
 #[derive(Debug, Clone)]
 enum Resume {
+    /// The root the founder signs over a founder act just carried, so light
+    /// members, which learn of acts only from roots, learn of this one.
+    FounderRoot {
+        /// Which network.
+        label: Label,
+    },
+    /// This device made an admin of `label` with the founder's words: the
+    /// revocations, and where this device was not an admin, the admission of its
+    /// new identity, made under `temporary`.
+    Recovering {
+        /// Which network.
+        label: Label,
+        /// The label the new identity was made under, where one was.
+        temporary: Option<Label>,
+        /// Where its roster stood when the batch was built.
+        prepared_against: crate::signing::Moment,
+    },
     /// A device is being expelled from the network this device calls `label`:
     /// the revocation, and the snapshot the network is then owed, if it is.
     Revoking {
@@ -189,6 +206,24 @@ enum Resume {
     },
 }
 
+impl Resume {
+    /// The network the act is for, where it is one this device already holds.
+    const fn label(&self) -> Option<&Label> {
+        match self {
+            Self::FounderRoot { label }
+            | Self::Recovering { label, .. }
+            | Self::Revoking { label, .. }
+            | Self::Renaming { label, .. }
+            | Self::Demoting { label, .. }
+            | Self::ChangingParameters { label, .. }
+            | Self::AdmittingBatch { label, .. }
+            | Self::Admitting { label, .. } => Some(label),
+            // A founding and a join are this device's own, never the founder's.
+            Self::Founding { .. } | Self::JoinProof { .. } => None,
+        }
+    }
+}
+
 /// What a batch's admin asked for beside its devices.
 pub(crate) struct BatchWanted {
     /// Its label.
@@ -220,6 +255,73 @@ fn expulsion_of(taken: &crate::admitting::Taken) -> crate::revoking::Expulsion {
             crate::control::shown(&taken.name)
         ),
     }
+}
+
+// Whether the command being answered is signed with the founder's words
+// (`Command::AsFounder`). Scoped to the answer's own task, so two commands
+// answered at once never see each other's.
+tokio::task_local! {
+    static AS_FOUNDER: bool;
+}
+
+/// Where a verified revocation of this device is kept, beside its log, while
+/// its parents are not held (offline-founder design §16).
+const REVOCATION_NOTICE: &str = "revocation-notice";
+
+/// What a founder act keeps for its end: the founder's transport seed, and the
+/// revocations held before it, so that only what it signed is pushed.
+struct FounderAct {
+    seed: zeroize::Zeroizing<[u8; 32]>,
+    held_before: BTreeSet<Vec<u8>>,
+}
+
+/// Whether the act being answered is the founder's to sign.
+fn as_founder() -> bool {
+    AS_FOUNDER.try_with(|founder| *founder).unwrap_or(false)
+}
+
+/// The refusal of an act on an admin that this device's own key would sign:
+/// only the founder key governs admins (offline-founder design §14), and the
+/// roster would hold the act without authority. Said before anything is signed,
+/// with the command that does it.
+fn founders_alone(
+    state: &roster::state::RosterState,
+    device: &roster::id::DeviceId,
+    command: &str,
+) -> Option<Outcome> {
+    if as_founder() || !state.is_admin(device) {
+        return None;
+    }
+    let name = state.devices.get(device).map(|record| record.name.clone());
+    Some(Outcome::refused(format!(
+        "{} is an admin, and only the founder governs admins: run it again with the founder's \
+         words, `{command} --founder`. Nothing was signed.",
+        crate::control::Named::new(device, name)
+    )))
+}
+
+/// Who the act being answered names as its author, in `state`.
+fn author_in(
+    identity: &identity::NodeIdentity,
+    state: &roster::state::RosterState,
+) -> crate::signing::Author {
+    if as_founder() {
+        crate::signing::Author::founder(&state.params.founder)
+    } else {
+        crate::signing::Author::of(identity)
+    }
+}
+
+/// Whether this process signs the act being answered itself. Never for the
+/// founder's: the words are in the person's process, not this one.
+fn signs_here(identity: &identity::NodeIdentity) -> bool {
+    !as_founder() && identity.signing_key().answers_here()
+}
+
+/// The founder's signing key as a public key, for verifying what it signed.
+fn founder_public(keys: &roster::types::FounderKeys) -> Option<roster::sign::PublicKey> {
+    let entry = keys.signing_entry();
+    roster::sign::PublicKey::new(entry.alg, entry.value).ok()
 }
 
 /// What the key store knows a signing key by, when a custodian holds it.
@@ -311,6 +413,10 @@ pub struct Network {
     node: Arc<Node>,
     /// What is installed while its tunnel is up.
     up: Mutex<Option<Up>>,
+    /// Up in the revoked standing: the person has it up, its roster does not
+    /// name this device, and its transport runs alone, with no tunnel, carrying
+    /// the roster and nothing else (offline-founder design §22).
+    revoked_up: Mutex<bool>,
     /// The resolver answering its names, while its tunnel is up.
     answering: Mutex<Option<Box<dyn Answering>>>,
     /// The loops driving its node, while its tunnel is up.
@@ -357,6 +463,7 @@ impl Network {
             paths,
             node,
             up: Mutex::new(None),
+            revoked_up: Mutex::new(false),
             answering: Mutex::new(None),
             driving: Mutex::new(Vec::new()),
             known_at: Mutex::new(known_at),
@@ -379,6 +486,11 @@ impl Network {
     /// Whether its tunnel is up.
     pub async fn tunnel(&self) -> Tunnel {
         if self.up.lock().await.is_some() { Tunnel::Up } else { Tunnel::Down }
+    }
+
+    /// Whether it runs at all: its tunnel up, or, revoked, its transport alone.
+    async fn running(&self) -> bool {
+        self.up.lock().await.is_some() || *self.revoked_up.lock().await
     }
 
     /// Whether the loops that drive its node are running.
@@ -464,6 +576,11 @@ pub struct Service {
     /// Where a port opened to one network is written: the machine's firewall,
     /// or nowhere on a platform that has none.
     exposing: Arc<dyn crate::exposing::Exposing>,
+    /// Whether this service brings a network up to carry an act signed while
+    /// it is down. Not on a phone, where only the app, with the person's
+    /// consent, can bring the VPN up: there the act is held, and goes out when
+    /// the person turns the network on (2026-11-24).
+    brings_up_to_carry: bool,
     /// Where the state is kept, when the platform was told somewhere other than
     /// its default; for the report.
     state_named: Option<String>,
@@ -471,6 +588,14 @@ pub struct Service {
     /// demotion. The identity in use still names the key until the network is
     /// opened again, so the report says what is on disk, not what is in memory.
     settled: Mutex<BTreeSet<Label>>,
+    /// The transports a founder session runs on, by network, held until the
+    /// founder's act ends.
+    founder_carriers: Mutex<BTreeMap<Label, Arc<dyn transport::Transport>>>,
+    /// What a founder act needs at its end, by network: the founder's transport
+    /// seed, and the devices revoked before it, so the ones it revokes are
+    /// pushed their revocation under the founder's key (offline-founder design
+    /// §16). Overwritten when the act ends.
+    founder_acts: Mutex<BTreeMap<Label, FounderAct>>,
     /// The one thing waiting for a person to look at something.
     ///
     /// Held here rather than passed back and forth because a person stands in the
@@ -568,6 +693,14 @@ struct Unkeyed {
 
 /// The act waiting on that key.
 enum Unfinished {
+    /// A network being recovered: this device's new admin identity was being
+    /// made.
+    Recovering {
+        /// Which network.
+        label: Label,
+        /// The admins to revoke.
+        revoke: Vec<crate::control::Target>,
+    },
     /// A network being founded.
     Founding {
         /// What it will be called here.
@@ -593,6 +726,9 @@ enum Stop {
     Chosen,
     /// Everything is stopping: what the person last chose is left as it was.
     Everything,
+    /// This device's standing changed, member or revoked: brought up again
+    /// as the other at once, and what the person chose is left as it was.
+    Standing,
 }
 
 impl Service {
@@ -641,6 +777,12 @@ impl Service {
         // key changes.
         let _adopted = home.adopt_anything_in_the_old_shape()?;
         // An attempt the process did not live to finish holds a name and no network.
+        // A recovery stopped after its batch was decided is finished first: its
+        // new directory carries a record by then, and would otherwise be taken
+        // for a network of its own (`crate::recovering`).
+        for finished in crate::recovering::finish_interrupted(&home, keys.as_ref())? {
+            tracing::info!("finished taking up the recovered identity of `{finished}`");
+        }
         let _discarded = home.discard_every_unfounded()?;
         // And one that got as far as a roster but not as far as the record: the
         // membership is proved and only the note of which network it is was lost.
@@ -715,6 +857,11 @@ impl Service {
                     cause: crate::control::Trouble::ChangedOutside,
                     detail: why,
                 }),
+                crate::networks::Recovered::Refused(label, why) => broken.push(Broken {
+                    label: label.to_string(),
+                    cause: crate::control::Trouble::RosterProvesNothing,
+                    detail: why,
+                }),
                 crate::networks::Recovered::Carried(_) => {}
             }
         }
@@ -760,8 +907,11 @@ impl Service {
             keys: Arc::new(crate::keys::PlatformKeys),
             interfaces: Arc::new(crate::connectivity::SystemInterfaces),
             exposing: Arc::new(crate::exposing::Nowhere),
+            brings_up_to_carry: true,
             state_named: None,
             settled: Mutex::new(BTreeSet::new()),
+            founder_carriers: Mutex::new(BTreeMap::new()),
+            founder_acts: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(None),
             staged: Mutex::new((None, Vec::new())),
             unsigned: Mutex::new(crate::signing::Waiting::default()),
@@ -789,6 +939,16 @@ impl Service {
     #[must_use]
     pub fn with_keys(mut self, keys: Arc<dyn crate::keys::Keys>) -> Self {
         self.keys = keys;
+        self
+    }
+
+    /// The same service, never bringing a network up to carry an act: for a
+    /// platform where only the person brings a network up, as a phone's VPN.
+    /// An act signed while the network is down is held, and goes out when the
+    /// person turns it on.
+    #[must_use]
+    pub const fn carrying_only_when_up(mut self) -> Self {
+        self.brings_up_to_carry = false;
         self
     }
 
@@ -1047,7 +1207,7 @@ impl Service {
     /// Builds a network's node again from what its directory keeps — after a
     /// change of mode — and brings it back up where it was up.
     async fn rebuild(&self, network: &Arc<Network>) {
-        let was_up = network.up.lock().await.is_some();
+        let was_up = network.running().await;
         if was_up {
             let _lowered = Box::pin(self.lower(network, Stop::Everything)).await;
         }
@@ -1254,7 +1414,7 @@ impl Service {
     ///
     /// When any step fails. The error names the step and what is still installed.
     async fn raise(&self, network: &Arc<Network>) -> Result<()> {
-        if network.up.lock().await.is_some() {
+        if network.running().await {
             return Ok(());
         }
         // Refused before anything is installed: there is no address, prefix or
@@ -1265,9 +1425,16 @@ impl Service {
             cause: format!("the roster does not describe a network: {cause}"),
         })?;
 
-        let resolver = Self::own_address(&node, &state).ok_or_else(|| Error::Parameters {
-            cause: "this device has no address on its own network".to_owned(),
-        })?;
+        let Some(resolver) = Self::own_address(&node, &state) else {
+            // Revoked: its transport alone, so that a voiding of the revocation
+            // reaches it (offline-founder design §22).
+            if Self::revoked_standing(network).await {
+                return self.raise_revoked(network, state).await;
+            }
+            return Err(Error::Parameters {
+                cause: "this device has no address on its own network".to_owned(),
+            });
+        };
 
         // Two networks up in one block would answer for the same addresses, and
         // services that pass addresses to each other would reach the wrong
@@ -1413,6 +1580,8 @@ impl Service {
         *network.up.lock().await = Some(installed);
         Self::knew(network).await;
 
+        self.watch_standing(network).await;
+
         // A roster change while up can move IPv4 routes: a device admitted gains
         // one, a device revoked loses one. The node signals it; this passes it on.
         let mut holdings = node.ipv4_holdings();
@@ -1432,6 +1601,95 @@ impl Service {
         Choice::Up.write(&network.paths.choice())?;
         Self::keep_checkpoint(network, true).await;
         Ok(())
+    }
+
+    /// Whether this device is revoked in `network`: its roster does not name
+    /// it, and holds its revocation or a notice of it.
+    async fn revoked_standing(network: &Arc<Network>) -> bool {
+        network.node().revoked_in_roster().await
+            || network.paths.root().join(REVOCATION_NOTICE).exists()
+    }
+
+    /// Brings a network up in the revoked standing: its transport alone, with
+    /// no tunnel and no address, carrying the roster and nothing else
+    /// (offline-founder design §22).
+    ///
+    /// It dials the full members it knew once now and again when the machine
+    /// changes network, and at no other time: a member holding its revocation
+    /// answers with it, one that no longer does lets it in, and its roster
+    /// naming it again brings it up as a member.
+    async fn raise_revoked(
+        &self,
+        network: &Arc<Network>,
+        state: roster::state::RosterState,
+    ) -> Result<()> {
+        let node = Arc::clone(network.node());
+        let plan = RelayPlan::of(&state.params, crate::clock::now_ms());
+        let transport = self.start_transport(&node, state).await?;
+        node.started(transport).await;
+        *network.plan.lock().await = Some(plan);
+        let dialling = Arc::clone(&node);
+        *network.driving.lock().await = vec![
+            tokio::spawn(Arc::clone(&node).accept_forever()),
+            tokio::spawn(async move { dialling.reconcile_with_neighbours().await }),
+        ];
+        *network.revoked_up.lock().await = true;
+        self.watch_standing(network).await;
+        node.record(
+            crate::node::Severity::Event,
+            "membership",
+            "up as revoked: no tunnel, and only the roster is carried, so that the device comes \
+             back by itself if its revocation is voided",
+        )
+        .await;
+        Choice::Up.write(&network.paths.choice())?;
+        Self::keep_checkpoint(network, true).await;
+        Ok(())
+    }
+
+    /// Wakes the reconciliation whenever this device's standing in `network`
+    /// may have changed, for as long as the network runs.
+    async fn watch_standing(&self, network: &Arc<Network>) {
+        let standing = network.node().standing();
+        let wake = Arc::clone(&self.reconciling);
+        network.driving.lock().await.push(tokio::spawn(async move {
+            loop {
+                standing.notified().await;
+                wake.notify_one();
+            }
+        }));
+    }
+
+    /// Brings each network that runs in line with its standing: up as a
+    /// member where its roster names this device, as revoked where it does
+    /// not and holds its revocation (offline-founder design §22). A network
+    /// the person has down stays down.
+    async fn follow_standings(&self) {
+        for network in self.all().await {
+            let as_member = network.up.lock().await.is_some();
+            let as_revoked = *network.revoked_up.lock().await;
+            if !as_member && !as_revoked {
+                continue;
+            }
+            let named = network.node().state().await.is_ok_and(|state| {
+                state.devices.contains_key(&network.node().identity().device_id())
+            });
+            let changed = if as_member {
+                !named && Self::revoked_standing(&network).await
+            } else {
+                named
+            };
+            if !changed {
+                continue;
+            }
+            let _lowered = self.lower(&network, Stop::Standing).await;
+            if let Err(cause) = self.raise(&network).await {
+                network
+                    .node()
+                    .record(crate::node::Severity::Problem, "tunnel", cause.to_string())
+                    .await;
+            }
+        }
     }
 
     /// Takes one network's tunnel down and records that the person chose it.
@@ -1492,6 +1750,7 @@ impl Service {
     /// Takes one network down, recording it as the person's choice when it was one.
     async fn lower(&self, network: &Arc<Network>, stop: Stop) -> Result<()> {
         let installed = network.up.lock().await.take();
+        *network.revoked_up.lock().await = false;
         // Nothing running, so nothing for a relay change to rebuild.
         network.plan.lock().await.take();
 
@@ -1740,6 +1999,10 @@ impl Service {
             self.follow_relays().await;
             // A demoted device's signing key, once its demotion is settled.
             self.settle_demotions().await;
+            // What this device heard of its own revocation (offline-founder
+            // design §16), and the standing each network runs in (§22).
+            self.be_told().await;
+            self.follow_standings().await;
             // And what changed is vouched for, grouped.
             self.keep_checkpoints(false).await;
             if !woken {
@@ -1885,7 +2148,7 @@ impl Service {
         state: roster::state::RosterState,
         wanted: RelayPlan,
     ) -> Result<()> {
-        if network.up.lock().await.is_none() {
+        if !network.running().await {
             return Ok(());
         }
         let node = Arc::clone(network.node());
@@ -2064,6 +2327,7 @@ impl Service {
                 admin: false,
                 custody,
                 key_until_settled: false,
+                revoked_by: None,
                 owner_taken: crate::state::was_taken(&network.paths),
                 // A roster that derives no state has no network to be unable to
                 // confirm. The trouble here is a different one, and reported as
@@ -2113,12 +2377,14 @@ impl Service {
             && !node.identity().signing_key().is_public_only()
             && network.paths.was_admin().exists()
             && !state.is_admin(&me);
+        let revoked_by = Self::revoked_by(network).await;
         crate::control::Network {
             label,
             tunnel,
             standing,
             custody,
             key_until_settled,
+            revoked_by,
             owner_taken: crate::state::was_taken(&network.paths),
             confirmation: node.unconfirmed().await,
             arrived,
@@ -2397,7 +2663,7 @@ impl Service {
         // revocation, and attesting to the result is the same act finished.
         network.node().attest_now().await;
 
-        if network.tunnel().await == Tunnel::Up {
+        if network.tunnel().await == Tunnel::Up || !self.brings_up_to_carry {
             return Ok(false);
         }
         self.raise(network).await?;
@@ -2429,7 +2695,971 @@ impl Service {
             }
         };
 
+        // A batch the founder signed is followed by the founder's root over
+        // what it did: the label, and whether it was the founder's, read before
+        // the batch is handed on.
+        // The root itself is the end of it.
+        let after_the_act = !matches!(resume, Resume::FounderRoot { .. });
+        let signed_by = requests.first().map(|request| request.key());
+        let founder_act = match resume.label().filter(|_| after_the_act) {
+            Some(label) => match self.named(label).await {
+                Ok(network) => network.node().state().await.ok().is_some_and(|state| {
+                    signed_by == Some(state.params.founder.signing_id())
+                }),
+                Err(_) => false,
+            },
+            None => false,
+        }
+        .then(|| resume.label().cloned().zip(signed_by))
+        .flatten();
+
+        let outcome = self.resumed(resume, &requests, signatures).await;
+        match (founder_act, &outcome) {
+            (Some((label, by)), Outcome::Reported(_)) => {
+                self.founder_root_wanted(&label, &by, outcome).await
+            }
+            _ => outcome,
+        }
+    }
+
+    /// Opens a founder session where this device reaches no full member: a
+    /// transport of its own under the founder's transport key, a session to a
+    /// member the roster names — anchors first — and the roster synchronised
+    /// over it, so the founder's act is built on what the network holds now.
+    async fn founder_session(&self, which: Option<&Label>, seed: &str) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let node = Arc::clone(network.node());
+        let Ok(state) = node.state().await else {
+            return Outcome::refused("this device holds no roster for that network".to_owned());
+        };
+        // Kept for the act's end, whatever carries it: what it revokes is pushed
+        // under the founder's key to the devices it names, which admit that key
+        // whatever their roster says.
+        if let Some(seed) =
+            roster::hex::decode(seed).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        {
+            self.founder_acts.lock().await.insert(
+                network.label().clone(),
+                FounderAct {
+                    seed: zeroize::Zeroizing::new(seed),
+                    held_before: crate::notices::revoked_peers(&node)
+                        .await
+                        .into_values()
+                        .map(|held| held.revocation)
+                        .collect(),
+                },
+            );
+        }
+        // Reached already: the act travels on the sessions this device has.
+        let reached = node.session_peers().await;
+        if reached.iter().any(|peer| {
+            state.devices.contains_key(peer)
+                && state.settings_of(peer).mode == roster::leaf::Mode::Full
+        }) {
+            return Outcome::Done;
+        }
+        // Otherwise a founder session is tried even where this device still
+        // counts itself a member: one the network revoked may not have heard
+        // so yet, and the session brings it up to date before the act is built.
+        // A member that reaches nobody now goes on without one: its own
+        // sessions carry the act once its peers are up.
+        let member = state.devices.contains_key(&node.identity().device_id());
+        let Some(seed) =
+            roster::hex::decode(seed).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        else {
+            return Outcome::refused(
+                "the founder's transport key is not 32 bytes of hex".to_owned(),
+            );
+        };
+        let seed = zeroize::Zeroizing::new(seed);
+        let founder = state.params.founder;
+        let (Ok(transport), Ok(attestation)) = (
+            identity::PrivateKey::from_material(roster::types::Algorithm::Ed25519, *seed),
+            identity::PrivateKey::generate(roster::types::Algorithm::Ed25519),
+        ) else {
+            return Outcome::refused("the founder's transport key would not load".to_owned());
+        };
+        if transport.public_key().as_bytes() != founder.transport().as_slice() {
+            return Outcome::refused(
+                "that is not this network's founder's transport key. Nothing was opened."
+                    .to_owned(),
+            );
+        }
+        let signing = match roster::sign::PublicKey::new(
+            roster::types::Algorithm::Ed25519,
+            founder.signing().to_vec(),
+        ) {
+            Ok(key) => key,
+            Err(cause) => return Outcome::refused(cause.to_string()),
+        };
+        let as_founder = match identity::NodeIdentity::public_only(signing, transport, attestation)
+        {
+            Ok(identity) => Arc::new(identity),
+            Err(cause) => return Outcome::refused(cause.to_string()),
+        };
+        // Anchors first, then every full member the roster names, this device
+        // aside. None: this device is the network's only full member, and what
+        // it holds is what there is. Nothing is started to reach nobody — on a
+        // phone with its network off, starting one failed, and the act with it
+        // (2026-11-24).
+        let me = node.identity().device_id();
+        let mut candidates: Vec<roster::id::DeviceId> =
+            state.params.anchors.iter().copied().filter(|anchor| *anchor != me).collect();
+        for (device, leaf) in state.devices.iter() {
+            if device != me
+                && leaf.settings.mode == roster::leaf::Mode::Full
+                && !candidates.contains(&device)
+            {
+                candidates.push(device);
+            }
+        }
+        if candidates.is_empty() && member {
+            return Outcome::Done;
+        }
+        let carrier = match self.connectivity.start(&as_founder, state.clone()).await {
+            Ok(transport) => transport,
+            Err(cause) => return Outcome::refused(format!("no founder session: {cause}")),
+        };
+        let mut last: Option<String> = None;
+        for device in candidates {
+            let Some(key) = state.devices.get(&device).and_then(|leaf| {
+                leaf.record
+                    .keys
+                    .iter()
+                    .find(|entry| entry.purpose == roster::types::KeyPurpose::Transport)
+                    .and_then(|entry| {
+                        roster::sign::PublicKey::new(entry.alg, entry.value.clone()).ok()
+                    })
+            }) else {
+                continue;
+            };
+            // The new transport registers at the relay as it starts: a dial
+            // before then fails, so it is tried a few times.
+            let mut reached = None;
+            for _ in 0..8 {
+                match carrier.connect(&key).await {
+                    Ok(session) => {
+                        reached = Some(session);
+                        break;
+                    }
+                    Err(cause) => last = Some(cause.to_string()),
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let Some(session) = reached else { continue };
+            node.serve_founder_session(session).await;
+            // The roster from the member first: up to a few seconds, until the
+            // heads stop moving.
+            let mut heads = node.heads().await;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let now = node.heads().await;
+                if now == heads {
+                    break;
+                }
+                heads = now;
+            }
+            self.founder_carriers.lock().await.insert(network.label().clone(), carrier);
+            let name = state.devices.get(&device).map(|leaf| leaf.record.name.clone());
+            return Outcome::Reported(self.report().await.with_note(&format!(
+                "a founder session to {} carries what the founder signs next",
+                crate::control::Named::new(&device, name)
+            )));
+        }
+        if member {
+            // Said, not passed over: what follows rests on what this device
+            // holds, which may be behind — a peer that took a new identity is
+            // one this device cannot know.
+            return Outcome::Reported(self.report().await.with_note(&format!(
+                "no full member of the network could be reached with the founder's key{}: what \
+                 is signed now rests on what this device holds, and reaches the network once a \
+                 peer it knows is up. A device that took a new identity since is not one this \
+                 device knows: from it, invite this device again instead.",
+                last.map(|cause| format!(" (the last: {cause})")).unwrap_or_default()
+            )));
+        }
+        Outcome::refused(format!(
+            "no full member of the network could be reached with the founder's key{}. Nothing \
+             was signed.",
+            last.map(|cause| format!(" (the last: {cause})")).unwrap_or_default()
+        ))
+    }
+
+    /// Ends a founder session once the founder's act is over.
+    async fn end_founder_session(&self, label: &Label) {
+        let carrier = self.founder_carriers.lock().await.remove(label);
+        let act = self.founder_acts.lock().await.remove(label);
+        if let Some(act) = act {
+            self.push_founders_revocations(label, act, carrier.clone()).await;
+        }
+        if let Some(carrier) = carrier {
+            if let Ok(network) = self.named(label).await {
+                // Given a moment to carry what was just signed to the member.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                network.node().release_founder_session().await;
+            }
+            drop(carrier);
+        }
+    }
+
+    /// Pushes the revocations a founder act signed to the devices they name,
+    /// under the founder's transport key, which every device admits whatever its
+    /// roster says (offline-founder design §16). In the background: the act is
+    /// over, and a device not reached now is told when it next dials a member.
+    async fn push_founders_revocations(
+        &self,
+        label: &Label,
+        act: FounderAct,
+        carrier: Option<Arc<dyn transport::Transport>>,
+    ) {
+        let Ok(network) = self.named(label).await else { return };
+        let node = Arc::clone(network.node());
+        let Ok(state) = node.state().await else { return };
+        let founder = state.params.founder.signing_id();
+        let fresh: Vec<transport::session::Revoked> = crate::notices::revoked_peers(&node)
+            .await
+            .into_values()
+            .filter(|peer| {
+                !act.held_before.contains(&peer.revocation)
+                    && roster::sign::RawOperation::decode(&peer.revocation)
+                        .is_ok_and(|raw| raw.core().author == founder)
+            })
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let carrier = match carrier {
+            Some(carrier) => carrier,
+            None => match self.founder_carrier(&act.seed, &state).await {
+                Some(carrier) => carrier,
+                None => return,
+            },
+        };
+        tokio::spawn(async move {
+            for peer in fresh {
+                let Ok(key) =
+                    roster::sign::PublicKey::new(roster::types::Algorithm::Ed25519, peer.transport)
+                else {
+                    continue;
+                };
+                let _read = carrier.notify(&key, peer.revocation).await;
+            }
+            drop(carrier);
+        });
+    }
+
+    /// A transport under the founder's transport key, from its seed: what a
+    /// founder session runs on.
+    async fn founder_carrier(
+        &self,
+        seed: &[u8; 32],
+        state: &roster::state::RosterState,
+    ) -> Option<Arc<dyn transport::Transport>> {
+        let transport =
+            identity::PrivateKey::from_material(roster::types::Algorithm::Ed25519, *seed).ok()?;
+        let attestation = identity::PrivateKey::generate(roster::types::Algorithm::Ed25519).ok()?;
+        if transport.public_key().as_bytes() != state.params.founder.transport().as_slice() {
+            return None;
+        }
+        let signing = roster::sign::PublicKey::new(
+            roster::types::Algorithm::Ed25519,
+            state.params.founder.signing().to_vec(),
+        )
+        .ok()?;
+        let as_founder =
+            Arc::new(identity::NodeIdentity::public_only(signing, transport, attestation).ok()?);
+        self.connectivity.start(&as_founder, state.clone()).await.ok()
+    }
+
+    /// Judges the notices each network's transport heard of this device's own
+    /// revocation (offline-founder design §16).
+    async fn be_told(&self) {
+        for network in self.all().await {
+            let node = Arc::clone(network.node());
+            for notice in node.take_heard() {
+                if let Some(by) = crate::notices::judged(&node, &notice).await {
+                    self.revoked_here(&network, &notice, &by).await;
+                }
+            }
+        }
+    }
+
+    /// This device holds a verified revocation of itself in `network`: kept,
+    /// said, its invites withdrawn, and, where it was an admin, its signing key
+    /// destroyed — only the founder revokes an admin, so that is final
+    /// (offline-founder design §17). A member keeps its keys: a revocation by an
+    /// admin can still be voided by the founder.
+    async fn revoked_here(&self, network: &Arc<Network>, notice: &[u8], by: &str) {
+        // The same notice again says nothing new. Another — the founder's,
+        // after an admin's that was voided — is kept in its place and taken in.
+        let path = network.paths.root().join(REVOCATION_NOTICE);
+        if std::fs::read(&path).is_ok_and(|kept| kept == notice) {
+            return;
+        }
+        let node = network.node();
+        if let Err(cause) = crate::state::replace_file(&path, notice) {
+            node.record(crate::node::Severity::Problem, "membership", cause.to_string()).await;
+            return;
+        }
+        // Whether it was an admin, read before the revocation is taken in: after
+        // it, the state no longer names this device at all.
+        let was_admin = network.paths.was_admin().exists()
+            || node.state().await.is_ok_and(|state| state.is_admin(&node.identity().device_id()));
+        // Into the log too, where its parents are held; kept beside it where
+        // they are not, and admitted when they arrive.
+        let _taken = node.admit_without_activating(notice).await;
+        node.record(
+            crate::node::Severity::Event,
+            "membership",
+            format!(
+                "this device was revoked by {by}: no device of the network accepts it any \
+                 more. It comes back by itself if the founder voids that revocation, and \
+                 otherwise by an invite"
+            ),
+        )
+        .await;
+        let now = crate::state::wall_seconds();
+        if let Ok(mut invites) = Self::invites_of(network).await {
+            let open: Vec<_> = invites.open(now).map(|record| record.invite.secret).collect();
+            if !open.is_empty() {
+                for secret in &open {
+                    let _withdrawn = invites.withdraw(secret, now);
+                }
+                if Self::save_invites(network, &invites).is_ok() {
+                    Self::keep_checkpoint(network, true).await;
+                }
+            }
+        }
+        if was_admin && !node.identity().signing_key().is_public_only() {
+            match self.destroy_signing_key(network).await {
+                Ok(()) => {
+                    self.settled.lock().await.insert(network.label().clone());
+                    node.record(
+                        crate::node::Severity::Event,
+                        "keys",
+                        "this device was an admin, and is revoked: its signing key for this \
+                         network was destroyed",
+                    )
+                    .await;
+                }
+                Err(cause) => {
+                    node.record(
+                        crate::node::Severity::Problem,
+                        "keys",
+                        format!("the signing key of a revoked admin would not go: {cause}"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Who revoked this device from `network`, where it holds its own
+    /// revocation, as a notice kept or among the operations held.
+    async fn revoked_by(network: &Arc<Network>) -> Option<String> {
+        let node = network.node();
+        let me = node.identity().device_id();
+        let kept = network.paths.root().join(REVOCATION_NOTICE);
+        if let Ok(notice) = std::fs::read(&kept) {
+            // A notice whose revocation the log now holds, while the state still
+            // names this device, is one that did not hold: voided by the
+            // founder's revocation of its signer, or followed by an admission.
+            // It is said no more.
+            let held = node.held_with_verdicts().await.map(|(held, _)| held).unwrap_or_default();
+            let named = node.state().await.is_ok_and(|state| state.devices.contains_key(&me));
+            let stale = roster::sign::RawOperation::decode(&notice).map_or(true, |raw| {
+                let id = raw.id();
+                named && held.iter().any(|(operation, _)| operation.id() == id)
+            });
+            if stale {
+                let _gone = std::fs::remove_file(&kept);
+            } else if let Some(by) = crate::notices::judged(node, &notice).await {
+                return Some(by);
+            }
+        }
+        let state = node.state().await.ok()?;
+        if !state.revoked.contains(&me) {
+            return None;
+        }
+        let (held, _) = node.held_with_verdicts().await?;
+        held.iter().find_map(|(operation, verdict)| {
+            if verdict.is_some() {
+                return None;
+            }
+            let roster::types::OperationBody::RevokeDevice { device, .. } = operation.body() else {
+                return None;
+            };
+            (*device == me).then(|| {
+                let author = operation.core().author;
+                if author == state.params.founder.signing_id() {
+                    "the founder".to_owned()
+                } else {
+                    state.device_for_key(&author).map_or_else(
+                        || "an admin".to_owned(),
+                        |leaf| {
+                            format!(
+                                "{} [{}]",
+                                leaf.record.name,
+                                crate::control::short_id(&leaf.record.id)
+                            )
+                        },
+                    )
+                }
+            })
+        })
+    }
+
+    /// Replaces the founder's keys, signed by the founder's current words.
+    async fn replace_founder(
+        &self,
+        which: Option<&Label>,
+        founder: &crate::control::FounderPublic,
+    ) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let label = network.label().clone();
+        let Ok(state) = network.node().state().await else {
+            return Outcome::refused(format!(
+                "`{label}` holds no roster here. Nothing was signed."
+            ));
+        };
+        let new = match founder.keys() {
+            Ok(keys) => keys,
+            Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was signed.")),
+        };
+        if new == state.params.founder {
+            return Outcome::refused(
+                "those are the founder's keys already. Nothing was signed.".to_owned(),
+            );
+        }
+        if state.devices.keys().any(|device| {
+            state
+                .devices
+                .get(&device)
+                .is_some_and(|leaf| leaf.record.keys.iter().any(|entry| new.holds(&entry.value)))
+        }) {
+            return Outcome::refused(
+                "a device holds one of those keys. Nothing was signed.".to_owned(),
+            );
+        }
+        let mut params = state.params.clone();
+        params.founder = new;
+        let issued = crate::clock::signing_time();
+        self.sign_parameters(&network, &label, &state, params, issued).await
+    }
+
+    /// The operations this device holds for a network, newest first, by who
+    /// signed them and with what effect.
+    async fn history(&self, which: Option<&Label>, by: Option<&str>) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let node = network.node();
+        let depths = node.depths().await;
+        let (Ok(state), Some((held, compacted))) =
+            (node.state().await, node.held_with_verdicts().await)
+        else {
+            return Outcome::refused("this device holds no history for that network".to_owned());
+        };
+        let founders: Vec<roster::id::KeyId> = core::iter::once(state.params.founder.signing_id())
+            .chain(held.iter().filter_map(|(operation, _)| match &operation.core().body {
+                roster::types::OperationBody::CreateNetwork { params, .. }
+                | roster::types::OperationBody::SetNetwork(params) => {
+                    Some(params.founder.signing_id())
+                }
+                _ => None,
+            }))
+            .collect();
+        let valid: Vec<&roster::sign::VerifiedOperation> = held
+            .iter()
+            .filter(|(_, reason)| reason.is_none())
+            .map(|(operation, _)| operation)
+            .collect();
+        let directory = crate::describing::Directory::of(&state, &valid);
+        let mut ordered: Vec<&(
+            roster::sign::VerifiedOperation,
+            Option<roster::state::Invalidity>,
+        )> = held.iter().collect();
+        // Newest first by causal depth: the signed time is a minute's, and two
+        // acts in one minute would otherwise come in any order.
+        ordered.sort_by_key(|(operation, _)| {
+            core::cmp::Reverse((
+                depths.get(&operation.id()).copied().unwrap_or(0),
+                operation.core().ts,
+            ))
+        });
+        let wanted_by = by.map(str::trim).filter(|by| !by.is_empty());
+        let entries: Vec<crate::control::HistoryEntry> = ordered
+            .into_iter()
+            .filter_map(|(operation, reason)| {
+                let author = operation.core().author;
+                let by = if founders.contains(&author) {
+                    None
+                } else {
+                    Some(directory.named(&directory.owner(&author)))
+                };
+                let keep = match (wanted_by, &by) {
+                    (None, _) => true,
+                    (Some("founder"), None) => true,
+                    (Some(_), None) | (Some("founder"), Some(_)) => false,
+                    (Some(wanted), Some(named)) => {
+                        named.name.as_deref() == Some(wanted) || named.id == wanted
+                    }
+                };
+                keep.then(|| crate::control::HistoryEntry {
+                    at: operation.core().ts,
+                    by,
+                    does: directory.act(&operation.core().body),
+                    no_effect: reason.map(|reason| reason.kind().replace('_', " ")),
+                    id: operation.id().to_hex(),
+                })
+            })
+            .collect();
+        let complete_from =
+            held.iter().map(|(operation, _)| operation.core().ts).min().unwrap_or(0);
+        Outcome::History(crate::control::History {
+            network: network.label().to_string(),
+            entries,
+            complete_from,
+            compacted,
+        })
+    }
+
+    /// Makes this device an admin of a network with the founder's words: the
+    /// batch, prepared for the founder to sign (`crate::recovering`).
+    async fn recover(&self, which: Option<&Label>, revoke: &[crate::control::Target]) -> Outcome {
+        let network = match self.which(which).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let label = network.label().clone();
+        let node = Arc::clone(network.node());
+        let Ok(state) = node.state().await else {
+            return Outcome::refused(format!(
+                "`{label}` holds no roster here: a light member cannot recover a network. Nothing \
+                 was signed."
+            ));
+        };
+        let me = node.identity().device_id();
+        if state.settings_of(&me).mode == roster::leaf::Mode::Light {
+            return Outcome::refused(
+                "a light member holds no roster to recover a network from. Nothing was signed."
+                    .to_owned(),
+            );
+        }
+        if revoke.len() > 2 {
+            return Outcome::refused(
+                "a recovery revokes at most two admins; revoke the others with `--founder` \
+                 afterwards. Nothing was signed."
+                    .to_owned(),
+            );
+        }
+        let mut expulsions = Vec::new();
+        for target in revoke {
+            let found = match crate::revoking::find(&state, target, "name it by its id") {
+                Ok(found) => found,
+                Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was signed.")),
+            };
+            if found.role != roster::types::Role::Admin {
+                return Outcome::refused(format!(
+                    "{name} is not an admin, so it is not one recovery revokes: recover without \
+                     naming it, and revoke it afterwards with `peerfectly revoke {name} <reason>`. \
+                     Nothing was signed.",
+                    name = crate::control::shown(&found.name)
+                ));
+            }
+            expulsions.push(crate::revoking::Expulsion {
+                device: found.id,
+                name: found.name.clone(),
+                reason: "revoked by the founder's recovery".to_owned(),
+            });
+        }
+
+        let identity = node.identity();
+        let author = author_in(identity, &state);
+        let prepared_against = node.moment().await;
+        let mut cores: Vec<roster::types::OperationCore> = Vec::new();
+        let mut parents = prepared_against.heads.clone();
+        let mut push = |body: roster::types::OperationBody,
+                        cores: &mut Vec<roster::types::OperationCore>| {
+            let core = roster::types::OperationCore::new(
+                crate::clock::signing_time(),
+                author.algorithm,
+                body,
+                parents.clone(),
+                author.key_id,
+                state.network,
+            )
+            .map_err(|cause| cause.to_string())?;
+            parents = vec![core.id()];
+            cores.push(core);
+            Ok::<(), String>(())
+        };
+        for expulsion in &expulsions {
+            let body = roster::types::OperationBody::RevokeDevice {
+                device: expulsion.device,
+                reason: expulsion.reason.clone(),
+            };
+            if let Err(refusal) = push(body, &mut cores) {
+                return Outcome::refused(refusal);
+            }
+        }
+
+        // An admin keeps its identity: only the revocations.
+        let temporary = if state.is_admin(&me) {
+            if cores.is_empty() {
+                return Outcome::refused(
+                    "this device is already an admin, and no admin was named to revoke. Nothing \
+                     was signed."
+                        .to_owned(),
+                );
+            }
+            None
+        } else {
+            let temporary = match crate::recovering::temporary(&label) {
+                Ok(temporary) => temporary,
+                Err(cause) => return Outcome::refused(cause.to_string()),
+            };
+            let paths = self.home.paths_for(&temporary);
+            if !paths.identity().exists() {
+                if let Err(cause) = paths.create() {
+                    return Outcome::refused(cause.to_string());
+                }
+                if let Some(asked) = self
+                    .wants_a_key(
+                        &paths,
+                        Unfinished::Recovering { label: label.clone(), revoke: revoke.to_vec() },
+                    )
+                    .await
+                {
+                    return asked;
+                }
+            }
+            let new = match self.keys.identity(&paths) {
+                Ok(new) => new,
+                Err(cause) => {
+                    let _discarded = self.home.discard_unfounded(&temporary);
+                    return Outcome::refused(format!("the new admin key: {cause}"));
+                }
+            };
+            // The name this device answers to, or, revoked, the one it was
+            // admitted under: its admission is among the operations held.
+            let admitted_as = node.held_with_verdicts().await.and_then(|(held, _)| {
+                held.iter().find_map(|(operation, _)| match &operation.core().body {
+                    roster::types::OperationBody::AddDevice(spec)
+                    | roster::types::OperationBody::CreateNetwork { device: spec, .. }
+                        if spec.device_id().ok() == Some(me) =>
+                    {
+                        Some(spec.name.clone())
+                    }
+                    _ => None,
+                })
+            });
+            let name = state
+                .devices
+                .get(&me)
+                .map(|leaf| leaf.record.name.clone())
+                .or(admitted_as)
+                .unwrap_or_else(|| label.to_string());
+            let spec = match new.device_spec(name, roster::types::Role::Admin, Vec::new()) {
+                Ok(spec) => spec,
+                Err(cause) => return Outcome::refused(cause.to_string()),
+            };
+            let device = match spec.device_id() {
+                Ok(device) => device,
+                Err(cause) => return Outcome::refused(cause.to_string()),
+            };
+            if let Err(refusal) = push(roster::types::OperationBody::AddDevice(spec), &mut cores) {
+                return Outcome::refused(refusal);
+            }
+            // The old identity is revoked last: each operation goes out on this
+            // device's sessions as it is admitted, and a peer ends the session
+            // with the old identity at its revocation, so by then the peer must
+            // already know the new one, or it would refuse it too.
+            let replaces_itself = !state.revoked.contains(&me) && state.devices.contains_key(&me);
+            let room = crate::control::MOST_IN_A_BATCH.saturating_sub(usize::from(replaces_itself));
+            // The address the old identity holds, where nothing else holds it:
+            // given to the new one once the old is revoked, so the device keeps
+            // its IPv4 address (offline-founder design §20). Given before, the
+            // two identities would hold it at once.
+            let kept_offset =
+                replaces_itself.then(|| state.settings_of(&me).ipv4).flatten().filter(|offset| {
+                    state.params.ipv4_range().address_at(*offset).is_some_and(|address| {
+                        state.devices.holding_address(address).iter().all(|held| *held == me)
+                    })
+                });
+            let given = |offset| roster::types::OperationBody::SetDevice {
+                device,
+                change: roster::leaf::SettingsChange {
+                    ipv4: Some(Some(offset)),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            };
+            // Otherwise the lowest free, where the batch has room: a device
+            // admitted without one is reached by IPv6 only until an admin gives
+            // it one.
+            if kept_offset.is_none()
+                && cores.len() < room
+                && let Some(offset) = state.free_offsets(1)
+                && let Err(refusal) = push(given(offset), &mut cores)
+            {
+                return Outcome::refused(refusal);
+            }
+            if replaces_itself {
+                let body = roster::types::OperationBody::RevokeDevice {
+                    device: me,
+                    reason: "replaced by this device's admin identity".to_owned(),
+                };
+                if let Err(refusal) = push(body, &mut cores) {
+                    return Outcome::refused(refusal);
+                }
+            }
+            if let Some(offset) = kept_offset
+                && cores.len() < crate::control::MOST_IN_A_BATCH
+                && let Err(refusal) = push(given(offset), &mut cores)
+            {
+                return Outcome::refused(refusal);
+            }
+            Some(temporary)
+        };
+
+        let requests = Self::with_owed_snapshot(&node, &cores).await;
+        let resume = Resume::Recovering { label: label.clone(), temporary, prepared_against };
+        self.wants_signatures(requests, identity, &label, resume).await
+    }
+
+    /// Carries a signed recovery: the batch into the log, then, where a new
+    /// identity was made, the swap (`crate::recovering::swap`) and the network
+    /// taken up again under it.
+    async fn recovery_signed(
+        &self,
+        label: &Label,
+        temporary: Option<Label>,
+        prepared_against: &crate::signing::Moment,
+        requests: &[identity::detached::SigningRequest],
+        signatures: &[Vec<u8>],
+    ) -> Outcome {
+        let network = match self.named(label).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let artifacts =
+            match self.verified_batch(&network, prepared_against, requests, signatures).await {
+                Ok(artifacts) => artifacts,
+                Err(refused) => return refused,
+            };
+        for signed in &artifacts {
+            if let Err(cause) = network.node().admit_without_activating(signed).await {
+                return Outcome::Failed {
+                    message: format!("the recovery was not recorded: {cause}"),
+                    left_behind: Vec::new(),
+                };
+            }
+        }
+        let Some(_temporary) = temporary else {
+            return Outcome::Reported(self.report().await);
+        };
+
+        // Decided: the batch is in the log. The rest is repeatable, and a stop
+        // is finished on the next start.
+        let was_up = network.running().await;
+        let _lowered = Box::pin(self.lower(&network, Stop::Everything)).await;
+        self.networks.lock().await.remove(label);
+        if let Err(cause) = crate::recovering::swap(&self.home, label, self.keys.as_ref()) {
+            return Outcome::Failed {
+                message: format!(
+                    "the recovery is in the roster, and this device did not finish taking up its \
+                     new identity: {cause}. It finishes on the next start."
+                ),
+                left_behind: Vec::new(),
+            };
+        }
+        if let Err(cause) = self.acquire(label.clone(), self.home.paths_for(label)).await {
+            return Outcome::Failed {
+                message: format!(
+                    "the recovery is done, and the network did not open again: {cause}"
+                ),
+                left_behind: Vec::new(),
+            };
+        }
+        // Up again where it was up: the new identity carries it now.
+        if was_up && let Ok(taken_up) = self.named(label).await {
+            let _raised = Box::pin(self.raise(&taken_up)).await;
+        }
+        Outcome::Reported(
+            self.report()
+                .await
+                .with_note("this device is now the network's admin, under a new identity"),
+        )
+    }
+
+    /// Asks the founder for the root over a founder act just carried, or hands
+    /// the act's outcome back where there is no root to sign.
+    async fn founder_root_wanted(
+        &self,
+        label: &Label,
+        signed_by: &roster::id::KeyId,
+        carried: Outcome,
+    ) -> Outcome {
+        let Ok(network) = self.named(label).await else { return carried };
+        let node = network.node();
+        if node.state().await.is_err() {
+            return carried;
+        }
+        let body = match node.founder_root_body().await {
+            Ok(body) => body,
+            // Said rather than skipped: light members learn of the act from an
+            // admin's next root instead.
+            Err(cause) => {
+                return match carried {
+                    Outcome::Reported(report) => Outcome::Reported(report.with_note(&format!(
+                        "the founder's root over it was not made ({cause}); light members \
+                         learn of it from an admin's next root"
+                    ))),
+                    other => other,
+                };
+            }
+        };
+        // The founder the root names: proved in the root it follows, so after a
+        // replacement still the founder whose words signed it.
+        let roster::snapshot::RootSigner::Founder { keys: signer, .. } = body.signer else {
+            return carried;
+        };
+        // Only the words that signed the act are in front of the person. A
+        // replacement on a network holding no root yet names the new founder
+        // here, whose words are not: asking would refuse an act already taken
+        // (found on a phone founding a network alone, 2026-11-24). The act
+        // stands, and light members learn of it from an admin's next root.
+        if signer.signing_id() != *signed_by {
+            return match carried {
+                Outcome::Reported(report) => Outcome::Reported(report.with_note(
+                    "done; the founder's root over it waits for the next one an admin or the \
+                     new words sign, and light members learn of it then",
+                )),
+                other => other,
+            };
+        }
+        let Ok(key) = body.named_key() else { return carried };
+        let request = identity::detached::prepare_snapshot(&body, &key);
+        let items = vec![crate::control::ToSign::from_request(&request)];
+        let asked = self.asking.lock().await.clone();
+        let (id, lapsed) = {
+            let mut unsigned = self.unsigned.lock().await;
+            let id = unsigned.issue_for(
+                vec![request],
+                Resume::FounderRoot { label: label.clone() },
+                crate::clock::now_ms(),
+                asked,
+            );
+            (id, unsigned.lapsed())
+        };
+        self.tidy_after(lapsed).await;
+        Outcome::NeedsSignatures(crate::control::SignaturesWanted {
+            id,
+            key: "founder".to_owned(),
+            network: label.to_string(),
+            items,
+            keys: None,
+            founder: Some(crate::control::FounderPublic::of(&signer)),
+        })
+    }
+
+    /// Keeps and sends the root the founder signed.
+    async fn founder_root_signed(
+        &self,
+        label: &Label,
+        requests: &[identity::detached::SigningRequest],
+        signatures: &[Vec<u8>],
+    ) -> Outcome {
+        let network = match self.named(label).await {
+            Ok(network) => network,
+            Err(cause) => {
+                return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
+            }
+        };
+        let node = network.node();
+        // Verified with the key the root names, which the roster then checks
+        // against the root it follows.
+        let named = requests
+            .first()
+            .and_then(|request| roster::snapshot::Snapshot::decode(request.payload()).ok())
+            .and_then(|body| body.named_key().ok());
+        let Some(key) = named else {
+            return Outcome::refused("the root names no founder key".to_owned());
+        };
+        let root = match identity::detached::finish_all(requests, &key, signatures) {
+            Ok(mut artifacts) => artifacts.pop(),
+            Err(cause) => {
+                return Outcome::refused(format!(
+                    "that signature does not match what was prepared, so the root was not \
+                     kept: {cause}"
+                ));
+            }
+        };
+        let Some(root) = root else { return Outcome::refused("no root came back".to_owned()) };
+        let published = node.publish_root(&root).await;
+        self.end_founder_session(label).await;
+        if !published {
+            return Outcome::Reported(self.report().await.with_note(
+                "the act is in the roster; the founder's root over it was not one this \
+                 device's roster would take, so light members learn of it from an admin's next",
+            ));
+        }
+        self.keep_founder_root(&network, &root).await;
+        Outcome::Reported(self.report().await.with_note("the founder signed the root over it"))
+    }
+
+    /// Keeps the founder's `root` with every approved invite anchored to the
+    /// founder whose device it admits: the device takes the network only with a
+    /// root its invite's anchor signed, and nothing here can sign as the founder
+    /// once the words are gone.
+    async fn keep_founder_root(&self, network: &Arc<Network>, root: &[u8]) {
+        let Ok(raw) = roster::snapshot::RawSnapshot::decode(root) else { return };
+        let author = raw.body().author;
+        let node = network.node();
+        let Ok(vouched) = node.state_at(&raw.body().heads).await else { return };
+        let _held = self.invites_lock.lock().await;
+        let Ok(mut invites) = Self::invites_of(network).await else { return };
+        let kept = invites.keep_root(&author, root, crate::state::wall_seconds(), |request| {
+            admitted_device(&vouched, &request.applicant).is_some()
+        });
+        if kept && Self::save_invites(network, &invites).is_ok() {
+            Self::keep_checkpoint(network, true).await;
+        }
+    }
+
+    /// Hands a batch's signatures to the act that was waiting for them.
+    async fn resumed(
+        &self,
+        resume: Resume,
+        requests: &[identity::detached::SigningRequest],
+        signatures: &[Vec<u8>],
+    ) -> Outcome {
+        let requests = requests.to_vec();
         match resume {
+            Resume::FounderRoot { label } => {
+                self.founder_root_signed(&label, &requests, signatures).await
+            }
+            Resume::Recovering { label, temporary, prepared_against } => {
+                self.recovery_signed(&label, temporary, &prepared_against, &requests, signatures)
+                    .await
+            }
             Resume::Revoking { label, prepared_against } => {
                 self.revocation_signed(&label, &prepared_against, &requests, signatures).await
             }
@@ -2492,7 +3722,21 @@ impl Service {
         requests: &[identity::detached::SigningRequest],
         signatures: &[Vec<u8>],
     ) -> core::result::Result<Vec<Vec<u8>>, Outcome> {
-        let key = network.node().identity().signing_key().public_key();
+        // The key the batch was prepared for: this device's, or the founder's,
+        // as the network holds it now.
+        let own = network.node().identity().signing_key().public_key();
+        let founder = match network.node().state().await {
+            Ok(state) => founder_public(&state.params.founder),
+            Err(_) => None,
+        };
+        let key = match founder {
+            Some(founder)
+                if requests.first().is_some_and(|request| request.key() == founder.key_id()) =>
+            {
+                founder
+            }
+            _ => own,
+        };
         let artifacts = identity::detached::finish_all(requests, &key, signatures).map_err(|cause| {
             Outcome::refused(format!(
                 "that signature does not match what was prepared, so nothing was signed: {cause}"
@@ -2695,11 +3939,26 @@ impl Service {
                 Ok(artifacts) => artifacts,
                 Err(refused) => return refused,
             };
-        let mut artifacts = artifacts.into_iter();
+        let mut artifacts = artifacts.into_iter().peekable();
         let Some(signed) = artifacts.next() else {
             return Outcome::refused("the batch held no revocation".to_owned());
         };
-        let carried = self.carry_revocation(&network, signed).await;
+        let mut carried = self.carry_revocation(&network, signed).await;
+        // The devices revoked again in the same act, after it.
+        while let Some(again) =
+            artifacts.next_if(|artifact| roster::sign::RawOperation::decode(artifact).is_ok())
+        {
+            if let Err(cause) = network.node().admit_without_activating(&again).await {
+                carried = Outcome::Failed {
+                    message: format!(
+                        "the revocation is held, and a device it brought back was not revoked \
+                         again: {cause}"
+                    ),
+                    left_behind: Vec::new(),
+                };
+                break;
+            }
+        }
         self.with_the_snapshot(&network, carried, artifacts.next()).await
     }
 
@@ -2808,7 +4067,7 @@ impl Service {
                 return Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() };
             }
         };
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
@@ -2868,12 +4127,13 @@ impl Service {
                 };
             }
         };
-        if !state.is_admin(&node.identity().device_id()) {
+        if !state.is_admin(&node.identity().device_id()) && !as_founder() {
             return Outcome::refused(
-                "only an admin of the network admits a batch. Nothing was signed.".to_owned(),
+                "only an admin of the network, or its founder, admits a batch. Nothing was signed."
+                    .to_owned(),
             );
         }
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
@@ -2918,18 +4178,19 @@ impl Service {
 
         let identity = node.identity();
         let prepared_against = node.moment().await;
+        let author = author_in(identity, &state);
         let core = match roster::types::OperationCore::new(
             crate::clock::signing_time(),
-            identity.signing_key().algorithm(),
+            author.algorithm,
             roster::types::OperationBody::AdmitBatch(header),
             prepared_against.heads.clone(),
-            identity.signing_key().key_id(),
+            author.key_id,
             state.network,
         ) {
             Ok(core) => core,
             Err(cause) => return Outcome::refused(format!("{cause}. Nothing was signed.")),
         };
-        if !identity.signing_key().answers_here() {
+        if !signs_here(identity) {
             let requests = Self::with_owed_snapshot(&node, core::slice::from_ref(&core)).await;
             let resume = Resume::AdmittingBatch { label: label.clone(), entries, prepared_against };
             return self.wants_signatures(requests, identity, &label, resume).await;
@@ -3027,12 +4288,12 @@ impl Service {
                 };
             }
         };
-        if !state.is_admin(&network.node().identity().device_id()) {
+        if !state.is_admin(&network.node().identity().device_id()) && !as_founder() {
             return Outcome::refused(
                 "only an admin of the network sets its anchors. Nothing was signed.".to_owned(),
             );
         }
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
@@ -3098,12 +4359,12 @@ impl Service {
             message: format!("the roster does not describe a network: {cause}"),
             left_behind: Vec::new(),
         })?;
-        if !state.is_admin(&network.node().identity().device_id()) {
+        if !state.is_admin(&network.node().identity().device_id()) && !as_founder() {
             return Err(Outcome::refused(format!(
                 "only an admin of the network {act}. Nothing was signed."
             )));
         }
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Err(Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             )));
@@ -3132,7 +4393,7 @@ impl Service {
                 };
             }
         };
-        if !state.is_admin(&network.node().identity().device_id()) {
+        if !state.is_admin(&network.node().identity().device_id()) && !as_founder() {
             return Outcome::refused(
                 "only an admin of the network provisions boards for it: this device is not one."
                     .to_owned(),
@@ -3298,6 +4559,11 @@ impl Service {
             Ok(found) => found,
             Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was signed.")),
         };
+        if let Some(refusal) =
+            founders_alone(&state, &found.record.id, "peerfectly ipv4 give <device>")
+        {
+            return refusal;
+        }
         let named = crate::control::Named::new(&found.record.id, Some(found.record.name.clone()));
         let range = state.params.ipv4_range();
         if let Some(address) = found.settings.ipv4.and_then(|offset| range.address_at(offset)) {
@@ -3355,19 +4621,20 @@ impl Service {
         let node = network.node();
         let identity = node.identity();
         let prepared_against = node.moment().await;
+        let author = author_in(identity, state);
         let core = match roster::types::OperationCore::new(
             issued,
-            identity.signing_key().algorithm(),
+            author.algorithm,
             body,
             prepared_against.heads.clone(),
-            identity.signing_key().key_id(),
+            author.key_id,
             state.network,
         ) {
             Ok(core) => core,
             Err(cause) => return Outcome::refused(cause.to_string()),
         };
 
-        if !identity.signing_key().answers_here() {
+        if !signs_here(identity) {
             let requests = Self::with_owed_snapshot(node, core::slice::from_ref(&core)).await;
             let resume = Resume::ChangingParameters { label: label.clone(), prepared_against };
             return self.wants_signatures(requests, identity, label, resume).await;
@@ -3409,12 +4676,29 @@ impl Service {
     /// Puts a signed relay change into the roster, bringing the network up to
     /// carry it — as every administrative act does.
     async fn carry_relay_change(&self, network: &Arc<Network>, signed: Vec<u8>) -> Outcome {
-        match self.admit_to(network, &signed).await {
+        // Refused by the roster, nothing changed; held, it changed, whether or
+        // not the network comes up now to carry it. Said apart: a phone, whose
+        // network only the app can bring up, said only that it would not come
+        // up, and a person who had replaced the founder's words did it again
+        // with the old ones (2026-11-24).
+        if let Err(cause) = network.node().admit_without_activating(&signed).await {
+            return Outcome::Failed {
+                message: format!("nothing was changed: {cause}"),
+                left_behind: Vec::new(),
+            };
+        }
+        match self.carried_by(network).await {
             Ok(false) => Outcome::Reported(self.report().await),
             Ok(true) => Outcome::Reported(
                 self.report().await.with_note("the network was brought up to carry it"),
             ),
-            Err(cause) => Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() },
+            Err(cause) => Outcome::Failed {
+                message: format!(
+                    "the change is signed and held, and takes effect here: the network would not \
+                     come up to carry it ({cause}), so it goes out when the network is on"
+                ),
+                left_behind: Vec::new(),
+            },
         }
     }
 
@@ -3441,12 +4725,26 @@ impl Service {
             (id, unsigned.lapsed())
         };
         self.tidy_after(lapsed).await;
+        let founder = if as_founder() {
+            match self.named(label).await {
+                Ok(network) => network
+                    .node()
+                    .state()
+                    .await
+                    .ok()
+                    .map(|state| crate::control::FounderPublic::of(&state.params.founder)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         Outcome::NeedsSignatures(crate::control::SignaturesWanted {
             id,
-            key: reference_of(identity),
+            key: if founder.is_some() { "founder".to_owned() } else { reference_of(identity) },
             network: label.to_string(),
             items,
             keys: self.keys.keys_directory(),
+            founder,
         })
     }
 
@@ -3478,7 +4776,11 @@ impl Service {
         node: &Arc<crate::node::Node>,
         cores: &[roster::types::OperationCore],
     ) -> Vec<identity::detached::SigningRequest> {
-        let key = node.identity().signing_key().public_key();
+        let founder = match node.state().await {
+            Ok(state) if as_founder() => founder_public(&state.params.founder),
+            _ => None,
+        };
+        let key = founder.unwrap_or_else(|| node.identity().signing_key().public_key());
         // The root that follows is signed by this daemon with the attestation
         // key once the operations are in: nothing about it is the person's to
         // authorise, so it is not part of what they are asked to sign.
@@ -3711,8 +5013,14 @@ impl Service {
         // A network being joined has no name here yet: its label is a
         // placeholder until it arrives, and a person shown `network` would be
         // shown a word that means nothing. Empty says *the one being joined*.
-        let network =
-            if matches!(then, Unfinished::Joining { .. }) { String::new() } else { asked.network };
+        // A network being joined has no name here yet, and one being recovered
+        // keeps the one it has: the directory its new key is made in is a
+        // passing one.
+        let network = match &then {
+            Unfinished::Joining { .. } => String::new(),
+            Unfinished::Recovering { label, .. } => label.to_string(),
+            Unfinished::Founding { .. } => asked.network,
+        };
 
         let issued = crate::clock::now_ms();
         let id = format!("k{issued:x}");
@@ -3771,6 +5079,9 @@ impl Service {
         }
 
         match held.then {
+            Unfinished::Recovering { label, revoke } => {
+                AS_FOUNDER.scope(true, self.recover(Some(&label), &revoke)).await
+            }
             Unfinished::Founding { label, wanted } => {
                 self.finish_founding(label, *wanted, &held.by).await
             }
@@ -3783,6 +5094,35 @@ impl Service {
     /// Answers a command.
     async fn answer(&self, command: Command) -> Outcome {
         match command {
+            // The act inside, with the founder's key as its author. A founding
+            // and a join are not acts the founder signs, and nothing nests.
+            Command::AsFounder(inner) => match *inner {
+                Command::Found { .. } | Command::Join { .. } | Command::AsFounder(_) => {
+                    Outcome::refused(
+                        "that is not an act the founder's words sign. Nothing was signed."
+                            .to_owned(),
+                    )
+                }
+                inner => AS_FOUNDER.scope(true, Box::pin(self.answer(inner))).await,
+            },
+            Command::ReplaceFounder { network, founder } => match Self::wanted(network) {
+                Ok(label) => {
+                    AS_FOUNDER.scope(true, self.replace_founder(label.as_ref(), &founder)).await
+                }
+                Err(refusal) => Self::said(Err(refusal)),
+            },
+            Command::FounderSession { network, transport } => match Self::wanted(network) {
+                Ok(label) => self.founder_session(label.as_ref(), &transport).await,
+                Err(refusal) => Self::said(Err(refusal)),
+            },
+            Command::History { network, by } => match Self::wanted(network) {
+                Ok(label) => self.history(label.as_ref(), by.as_deref()).await,
+                Err(refusal) => Self::said(Err(refusal)),
+            },
+            Command::Recover { network, revoke } => match Self::wanted(network) {
+                Ok(label) => AS_FOUNDER.scope(true, self.recover(label.as_ref(), &revoke)).await,
+                Err(refusal) => Self::said(Err(refusal)),
+            },
             Command::Status => Outcome::Reported(self.report().await),
             // A reading command that names a network is asking about that one,
             // so a name this device does not hold is a mistake to say rather
@@ -3924,6 +5264,30 @@ impl Service {
                     Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
                 }
             },
+            Command::RevokeFrom { network, target, reason, from, again } => {
+                let Some(from) = roster::id::OperationId::from_hex(from.trim()) else {
+                    return Outcome::refused(format!(
+                        "`{}` is not an act's id as `history` lists it. Nothing was signed.",
+                        crate::control::shown(&from)
+                    ));
+                };
+                if !as_founder() {
+                    return Outcome::refused(
+                        "voiding an admin's acts is the founder's to sign: revoke it with \
+                         `--founder`. Nothing was signed."
+                            .to_owned(),
+                    );
+                }
+                match Self::wanted(network) {
+                    Ok(label) => {
+                        self.revoke_from(label.as_ref(), &target, &reason, Some(&from), &again)
+                            .await
+                    }
+                    Err(cause) => {
+                        Outcome::Failed { message: cause.to_string(), left_behind: Vec::new() }
+                    }
+                }
+            }
             Command::StageBatch { network, devices } => {
                 let mut staged = self.staged.lock().await;
                 if staged.0 != network {
@@ -4032,7 +5396,25 @@ impl Service {
             }
             Command::Forget { label, last_admin } => self.forget(&label, last_admin).await,
             Command::Waiting => self.waiting_on().await,
-            Command::Found { label, name, suffix, relay, ipv4_range, devices, window_days } => {
+            Command::Found {
+                founder,
+                label,
+                name,
+                suffix,
+                relay,
+                ipv4_range,
+                devices,
+                window_days,
+            } => {
+                let founder = match founder.keys() {
+                    Ok(keys) => keys,
+                    Err(refusal) => {
+                        return Outcome::Failed {
+                            message: format!("{refusal}. Nothing was signed."),
+                            left_behind: Vec::new(),
+                        };
+                    }
+                };
                 let name = match crate::names::usable(&name) {
                     Ok(name) => name,
                     Err(unusable) => {
@@ -4079,6 +5461,7 @@ impl Service {
                     }
                 };
                 let wanted = crate::founding::Founding {
+                    founder,
                     ipv4_range,
                     name,
                     suffix,
@@ -4115,6 +5498,34 @@ impl Service {
         reason: &str,
         voiding_agreed: bool,
     ) -> Outcome {
+        self.revoke_anchored(which, target, reason, voiding_agreed, None, &[]).await
+    }
+
+    /// A founder revocation voiding the target's acts from `from` on: the
+    /// person chose them, from `history`, before the words were asked.
+    async fn revoke_from(
+        &self,
+        which: Option<&Label>,
+        target: &crate::control::Target,
+        reason: &str,
+        from: Option<&roster::id::OperationId>,
+        again: &[String],
+    ) -> Outcome {
+        self.revoke_anchored(which, target, reason, true, from, again).await
+    }
+
+    /// Revokes a device, anchored off recent batches or, with `from`, so as to
+    /// void the target's acts from that one on, revoking `again` in the same
+    /// act the devices named there that the voiding brings back.
+    async fn revoke_anchored(
+        &self,
+        which: Option<&Label>,
+        target: &crate::control::Target,
+        reason: &str,
+        voiding_agreed: bool,
+        from: Option<&roster::id::OperationId>,
+        again: &[String],
+    ) -> Outcome {
         let network = match self.which(which).await {
             Ok(network) => network,
             Err(cause) => {
@@ -4137,12 +5548,49 @@ impl Service {
             Ok(expulsion) => expulsion,
             Err(refusal) => return Outcome::Failed { message: refusal, left_behind: Vec::new() },
         };
+        if let Some(refusal) =
+            founders_alone(&state, &expulsion.device, "peerfectly revoke <device> <reason>")
+        {
+            return refusal;
+        }
 
         let prepared_against = node.moment().await;
         // Anchored off recent batches, so no node still fetching one is held
-        // back from the revocation; see `Node::urgent_anchor`.
-        let anchor = node.urgent_anchor(&expulsion.device).await;
+        // back from the revocation; see `Node::urgent_anchor`. Or, where the
+        // founder voids the target's acts from one chosen, beneath them.
+        let anchor = match from {
+            None => node.urgent_anchor(&expulsion.device).await,
+            Some(from) => match node.voiding_anchor(&expulsion.device, from).await {
+                Ok(anchor) => anchor,
+                Err(roster::roster::VoidingRefused::NotItsAct) => {
+                    return Outcome::refused(format!(
+                        "that act is not one of {}'s held here. Nothing was signed.",
+                        crate::control::shown(&expulsion.name)
+                    ));
+                }
+                Err(roster::roster::VoidingRefused::FounderRestsOn(act)) => {
+                    let directory = crate::describing::Directory::of(&state, &[]);
+                    let rests = node
+                        .held_with_verdicts()
+                        .await
+                        .map(|(held, _)| held)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|(operation, _)| operation.id() == act)
+                        .map(|(operation, _)| directory.act(operation.body()).to_string())
+                        .unwrap_or_else(|| act.to_hex());
+                    return Outcome::refused(format!(
+                        "the founder's own act ({rests}) rests on those acts, and voiding them \
+                         would void it too: choose an act after it. Nothing was signed."
+                    ));
+                }
+            },
+        };
         let voids = voided_note(&state, &expulsion, &anchor);
+        let again = match revoked_again(&anchor, again, reason) {
+            Ok(again) => again,
+            Err(refusal) => return Outcome::refused(format!("{refusal}. Nothing was signed.")),
+        };
         let heads = anchor.heads;
         if let (Some(voids), false) = (&voids, voiding_agreed) {
             return Outcome::WouldVoid {
@@ -4155,7 +5603,7 @@ impl Service {
         // key is declared, not exercised. Signing anyway would put this
         // network's authority behind a key the platform cannot protect, which is
         // the finding this change exists to close — a role is not a capability.
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
@@ -4164,14 +5612,27 @@ impl Service {
         // Where the signing key is somewhere this process cannot reach, the act
         // stops here and somebody else signs these exact bytes. Asked before
         // signing rather than found out by signing; see `answers_here`.
-        if !identity.signing_key().answers_here() {
-            let core = match crate::revoking::core(&expulsion, identity, &state, heads) {
+        if !signs_here(identity) {
+            let author = author_in(identity, &state);
+            let core = match crate::revoking::core(&expulsion, &author, &state, heads) {
                 Ok(core) => core,
                 Err(refusal) => {
                     return Outcome::Failed { message: refusal, left_behind: Vec::new() };
                 }
             };
-            let requests = Self::with_owed_snapshot(&node, core::slice::from_ref(&core)).await;
+            // Revoked again after the voiding, resting on it: brought back by
+            // it, and out again by the founder's own act, final.
+            let mut cores = vec![core];
+            for device in &again {
+                let parents = cores.first().map(|first| vec![first.id()]).unwrap_or_default();
+                match crate::revoking::core(device, &author, &state, parents) {
+                    Ok(core) => cores.push(core),
+                    Err(refusal) => {
+                        return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                    }
+                }
+            }
+            let requests = Self::with_owed_snapshot(&node, &cores).await;
             let label = network.label().clone();
             let resume = Resume::Revoking { label: label.clone(), prepared_against };
             return self.wants_signatures(requests, identity, &label, resume).await;
@@ -4268,24 +5729,31 @@ impl Service {
             Ok(renaming) => renaming,
             Err(refusal) => return Outcome::Failed { message: refusal, left_behind: Vec::new() },
         };
+        if let Some(refusal) =
+            founders_alone(&state, &renaming.device, "peerfectly rename <device> <new name>")
+        {
+            return refusal;
+        }
 
         let identity = node.identity();
         let prepared_against = node.moment().await;
         let heads = prepared_against.heads.clone();
 
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
         }
 
-        if !identity.signing_key().answers_here() {
-            let core = match crate::renaming::core(&renaming, identity, &state, heads) {
-                Ok(core) => core,
-                Err(refusal) => {
-                    return Outcome::Failed { message: refusal, left_behind: Vec::new() };
-                }
-            };
+        if !signs_here(identity) {
+            let core =
+                match crate::renaming::core(&renaming, &author_in(identity, &state), &state, heads)
+                {
+                    Ok(core) => core,
+                    Err(refusal) => {
+                        return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                    }
+                };
             let requests = Self::with_owed_snapshot(&node, core::slice::from_ref(&core)).await;
             let label = network.label().clone();
             let resume = Resume::Renaming { label: label.clone(), prepared_against };
@@ -4302,9 +5770,9 @@ impl Service {
     }
 
     /// For every network: marks this device as having been an admin while it
-    /// is one, and destroys the signing key of one demoted once the demotion is
-    /// settled (`crate::demoting`). Quiet when there is nothing to do, which is
-    /// every pass but one.
+    /// is one, and destroys the signing key of one demoted as soon as it sees
+    /// itself a member (`crate::demoting`). Quiet when there is nothing to do,
+    /// which is every pass but one.
     async fn settle_demotions(&self) {
         for network in self.all().await {
             let node = network.node();
@@ -4326,7 +5794,11 @@ impl Service {
             if self.settled.lock().await.contains(network.label()) {
                 continue;
             }
-            let due = resuming || (paths.was_admin().exists() && node.settled_member(&me).await);
+            // Only the founder key demotes an admin, and nothing voids its work
+            // but the founder's own words used twice at once: a demotion seen is
+            // final, and the key goes now rather than when the window has moved
+            // past it (offline-founder design §17).
+            let due = resuming || (paths.was_admin().exists() && state.devices.contains_key(&me));
             if !due {
                 continue;
             }
@@ -4336,8 +5808,8 @@ impl Service {
                     node.record(
                         crate::node::Severity::Event,
                         "keys",
-                        "this device was demoted, and the demotion is settled: its signing key \
-                         for this network was destroyed, and it holds none, as a member",
+                        "this device was demoted by the founder: its signing key for this \
+                         network was destroyed, and it holds none, as a member",
                     )
                     .await;
                 }
@@ -4345,7 +5817,7 @@ impl Service {
                     node.record(
                         crate::node::Severity::Problem,
                         "keys",
-                        format!("the signing key of a settled demotion would not go: {cause}"),
+                        format!("the signing key of a demotion would not go: {cause}"),
                     )
                     .await;
                 }
@@ -4432,24 +5904,31 @@ impl Service {
             Ok(demotion) => demotion,
             Err(refusal) => return Outcome::Failed { message: refusal, left_behind: Vec::new() },
         };
+        if let Some(refusal) =
+            founders_alone(&state, &demotion.device, "peerfectly demote <device>")
+        {
+            return refusal;
+        }
 
         let identity = node.identity();
         let prepared_against = node.moment().await;
         let heads = prepared_against.heads.clone();
 
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this network makes this device an admin, and {refusal}. Nothing was signed."
             ));
         }
 
-        if !identity.signing_key().answers_here() {
-            let core = match crate::demoting::core(&demotion, identity, &state, heads) {
-                Ok(core) => core,
-                Err(refusal) => {
-                    return Outcome::Failed { message: refusal, left_behind: Vec::new() };
-                }
-            };
+        if !signs_here(identity) {
+            let core =
+                match crate::demoting::core(&demotion, &author_in(identity, &state), &state, heads)
+                {
+                    Ok(core) => core,
+                    Err(refusal) => {
+                        return Outcome::Failed { message: refusal, left_behind: Vec::new() };
+                    }
+                };
             let requests = Self::with_owed_snapshot(&node, core::slice::from_ref(&core)).await;
             let label = network.label().clone();
             let resume = Resume::Demoting { label: label.clone(), prepared_against };
@@ -4494,8 +5973,8 @@ impl Service {
 
     /// Puts a signed demotion into the roster, bringing the network up to carry
     /// it, as every administrative act does. A refusal is the roster's: one it
-    /// takes into its graph and gives no effect — a founder demoted by another
-    /// admin — is said as plainly as one it turns away.
+    /// takes into its graph and gives no effect is said as plainly as one it
+    /// turns away.
     async fn carry_demotion(&self, network: &Arc<Network>, signed: Vec<u8>) -> Outcome {
         if let Err(cause) = network.node().admit_without_activating(&signed).await {
             return Outcome::Failed {
@@ -4504,12 +5983,7 @@ impl Service {
             };
         }
         if let Some(reason) = network.node().without_effect(&signed).await {
-            let why = match reason {
-                roster::state::Invalidity::FounderProtected => {
-                    "a founder can be demoted only by itself".to_owned()
-                }
-                other => other.kind().replace('_', " "),
-            };
+            let why = reason.kind().replace('_', " ");
             return Outcome::Failed {
                 message: format!(
                     "nothing was demoted: the roster gives this demotion no effect ({}): {why}",
@@ -4595,12 +6069,22 @@ impl Service {
         let Ok(state) = node.state().await else {
             return Outcome::refused(format!("`{label}` has no state to invite into"));
         };
-        if !state.is_admin(&node.identity().device_id()) {
+        // A device revoked here invites nobody (offline-founder design §16).
+        if let Some(by) = Self::revoked_by(&network).await {
             return Outcome::refused(format!(
-                "only an admin of `{label}` can invite a device into it. Nothing was issued."
+                "this device was revoked from `{label}` by {by}: it invites nobody. Nothing was \
+                 issued."
             ));
         }
-        if let Some(refusal) = self.keys.admin_refusal() {
+        // A member may open one for the founder to approve: the invite itself
+        // signs nothing, and its approval is the founder's.
+        if !state.is_admin(&node.identity().device_id()) && !as_founder() {
+            return Outcome::refused(format!(
+                "only an admin of `{label}`, or its founder, can invite a device into it. Nothing \
+                 was issued."
+            ));
+        }
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "admitting a device is an admin's act, and {refusal}. Nothing was issued."
             ));
@@ -4659,10 +6143,20 @@ impl Service {
             ));
         }
         let name = invited.name.clone();
+        // The key that vouches for what the device is given: this admin's
+        // attestation key, which signs the root it delivers; on a member, the
+        // founder's, whose root over the admission is kept with the invite.
+        let me = network.node().identity();
+        let anchor = if state.is_admin(&me.device_id()) {
+            me.attestation_key().key_id()
+        } else {
+            state.params.founder.signing_id()
+        };
         let record = match crate::invites::Record::issue(
             &relay,
             state.network,
             state.params.ipv4_range(),
+            anchor,
             invited,
             now,
             lifetime,
@@ -4670,6 +6164,13 @@ impl Service {
             Ok(record) => record,
             Err(cause) => return Self::said(Err(cause)),
         };
+        // The network's suffix, so a device whose names would overlap it says so
+        // before it asks (offline-founder design §21).
+        let mut record = record;
+        match record.invite.clone().with_suffix(state.params.suffix.clone()) {
+            Ok(invite) => record.invite = invite,
+            Err(cause) => return Outcome::refused(cause.to_string()),
+        }
         let text = record.invite.to_text();
         let expires_at = record.expires_at;
         invites.add(record);
@@ -4769,6 +6270,7 @@ impl Service {
                     fingerprint: crate::joining::fingerprint(&request.applicant.signing),
                     arrived_at: request.arrived_at,
                     conflicts: request.applicant.conflicts.clone(),
+                    admin: record.invited.role == roster::types::Role::Admin,
                     taken: state
                         .as_ref()
                         .filter(|_| record.standing(now) == crate::invites::Standing::Requested)
@@ -4933,11 +6435,9 @@ impl Service {
             if open.is_empty() && approved.is_empty() {
                 continue;
             }
-            let node = Arc::clone(network.node());
-            let Ok(state) = node.state().await else { continue };
-            if !state.is_admin(&node.identity().device_id()) {
-                continue;
-            }
+            // Dialled whoever this device is: an invite is here only because an
+            // admin, or the founder's words, opened it, and its approval is
+            // signed by one of them.
             for record in open {
                 let this = Arc::clone(self);
                 let network = Arc::clone(&network);
@@ -5077,7 +6577,7 @@ impl Service {
         };
         let mut taken = met;
         if !taken {
-            let Ok(delivery) = self.delivery_of(network).await else { return };
+            let Ok(delivery) = self.delivery_of(network, Some(record)).await else { return };
             let rendezvous =
                 transport_convesso::enrolment::rendezvous_key(&record.invite.rendezvous_seed());
             let mut destinations = Vec::new();
@@ -5122,9 +6622,15 @@ impl Service {
 
     /// What a device is given when it is brought the network: everything this
     /// device holds, as an admin delivers it.
+    ///
+    /// For the device of `record`, the root its invite's anchor signed
+    /// (`enrollment::adopt::adopt_anchored`): this admin's own, made now, where
+    /// the anchor is this device's attestation key; the founder's, kept with
+    /// the invite when it was approved, where the anchor is the founder.
     async fn delivery_of(
         &self,
         network: &Arc<Network>,
+        record: Option<&crate::invites::Record>,
     ) -> core::result::Result<crate::admitting::Delivery, String> {
         let paths = &network.paths;
         let node = network.node();
@@ -5143,12 +6649,22 @@ impl Service {
         // nobody. A member that is not an admin delivers the root it holds.
         let admin =
             node.state().await.is_ok_and(|state| state.is_admin(&node.identity().device_id()));
-        let snapshot = if admin {
-            root_after(node.identity(), base.clone(), &operations, &pieces, held.as_deref(), &[])
-                .ok()
-                .or(held)
-        } else {
-            held
+        let anchored_here = record.is_none_or(|record| {
+            record.invite.anchor == node.identity().attestation_key().key_id()
+        });
+        let snapshot = match record.and_then(|record| record.root.clone()) {
+            Some(kept) if !anchored_here => Some(kept),
+            _ if admin => root_after(
+                node.identity(),
+                base.clone(),
+                &operations,
+                &pieces,
+                held.as_deref(),
+                &[],
+            )
+            .ok()
+            .or(held),
+            _ => held,
         };
         Ok(crate::admitting::Delivery { operations, pieces, snapshot, base })
     }
@@ -5239,7 +6755,7 @@ impl Service {
                 let delivery = match &delivery {
                     Some(delivery) => Arc::clone(delivery),
                     None => {
-                        let Ok(read) = self.delivery_of(&network).await else { break };
+                        let Ok(read) = self.delivery_of(&network, None).await else { break };
                         Arc::clone(delivery.insert(Arc::new(read)))
                     }
                 };
@@ -5287,7 +6803,7 @@ impl Service {
         };
         let label = network.label().clone();
         let node = Arc::clone(network.node());
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "admitting a device is an admin's act, and {refusal}. Nothing was signed."
             ));
@@ -5295,9 +6811,10 @@ impl Service {
         let Ok(state) = node.state().await else {
             return Outcome::refused(format!("`{label}` has no state to admit into"));
         };
-        if !state.is_admin(&node.identity().device_id()) {
+        if !state.is_admin(&node.identity().device_id()) && !as_founder() {
             return Outcome::refused(format!(
-                "only an admin of `{label}` can admit a device into it. Nothing was signed."
+                "only an admin of `{label}`, or its founder, can admit a device into it. Nothing \
+                 was signed."
             ));
         }
         let now = crate::state::wall_seconds();
@@ -5321,10 +6838,24 @@ impl Service {
         } else {
             None
         };
+        // Admitting an admin, or replacing one, is the founder's to sign.
+        if record.invited.role == roster::types::Role::Admin && !as_founder() {
+            return Outcome::refused(format!(
+                "`{}` asks to join as an admin, and only the founder governs admins: approve it \
+                 with the founder's words, `peerfectly approve {} --founder`. Nothing was signed.",
+                crate::control::shown(name),
+                crate::control::shown(name)
+            ));
+        }
+        if let Some(refusal) = taken.as_ref().and_then(|taken| {
+            founders_alone(&state, &taken.device, "peerfectly approve <name> --replace")
+        }) {
+            return refusal;
+        }
 
         // Where the key is out of reach, the whole admission — the revocation
         // too, when there is one — is prepared as one batch and signed at once.
-        if !node.identity().signing_key().answers_here() {
+        if !signs_here(node.identity()) {
             return self.approving_batch(&network, &record, &request, taken).await;
         }
 
@@ -5364,14 +6895,19 @@ impl Service {
         let prepared = crate::admitting::admission_core(
             &request.applicant,
             &record.invited,
-            identity,
+            &author_in(identity, &state),
             &state,
             heads,
             keeping_the_name,
         )
         .and_then(|(operation, spec_name)| {
-            crate::admitting::settings_core(&record.invited, identity, &state, &operation)
-                .map(|settings| (operation, spec_name, settings))
+            crate::admitting::settings_core(
+                &record.invited,
+                &author_in(identity, &state),
+                &state,
+                &operation,
+            )
+            .map(|settings| (operation, spec_name, settings))
         });
         let (operation, spec_name, settings) = match prepared {
             Ok(prepared) => prepared,
@@ -5417,7 +6953,7 @@ impl Service {
                 let expulsion = expulsion_of(taken);
                 let revocation = match crate::revoking::core(
                     &expulsion,
-                    identity,
+                    &author_in(identity, &state),
                     &state,
                     prepared_against.heads.clone(),
                 ) {
@@ -5440,14 +6976,19 @@ impl Service {
         let prepared = crate::admitting::admission_core(
             &request.applicant,
             &record.invited,
-            identity,
+            &author_in(identity, &state),
             &state,
             heads,
             taken.is_some(),
         )
         .and_then(|(admission, spec_name)| {
-            crate::admitting::settings_core(&record.invited, identity, &state, &admission)
-                .map(|settings| (admission, spec_name, settings))
+            crate::admitting::settings_core(
+                &record.invited,
+                &author_in(identity, &state),
+                &state,
+                &admission,
+            )
+            .map(|settings| (admission, spec_name, settings))
         });
         let (admission, spec_name, settings) = match prepared {
             Ok(prepared) => prepared,
@@ -5556,10 +7097,21 @@ impl Service {
     /// an admin's.
     async fn begin_joining(&self, text: &str, name: &str, admin: bool) -> Outcome {
         let text = text.trim();
-        if let Err(cause) = enrollment::Invite::from_text(text) {
-            return Outcome::refused(format!("that is not an invite this build reads: {cause}"));
+        let read = match enrollment::Invite::from_text(text) {
+            Ok(read) => read,
+            Err(cause) => {
+                return Outcome::refused(format!(
+                    "that is not an invite this build reads: {cause}"
+                ));
+            }
+        };
+        if let Some(refusal) = self.issued_by_one_revoked_here(&read).await {
+            return refusal;
         }
-        if admin && let Some(reason) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.names_would_overlap(&read).await {
+            return refusal;
+        }
+        if admin && let Some(reason) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "this machine cannot join a network as an admin: {reason}. It can join as a \
                  member: run the join again without --admin, with an invite made for a member."
@@ -5599,6 +7151,96 @@ impl Service {
             return waiting;
         }
         self.join_under(label, name, text.to_owned()).await
+    }
+
+    /// The refusal of an invite into a network this device holds, issued by a
+    /// device it holds as revoked there, or as no admin there (offline-founder
+    /// design §18). Said before anything is sent: the request would otherwise
+    /// reach that device, be approved by it, and be refused only when the
+    /// network arrived.
+    ///
+    /// An anchor this device cannot place — an admin admitted after its last
+    /// sync — is not judged here; the delivery is, against what is held.
+    async fn issued_by_one_revoked_here(&self, invite: &enrollment::Invite) -> Option<Outcome> {
+        for network in self.all().await {
+            let node = network.node();
+            let Ok(state) = node.state().await else { continue };
+            if state.network != invite.network {
+                continue;
+            }
+            if state.params.founder.signing_id() == invite.anchor {
+                return None;
+            }
+            let attests = |keys: &[roster::types::KeyEntry]| {
+                keys.iter().any(|entry| {
+                    entry.purpose == roster::types::KeyPurpose::Attestation
+                        && entry.key_id() == invite.anchor
+                })
+            };
+            if let Some(record) = state.devices.values().find(|record| attests(&record.keys)) {
+                if record.role == roster::types::Role::Admin {
+                    return None;
+                }
+                return Some(Outcome::refused(format!(
+                    "this invite was issued by {}, which is not an admin of `{}` on this \
+                     device. Nothing was sent: ask an admin of the network for an invite.",
+                    crate::control::Named::new(&record.id, Some(record.name.clone())),
+                    network.label()
+                )));
+            }
+            // Revoked devices are no longer in the state: their admission, among
+            // the operations held, still names their keys.
+            let held = node.held_with_verdicts().await.map(|(held, _)| held).unwrap_or_default();
+            for (operation, _) in &held {
+                let spec = match operation.body() {
+                    roster::types::OperationBody::AddDevice(spec) => spec,
+                    roster::types::OperationBody::CreateNetwork { device, .. } => device,
+                    _ => continue,
+                };
+                let Ok(device) = spec.device_id() else { continue };
+                if attests(&spec.keys) && state.revoked.contains(&device) {
+                    return Some(Outcome::refused(format!(
+                        "this invite was issued by {}, which this device holds as revoked in \
+                         `{}`. Nothing was sent, and the invite should not be trusted.",
+                        crate::control::Named::new(&device, Some(spec.name.clone())),
+                        network.label()
+                    )));
+                }
+            }
+            return None;
+        }
+        None
+    }
+
+    /// The refusal of a join into another network whose suffix, as the invite
+    /// says it, overlaps one this device holds (offline-founder design §21).
+    ///
+    /// Said before anything is sent, so no admin approves a device that will
+    /// not hold the network; the delivered roster's suffix is judged again, and
+    /// this is only the issuer's word. Typically the old network of the same
+    /// name, still held while a new one is founded.
+    async fn names_would_overlap(&self, invite: &enrollment::Invite) -> Option<Outcome> {
+        if invite.suffix.is_empty() {
+            return None;
+        }
+        for network in self.all().await {
+            let Ok(state) = network.node().state().await else { continue };
+            if state.network == invite.network {
+                continue;
+            }
+            if crate::rule::overlapping(&invite.suffix, &state.params.suffix) {
+                return Some(Outcome::refused(format!(
+                    "this invite is into a network named `{}`, which overlaps `{}`, the names \
+                     of `{label}` on this device: one resolver would answer for both. Nothing \
+                     was sent. If `{label}` is the network you are leaving, remove it first \
+                     (peerfectly forget {label}), then join again.",
+                    invite.suffix,
+                    state.params.suffix,
+                    label = network.label(),
+                )));
+            }
+        }
+        None
     }
 
     /// A member's join: keys made here, the signing key's proof made with a key
@@ -5663,7 +7305,7 @@ impl Service {
             let _discarded = self.home.discard_unfounded(&label);
             return Outcome::Failed { message: refusal, left_behind: Vec::new() };
         }
-        if !identity.signing_key().answers_here() {
+        if !signs_here(&identity) {
             // The key is somewhere this process cannot reach — a key store that
             // answers only in the session of the person who owns it. So the
             // challenge is prepared here and somebody else signs it.
@@ -5694,6 +7336,7 @@ impl Service {
                     payload: Vec::new(),
                 }],
                 keys: self.keys.keys_directory(),
+                founder: None,
             });
         }
         let proof = match crate::joining::prove_here(&read, &identity) {
@@ -5764,7 +7407,7 @@ impl Service {
         // Said now, before anything is asked, and carried in the request: the
         // admin approving it sees them too, and may move the network.
         let conflicts = match enrollment::Invite::from_text(&invite) {
-            Ok(read) => self.join_conflicts(&read.block).await,
+            Ok(read) => self.join_conflicts(&read.network, &read.block).await,
             Err(_) => Vec::new(),
         };
         let join = crate::joins::Join {
@@ -5792,8 +7435,16 @@ impl Service {
     /// Where a network's IPv4 block, as its invite says it, coincides with
     /// this device's other networks or the subnets it is on, in words
     /// (`scalable-membership` 19.5).
-    async fn join_conflicts(&self, block: &roster::types::Ipv4Range) -> Vec<String> {
+    async fn join_conflicts(
+        &self,
+        invited: &roster::id::NetworkId,
+        block: &roster::types::Ipv4Range,
+    ) -> Vec<String> {
         let mut said = Vec::new();
+        // The network itself, where this device already holds it: its block is
+        // the invited one's own, and no conflict. What is said instead is what
+        // the join does (offline-founder design §21).
+        let mut held_here = false;
         for network in self.all().await {
             let Ok(state) = network.node().state().await else { continue };
             let theirs = state.params.ipv4_range();
@@ -5801,6 +7452,15 @@ impl Service {
                 address: theirs.address().into(),
                 prefix_len: theirs.prefix_len(),
             };
+            if state.network == *invited {
+                said.push(format!(
+                    "this device already holds this network, as `{}`: the join replaces it, if \
+                     the network admits it",
+                    network.label()
+                ));
+                held_here = true;
+                continue;
+            }
             if taken.overlaps_block(block) {
                 said.push(format!(
                     "{block} overlaps {theirs}, the block of `{}` on this device",
@@ -5808,7 +7468,10 @@ impl Service {
                 ));
             }
         }
-        for interface in self.interfaces.list() {
+        // Where the network is held already, its block lives with these subnets
+        // now, its own adapter among them: the join changes nothing there.
+        let interfaces = if held_here { Vec::new() } else { self.interfaces.list() };
+        for interface in interfaces {
             for subnet in interface.subnets {
                 let taken = crate::founding::Taken {
                     address: subnet.address,
@@ -6154,6 +7817,23 @@ impl Service {
         {
             return Outcome::OnlyAdmin { network: label.to_owned() };
         }
+        // An admin forgotten is still an admin to the network until the founder
+        // revokes it: said, with the command, once it is gone here.
+        let was_admin = match &carried {
+            Some(network) => {
+                let node = network.node();
+                let me = node.identity().device_id();
+                node.state().await.ok().and_then(|state| {
+                    state.is_admin(&me).then(|| {
+                        crate::control::Named::new(
+                            &me,
+                            state.devices.get(&me).map(|record| record.name.clone()),
+                        )
+                    })
+                })
+            }
+            None => None,
+        };
         let carried = carried.is_some();
 
         // Down before it goes. A network removed while its tunnel was up would
@@ -6197,6 +7877,14 @@ impl Service {
         // Its exposed ports go with it. Said beside the forget rather than
         // instead of it: the network is gone either way.
         let mut report = self.report().await;
+        if let Some(me) = &was_admin {
+            report.note = Some(format!(
+                "`{label}` was removed, and this device's keys for it with it. The network still \
+                 counts {me} an admin until the founder revokes it: from a device that holds \
+                 the network, `peerfectly revoke {} forgotten --network {label} --founder`.",
+                me.name.as_deref().unwrap_or(me.id.as_str())
+            ));
+        }
         if let Err(cause) = self.sweep_exposures().await {
             report.note = Some(format!(
                 "`{label}` was removed, but its firewall rules would not go: {cause}"
@@ -6268,7 +7956,23 @@ impl Service {
     /// two screens, into this same network. The alternative is not a safer
     /// choice — it is two memberships, one of them dead, and a question about a
     /// directory they did not know existed.
-    async fn settle(&self, provisional: Label, suffix: &str) -> Label {
+    ///
+    /// # Never on the arriving roster's word
+    ///
+    /// The old directory is not removed until what it held has been merged with
+    /// what arrived and the new membership still stands
+    /// ([`crate::networks::supersede_with_proof`]). Where it does not — the admin
+    /// that admitted this device is revoked in what this device held — the join
+    /// is refused, what arrived is removed, and the held network is untouched.
+    ///
+    /// # Errors
+    ///
+    /// That refusal, as the join's outcome.
+    async fn settle(
+        &self,
+        provisional: Label,
+        suffix: &str,
+    ) -> core::result::Result<Label, Outcome> {
         let paths = self.home.paths_for(&provisional);
         let arrived = crate::networks::network_of(&paths);
         // What the person had chosen about this network, where one is replaced.
@@ -6286,6 +7990,31 @@ impl Service {
             None => None,
         };
 
+        if let Some(taken) = &superseded {
+            let proof = match self.keys.identity(&paths) {
+                Ok(joined) => crate::networks::supersede_with_proof(
+                    &paths,
+                    &self.home.paths_for(taken),
+                    &joined.device_id(),
+                ),
+                Err(cause) => Err(cause.to_string()),
+            };
+            if let Err(message) = proof {
+                // Everything that arrived goes, keys included. Whose join it
+                // was stays, alone, so the person who asked is shown why until
+                // they cancel it; an empty directory is tidied at start.
+                let owner = crate::state::read_owner(&paths);
+                let _forgotten = self.keys.forget(&paths);
+                let _gone = std::fs::remove_dir_all(paths.root());
+                if let Some(owner) = owner
+                    && paths.create().is_ok()
+                {
+                    let _kept = crate::state::write_owner(&paths, &owner);
+                }
+                return Err(Outcome::Failed { message, left_behind: Vec::new() });
+            }
+        }
+
         let wanted = match &superseded {
             // Its name, because it is the name this device already used for this
             // network and the one a person knows it by.
@@ -6302,6 +8031,11 @@ impl Service {
                 let _down = self.take_down(Some(taken)).await;
                 self.networks.lock().await.remove(taken);
                 let old = self.home.paths_for(taken);
+                // The old identity's keys first, where the platform keeps them
+                // outside the directory: an identity replaced keeps no key, and
+                // its signing key, an admin's, would otherwise stay in the key
+                // store for nothing (offline-founder design §21).
+                let _forgotten = self.keys.forget(&old);
                 if let Err(cause) = std::fs::remove_dir_all(old.root()) {
                     // The membership that just arrived is on the disk and valid;
                     // failing here would disown it over a directory that is merely
@@ -6328,7 +8062,7 @@ impl Service {
         if crate::lifecycle::resume(inherited) {
             let _written = Choice::Up.write(&self.home.paths_for(&label).choice());
         }
-        label
+        Ok(label)
     }
 
     /// Takes on a network a join has finished delivering.
@@ -6347,7 +8081,22 @@ impl Service {
 
         // The network is known now — its id and its suffix — so this is where the
         // directory stops being provisional.
-        let label = self.settle(provisional.clone(), &suffix).await;
+        let label = match self.settle(provisional.clone(), &suffix).await {
+            Ok(label) => label,
+            Err(refused) => {
+                // Said where the person looks: the join stays listed as ended,
+                // with why, until it is cancelled. A join finished in the
+                // background has nobody else to tell.
+                if let Outcome::Failed { message, .. } = &refused {
+                    tracing::warn!(join = %provisional, why = %message, "a join was refused");
+                    self.joins
+                        .lock()
+                        .await
+                        .insert(provisional.clone(), Self::cannot_go_on(joining.since, message));
+                }
+                return refused;
+            }
+        };
         let paths = self.home.paths_for(&label);
         if let Err(cause) = self.acquire(label.clone(), paths.clone()).await {
             return Outcome::Failed {
@@ -6462,10 +8211,12 @@ impl Service {
             if crate::rule::overlapping(&state.params.suffix, &theirs.params.suffix) {
                 return Err(Error::Parameters {
                     cause: format!(
-                        "`{}` overlaps `{}`, which `{}` already answers for on this device",
+                        "`{}` overlaps `{}`, which `{label}` already answers for on this device. \
+                         If `{label}` is the network you are leaving, remove it first \
+                         (peerfectly forget {label}), then join again",
                         state.params.suffix,
                         theirs.params.suffix,
-                        held.label(),
+                        label = held.label(),
                     ),
                 });
             }
@@ -6607,7 +8358,7 @@ impl Service {
         // Before the directory, before the identity, before anything. A person
         // founding on a machine that cannot protect the key must be told so
         // rather than handed a network that looks like every other one.
-        if let Some(refusal) = self.keys.admin_refusal() {
+        if let Some(refusal) = self.keys.admin_refusal().filter(|_| !as_founder()) {
             return Outcome::refused(format!(
                 "founding a network here would make this device an admin, and {refusal}. \
                  Nothing was created. This device can join a network as a member."
@@ -6652,7 +8403,7 @@ impl Service {
         // the genesis since neither is signed yet. A person is shown both and
         // asked once, and declining leaves no network rather than one without a
         // snapshot.
-        if !identity.signing_key().answers_here() {
+        if !signs_here(&identity) {
             let identity = Arc::new(identity);
             let key = identity.signing_key().public_key();
             let requests = vec![identity::detached::prepare_operation(&genesis, &key)];
@@ -6883,6 +8634,56 @@ fn root_after(
     crate::snapshots::sign_over_heads(&roster, identity)
 }
 
+/// The devices `again` names, each by its short id, that the voiding
+/// `anchor` brings back: revoked by one of the voided acts. Revoked again in
+/// the same act, for `reason`. Refused where one names any other device, or
+/// where the act would no longer fit a batch (offline-founder design §22).
+fn revoked_again(
+    anchor: &roster::roster::UrgentAnchor,
+    again: &[String],
+    reason: &str,
+) -> core::result::Result<Vec<crate::revoking::Expulsion>, String> {
+    if again.is_empty() {
+        return Ok(Vec::new());
+    }
+    if again.len() >= crate::control::MOST_IN_A_BATCH {
+        return Err(format!(
+            "one act revokes again at most {} of the devices a voiding brings back; revoke the \
+             rest afterwards",
+            crate::control::MOST_IN_A_BATCH.saturating_sub(1)
+        ));
+    }
+    let returning: Vec<roster::id::DeviceId> = anchor
+        .voided
+        .iter()
+        .filter_map(|(_, body)| match body {
+            roster::types::OperationBody::RevokeDevice { device, .. } => Some(*device),
+            _ => None,
+        })
+        .collect();
+    let mut chosen = Vec::new();
+    for asked in again {
+        let asked = asked.trim();
+        let Some(device) =
+            returning.iter().find(|device| crate::control::short_id(device) == asked)
+        else {
+            return Err(format!(
+                "`{}` is not a device this voiding brings back",
+                crate::control::shown(asked)
+            ));
+        };
+        if chosen.iter().any(|kept: &crate::revoking::Expulsion| kept.device == *device) {
+            continue;
+        }
+        chosen.push(crate::revoking::Expulsion {
+            device: *device,
+            name: asked.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+    Ok(chosen)
+}
+
 /// What a revocation of an admin voids of that admin's acts, in a person's
 /// words, when it voids anything.
 ///
@@ -7009,7 +8810,7 @@ mod tests {
             3,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("phone", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("phone", Role::Member, vec![]).expect("spec"),
             ),
             heads,
             founder.signing_key().key_id(),
@@ -7037,7 +8838,7 @@ mod tests {
             2,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("laptop", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("laptop", Role::Member, vec![]).expect("spec"),
             ),
             service.node().await.expect("the fixture holds a network").heads().await,
             founder.signing_key().key_id(),
@@ -7166,6 +8967,7 @@ mod tests {
         let network = crate::founding::found(
             &paths,
             &crate::founding::Founding {
+                founder: the_founders_words().keys(),
                 name: "nas".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: Some(relay.to_owned()),
@@ -7611,9 +9413,18 @@ mod tests {
         };
         let _requested =
             pending_until(&service, |list| standing_of(list, "desk") == Some("requested")).await;
-        let approved = service
+        let refused = service
             .handle(Command::Approve { network: None, name: "desk".to_owned(), replace: false })
             .await;
+        assert!(
+            matches!(&refused, Outcome::Failed { message, .. } if message.contains("--founder")),
+            "an admin is the founder's to admit: {refused:?}"
+        );
+        let approved = as_the_founder(
+            &service,
+            Command::Approve { network: None, name: "desk".to_owned(), replace: false },
+        )
+        .await;
         assert!(matches!(approved, Outcome::Reported(_)), "{approved:?}");
         let arrived = holding_a_network(&joiner).await;
         assert!(
@@ -7922,7 +9733,7 @@ mod tests {
             .and_then(|record| record.request.clone())
             .expect("the request")
             .applicant;
-        let delivery = service.delivery_of(&network).await.expect("a delivery");
+        let delivery = service.delivery_of(&network, None).await.expect("a delivery");
         let written = relay.written();
         let destination = crate::admitting::Destination {
             dialled: applicant.transport.clone(),
@@ -8151,6 +9962,7 @@ mod tests {
         let network = crate::founding::found(
             &paths,
             &crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "nas".to_owned(),
                 suffix: format!("{label}.internal"),
                 relay: None,
@@ -8197,10 +10009,14 @@ mod tests {
             roster.offer_bytes(operation);
         }
         let state = roster.state().expect("derives");
+        // The suffix, not the admin's own name: an act on an admin is the
+        // founder key's alone.
+        let mut params = state.params.clone();
+        params.suffix = format!("{name}.internal");
         let core = OperationCore::new(
             crate::clock::signing_time(),
             founder.signing_key().algorithm(),
-            OperationBody::Rename { device: founder.device_id(), name: name.to_owned() },
+            OperationBody::SetNetwork(params),
             roster.heads(),
             founder.signing_key().key_id(),
             state.network,
@@ -8224,6 +10040,7 @@ mod tests {
         let network = crate::founding::found(
             &paths,
             &crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "nas".to_owned(),
                 suffix: "other.internal".to_owned(),
                 relay: None,
@@ -8261,7 +10078,7 @@ mod tests {
             crate::clock::signing_time(),
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                ours.device_spec("victim", Role::Member, false, vec![]).expect("spec"),
+                ours.device_spec("victim", Role::Member, vec![]).expect("spec"),
             ),
             roster.heads(),
             founder.signing_key().key_id(),
@@ -8588,6 +10405,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "test".to_owned(),
                 name: "nas".to_owned(),
                 suffix: "example.internal".to_owned(),
@@ -8622,6 +10442,9 @@ mod tests {
     async fn founding_on_a_relay_in_no_form_founds_nothing() {
         let (service, _machine, _scratch) = unjoined().await;
         let founding = |relay: &str| Command::Found {
+            founder: crate::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "test".to_owned(),
             name: "nas".to_owned(),
             suffix: "example.internal".to_owned(),
@@ -8687,6 +10510,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "test".to_owned(),
                 name: "NAS".to_owned(),
                 suffix: "example.internal".to_owned(),
@@ -8712,6 +10538,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "test".to_owned(),
                 name: "PC di Giovanni".to_owned(),
                 suffix: "example.internal".to_owned(),
@@ -8765,6 +10594,9 @@ mod tests {
         let outcome = fixture
             .service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "test".to_owned(),
                 name: "second".to_owned(),
                 suffix: "example.internal".to_owned(),
@@ -8800,6 +10632,9 @@ mod tests {
 
         let (service, _machine, _scratch) = unjoined().await;
         let found = Command::Found {
+            founder: crate::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "test".to_owned(),
             name: "nas".to_owned(),
             suffix: "example.internal".to_owned(),
@@ -8842,6 +10677,9 @@ mod tests {
 
         let (service, _machine, _scratch) = unjoined().await;
         let found = Command::Found {
+            founder: crate::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "test".to_owned(),
             name: "nas".to_owned(),
             suffix: "example.internal".to_owned(),
@@ -8866,6 +10704,9 @@ mod tests {
         let port = crate::relay::answering_once(crate::relay::http_response("404 Not Found", ""));
         let (service, _machine, _scratch) = unjoined().await;
         let found = Command::Found {
+            founder: crate::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "test".to_owned(),
             name: "nas".to_owned(),
             suffix: "example.internal".to_owned(),
@@ -8953,6 +10794,7 @@ mod tests {
         crate::founding::found_with(
             &source,
             &crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "nas".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
@@ -9139,30 +10981,31 @@ mod tests {
     /// can still admit and revoke after this device goes.
     #[tokio::test]
     async fn a_network_with_another_admin_is_removed_without_the_question() {
-        use roster::types::{OperationBody, OperationCore};
+        use roster::types::OperationBody;
 
         let (service, _machine, _scratch) = two_networks().await;
         let network = service.all().await.first().map(Arc::clone).expect("a network");
         let going = network.label().to_string();
         let node = network.node();
-        let state = node.state().await.expect("derives");
         let other = NodeIdentity::generate().expect("generates");
-        let core = OperationCore::new(
-            2,
-            node.identity().signing_key().algorithm(),
-            OperationBody::AddDevice(
-                other.device_spec("desk", Role::Admin, false, vec![]).expect("spec"),
-            ),
-            node.heads().await,
-            node.identity().signing_key().key_id(),
-            state.network,
+        let signed = founder_signed_on(
+            node,
+            OperationBody::AddDevice(other.device_spec("desk", Role::Admin, vec![]).expect("spec")),
         )
-        .expect("well-formed");
-        let signed = node.identity().sign_operation(&core).expect("signs");
+        .await;
         service.admit_to(&network, &signed).await.expect("admits");
 
         let done = service.handle(Command::Forget { label: going, last_admin: false }).await;
-        assert!(matches!(done, Outcome::Reported(_)), "no question to ask: {done:?}");
+        let Outcome::Reported(report) = done else { panic!("no question to ask: {done:?}") };
+        // And what it leaves is said: an admin to the network until the
+        // founder revokes it, with the command (offline-founder design §20).
+        let note = report.note.unwrap_or_default();
+        assert!(
+            note.contains("until the founder revokes it")
+                && note.contains("peerfectly revoke")
+                && note.contains("--founder"),
+            "{note}"
+        );
     }
 
     /// Keys kept as this platform keeps them, with a `forget` that can be made
@@ -9361,7 +11204,7 @@ mod tests {
         std::fs::copy(from.roster(), to.roster()).expect("the same roster");
         std::fs::copy(from.identity(), to.identity()).expect("an identity of its own");
 
-        let settled = service.settle(provisional.clone(), "one.internal").await;
+        let settled = service.settle(provisional.clone(), "one.internal").await.expect("settles");
 
         assert_eq!(taken, settled, "the new membership takes the old one's name");
         assert!(
@@ -9422,7 +11265,7 @@ mod tests {
         std::fs::copy(from.roster(), to.roster()).expect("the same roster");
         std::fs::copy(from.identity(), to.identity()).expect("an identity of its own");
 
-        let settled = service.settle(provisional, "one.internal").await;
+        let settled = service.settle(provisional, "one.internal").await.expect("settles");
 
         assert_eq!(taken, settled, "the same network, the same name");
         assert!(
@@ -9447,7 +11290,7 @@ mod tests {
         std::fs::copy(from.roster(), to.roster()).expect("the same roster");
         std::fs::copy(from.identity(), to.identity()).expect("an identity of its own");
 
-        let settled = service.settle(provisional, "one.internal").await;
+        let settled = service.settle(provisional, "one.internal").await.expect("settles");
 
         assert!(
             !crate::lifecycle::resume(Choice::read(&home.paths_for(&settled).choice())),
@@ -9461,6 +11304,11 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_carries_the_choice_and_nothing_else() {
         let (service, _machine, scratch) = two_networks().await;
+        let keys = Arc::new(Stubborn {
+            refuses: std::sync::atomic::AtomicBool::new(false),
+            asked: std::sync::Mutex::default(),
+        });
+        let service = service.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
         let home = Home::under(scratch.path());
         let taken = service.all().await.first().map(Arc::clone).expect("a network").label().clone();
         let from = home.paths_for(&taken);
@@ -9473,16 +11321,194 @@ mod tests {
         let to = home.paths_for(&provisional);
         to.create().expect("creates");
         std::fs::copy(from.roster(), to.roster()).expect("the same roster");
-        let _made =
+        let made =
             crate::keys::Keys::identity(&crate::keys::PlatformKeys, &to).expect("its own identity");
+        // Admitted by the network's admin, as a replacement is: a roster that
+        // does not admit the new identity proves no membership to replace with.
+        let admin =
+            crate::keys::Keys::identity(&crate::keys::PlatformKeys, &from).expect("the admin");
+        let _admitted = signed_onto(
+            &to,
+            &admin,
+            roster::types::OperationBody::AddDevice(
+                made.device_spec("pc", roster::types::Role::Member, vec![]).expect("spec"),
+            ),
+        );
         let now = std::fs::read(to.identity()).expect("the new identity");
 
-        let settled = service.settle(provisional, "one.internal").await;
+        let settled = service.settle(provisional, "one.internal").await.expect("settles");
         let where_it_is = home.paths_for(&settled);
 
         assert!(!where_it_is.root().join("only-the-old-one").exists(), "nothing else came across");
         assert_eq!(now, std::fs::read(where_it_is.identity()).expect("reads"), "its own keys");
         assert_ne!(was, now, "which are not the ones that were replaced");
+        // And the replaced identity's keys were destroyed, asked while its
+        // identity still named them (offline-founder design §21).
+        assert!(
+            keys.asked.lock().expect("not poisoned").contains(&(from.root().to_path_buf(), true)),
+            "{:?}",
+            keys.asked.lock().expect("not poisoned")
+        );
+    }
+
+    /// Signs `body` by `author` after the heads of the roster held at `paths`,
+    /// and appends it there; the bytes, for a caller that wants them elsewhere.
+    fn signed_onto(
+        paths: &crate::state::Paths,
+        author: &dyn SignsAs,
+        body: roster::types::OperationBody,
+    ) -> Vec<u8> {
+        let roster = crate::node::replayed(paths).expect("a roster");
+        let network = roster.state().expect("derives").network;
+        let core = roster::types::OperationCore::new(
+            1_760_000_000_000,
+            roster::types::Algorithm::Ed25519,
+            body,
+            roster.heads(),
+            author.key(),
+            network,
+        )
+        .expect("well-formed");
+        let bytes = roster::sign::sign_operation(&core, author.signs()).expect("signs");
+        Log::at(paths.roster()).append(&bytes).expect("appends");
+        bytes
+    }
+
+    /// A device's keys or the founder's, as [`signed_onto`] signs with them.
+    trait SignsAs {
+        fn key(&self) -> roster::id::KeyId;
+        fn signs(&self) -> &dyn roster::sign::Signer;
+    }
+
+    impl SignsAs for NodeIdentity {
+        fn key(&self) -> roster::id::KeyId {
+            self.signing_key().key_id()
+        }
+        fn signs(&self) -> &dyn roster::sign::Signer {
+            self.signer()
+        }
+    }
+
+    impl SignsAs for identity::founder::FounderKey {
+        fn key(&self) -> roster::id::KeyId {
+            self.keys().signing_id()
+        }
+        fn signs(&self) -> &dyn roster::sign::Signer {
+            self.signer()
+        }
+    }
+
+    /// What a join into `casa` leaves just before it settles: the roster as it
+    /// stood before `held_only` was signed here, and a new identity of this
+    /// device, admitted by `admitting`, which never heard of `held_only`.
+    fn rejoined_by(
+        home: &Home,
+        admitting: &NodeIdentity,
+        held_only: impl FnOnce(&crate::state::Paths),
+    ) -> (Label, NodeIdentity) {
+        let held = home.paths_for(&label("casa"));
+        let provisional = home.free_label(None).expect("a name");
+        let arriving = home.paths_for(&provisional);
+        arriving.create().expect("creates");
+        std::fs::copy(held.roster(), arriving.roster()).expect("the roster as it stood");
+        held_only(&held);
+
+        let newcomer = NodeIdentity::generate().expect("generates");
+        identity::store::save(&newcomer, &arriving.identity()).expect("seals it");
+        let _admitted = signed_onto(
+            &arriving,
+            admitting,
+            roster::types::OperationBody::AddDevice(
+                newcomer.device_spec("pc", roster::types::Role::Member, vec![]).expect("spec"),
+            ),
+        );
+        (provisional, newcomer)
+    }
+
+    /// **A revoked admin's invite does not undo its revocation.**
+    ///
+    /// # What this caught
+    ///
+    /// On a real PC and phone: the PC, a member, revoked the phone with the
+    /// founder's words. The phone never heard it (a revoked device is cut off)
+    /// and went on as the admin it believed it was: it invited the PC again. The
+    /// PC accepted, and the join, finding the same network already held,
+    /// removed the old directory: the one place the phone's revocation existed.
+    /// The PC ended up a member of the network as the revoked phone had it.
+    #[tokio::test]
+    async fn a_join_admitted_by_an_admin_revoked_here_is_refused_and_the_network_kept() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, desk, scratch) =
+            two_admins_and(false, Arc::clone(&desk), None, Some(phone)).await;
+        let home = Home::under(scratch.path());
+        let words = the_founders_words();
+
+        // The founder revokes `desk` here; `desk` admits this device again,
+        // never having heard.
+        let (provisional, _newcomer) = rejoined_by(&home, &desk, |held| {
+            let _revoked = signed_onto(
+                held,
+                &words,
+                roster::types::OperationBody::RevokeDevice {
+                    device: desk.device_id(),
+                    reason: "lost device".to_owned(),
+                },
+            );
+        });
+        let held_before = Log::at(home.paths_for(&label("casa")).roster()).read().expect("reads");
+
+        let settled = service.settle(provisional.clone(), "casa.internal").await;
+
+        let Err(Outcome::Failed { message, .. }) = settled else {
+            panic!("the join must be refused: {settled:?}")
+        };
+        assert!(
+            message.contains("revoked here") && message.contains("Nothing was replaced"),
+            "{message}"
+        );
+        assert!(!home.paths_for(&provisional).root().exists(), "what arrived is removed");
+        assert_eq!(
+            held_before,
+            Log::at(home.paths_for(&label("casa")).roster()).read().expect("reads"),
+            "and the network held, with the revocation in it, is untouched"
+        );
+        assert!(service.named(&label("casa")).await.is_ok(), "and still carried");
+    }
+
+    /// A replacement by an admin in good standing still happens, and what this
+    /// device held that the network lacked goes with it rather than away.
+    #[tokio::test]
+    async fn a_replacement_carries_the_revocations_held_here_into_the_network() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, desk, scratch) =
+            two_admins_and(false, Arc::clone(&desk), None, Some(phone)).await;
+        let home = Home::under(scratch.path());
+        let words = the_founders_words();
+
+        let (provisional, newcomer) = rejoined_by(&home, &nas, |held| {
+            let _revoked = signed_onto(
+                held,
+                &words,
+                roster::types::OperationBody::RevokeDevice {
+                    device: desk.device_id(),
+                    reason: "lost device".to_owned(),
+                },
+            );
+        });
+
+        let settled = service.settle(provisional, "casa.internal").await.expect("settles");
+
+        let state = crate::node::replayed(&home.paths_for(&settled))
+            .expect("a roster")
+            .state()
+            .expect("derives");
+        assert!(state.devices.contains_key(&newcomer.device_id()), "this device, admitted");
+        assert!(
+            state.revoked.contains(&desk.device_id()),
+            "and the revocation only this device held is in the network it now holds"
+        );
     }
 
     /// Carrying the choice is only half of it: nothing raises a network at
@@ -9563,7 +11589,7 @@ mod tests {
         let provisional = home.free_label(None).expect("a name");
         home.paths_for(&provisional).create().expect("creates");
 
-        let settled = service.settle(provisional, "casa.internal").await;
+        let settled = service.settle(provisional, "casa.internal").await.expect("settles");
 
         assert_eq!("casa", settled.as_str(), "from the network's own suffix");
     }
@@ -9596,6 +11622,7 @@ mod tests {
         crate::founding::found_with(
             &paths,
             &crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "phone".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
@@ -9607,7 +11634,7 @@ mod tests {
         .expect("a roster to have been given");
         assert!(!paths.record().exists(), "this is what has not happened yet");
 
-        let settled = service.settle(provisional, "casa.internal").await;
+        let settled = service.settle(provisional, "casa.internal").await.expect("settles");
         let where_it_is = home.paths_for(&settled);
         service.acquire(settled.clone(), where_it_is.clone()).await.expect("takes it on");
 
@@ -9638,6 +11665,7 @@ mod tests {
         crate::founding::found_with(
             &paths,
             &crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "laptop".to_owned(),
                 suffix: "casa.internal".to_owned(),
                 relay: None,
@@ -9708,6 +11736,7 @@ mod tests {
         *service.pending.lock().await = Some(Pending::Founding {
             label: only_label(),
             wanted: crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "nas".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: Some(relay.clone()),
@@ -9739,6 +11768,7 @@ mod tests {
         *service.pending.lock().await = Some(Pending::Founding {
             label: only_label(),
             wanted: crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "nas".to_owned(),
                 suffix: "example.internal".to_owned(),
                 relay: None,
@@ -9750,6 +11780,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "lavoro".to_owned(),
                 name: "nas".to_owned(),
                 suffix: "lavoro.internal".to_owned(),
@@ -9832,6 +11865,7 @@ mod tests {
         // decoded before anything is verified, so this is the refusal an older
         // build's log produces.
         let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "example.internal",
             2_592_000,
@@ -9841,7 +11875,7 @@ mod tests {
             1,
             identity.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: identity.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: identity.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -9874,29 +11908,10 @@ mod tests {
         }
     }
 
-    /// The founder given its block's first host, after `genesis`.
-    fn first_host(founder: &NodeIdentity, genesis: &OperationCore) -> Vec<u8> {
-        let core = OperationCore::new(
-            2,
-            founder.signing_key().algorithm(),
-            OperationBody::SetDevice {
-                device: founder.device_id(),
-                change: roster::leaf::SettingsChange {
-                    ipv4: Some(Some(1_u32.to_be_bytes())),
-                    ..roster::leaf::SettingsChange::default()
-                },
-            },
-            vec![genesis.id()],
-            founder.signing_key().key_id(),
-            NetworkId::from_bytes(*genesis.id().as_bytes()),
-        )
-        .expect("well-formed");
-        sign_operation(&core, founder.signer()).expect("signs")
-    }
-
     async fn fixture(fail_at: Option<Fail>) -> Fixture {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::new(
+            the_founders_words().keys(),
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "example.internal",
             2_592_000,
@@ -9907,7 +11922,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -9919,7 +11934,6 @@ mod tests {
 
         let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
         assert!(roster.offer_bytes(&bytes).is_accepted());
-        assert!(roster.offer_bytes(&first_host(&founder, &genesis)).is_accepted());
         let state = roster.state().expect("derives");
 
         let scratch = tempfile::tempdir().expect("a scratch directory");
@@ -9989,6 +12003,7 @@ mod tests {
 
             let founder = Arc::new(NodeIdentity::generate().expect("generates"));
             let params = NetworkParams::new(
+                the_founders_words().keys(),
                 vec![0xfd, ula, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 format!("{name}.internal"),
                 2_592_000,
@@ -9999,7 +12014,7 @@ mod tests {
                 1,
                 founder.signing_key().algorithm(),
                 OperationBody::CreateNetwork {
-                    device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                    device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                     params,
                 },
                 vec![],
@@ -10009,14 +12024,11 @@ mod tests {
             .expect("well-formed");
             let bytes = sign_operation(&genesis, founder.signer()).expect("signs");
 
-            let given = first_host(&founder, &genesis);
             let log = Log::at(paths.roster());
             log.append(&bytes).expect("writes");
-            log.append(&given).expect("writes");
 
             let mut roster = Roster::with_clock(Box::new(crate::state::WallClock));
             assert!(roster.offer_bytes(&bytes).is_accepted());
-            assert!(roster.offer_bytes(&given).is_accepted());
             let state = roster.state().expect("derives");
             let prefix = Prefix::from_parameter(&state.params.ula).expect("usable");
 
@@ -10069,6 +12081,26 @@ mod tests {
         desk: Arc<NodeIdentity>,
         running: Option<Arc<NodeIdentity>>,
     ) -> (Service, Arc<NodeIdentity>, Arc<NodeIdentity>, tempfile::TempDir) {
+        two_admins_and(this_is_the_founder, desk, running, None).await
+    }
+
+    /// The founder's words of the fixture networks: BIP39's own vector.
+    fn the_founders_words() -> identity::founder::FounderKey {
+        identity::founder::FounderKey::from_text(
+            "legal winner thank year wave sausage worth useful legal winner thank year wave \
+             sausage worth useful legal winner thank year wave sausage worth title",
+        )
+        .expect("the words")
+    }
+
+    /// The same, with the network founded by [`the_founders_words`], and this
+    /// device the member `phone` where one is given.
+    async fn two_admins_and(
+        this_is_the_founder: bool,
+        desk: Arc<NodeIdentity>,
+        running: Option<Arc<NodeIdentity>>,
+        member: Option<Arc<NodeIdentity>>,
+    ) -> (Service, Arc<NodeIdentity>, Arc<NodeIdentity>, tempfile::TempDir) {
         use roster::sign::sign_operation;
         use roster::types::{NetworkParams, OperationBody, OperationCore, Role};
 
@@ -10080,15 +12112,21 @@ mod tests {
         paths.create().expect("creates");
 
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
-        let phone = NodeIdentity::generate().expect("generates");
-        let params =
-            NetworkParams::new(vec![0xfd, 0x33, 0, 0, 0, 0, 0, 0], "casa.internal", 2_592_000)
-                .expect("valid");
+        let phone = member
+            .clone()
+            .unwrap_or_else(|| Arc::new(NodeIdentity::generate().expect("generates")));
+        let params = NetworkParams::new(
+            the_founders_words().keys(),
+            vec![0xfd, 0x33, 0, 0, 0, 0, 0, 0],
+            "casa.internal",
+            2_592_000,
+        )
+        .expect("valid");
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -10099,21 +12137,27 @@ mod tests {
         let network = NetworkId::from_bytes(*genesis.id().as_bytes());
         let mut operations = vec![sign_operation(&genesis, founder.signer()).expect("signs")];
         let mut heads = vec![genesis.id()];
+        // A second admin is the founder key's to admit; a member, the first
+        // admin's.
+        let words = the_founders_words();
         for (at, (device, name, role)) in
             [(&*desk, "desk", Role::Admin), (&phone, "phone", Role::Member)].into_iter().enumerate()
         {
+            let (author, signer): (_, &dyn roster::sign::Signer) = if role == Role::Admin {
+                (words.keys().signing_id(), words.signer())
+            } else {
+                (founder.signing_key().key_id(), founder.signer())
+            };
             let add = OperationCore::new(
                 u64::try_from(at).expect("small").saturating_add(2),
                 founder.signing_key().algorithm(),
-                OperationBody::AddDevice(
-                    device.device_spec(name, role, false, vec![]).expect("spec"),
-                ),
+                OperationBody::AddDevice(device.device_spec(name, role, vec![]).expect("spec")),
                 heads.clone(),
-                founder.signing_key().key_id(),
+                author,
                 network,
             )
             .expect("well-formed");
-            operations.push(sign_operation(&add, founder.signer()).expect("signs"));
+            operations.push(sign_operation(&add, signer).expect("signs"));
             heads = vec![add.id()];
         }
 
@@ -10125,10 +12169,11 @@ mod tests {
         }
         let state = roster.state().expect("derives");
         let prefix = Prefix::from_parameter(&state.params.ula).expect("usable");
-        let this = match (this_is_the_founder, running) {
-            (true, _) => Arc::clone(&founder),
-            (false, Some(running)) => running,
-            (false, None) => Arc::clone(&desk),
+        let this = match (this_is_the_founder, running, member) {
+            (true, _, _) => Arc::clone(&founder),
+            (false, _, Some(member)) => member,
+            (false, Some(running), None) => running,
+            (false, None, None) => Arc::clone(&desk),
         };
         let node = Arc::new(Node::new(
             Arc::clone(&this),
@@ -10152,6 +12197,14 @@ mod tests {
         (service, founder, desk, scratch)
     }
 
+    fn revoking_by_name(name: &str) -> Command {
+        Command::Revoke {
+            network: Some("casa".to_owned()),
+            target: by_name(name),
+            reason: "stolen".to_owned(),
+        }
+    }
+
     fn demoting(target: crate::control::Target) -> Command {
         Command::Demote { network: None, target }
     }
@@ -10160,8 +12213,8 @@ mod tests {
         crate::control::Target::Name(name.to_owned())
     }
 
-    /// **An admin is demoted by name, and by its short id**: one demotion, and
-    /// the device is a member on this device at once.
+    /// **An admin is demoted by name, and by its short id**, with the founder's
+    /// words: one demotion, and the device is a member on this device at once.
     #[tokio::test]
     async fn an_admin_is_demoted_by_name_or_by_short_id() {
         for by_id in [false, true] {
@@ -10171,7 +12224,7 @@ mod tests {
             } else {
                 by_name("desk")
             };
-            let outcome = service.handle(demoting(target)).await;
+            let outcome = as_the_founder(&service, demoting(target)).await;
             assert!(matches!(outcome, Outcome::Reported(_)), "{outcome:?}");
             let state = service.node().await.expect("a network").state().await.expect("derives");
             assert!(!state.is_admin(&desk.device_id()), "a member now");
@@ -10203,14 +12256,24 @@ mod tests {
         assert_eq!(before, node.heads().await, "nothing was signed");
     }
 
-    /// With another admin present, an admin may demote itself.
+    /// **An admin demotes no admin, itself included**: only the founder governs
+    /// admins, and the refusal says so, with the command, before anything is
+    /// signed.
     #[tokio::test]
-    async fn an_admin_may_demote_itself_beside_another() {
-        let (service, _founder, desk, _scratch) = two_admins(false).await;
-        let outcome = service.handle(demoting(by_name("desk"))).await;
-        assert!(matches!(outcome, Outcome::Reported(_)), "{outcome:?}");
-        let state = service.node().await.expect("a network").state().await.expect("derives");
-        assert!(!state.is_admin(&desk.device_id()), "itself, a member now");
+    async fn an_admin_demotes_no_admin_itself_included() {
+        let (service, _founder, _desk, _scratch) = two_admins(false).await;
+        let node = service.node().await.expect("a network");
+        let before = node.heads().await;
+        for name in ["desk", "nas"] {
+            let outcome = service.handle(demoting(by_name(name))).await;
+            assert!(
+                matches!(&outcome, Outcome::Failed { message, .. }
+                    if message.contains("only the founder governs admins")
+                        && message.contains("--founder")),
+                "{name}: {outcome:?}"
+            );
+        }
+        assert_eq!(before, node.heads().await, "nothing was signed");
     }
 
     /// Keys that hold `desk`'s identity as [`two_admins_with`] gave it, and
@@ -10297,13 +12360,46 @@ mod tests {
         sign_operation(&core, author.signer()).expect("signs")
     }
 
-    /// **A demoted device keeps its key until the demotion is settled**, and
-    /// the report says so; a key it was demoted from by a demotion that is
-    /// voided is the key of an admin again.
+    /// An operation of `body` that [`the_founders_words`] sign, on the roster
+    /// `node` holds.
+    async fn founder_signed_on(node: &Node, body: OperationBody) -> Vec<u8> {
+        let words = the_founders_words();
+        let state = node.state().await.expect("derives");
+        let core = OperationCore::new(
+            crate::clock::signing_time(),
+            roster::types::Algorithm::Ed25519,
+            body,
+            node.heads().await,
+            words.keys().signing_id(),
+            state.network,
+        )
+        .expect("well-formed");
+        sign_operation(&core, words.signer()).expect("signs")
+    }
+
+    /// `command` answered as the founder: every batch asked of the founder's
+    /// words is signed with [`the_founders_words`], until nothing more is asked.
+    async fn as_the_founder(service: &Service, command: Command) -> Outcome {
+        let words = the_founders_words();
+        let mut outcome = service.handle(Command::AsFounder(Box::new(command))).await;
+        while let Outcome::NeedsSignatures(wanted) = outcome {
+            let signatures = wanted
+                .items
+                .iter()
+                .map(|item| words.signer().sign(&item.message).expect("signs"))
+                .collect();
+            outcome = service.handle(Command::Signed { id: wanted.id.clone(), signatures }).await;
+        }
+        outcome
+    }
+
+    /// **A demotion by the founder destroys the key at once**: nothing but the
+    /// founder's own words can void it, so the key does not wait for the window
+    /// to move past it.
     #[tokio::test]
-    async fn a_demoted_key_is_kept_until_the_demotion_is_settled() {
+    async fn a_demotion_by_the_founder_destroys_the_key_at_once() {
         let desk = custodied_desk();
-        let (service, founder, desk, _scratch) =
+        let (service, _founder, desk, _scratch) =
             two_admins_with(false, Arc::clone(&desk), None).await;
         let keys = Arc::new(Forgetting::default());
         let service = service.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
@@ -10315,26 +12411,25 @@ mod tests {
         assert!(network.paths.was_admin().exists(), "an admin, noted");
 
         let demotion =
-            signed_on(&node, &founder, OperationBody::Demote { device: desk.device_id() }).await;
+            founder_signed_on(&node, OperationBody::Demote { device: desk.device_id() }).await;
         node.admit_without_activating(&demotion).await.expect("held");
         service.settle_demotions().await;
 
-        assert!(keys.forgotten.lock().expect("not poisoned").is_empty(), "nothing destroyed");
         assert_eq!(
-            crate::keys::signing_key_named_in(&network.paths).as_deref(),
-            Some("peerfectly.casa.0011223344556677.signing"),
-            "the identity still names its key"
+            *keys.forgotten.lock().expect("not poisoned"),
+            vec!["peerfectly.casa.0011223344556677.signing".to_owned()],
+            "the key, by its name, at once"
         );
         let report = service.report().await;
         let said = report.networks.first().expect("the network");
-        assert!(said.key_until_settled, "said to be kept until settled: {said:?}");
-        assert_eq!(said.custody, crate::control::Custody::KeyStore);
+        assert!(!said.key_until_settled, "{said:?}");
+        assert_eq!(said.custody, crate::control::Custody::None);
     }
 
-    /// **A demotion voided by its author's concurrent revocation leaves an admin
-    /// that can sign**: its key, and its role.
+    /// **An admin's demotion of an admin is refused, and leaves an admin that
+    /// can sign**: its key, and its role.
     #[tokio::test]
-    async fn a_voided_demotion_leaves_the_key_and_the_role() {
+    async fn an_admins_demotion_of_an_admin_leaves_the_key_and_the_role() {
         let desk = custodied_desk();
         let (service, founder, desk, _scratch) =
             two_admins_with(false, Arc::clone(&desk), None).await;
@@ -10344,44 +12439,27 @@ mod tests {
         let node = Arc::clone(network.node());
         service.settle_demotions().await;
 
-        // A third admin, which demotes desk while the founder revokes it.
-        let third = NodeIdentity::generate().expect("generates");
-        let admitted = signed_on(
-            &node,
-            &founder,
-            OperationBody::AddDevice(
-                third.device_spec("third", Role::Admin, false, vec![]).expect("spec"),
-            ),
-        )
-        .await;
-        node.admit_without_activating(&admitted).await.expect("held");
         let demotion =
-            signed_on(&node, &third, OperationBody::Demote { device: desk.device_id() }).await;
-        let revocation = signed_on(
-            &node,
-            &founder,
-            OperationBody::RevokeDevice { device: third.device_id(), reason: "taken".to_owned() },
-        )
-        .await;
-        node.admit_without_activating(&demotion).await.expect("held");
-        node.admit_without_activating(&revocation).await.expect("held");
+            signed_on(&node, &founder, OperationBody::Demote { device: desk.device_id() }).await;
+        assert!(
+            node.admit_without_activating(&demotion).await.is_err(),
+            "an admin's demotion of an admin is without authority"
+        );
 
         let state = node.state().await.expect("derives");
-        assert!(state.is_admin(&desk.device_id()), "the demotion is voided");
+        assert!(state.is_admin(&desk.device_id()), "still an admin");
         service.settle_demotions().await;
         assert!(keys.forgotten.lock().expect("not poisoned").is_empty(), "the key is kept");
         assert!(!network.node().identity().signing_key().is_public_only());
-        let said = service.report().await;
-        assert!(!said.networks.first().expect("the network").key_until_settled);
     }
 
-    /// **A settled demotion destroys the key**: the identity holds the public
-    /// half, the key goes by its name, the notes go, and the report says none.
-    /// And a stop after the identity was rewritten is finished by the next pass.
+    /// **A demotion destroys the key**: the identity holds the public half, the
+    /// key goes by its name, the notes go, and the report says none. And a stop
+    /// after the identity was rewritten is finished by the next pass.
     #[tokio::test]
-    async fn a_settled_demotion_destroys_the_key_and_a_stop_is_finished() {
+    async fn a_demotion_destroys_the_key_and_a_stop_is_finished() {
         let desk = custodied_desk();
-        let (service, founder, desk, scratch) =
+        let (service, _founder, desk, scratch) =
             two_admins_with(false, Arc::clone(&desk), None).await;
         let keys = Arc::new(Forgetting::default());
         let service = service.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
@@ -10389,11 +12467,10 @@ mod tests {
         let node = Arc::clone(network.node());
         service.settle_demotions().await;
         let demotion =
-            signed_on(&node, &founder, OperationBody::Demote { device: desk.device_id() }).await;
+            founder_signed_on(&node, OperationBody::Demote { device: desk.device_id() }).await;
         node.admit_without_activating(&demotion).await.expect("held");
 
-        // What a settled demotion does, by its own step: the base that says so
-        // is the roster's, and `demoting` checks how it is read.
+        // What a demotion does, by its own step.
         service.destroy_signing_key(&network).await.expect("destroyed");
         service.settled.lock().await.insert(network.label().clone());
 
@@ -10416,16 +12493,13 @@ mod tests {
         // Stopped after the identity was rewritten and before the key went: the
         // next daemon opens a member's identity, and finishes from the note.
         let keys = Arc::new(Forgetting::default());
-        let (again, again_founder, _desk, _again_scratch) =
+        let (again, _again_founder, _desk, _again_scratch) =
             two_admins_with(false, Arc::clone(&desk), Some(Arc::new(kept))).await;
         let again = again.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
         let resumed = again.all().await.first().map(Arc::clone).expect("the network");
-        let demotion = signed_on(
-            resumed.node(),
-            &again_founder,
-            OperationBody::Demote { device: desk.device_id() },
-        )
-        .await;
+        let demotion =
+            founder_signed_on(resumed.node(), OperationBody::Demote { device: desk.device_id() })
+                .await;
         resumed.node().admit_without_activating(&demotion).await.expect("held");
         crate::state::replace_file(
             &resumed.paths.settling_key(),
@@ -10442,18 +12516,781 @@ mod tests {
         drop(scratch);
     }
 
-    /// **A founder demoted by another admin is the roster's refusal**: the
-    /// daemon decides nothing, and the founder stays an admin.
+    /// **The admin that founded the network is demoted by the founder alone**:
+    /// another admin is refused, the founder's words are not.
     #[tokio::test]
-    async fn a_founder_demoted_by_another_admin_stays_an_admin() {
+    async fn the_admin_that_founded_the_network_is_demoted_by_the_founder_alone() {
         let (service, founder, _desk, _scratch) = two_admins(false).await;
-        let outcome = service.handle(demoting(by_name("nas"))).await;
+        let refused = service.handle(demoting(by_name("nas"))).await;
+        assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
+        let outcome = as_the_founder(&service, demoting(by_name("nas"))).await;
         let state = service.node().await.expect("a network").state().await.expect("derives");
-        assert!(state.is_admin(&founder.device_id()), "the founder is still an admin: {outcome:?}");
+        assert!(!state.is_admin(&founder.device_id()), "{outcome:?}");
+    }
+
+    /// **The founder's revocation voids a stolen admin's acts from the one
+    /// chosen**: what it admitted leaves, what it revoked is back, and the act
+    /// before the chosen one stands. Without the founder's words it is refused.
+    #[tokio::test]
+    async fn a_founder_revocation_voids_a_stolen_admins_acts_from_the_one_chosen() {
+        let (service, _nas, desk, _scratch) = two_admins(true).await;
+        let node = service.node().await.expect("a network");
+        let printer = NodeIdentity::generate().expect("generates");
+        let laptop = NodeIdentity::generate().expect("generates");
+        let phone = node
+            .state()
+            .await
+            .expect("derives")
+            .devices
+            .values()
+            .find(|record| record.name == "phone")
+            .map(|record| record.id)
+            .expect("the phone");
+
+        // desk, stolen: one act still trusted, then the two that are not.
+        let trusted = signed_on(
+            &node,
+            &desk,
+            OperationBody::AddDevice(
+                printer.device_spec("printer", Role::Member, vec![]).expect("spec"),
+            ),
+        )
+        .await;
+        node.admit_without_activating(&trusted).await.expect("held");
+        let smuggled = signed_on(
+            &node,
+            &desk,
+            OperationBody::AddDevice(
+                laptop.device_spec("laptop", Role::Member, vec![]).expect("spec"),
+            ),
+        )
+        .await;
+        node.admit_without_activating(&smuggled).await.expect("held");
+        let first = roster::sign::RawOperation::decode(&smuggled).expect("decodes").id();
+        let out = signed_on(
+            &node,
+            &desk,
+            OperationBody::RevokeDevice { device: phone, reason: "mine".to_owned() },
+        )
+        .await;
+        node.admit_without_activating(&out).await.expect("held");
+
+        let from = Command::RevokeFrom {
+            network: Some("casa".to_owned()),
+            target: by_name("desk"),
+            reason: "stolen".to_owned(),
+            from: first.to_hex(),
+            again: Vec::new(),
+        };
+        let refused = service.handle(from.clone()).await;
         assert!(
-            matches!(&outcome, Outcome::Failed { message, .. } if message.contains("founder")),
-            "said in the roster's words: {outcome:?}"
+            matches!(&refused, Outcome::Failed { message, .. } if message.contains("--founder")),
+            "{refused:?}"
         );
+
+        let done = as_the_founder(&service, from).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+        let state = node.state().await.expect("derives");
+        assert!(!state.devices.contains_key(&desk.device_id()), "the stolen admin is out");
+        assert!(!state.devices.contains_key(&laptop.device_id()), "what it admitted leaves");
+        assert!(state.devices.contains_key(&phone), "what it revoked is back");
+        assert!(state.devices.contains_key(&printer.device_id()), "its earlier act stands");
+
+        // And `history` gives every act its id, which is what is chosen from.
+        let listed =
+            service.handle(Command::History { network: None, by: Some("desk".to_owned()) }).await;
+        let Outcome::History(history) = listed else { panic!("{listed:?}") };
+        assert!(history.entries.iter().all(|entry| entry.id.len() == 64), "{history:?}");
+    }
+
+    /// **A device the voiding brings back is revoked again in the same act**,
+    /// where the founder says so: the revocation, then that device's, resting
+    /// on it. A device the voiding does not bring back is refused, with nothing
+    /// signed (offline-founder design §22).
+    #[tokio::test]
+    async fn a_device_the_voiding_brings_back_is_revoked_again_in_the_same_act() {
+        let (service, _nas, desk, _scratch) = two_admins(true).await;
+        let node = service.node().await.expect("a network");
+        let phone = node
+            .state()
+            .await
+            .expect("derives")
+            .devices
+            .values()
+            .find(|record| record.name == "phone")
+            .map(|record| record.id)
+            .expect("the phone");
+        let out = signed_on(
+            &node,
+            &desk,
+            OperationBody::RevokeDevice { device: phone, reason: "mine".to_owned() },
+        )
+        .await;
+        node.admit_without_activating(&out).await.expect("held");
+        let first = roster::sign::RawOperation::decode(&out).expect("decodes").id();
+        let voiding = |again: Vec<String>| Command::RevokeFrom {
+            network: Some("casa".to_owned()),
+            target: by_name("desk"),
+            reason: "stolen".to_owned(),
+            from: first.to_hex(),
+            again,
+        };
+
+        let other = as_the_founder(&service, voiding(vec!["0000-0000-0000-0000".to_owned()])).await;
+        assert!(
+            matches!(&other, Outcome::Failed { message, .. } if message.contains("brings back")),
+            "{other:?}"
+        );
+        let state = node.state().await.expect("derives");
+        assert!(state.devices.contains_key(&desk.device_id()), "nothing was signed");
+
+        let done =
+            as_the_founder(&service, voiding(vec![crate::control::short_id(&phone)])).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+        let state = node.state().await.expect("derives");
+        assert!(!state.devices.contains_key(&desk.device_id()), "the stolen admin is out");
+        assert!(!state.devices.contains_key(&phone), "and the phone stays out, by the founder");
+        assert!(state.revoked.contains(&phone));
+    }
+
+    /// **An invite from a device revoked here is refused before anything is
+    /// sent**, and so is one from a device that is no admin here; the founder's
+    /// own invite is not.
+    #[tokio::test]
+    async fn an_invite_from_a_device_revoked_here_is_refused_at_once() {
+        let (service, _nas, desk, _scratch) = two_admins(true).await;
+        let revoked = as_the_founder(&service, revoking_by_name("desk")).await;
+        assert!(matches!(revoked, Outcome::Reported(_)), "{revoked:?}");
+        let node = service.node().await.expect("a network");
+        let state = node.state().await.expect("derives");
+        let phone = state
+            .devices
+            .values()
+            .find(|record| record.name == "phone")
+            .map(|record| record.keys.clone())
+            .expect("the phone");
+        let phone_attests = phone
+            .iter()
+            .find(|entry| entry.purpose == roster::types::KeyPurpose::Attestation)
+            .map(roster::types::KeyEntry::key_id)
+            .expect("an attestation key");
+        let invite_from = |anchor: roster::id::KeyId| Command::Join {
+            invite: enrollment::Invite::issue(
+                "relay.example:443",
+                state.network,
+                state.params.ipv4_range(),
+                anchor,
+            )
+            .expect("an invite")
+            .to_text(),
+            name: "tablet".to_owned(),
+            admin: false,
+        };
+
+        let by_desk = service.handle(invite_from(desk.attestation_key().key_id())).await;
+        assert!(
+            matches!(&by_desk, Outcome::Failed { message, .. }
+                if message.contains("revoked") && message.contains("Nothing was sent")),
+            "{by_desk:?}"
+        );
+        let by_phone = service.handle(invite_from(phone_attests)).await;
+        assert!(
+            matches!(&by_phone, Outcome::Failed { message, .. }
+                if message.contains("not an admin") && message.contains("Nothing was sent")),
+            "{by_phone:?}"
+        );
+        assert!(service.joins.lock().await.is_empty(), "no join was started");
+    }
+
+    /// **An invite into another network whose names overlap is refused before
+    /// anything is sent**, saying to forget the old one first; an invite into
+    /// the network held says that the join replaces it (offline-founder §21).
+    #[tokio::test]
+    async fn a_join_into_a_network_of_the_same_name_is_refused_at_once() {
+        let (service, _nas, _desk, _scratch) = two_admins(true).await;
+        let node = service.node().await.expect("a network");
+        let state = node.state().await.expect("derives");
+        let invite_into = |network: roster::id::NetworkId| Command::Join {
+            invite: enrollment::Invite::issue(
+                "relay.invalid:443",
+                network,
+                state.params.ipv4_range(),
+                state.params.founder.signing_id(),
+            )
+            .expect("an invite")
+            .with_suffix(state.params.suffix.clone())
+            .expect("a suffix")
+            .to_text(),
+            name: "tablet".to_owned(),
+            admin: false,
+        };
+
+        let another =
+            service.handle(invite_into(roster::id::NetworkId::from_bytes([0x5a; 32]))).await;
+        assert!(
+            matches!(&another, Outcome::Failed { message, .. }
+                if message.contains("Nothing was sent")
+                    && message.contains("peerfectly forget casa")),
+            "{another:?}"
+        );
+        assert!(service.joins.lock().await.is_empty(), "no join was started");
+
+        let same = service.handle(invite_into(state.network)).await;
+        let Outcome::JoinStarted { conflicts, .. } = same else { panic!("a join: {same:?}") };
+        assert!(
+            conflicts.iter().any(|said| said.contains("already holds this network")),
+            "{conflicts:?}"
+        );
+        assert!(!conflicts.iter().any(|said| said.contains("overlaps")), "{conflicts:?}");
+    }
+
+    /// **A revoked admin told of its revocation stops**: the notice is judged,
+    /// kept, said in the status, its invites refused, and its signing key
+    /// destroyed; a notice naming another device, or an admin's revocation of
+    /// an admin, is nothing (offline-founder design §16, §17).
+    #[tokio::test]
+    async fn a_revoked_admin_told_of_it_stops_and_destroys_its_key() {
+        let desk = custodied_desk();
+        let (service, founding, desk, _scratch) =
+            two_admins_with(false, Arc::clone(&desk), None).await;
+        let keys = Arc::new(Forgetting::default());
+        let service = service.with_keys(Arc::clone(&keys) as Arc<dyn crate::keys::Keys>);
+        let network = service.all().await.first().map(Arc::clone).expect("the network");
+        let node = Arc::clone(network.node());
+        // An admin's revocation of this admin is no revocation: nothing.
+        let by_an_admin = signed_on(
+            &node,
+            &founding,
+            OperationBody::RevokeDevice { device: desk.device_id(), reason: "mine".to_owned() },
+        )
+        .await;
+        assert_eq!(crate::notices::judged(&node, &by_an_admin).await, None);
+        let state = node.state().await.expect("derives");
+        let nas = state
+            .devices
+            .values()
+            .find(|record| record.name == "nas")
+            .map(|record| record.id)
+            .expect("nas");
+
+        // Not this device's: nothing.
+        let others = founder_signed_on(
+            &node,
+            OperationBody::RevokeDevice { device: nas, reason: "lost".to_owned() },
+        )
+        .await;
+        assert_eq!(crate::notices::judged(&node, &others).await, None);
+
+        // The founder's revocation of this device, unheard here.
+        let notice = founder_signed_on(
+            &node,
+            OperationBody::RevokeDevice { device: desk.device_id(), reason: "stolen".to_owned() },
+        )
+        .await;
+        assert_eq!(crate::notices::judged(&node, &notice).await.as_deref(), Some("the founder"));
+        service.revoked_here(&network, &notice, "the founder").await;
+
+        assert_eq!(
+            *keys.forgotten.lock().expect("not poisoned"),
+            vec!["peerfectly.casa.0011223344556677.signing".to_owned()],
+            "a revoked admin's key goes at once"
+        );
+        let report = service.report().await;
+        let said = report.networks.first().expect("the network");
+        assert_eq!(said.revoked_by.as_deref(), Some("the founder"), "{said:?}");
+        let invited = service
+            .handle(Command::Invite {
+                network: None,
+                name: "tv".to_owned(),
+                admin: false,
+                light: false,
+                groups: Vec::new(),
+                ipv4: None,
+                minutes: Some(60),
+            })
+            .await;
+        assert!(
+            matches!(&invited, Outcome::Failed { message, .. } if message.contains("invites nobody")),
+            "{invited:?}"
+        );
+    }
+
+    /// An admin's revocation of an admin is no revocation, so a notice of one
+    /// is nothing; a member is told of an admin's revocation of it, and keeps
+    /// its keys, since the founder may yet void it.
+    #[tokio::test]
+    async fn only_a_revocation_that_holds_is_taken_from_a_notice() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let network = service.all().await.first().map(Arc::clone).expect("the network");
+        let node = Arc::clone(network.node());
+        let before = node.heads().await;
+        let by_nas = signed_on(
+            &node,
+            &nas,
+            OperationBody::RevokeDevice { device: phone.device_id(), reason: "sold".to_owned() },
+        )
+        .await;
+        let judged =
+            crate::notices::judged(&node, &by_nas).await.expect("a member revoked by an admin");
+        assert!(judged.starts_with("nas ["), "{judged}");
+        service.revoked_here(&network, &by_nas, &judged).await;
+        assert!(network.paths.root().join(REVOCATION_NOTICE).exists(), "kept");
+        assert!(
+            !node.identity().signing_key().is_public_only(),
+            "a member's keys are kept: the founder may yet void an admin's revocation"
+        );
+        assert!(
+            service.report().await.networks.first().and_then(|n| n.revoked_by.clone()).is_some()
+        );
+
+        // The founder revokes nas from before its act: the revocation of the
+        // phone is void, the phone a member again, and the notice said no more.
+        let words = the_founders_words();
+        let state = node.state().await.expect("derives");
+        let core = OperationCore::new(
+            crate::clock::signing_time(),
+            roster::types::Algorithm::Ed25519,
+            OperationBody::RevokeDevice { device: nas.device_id(), reason: "stolen".to_owned() },
+            before,
+            words.keys().signing_id(),
+            state.network,
+        )
+        .expect("well-formed");
+        let voiding = sign_operation(&core, words.signer()).expect("signs");
+        node.admit_without_activating(&voiding).await.expect("held");
+        let state = node.state().await.expect("derives");
+        assert!(state.devices.contains_key(&phone.device_id()), "a member again");
+        assert_eq!(
+            service.report().await.networks.first().and_then(|n| n.revoked_by.clone()),
+            None,
+            "no longer said revoked"
+        );
+        assert!(!network.paths.root().join(REVOCATION_NOTICE).exists(), "the notice is gone");
+    }
+
+    /// **A member revoked by an admin runs as revoked, and comes back by itself
+    /// when the founder voids that**: its tunnel goes and its transport stays,
+    /// what the person chose is kept, it comes up as revoked again after being
+    /// taken down, and the voiding brings its tunnel back with no invite and no
+    /// timer (offline-founder design §22).
+    #[tokio::test]
+    async fn a_member_revoked_by_an_admin_runs_as_revoked_and_comes_back_when_voided() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let network = service.all().await.first().map(Arc::clone).expect("the network");
+        let node = Arc::clone(network.node());
+        service.bring_up(None).await.expect("up as a member");
+        assert_eq!(network.tunnel().await, Tunnel::Up);
+
+        // desk, stolen, revokes this device.
+        let out = signed_on(
+            &node,
+            &desk,
+            OperationBody::RevokeDevice { device: phone.device_id(), reason: "mine".to_owned() },
+        )
+        .await;
+        node.admit_without_activating(&out).await.expect("held");
+        service.follow_standings().await;
+        assert_eq!(network.tunnel().await, Tunnel::Down, "no tunnel");
+        assert!(*network.revoked_up.lock().await, "its transport alone");
+        assert!(node.transport().await.is_some(), "listening");
+        assert!(
+            crate::lifecycle::resume(Choice::read(&network.paths.choice())),
+            "what the person chose is kept"
+        );
+        service.take_down(None).await.expect("down");
+        assert!(node.transport().await.is_none(), "down is down, revoked or not");
+        service.bring_up(None).await.expect("up again, as revoked rather than refused");
+        assert!(*network.revoked_up.lock().await);
+        assert_eq!(network.tunnel().await, Tunnel::Down);
+
+        // The founder revokes desk, voiding from its revocation of this device.
+        let from = roster::sign::RawOperation::decode(&out).expect("decodes").id();
+        let anchor = node.voiding_anchor(&desk.device_id(), &from).await.expect("voidable");
+        let words = the_founders_words();
+        let state = node.state().await.expect("derives");
+        let voiding = OperationCore::new(
+            crate::clock::signing_time(),
+            roster::types::Algorithm::Ed25519,
+            OperationBody::RevokeDevice { device: desk.device_id(), reason: "stolen".to_owned() },
+            anchor.heads,
+            words.keys().signing_id(),
+            state.network,
+        )
+        .expect("well-formed");
+        let voiding = sign_operation(&voiding, words.signer()).expect("signs");
+        node.admit_without_activating(&voiding).await.expect("held");
+        service.follow_standings().await;
+        assert_eq!(network.tunnel().await, Tunnel::Up, "a member again, by itself");
+        assert!(!*network.revoked_up.lock().await);
+    }
+
+    /// **A member revokes a stolen admin with the founder's words**: the act is
+    /// prepared as an admin's would be, the founder signs it, and the founder's
+    /// root over it follows, signed in the same act.
+    #[tokio::test]
+    async fn a_member_revokes_a_stolen_admin_with_the_founders_words() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let words = the_founders_words();
+
+        // Without the founder's words a member signs nothing.
+        let refused = service.handle(revoking_by_name("nas")).await;
+        assert!(!matches!(refused, Outcome::NeedsSignatures(_)), "{refused:?}");
+
+        let asked = service.handle(Command::AsFounder(Box::new(revoking_by_name("nas")))).await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(
+            wanted.founder.as_ref().and_then(|founder| founder.keys().ok()),
+            Some(words.keys()),
+            "the founder is asked, by its keys"
+        );
+        let sign = |wanted: &crate::control::SignaturesWanted| -> Vec<Vec<u8>> {
+            wanted
+                .items
+                .iter()
+                .map(|item| words.signer().sign(&item.message).expect("signs"))
+                .collect()
+        };
+        let root = service
+            .handle(Command::Signed { id: wanted.id.clone(), signatures: sign(&wanted) })
+            .await;
+        let Outcome::NeedsSignatures(root) = root else { panic!("the founder's root: {root:?}") };
+        assert_eq!(root.items.len(), 1, "one root");
+        let done =
+            service.handle(Command::Signed { id: root.id.clone(), signatures: sign(&root) }).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+
+        let node = service.node().await.expect("a network");
+        let state = node.state().await.expect("derives");
+        assert!(!state.devices.contains_key(&nas.device_id()), "the stolen admin is revoked");
+        assert!(state.devices.contains_key(&phone.device_id()), "the member is still one");
+    }
+
+    /// **A member phone recovers a network whose admin was stolen**: the
+    /// admin is revoked, the phone's member identity too, and the phone is the
+    /// network's admin under a new identity, carried at once; the founder's root
+    /// over it follows.
+    #[tokio::test]
+    async fn a_member_phone_recovers_the_network_as_its_admin() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let words = the_founders_words();
+        let sign = |wanted: &crate::control::SignaturesWanted| -> Vec<Vec<u8>> {
+            wanted
+                .items
+                .iter()
+                .map(|item| words.signer().sign(&item.message).expect("signs"))
+                .collect()
+        };
+
+        let asked = service
+            .handle(Command::Recover {
+                network: Some("casa".to_owned()),
+                revoke: vec![by_name("nas"), by_name("desk")],
+            })
+            .await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(wanted.items.len(), 4, "two revocations, the old identity's, the new admission");
+        let root = service
+            .handle(Command::Signed { id: wanted.id.clone(), signatures: sign(&wanted) })
+            .await;
+        let Outcome::NeedsSignatures(root) = root else { panic!("the founder's root: {root:?}") };
+        let done =
+            service.handle(Command::Signed { id: root.id.clone(), signatures: sign(&root) }).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+
+        let node = service.node().await.expect("the network, carried again");
+        let now = node.identity().device_id();
+        assert_ne!(now, phone.device_id(), "a new identity");
+        let state = node.state().await.expect("derives");
+        assert!(state.is_admin(&now), "the phone is the admin");
+        for gone in [nas.device_id(), desk.device_id(), phone.device_id()] {
+            assert!(!state.devices.contains_key(&gone), "{gone:?} is revoked");
+        }
+        assert!(
+            !service
+                .home()
+                .paths_for(&crate::recovering::temporary(&label("casa")).expect("t"))
+                .root()
+                .exists(),
+            "the new identity's directory took the old one's place"
+        );
+    }
+
+    /// A member recovering from one admin has room in its batch for the new
+    /// identity's IPv4 address, and is given one: without it the recovered
+    /// admin would be reached by IPv6 alone.
+    #[tokio::test]
+    async fn a_member_recovering_from_one_admin_is_given_an_address() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let words = the_founders_words();
+        let sign = |wanted: &crate::control::SignaturesWanted| -> Vec<Vec<u8>> {
+            wanted
+                .items
+                .iter()
+                .map(|item| words.signer().sign(&item.message).expect("signs"))
+                .collect()
+        };
+
+        let asked =
+            service.handle(Command::Recover { network: None, revoke: vec![by_name("nas")] }).await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(
+            wanted.items.len(),
+            4,
+            "the admin's revocation, the old identity's, the admission, its address"
+        );
+        let root = service
+            .handle(Command::Signed { id: wanted.id.clone(), signatures: sign(&wanted) })
+            .await;
+        let Outcome::NeedsSignatures(root) = root else { panic!("the founder's root: {root:?}") };
+        let done =
+            service.handle(Command::Signed { id: root.id.clone(), signatures: sign(&root) }).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+
+        let node = service.node().await.expect("the network, carried again");
+        let now = node.identity().device_id();
+        let state = node.state().await.expect("derives");
+        assert!(state.is_admin(&now), "the phone is the admin");
+        assert!(!state.devices.contains_key(&nas.device_id()), "the stolen admin is revoked");
+        assert!(state.settings_of(&now).ipv4.is_some(), "the new identity has an IPv4 address");
+    }
+
+    /// A member that held an IPv4 address keeps it under its new identity: the
+    /// address is given once the old identity is revoked (offline-founder
+    /// design §20).
+    #[tokio::test]
+    async fn a_recovered_member_keeps_its_ipv4_address() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let node = service.node().await.expect("a network");
+        let held = 7_u32.to_be_bytes();
+        let given = founder_signed_on(
+            &node,
+            OperationBody::SetDevice {
+                device: phone.device_id(),
+                change: roster::leaf::SettingsChange {
+                    ipv4: Some(Some(held)),
+                    ..roster::leaf::SettingsChange::default()
+                },
+            },
+        )
+        .await;
+        node.admit_without_activating(&given).await.expect("held");
+        assert_eq!(
+            node.state().await.expect("derives").settings_of(&phone.device_id()).ipv4,
+            Some(held)
+        );
+
+        let done = as_the_founder(
+            &service,
+            Command::Recover { network: None, revoke: vec![by_name("nas")] },
+        )
+        .await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+        let node = service.node().await.expect("the network, carried again");
+        let now = node.identity().device_id();
+        assert_ne!(now, phone.device_id(), "a new identity");
+        let state = node.state().await.expect("derives");
+        assert_eq!(state.settings_of(&now).ipv4, Some(held), "the same IPv4 address");
+    }
+
+    /// An admin recovers by revocations alone: it keeps its identity, and only
+    /// the admin named is revoked.
+    #[tokio::test]
+    async fn an_admin_recovers_by_revocations_alone() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, desk, _scratch) =
+            two_admins_and(false, Arc::clone(&desk), None, None).await;
+        let words = the_founders_words();
+        let sign = |wanted: &crate::control::SignaturesWanted| -> Vec<Vec<u8>> {
+            wanted
+                .items
+                .iter()
+                .map(|item| words.signer().sign(&item.message).expect("signs"))
+                .collect()
+        };
+
+        let asked =
+            service.handle(Command::Recover { network: None, revoke: vec![by_name("nas")] }).await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(wanted.items.len(), 1, "the revocation alone");
+        let root = service
+            .handle(Command::Signed { id: wanted.id.clone(), signatures: sign(&wanted) })
+            .await;
+        let Outcome::NeedsSignatures(root) = root else { panic!("the founder's root: {root:?}") };
+        let done =
+            service.handle(Command::Signed { id: root.id.clone(), signatures: sign(&root) }).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+
+        let node = service.node().await.expect("a network");
+        assert_eq!(node.identity().device_id(), desk.device_id(), "the same identity");
+        let state = node.state().await.expect("derives");
+        assert!(state.is_admin(&desk.device_id()));
+        assert!(!state.devices.contains_key(&nas.device_id()), "the admin named is revoked");
+    }
+
+    /// A recovery that cannot be what it says is refused before anything is
+    /// signed: a device named that is not an admin, more than two named, or an
+    /// admin naming nobody.
+    #[tokio::test]
+    async fn a_recovery_that_cannot_hold_is_refused_before_anything_is_signed() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (on_phone, _nas, _desk, _scratch) =
+            two_admins_and(false, Arc::clone(&desk), None, Some(Arc::clone(&phone))).await;
+        for revoke in [
+            vec![by_name("phone")],
+            vec![by_name("nas"), by_name("desk"), by_name("phone")],
+            vec![by_name("nobody")],
+        ] {
+            let refused = on_phone.handle(Command::Recover { network: None, revoke }).await;
+            assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
+        }
+
+        let (on_desk, _nas, _desk, _scratch) = two_admins_and(false, desk, None, None).await;
+        let refused = on_desk.handle(Command::Recover { network: None, revoke: Vec::new() }).await;
+        assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
+        let state = on_desk.node().await.expect("a network").state().await.expect("derives");
+        assert_eq!(state.devices.len(), 3, "nothing was signed or revoked");
+    }
+
+    /// **The history lists the founder's acts as the founder's**, newest first,
+    /// with the admins' before them.
+    #[tokio::test]
+    async fn the_history_lists_who_did_what() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) = two_admins_and(false, desk, None, Some(phone)).await;
+        let words = the_founders_words();
+        let asked = service.handle(Command::AsFounder(Box::new(revoking_by_name("nas")))).await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        let signatures = wanted
+            .items
+            .iter()
+            .map(|item| words.signer().sign(&item.message).expect("signs"))
+            .collect();
+        let _root = service.handle(Command::Signed { id: wanted.id, signatures }).await;
+
+        let listed = service.handle(Command::History { network: None, by: None }).await;
+        let Outcome::History(history) = listed else { panic!("{listed:?}") };
+        let first = history.entries.first().expect("an entry");
+        assert!(first.by.is_none(), "the newest is the founder's: {first:?}");
+        assert!(matches!(first.does, crate::control::Act::Revokes(_)));
+        assert!(first.no_effect.is_none());
+        assert!(
+            history.entries.iter().any(|entry| matches!(entry.does, crate::control::Act::Founds))
+        );
+        assert!(!history.compacted, "nothing was compacted: the list starts at the founding");
+
+        let founders = service
+            .handle(Command::History { network: None, by: Some("founder".to_owned()) })
+            .await;
+        let Outcome::History(founders) = founders else { panic!("{founders:?}") };
+        assert_eq!(
+            founders.entries.len(),
+            2,
+            "only the founder's: desk's admission, and the revocation"
+        );
+    }
+
+    /// **The founder's keys are replaced by the founder alone**, and the old
+    /// words are nobody's afterwards.
+    #[tokio::test]
+    async fn the_founder_replaces_its_keys_and_the_old_words_sign_nothing_after() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) = two_admins_and(false, desk, None, Some(phone)).await;
+        let old = the_founders_words();
+        let new = identity::founder::FounderKey::generate().expect("words");
+        let sign = |key: &identity::founder::FounderKey,
+                    wanted: &crate::control::SignaturesWanted|
+         -> Vec<Vec<u8>> {
+            wanted
+                .items
+                .iter()
+                .map(|item| key.signer().sign(&item.message).expect("signs"))
+                .collect()
+        };
+
+        let asked = service
+            .handle(Command::ReplaceFounder {
+                network: None,
+                founder: crate::control::FounderPublic::of(&new.keys()),
+            })
+            .await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(
+            wanted.founder.as_ref().and_then(|founder| founder.keys().ok()),
+            Some(old.keys()),
+            "signed by the founder it replaces"
+        );
+        // No root is held yet, so the next one would name the new founder,
+        // whose words are not here: the act is done, and no root is asked of
+        // the old words, which would have to refuse it (found on a phone
+        // founding a network alone, 2026-11-24).
+        let done = service
+            .handle(Command::Signed { id: wanted.id.clone(), signatures: sign(&old, &wanted) })
+            .await;
+        let Outcome::Reported(report) = done else { panic!("done, with no root asked: {done:?}") };
+        assert!(
+            report.note.as_deref().is_some_and(|note| note.contains("the founder's root")),
+            "and it says the root waits: {:?}",
+            report.note
+        );
+
+        let state = service.node().await.expect("a network").state().await.expect("derives");
+        assert_eq!(state.params.founder, new.keys(), "the new keys are the founder's");
+
+        let asked = service.handle(Command::AsFounder(Box::new(revoking_by_name("nas")))).await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(
+            wanted.founder.as_ref().and_then(|founder| founder.keys().ok()),
+            Some(new.keys()),
+            "the founder asked for now is the new one"
+        );
+        let signatures = sign(&old, &wanted);
+        let refused = service.handle(Command::Signed { id: wanted.id, signatures }).await;
+        assert!(
+            matches!(refused, Outcome::Failed { .. }),
+            "the old words sign nothing: {refused:?}"
+        );
+    }
+
+    /// Words that are not this network's founder's sign nothing it accepts.
+    #[tokio::test]
+    async fn another_networks_founder_signs_nothing_here() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, nas, _desk, _scratch) = two_admins_and(false, desk, None, Some(phone)).await;
+        let someone = identity::founder::FounderKey::generate().expect("words");
+
+        let asked = service.handle(Command::AsFounder(Box::new(revoking_by_name("nas")))).await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        let signatures: Vec<Vec<u8>> = wanted
+            .items
+            .iter()
+            .map(|item| someone.signer().sign(&item.message).expect("signs"))
+            .collect();
+        let refused = service.handle(Command::Signed { id: wanted.id, signatures }).await;
+        assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
+        let state = service.node().await.expect("a network").state().await.expect("derives");
+        assert!(state.devices.contains_key(&nas.device_id()), "nothing was revoked");
     }
 
     /// Both, side by side, each answering about itself.
@@ -10982,6 +13819,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "cliente".to_owned(),
                 name: "nas".to_owned(),
                 suffix: "cliente.internal".to_owned(),
@@ -11047,6 +13887,9 @@ mod tests {
         );
 
         let found = |label: &str, range: Option<&str>| Command::Found {
+            founder: crate::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: label.to_owned(),
             name: "nas".to_owned(),
             suffix: format!("{label}.internal"),
@@ -11119,6 +13962,9 @@ mod tests {
         for name in ["casa", "lavoro"] {
             let outcome = service
                 .handle(Command::Found {
+                    founder: crate::control::FounderPublic::of(
+                        &roster::types::FounderKeys::held_by_nobody(),
+                    ),
                     label: name.to_owned(),
                     name: "nas".to_owned(),
                     suffix: format!("{name}.internal"),
@@ -11617,6 +14463,7 @@ mod tests {
         identity::store::save(&founder, &old.identity()).expect("seals");
 
         let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "casa.internal",
             2_592_000,
@@ -11626,7 +14473,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -11715,6 +14562,9 @@ mod tests {
 
         service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "casa".to_owned(),
                 name: "nas".to_owned(),
                 suffix: "casa.internal".to_owned(),
@@ -11748,6 +14598,9 @@ mod tests {
         for overlapping in ["casa.internal", "ufficio.casa.internal", "internal"] {
             let outcome = service
                 .handle(Command::Found {
+                    founder: crate::control::FounderPublic::of(
+                        &roster::types::FounderKeys::held_by_nobody(),
+                    ),
                     label: "terza".to_owned(),
                     name: "nas".to_owned(),
                     suffix: overlapping.to_owned(),
@@ -11777,6 +14630,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "terza".to_owned(),
                 name: "nas".to_owned(),
                 suffix: "cliente.internal".to_owned(),
@@ -11799,6 +14655,9 @@ mod tests {
 
         let outcome = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "casa".to_owned(),
                 name: "nas".to_owned(),
                 suffix: "altro.internal".to_owned(),
@@ -12309,7 +15168,10 @@ mod tests {
                 assert_eq!(revoked.device.id.len(), 19, "with its short id");
                 let revocation = revoked.revocations.first().expect("with the revocation");
                 assert_eq!(revocation.reason, "the machine was lost");
-                assert!(revocation.by.name.is_some(), "and the admin that signed it, by name");
+                assert!(
+                    revocation.by.as_ref().is_some_and(|by| by.name.is_some()),
+                    "and the admin that signed it, by name"
+                );
                 assert!(
                     matches!(revocation.signer_clock, crate::control::Signed::At { .. }),
                     "signed here, so its time is recorded"
@@ -12452,6 +15314,7 @@ mod tests {
             at(host),
             NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
         )
         .expect("issues")
         .to_text()
@@ -12655,6 +15518,7 @@ mod tests {
     #[test]
     fn a_move_asks_for_a_new_transport_at_its_end_and_not_before() {
         let moving = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             Some("https://old.example:443"),
             "example.internal",
@@ -13070,6 +15934,7 @@ mod tests {
         *service.pending.lock().await = Some(Pending::Founding {
             label: Label::new("casa").expect("valid"),
             wanted: crate::founding::Founding {
+                founder: roster::types::FounderKeys::held_by_nobody(),
                 name: "desktop".to_owned(),
                 suffix: "home.internal".to_owned(),
                 relay: None,
@@ -13122,6 +15987,7 @@ mod tests {
             .finish_founding(
                 Label::new("casa").expect("valid"),
                 crate::founding::Founding {
+                    founder: roster::types::FounderKeys::held_by_nobody(),
                     name: "desktop".to_owned(),
                     suffix: "home.internal".to_owned(),
                     relay: None,
@@ -13457,7 +16323,7 @@ mod tests {
         let before = node.state().await.expect("derives").devices.len();
         let device = |n: u32| {
             let board = NodeIdentity::generate().expect("generates");
-            let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+            let spec = board.device_spec("board", Role::Member, vec![]).expect("spec");
             let hex_of = |purpose: KeyPurpose| {
                 spec.keys
                     .iter()
@@ -13520,7 +16386,7 @@ mod tests {
         let fixture = fixture(None).await;
         let device = |n: u32| {
             let board = NodeIdentity::generate().expect("generates");
-            let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+            let spec = board.device_spec("board", Role::Member, vec![]).expect("spec");
             let hex_of = |purpose: KeyPurpose| {
                 spec.keys
                     .iter()
@@ -13598,36 +16464,26 @@ mod tests {
     #[tokio::test]
     async fn revoking_an_admin_says_what_it_voids_before_signing() {
         use roster::batch::{BatchEntry, BatchHeader};
-        use roster::sign::sign_operation;
         use roster::types::{OperationBody, OperationCore};
 
         let fixture = fixture(None).await;
         let node = fixture.service.node().await.expect("the fixture holds a network");
-        let founder = Arc::clone(node.identity());
         let network = node.state().await.expect("derives").network;
         let deputy = NodeIdentity::generate().expect("generates");
-        let promoted = OperationCore::new(
-            2,
-            founder.signing_key().algorithm(),
+        let promoted = founder_signed_on(
+            &node,
             OperationBody::AddDevice(
-                deputy.device_spec("deputy", Role::Admin, false, vec![]).expect("spec"),
+                deputy.device_spec("deputy", Role::Admin, vec![]).expect("spec"),
             ),
-            node.heads().await,
-            founder.signing_key().key_id(),
-            network,
         )
-        .expect("well-formed");
-        fixture
-            .service
-            .admit(&sign_operation(&promoted, founder.signer()).expect("signs"))
-            .await
-            .expect("admits");
+        .await;
+        fixture.service.admit(&promoted).await.expect("admits");
 
         // The deputy's batch, of which this device holds the header alone.
         let entries: Vec<BatchEntry> = (0..3)
             .map(|index| {
                 let board = NodeIdentity::generate().expect("generates");
-                let spec = board.device_spec("board", Role::Member, false, vec![]).expect("spec");
+                let spec = board.device_spec("board", Role::Member, vec![]).expect("spec");
                 BatchEntry {
                     keys: spec.keys,
                     name: format!("board-{index}"),
@@ -13663,14 +16519,14 @@ mod tests {
                 Command::Revoke { network, target, reason }
             }
         };
-        let asked = fixture.service.handle(revoke(false)).await;
+        let asked = as_the_founder(&fixture.service, revoke(false)).await;
         let Outcome::WouldVoid { voids, .. } = asked else {
             panic!("it must ask first: {asked:?}")
         };
         assert!(voids.contains("voids 1 act"), "{voids}");
         assert!(node.state().await.expect("derives").revoked.is_empty(), "nothing was signed");
 
-        let done = fixture.service.handle(revoke(true)).await;
+        let done = as_the_founder(&fixture.service, revoke(true)).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
         assert_eq!(node.state().await.expect("derives").revoked.len(), 1, "and now it is revoked");
     }
@@ -13764,6 +16620,9 @@ mod tests {
         let service = service.with_keys(Arc::new(crate::keys::PlatformKeys));
         let founded = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "lavoro".to_owned(),
                 name: "desktop".to_owned(),
                 suffix: "work.internal".to_owned(),
@@ -14744,6 +17603,9 @@ mod tests {
 
     fn founding_casa() -> Command {
         Command::Found {
+            founder: crate::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "casa".to_owned(),
             name: "desktop".to_owned(),
             suffix: "home.internal".to_owned(),
@@ -15035,9 +17897,7 @@ mod tests {
         let core = OperationCore::new(
             2,
             founder.signing_key().algorithm(),
-            OperationBody::AddDevice(
-                joiner.device_spec(name, Role::Member, false, vec![]).expect("spec"),
-            ),
+            OperationBody::AddDevice(joiner.device_spec(name, Role::Member, vec![]).expect("spec")),
             node.heads().await,
             founder.signing_key().key_id(),
             state.network,
@@ -15061,6 +17921,9 @@ mod tests {
 
         let declined = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "lavoro".to_owned(),
                 name: "pixel".to_owned(),
                 suffix: "work.internal".to_owned(),
@@ -15131,6 +17994,9 @@ mod tests {
         for (label, suffix) in [("casa", "home.internal"), ("lavoro", "work.internal")] {
             let founded = service
                 .handle(Command::Found {
+                    founder: crate::control::FounderPublic::of(
+                        &roster::types::FounderKeys::held_by_nobody(),
+                    ),
                     label: label.to_owned(),
                     name: "pixel".to_owned(),
                     suffix: suffix.to_owned(),
@@ -15151,7 +18017,7 @@ mod tests {
             crate::clock::signing_time(),
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                phone.device_spec("phone", Role::Member, false, vec![]).expect("spec"),
+                phone.device_spec("phone", Role::Member, vec![]).expect("spec"),
             ),
             node.heads().await,
             founder.signing_key().key_id(),
@@ -15195,6 +18061,9 @@ mod tests {
 
         let founded = service
             .handle(Command::Found {
+                founder: crate::control::FounderPublic::of(
+                    &roster::types::FounderKeys::held_by_nobody(),
+                ),
                 label: "casa".to_owned(),
                 name: "pixel".to_owned(),
                 suffix: "home.internal".to_owned(),
@@ -15221,7 +18090,7 @@ mod tests {
             crate::clock::signing_time(),
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                laptop.device_spec("laptop", Role::Member, false, vec![]).expect("spec"),
+                laptop.device_spec("laptop", Role::Member, vec![]).expect("spec"),
             ),
             node.heads().await,
             founder.signing_key().key_id(),
@@ -15250,7 +18119,7 @@ mod tests {
             crate::clock::signing_time(),
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                tablet.device_spec("tablet", Role::Member, false, vec![]).expect("spec"),
+                tablet.device_spec("tablet", Role::Member, vec![]).expect("spec"),
             ),
             node.heads().await,
             founder.signing_key().key_id(),
@@ -15340,6 +18209,7 @@ mod driven {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             "example.internal",
             2_592_000,
@@ -15350,7 +18220,7 @@ mod driven {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -15365,7 +18235,7 @@ mod driven {
             2,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("laptop", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("laptop", Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             founder.signing_key().key_id(),

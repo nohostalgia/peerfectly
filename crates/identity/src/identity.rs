@@ -654,7 +654,6 @@ impl NodeIdentity {
         &self,
         name: impl Into<String>,
         role: Role,
-        founder: bool,
         capabilities: Vec<Capability>,
     ) -> Result<DeviceSpec> {
         if self.signing.is_public_only() {
@@ -671,7 +670,7 @@ impl NodeIdentity {
         // agrees for two ed25519 keys disagrees as soon as a 33-byte P-256 key
         // sits beside a 32-byte one.
         keys.sort_by_key(KeyEntry::order_key);
-        Ok(DeviceSpec::new(keys, name, role, founder, capabilities)?)
+        Ok(DeviceSpec::new(keys, name, role, capabilities)?)
     }
 }
 
@@ -766,7 +765,7 @@ mod tests {
         let request = crate::detached::prepare_possession(b"anything", &public);
         assert_eq!(member.sign_request(&request), Err(Error::NoSigningKey));
         assert_eq!(
-            member.device_spec("laptop", roster::types::Role::Member, false, vec![]).map(|_| ()),
+            member.device_spec("laptop", roster::types::Role::Member, vec![]).map(|_| ()),
             Err(Error::NoSigningKey),
             "no specification claims a key it cannot sign with"
         );

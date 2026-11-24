@@ -23,8 +23,13 @@ use roster::types::{Algorithm, NetworkParams, OperationBody, OperationCore, Role
 
 /// Fixture network parameters.
 fn params() -> NetworkParams {
-    NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-        .expect("valid")
+    NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "example.internal",
+        2_592_000,
+    )
+    .expect("valid")
 }
 
 /// A founding operation core authored by an identity.
@@ -33,7 +38,7 @@ fn genesis_core(identity: &NodeIdentity) -> OperationCore {
         1_735_689_600_000,
         identity.signing_key().algorithm(),
         OperationBody::CreateNetwork {
-            device: identity.device_spec("phone", Role::Admin, true, vec![]).expect("spec"),
+            device: identity.device_spec("phone", Role::Admin, vec![]).expect("spec"),
             params: params(),
         },
         vec![],
@@ -102,7 +107,7 @@ fn operation_and_snapshot_requests_never_share_their_bytes() {
 
     let operation = prepare_operation(&core, &key);
     let record = identity
-        .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+        .device_spec("pc", roster::types::Role::Admin, Vec::new())
         .expect("a device")
         .into_record(core.id())
         .expect("a record");
@@ -112,10 +117,15 @@ fn operation_and_snapshot_requests_never_share_their_bytes() {
         [0xa0; 32],
         roster::snapshot::Covering { heads: vec![core.id()], depths: vec![0] },
         vec![],
-        roster::leaf::DeviceLeaf { record, settings: roster::leaf::DeviceSettings::default() },
-        roster::membership::MembershipProof {
-            devices: roster::merkle::Proof { siblings: vec![] },
-            parameters: [0; 32],
+        roster::snapshot::RootSigner::Device {
+            leaf: roster::leaf::DeviceLeaf {
+                record,
+                settings: roster::leaf::DeviceSettings::default(),
+            },
+            proof: roster::membership::MembershipProof {
+                devices: roster::merkle::Proof { siblings: vec![] },
+                parameters: [0; 32],
+            },
         },
         identity.signing_key().key_id(),
         NetworkId::from_bytes([9; 32]),

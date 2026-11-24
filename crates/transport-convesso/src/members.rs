@@ -33,13 +33,38 @@ pub const REVOKED: u16 = 0x0101;
 #[derive(Debug, Default, Clone)]
 pub struct Members {
     state: Option<RosterState>,
+    /// The transport keys of devices held as revoked, each with the
+    /// revocation that names it (offline-founder design §16): admitted at the
+    /// handshake only to be refused as revoked and told.
+    revoked: std::collections::HashMap<KeyId, Vec<u8>>,
 }
 
 impl Members {
     /// The members of this state: a copy of it, which costs its changes.
     #[must_use]
     pub fn from_state(state: &RosterState) -> Self {
-        Self { state: Some(state.clone()) }
+        Self { state: Some(state.clone()), revoked: std::collections::HashMap::new() }
+    }
+
+    /// The members of a newer state, keeping the revoked devices told.
+    #[must_use]
+    pub fn updated(&self, state: &RosterState) -> Self {
+        Self { state: Some(state.clone()), revoked: self.revoked.clone() }
+    }
+
+    /// Holds these devices as revoked, replacing the ones held before.
+    pub fn set_revoked(&mut self, revoked: Vec<transport::session::Revoked>) {
+        self.revoked = revoked
+            .into_iter()
+            .map(|device| (KeyId::of_public_key(&device.transport), device.revocation))
+            .collect();
+    }
+
+    /// The revocation of the device a peer is, where it is one held as
+    /// revoked.
+    #[must_use]
+    pub fn revocation_of(&self, peer: &PeerId) -> Option<Vec<u8>> {
+        candidates(peer).into_iter().find_map(|(key, _)| self.revoked.get(&key).cloned())
     }
 
     /// The transport key, among the two a peer id may stand for, that a
@@ -56,6 +81,11 @@ impl Members {
             let address =
                 Address::parse(bytes).ok().filter(|address| address.peer_id() == *peer)?;
             let key = KeyId::of_public_key(&bytes);
+            // The founder's transport key, which no device holds: a founder
+            // session's (`transport::auth::founder_peer`).
+            if key == state.params.founder.transport_id() {
+                return Some((key, address));
+            }
             state
                 .device_for_key_of_purpose(&key, roster::types::KeyPurpose::Transport)
                 .filter(|leaf| {
@@ -88,6 +118,21 @@ impl Members {
     pub fn member(&self, peer: &PeerId) -> Option<DeviceId> {
         self.verdict(peer).ok()
     }
+}
+
+/// The keys, and the addresses, a peer id may stand for: the form keeps no
+/// sign, so both.
+fn candidates(peer: &PeerId) -> Vec<(KeyId, Address)> {
+    let montgomery = curve25519_dalek::montgomery::MontgomeryPoint(*peer.as_bytes());
+    [0_u8, 1]
+        .into_iter()
+        .filter_map(|sign| {
+            let bytes = montgomery.to_edwards(sign)?.compress().to_bytes();
+            let address =
+                Address::parse(bytes).ok().filter(|address| address.peer_id() == *peer)?;
+            Some((KeyId::of_public_key(&bytes), address))
+        })
+        .collect()
 }
 
 /// The refusal code the handshake sends for a verdict, or `None` to admit.
@@ -123,7 +168,14 @@ impl Admission for Gate {
         if self.1 {
             return Decision::Accept { psk: None };
         }
-        let verdict = self.0.read().map_or(Err(Error::NotAMember), |members| members.verdict(peer));
+        let (verdict, told) = self.0.read().map_or((Err(Error::NotAMember), false), |members| {
+            (members.verdict(peer), members.revocation_of(peer).is_some())
+        });
+        // A device held as revoked is let through to be refused as revoked,
+        // and told (offline-founder design §16); nobody else new.
+        if verdict.is_err() && told {
+            return Decision::Accept { psk: None };
+        }
         match refusal_code(&verdict).and_then(RefusalCode::application) {
             None => Decision::Accept { psk: None },
             Some(code) => Decision::Refuse { code, psk: None },
@@ -171,8 +223,7 @@ mod tests {
             (0..32).map(|_| Arc::new(NodeIdentity::generate().unwrap())).collect();
         let mut signs = std::collections::BTreeSet::new();
         for device in &devices {
-            let spec =
-                device.device_spec("board", roster::types::Role::Member, false, vec![]).unwrap();
+            let spec = device.device_spec("board", roster::types::Role::Member, vec![]).unwrap();
             let record = spec.into_record(roster::id::OperationId::from_bytes([3; 32])).unwrap();
             state.devices.insert(device.device_id(), record);
             let key = device.transport_key().public_key().as_bytes().to_vec();

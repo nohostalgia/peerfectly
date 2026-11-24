@@ -497,7 +497,6 @@ mod tests {
             keys: Vec::new(),
             name: name.to_owned(),
             role: Role::Member,
-            founder: false,
             added_by: OperationId::from_bytes([0; 32]),
             capabilities: Vec::new(),
         }
@@ -520,6 +519,7 @@ mod tests {
         RosterState::from_parts(
             NetworkId::from_bytes([1; 32]),
             NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 suffix,
                 2_592_000,
@@ -629,6 +629,7 @@ mod tests {
         let before = answer(&state, &Ipv4View::default(), "nas.example.internal");
 
         state.params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0x11, 0x22, 0x33, 0x00, 0x00, 0x00, 0x00],
             "example.internal",
             2_592_000,

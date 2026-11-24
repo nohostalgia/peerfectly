@@ -771,6 +771,7 @@ mod over_the_wire {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             None::<String>,
             "example.internal",
@@ -782,7 +783,7 @@ mod over_the_wire {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("a", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("a", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -796,9 +797,7 @@ mod over_the_wire {
         let add = OperationCore::new(
             2,
             founder.signing_key().algorithm(),
-            OperationBody::AddDevice(
-                joiner.device_spec("b", Role::Member, false, vec![]).expect("spec"),
-            ),
+            OperationBody::AddDevice(joiner.device_spec("b", Role::Member, vec![]).expect("spec")),
             vec![genesis.id()],
             founder.signing_key().key_id(),
             network,
@@ -1060,25 +1059,27 @@ mod over_the_wire {
         let left = Arc::new(NodeIdentity::generate().expect("generates"));
         let right = Arc::new(NodeIdentity::generate().expect("generates"));
         let impostor = Arc::new(NodeIdentity::generate().expect("generates"));
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .expect("valid");
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
         let mut roster = Roster::new();
         let mut parents = Vec::new();
         let mut network = NetworkId::from_bytes([0; 32]);
         let bodies = [
             OperationBody::CreateNetwork {
-                device: founder.device_spec("a", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("a", Role::Admin, vec![]).expect("spec"),
                 params,
             },
+            OperationBody::AddDevice(left.device_spec("left", Role::Member, vec![]).expect("spec")),
             OperationBody::AddDevice(
-                left.device_spec("left", Role::Member, false, vec![]).expect("spec"),
+                right.device_spec("right", Role::Member, vec![]).expect("spec"),
             ),
             OperationBody::AddDevice(
-                right.device_spec("right", Role::Member, false, vec![]).expect("spec"),
-            ),
-            OperationBody::AddDevice(
-                impostor.device_spec("impostor", Role::Member, false, vec![]).expect("spec"),
+                impostor.device_spec("impostor", Role::Member, vec![]).expect("spec"),
             ),
         ];
         for (ts, body) in (1_u64..).zip(bodies) {

@@ -448,8 +448,16 @@ impl<K: Keys> Sessions<K> {
                 }
             }
             Some(Frame::Roots { id, roots }) => self.roots(engine, peer, id, &roots, now),
-            // It holds no roots to serve; a packet is not a message.
-            Some(Frame::Behind { .. } | Frame::Packet { .. }) | None => {}
+            // It holds no roots to serve; a packet is not a message. A light
+            // member carries no revocations, and is told of its own by the
+            // next root it follows (offline-founder design §16).
+            Some(
+                Frame::Behind { .. }
+                | Frame::Packet { .. }
+                | Frame::Notice { .. }
+                | Frame::Noticed,
+            )
+            | None => {}
         }
     }
 

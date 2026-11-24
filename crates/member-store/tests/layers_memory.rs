@@ -101,7 +101,7 @@ fn founder_spec(signer: &Ed25519Signer) -> DeviceSpec {
         key(KeyPurpose::Attestation, "a"),
     ];
     keys.sort_by_key(KeyEntry::order_key);
-    DeviceSpec::new(keys, "founder", Role::Admin, true, Vec::new()).unwrap()
+    DeviceSpec::new(keys, "founder", Role::Admin, Vec::new()).unwrap()
 }
 
 fn per(bytes: usize, devices: usize) -> usize {
@@ -135,7 +135,13 @@ fn a_full_member_holds_nothing_per_board_with_its_layers_on_disk() {
 
     let start = live();
     let founder = Ed25519Signer::from_seed([1; 32]);
-    let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "fleet.internal", 0).unwrap();
+    let params = NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "fleet.internal",
+        0,
+    )
+    .unwrap();
     let mut roster = Roster::new();
     roster.keep_layers_in(Arc::clone(&layers) as Arc<dyn LayerStore>);
     let mut ts = 1_760_000_000_000_u64;

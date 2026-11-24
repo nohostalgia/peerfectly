@@ -21,6 +21,10 @@ getrandom.workspace = true
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 zeroize.workspace = true
+# The founder's words: their keys are derived with BLAKE3, their checksum is
+# BIP39's SHA-256.
+blake3.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

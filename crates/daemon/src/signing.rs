@@ -259,6 +259,37 @@ impl<T> Waiting<T> {
     }
 }
 
+/// Who an operation names as its author: the algorithm and key id that go in
+/// its core.
+///
+/// This device's signing key for an act it signs itself, the founder's for an
+/// act signed with the founder's words. The rest of an act — what it does, the
+/// state it is judged in — is the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Author {
+    /// The algorithm.
+    pub algorithm: roster::types::Algorithm,
+    /// The key id.
+    pub key_id: roster::id::KeyId,
+}
+
+impl Author {
+    /// This device's signing key.
+    #[must_use]
+    pub fn of(identity: &identity::NodeIdentity) -> Self {
+        Self {
+            algorithm: identity.signing_key().algorithm(),
+            key_id: identity.signing_key().key_id(),
+        }
+    }
+
+    /// The founder's signing key.
+    #[must_use]
+    pub fn founder(keys: &roster::types::FounderKeys) -> Self {
+        Self { algorithm: roster::types::Algorithm::Ed25519, key_id: keys.signing_id() }
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
@@ -275,8 +306,9 @@ mod tests {
             1_735_689_600_000,
             identity.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: identity.device_spec(name, Role::Admin, true, vec![]).unwrap(),
+                device: identity.device_spec(name, Role::Admin, vec![]).unwrap(),
                 params: NetworkParams::new(
+                    roster::types::FounderKeys::held_by_nobody(),
                     vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
                     "example.internal",
                     2_592_000,

@@ -27,7 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::auth::{self, CHALLENGE_LEN, Handshake};
 use crate::error::{Error, Result};
 use crate::limits;
-use crate::session::{Session, Transport};
+use crate::session::{NoticeHandler, Revoked, Session, Transport};
 
 /// What a peer's endpoint receives when someone dials it.
 struct Incoming {
@@ -52,6 +52,9 @@ struct Incoming {
 pub struct MemoryFabric {
     /// Endpoints by transport key id.
     endpoints: Arc<Mutex<HashMap<KeyId, mpsc::Sender<Incoming>>>>,
+    /// Where each endpoint reads a notice of its revocation, by transport key
+    /// id ([`Transport::on_notice`]).
+    notices: Arc<std::sync::Mutex<HashMap<KeyId, NoticeHandler>>>,
 }
 
 impl MemoryFabric {
@@ -91,6 +94,9 @@ pub struct MemoryTransport {
     inbox: Mutex<mpsc::Receiver<Incoming>>,
     /// A deterministic source of nonces, so tests reproduce.
     nonce: Arc<Mutex<u64>>,
+    /// The devices held as revoked, by transport key id, with the revocation
+    /// each is told when it dials ([`Transport::tell_revoked`]).
+    revoked: std::sync::Mutex<HashMap<KeyId, Vec<u8>>>,
 }
 
 impl MemoryTransport {
@@ -110,6 +116,7 @@ impl MemoryTransport {
             open: Arc::new(Mutex::new(Vec::new())),
             inbox: Mutex::new(receiver),
             nonce: Arc::new(Mutex::new(0)),
+            revoked: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -222,6 +229,24 @@ impl Transport for MemoryTransport {
         let device = match outcome {
             Ok(device) => device,
             Err(refusal) => {
+                // A device held as revoked is refused as revoked, and told.
+                let dialler = incoming.handshake.key.key_id();
+                let told = self.revoked.lock().ok().and_then(|held| held.get(&dialler).cloned());
+                let refusal = match told {
+                    Some(revocation) => {
+                        let handler = self
+                            .fabric
+                            .notices
+                            .lock()
+                            .ok()
+                            .and_then(|handlers| handlers.get(&dialler).cloned());
+                        if let Some(handler) = handler {
+                            handler(revocation);
+                        }
+                        Error::Revoked
+                    }
+                    None => refusal,
+                };
                 // Tell the dialler why, rather than dropping the channel and
                 // leaving it to guess at a timeout.
                 let _ = incoming.reply.send(Err(refusal.clone()));
@@ -239,6 +264,33 @@ impl Transport for MemoryTransport {
         ));
         self.remember(&session).await;
         Ok(Box::new(SessionHandle(session)))
+    }
+
+    fn tell_revoked(&self, revoked: Vec<Revoked>) {
+        let held = revoked
+            .into_iter()
+            .filter_map(|device| {
+                let key = PublicKey::new(roster::types::Algorithm::Ed25519, device.transport).ok()?;
+                Some((key.key_id(), device.revocation))
+            })
+            .collect();
+        if let Ok(mut kept) = self.revoked.lock() {
+            *kept = held;
+        }
+    }
+
+    async fn notify(&self, peer: &PublicKey, revocation: Vec<u8>) -> Result<()> {
+        let handler =
+            self.fabric.notices.lock().ok().and_then(|handlers| handlers.get(&peer.key_id()).cloned());
+        let handler = handler.ok_or(Error::PeerUnreachable { cause: None })?;
+        handler(revocation);
+        Ok(())
+    }
+
+    fn on_notice(&self, handler: NoticeHandler) {
+        if let Ok(mut handlers) = self.fabric.notices.lock() {
+            handlers.insert(self.identity.transport_key().key_id(), handler);
+        }
     }
 }
 

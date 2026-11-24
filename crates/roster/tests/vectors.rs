@@ -482,7 +482,8 @@ fn the_merge_corpus_covers_every_rule() {
         "ancestor-relative-validity",
         "batch-skip",
         "causal-authorship",
-        "founder-protection",
+        "founder-governs-admins",
+        "founder-key",
         "network-identity",
         "genesis",
     ] {
@@ -540,7 +541,7 @@ fn a_corrupted_merge_vector_is_detected() {
 #[test]
 fn the_merge_corpus_declares_its_format_version() {
     let document = load("merge.json");
-    assert_eq!(document.get("format").and_then(Value::as_str), Some("roster/v1"));
+    assert_eq!(document.get("format").and_then(Value::as_str), Some("roster/v2"));
     assert_eq!(document.get("kind").and_then(Value::as_str), Some("merge"));
 }
 
@@ -756,7 +757,7 @@ fn the_corpus_declares_its_format_version() {
         ("snapshot.json", "snapshot"),
     ] {
         let document = load(name);
-        assert_eq!(document.get("format").and_then(Value::as_str), Some("roster/v1"));
+        assert_eq!(document.get("format").and_then(Value::as_str), Some("roster/v2"));
         assert_eq!(document.get("kind").and_then(Value::as_str), Some(kind));
     }
 }
@@ -827,13 +828,25 @@ fn the_merge_vectors_say_what_the_requirements_say() {
         Some(Role::Member)
     );
 
-    // "Demote beats promote among concurrent branches": the derived role is member.
-    let demoted = state_of("concurrent demote beats promote");
+    // Only the founder key promotes or demotes, so a concurrent demote and
+    // promote are the founder's fork, and neither stands: the role is as before.
+    let forked_roles = state_of("the founder's concurrent demote and promote are a fork");
     assert_eq!(
-        demoted.devices.get(&support::device_id(2)).map(|record| record.role),
-        Some(Role::Member),
-        "a race between a demote and a promote resolves downwards"
+        forked_roles.devices.get(&support::device_id(2)).map(|record| record.role),
+        Some(Role::Admin),
+        "neither branch of the founder's fork stands"
     );
+
+    // "Only the founder key governs admins": an admin's revocation of another
+    // admin, and an admin retiring itself, change nothing.
+    for name in [
+        "an admin's revocation of another admin is without authority",
+        "an admin cannot retire itself",
+    ] {
+        let kept = state_of(name);
+        assert!(kept.is_admin(&support::device_id(1)), "{name}");
+        assert!(kept.revoked.is_empty(), "{name}");
+    }
 
     // "Last-writer-wins with deterministic tie-break": at equal depth the greater
     // operation id wins. Which name that is depends on the ids, so the claim

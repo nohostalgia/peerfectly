@@ -75,7 +75,6 @@ fn leaf(n: u32) -> DeviceLeaf {
             keys,
             name: format!("board-{n}"),
             role: Role::Member,
-            founder: false,
             added_by: OperationId::from_bytes([1; 32]),
             capabilities: Vec::new(),
         },
@@ -95,7 +94,13 @@ fn what_a_full_members_daemon_holds_beside_its_roster() {
         println!("{what}: {} MB, {} B per device", bytes / 1_000_000, per(bytes));
     };
 
-    let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "fleet.internal", 0).unwrap();
+    let params = NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "fleet.internal",
+        0,
+    )
+    .unwrap();
     let mut state = RosterState::empty(NetworkId::from_bytes([7; 32]), params);
     state.devices = (0..devices).map(leaf).collect();
     let me = state.devices.keys().next().unwrap();

@@ -194,8 +194,13 @@ impl Simulation {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let others: Vec<NodeIdentity> =
             (1..fulls).map(|_| NodeIdentity::generate().expect("generates")).collect();
-        let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "sim.internal", 2_592_000)
-            .expect("parameters");
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "sim.internal",
+            2_592_000,
+        )
+        .expect("parameters");
         let mut log: Vec<Vec<u8>> = Vec::new();
         let mut roster = Roster::new();
         let mut clock = EPOCH_MS;
@@ -219,7 +224,7 @@ impl Simulation {
         let (genesis, bytes) = sign(
             &mut roster,
             OperationBody::CreateNetwork {
-                device: founder.device_spec("full-0", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("full-0", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             NetworkId::from_bytes([0; 32]),
@@ -227,9 +232,8 @@ impl Simulation {
         log.push(bytes);
         let network = NetworkId::from_bytes(*genesis.as_bytes());
         for (index, identity) in (1_usize..).zip(&others) {
-            let spec = identity
-                .device_spec(format!("full-{index}"), Role::Member, false, vec![])
-                .expect("spec");
+            let spec =
+                identity.device_spec(format!("full-{index}"), Role::Member, vec![]).expect("spec");
             log.push(sign(&mut roster, OperationBody::AddDevice(spec), network).1);
         }
         let ids: Vec<DeviceId> = std::iter::once(founder.device_id())
@@ -318,7 +322,7 @@ impl Simulation {
             .map(|index| {
                 let board = NodeIdentity::generate().expect("generates");
                 let spec = board
-                    .device_spec(format!("board-{index}"), Role::Member, false, vec![])
+                    .device_spec(format!("board-{index}"), Role::Member, vec![])
                     .expect("spec");
                 BatchEntry {
                     keys: spec.keys,

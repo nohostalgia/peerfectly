@@ -14,18 +14,8 @@ use support::{History, device, device_id};
 fn rooted() -> Roster {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "two",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
-    history.op(
-        "three",
-        1,
-        &["two"],
-        OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
-    );
+    history.op("two", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("three", 1, &["two"], OperationBody::AddDevice(device(3, "phone", Role::Member)));
     let mut roster = Roster::new();
     for entry in history.entries() {
         assert!(roster.offer_bytes(&entry.bytes).is_accepted());
@@ -35,7 +25,7 @@ fn rooted() -> Roster {
 }
 
 fn transport_key_of(seed: u8) -> roster::id::KeyId {
-    device(seed, "x", Role::Member, false)
+    device(seed, "x", Role::Member)
         .keys
         .iter()
         .find(|entry| entry.purpose == KeyPurpose::Transport)

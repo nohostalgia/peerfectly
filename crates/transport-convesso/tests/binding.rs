@@ -1312,3 +1312,83 @@ async fn a_changed_policy_closes_what_it_no_longer_allows() {
         "the receiver closes the session the new policy does not allow"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Telling a revoked device (offline-founder design §16)
+// ---------------------------------------------------------------------------
+
+/// A device held as revoked is let through the handshake only to be refused
+/// as revoked and sent its revocation; and a member pushes the revocation to
+/// it, outside any session, and hears it read.
+#[tokio::test]
+async fn a_revoked_device_is_told_when_it_dials_and_when_it_is_pushed_to() {
+    let (_relay, network, founder, joiner) = pair().await;
+    let mut revoked = network.state.clone();
+    revoked.devices.remove(&network.joiner.device_id());
+    revoked.revoked.insert(network.joiner.device_id());
+    founder.update_state(revoked).await;
+    let revocation = b"the revocation, as signed".to_vec();
+    founder.tell_revoked(vec![transport::session::Revoked {
+        transport: network.joiner.transport_key().public_key().as_bytes().to_vec(),
+        revocation: revocation.clone(),
+    }]);
+    let (told, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    joiner.on_notice(Arc::new(move |bytes| {
+        let _ = told.send(bytes);
+    }));
+
+    // Answered: its dial refused as revoked, and the revocation sent.
+    match tokio::time::timeout(PATIENCE, joiner.connect(&founder.transport_key()))
+        .await
+        .expect("the dial finishes")
+    {
+        Err(Error::Revoked) => {}
+        other => panic!("refused as revoked, not {:?}", other.err()),
+    }
+    let answered = tokio::time::timeout(PATIENCE, heard.recv()).await.expect("told").expect("read");
+    assert_eq!(answered, revocation);
+
+    // At every dial, with no clock between: a revoked device dials only at
+    // its own events (offline-founder design §16, §22).
+    match tokio::time::timeout(PATIENCE, joiner.connect(&founder.transport_key()))
+        .await
+        .expect("the second dial finishes")
+    {
+        Err(Error::Revoked) => {}
+        other => panic!("refused as revoked again, not {:?}", other.err()),
+    }
+    let again = tokio::time::timeout(PATIENCE, heard.recv()).await.expect("told again").expect("read");
+    assert_eq!(again, revocation);
+
+    // Pushed: read, and said read.
+    tokio::time::timeout(
+        PATIENCE,
+        founder.notify(&network.joiner.transport_key().public_key(), revocation.clone()),
+    )
+    .await
+    .expect("the push finishes")
+    .expect("the device said it read it");
+    let pushed = tokio::time::timeout(PATIENCE, heard.recv()).await.expect("pushed").expect("read");
+    assert_eq!(pushed, revocation);
+}
+
+/// A key no device ever held is refused at the handshake as before, whatever
+/// devices are held as revoked.
+#[tokio::test]
+async fn a_stranger_is_still_refused_while_revoked_devices_are_told() {
+    let (_relay, network, founder, _joiner) = pair().await;
+    founder.tell_revoked(vec![transport::session::Revoked {
+        transport: network.third.transport_key().public_key().as_bytes().to_vec(),
+        revocation: b"third's revocation".to_vec(),
+    }]);
+    let stranger = Arc::new(NodeIdentity::generate().unwrap());
+    let outsider = ConvessoTransport::bind(&stranger, network.state.clone()).await.unwrap();
+    tokio::time::timeout(PATIENCE, outsider.online()).await.expect("online");
+    match tokio::time::timeout(PATIENCE, outsider.connect(&founder.transport_key()))
+        .await
+        .expect("the dial finishes")
+    {
+        Err(Error::NotAMember | Error::PeerUnreachable { .. }) => {}
+        other => panic!("a stranger is refused, not {:?}", other.err()),
+    }
+}

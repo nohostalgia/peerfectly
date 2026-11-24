@@ -703,9 +703,13 @@ mod full_only {
     /// Fifty full members admitted one by one, and five thousand light members
     /// admitted by one batch.
     fn mixed() -> RosterState {
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .unwrap();
         let mut state = RosterState::from_parts(
             NetworkId::from_bytes([7; 32]),
             params,
@@ -729,7 +733,6 @@ mod full_only {
                     keys: Vec::new(),
                     name: format!("d{n}"),
                     role: Role::Member,
-                    founder: false,
                     added_by,
                     capabilities: Vec::new(),
                 },
@@ -788,7 +791,7 @@ mod full_only {
             silent in proptest::collection::btree_set(0u32..60, 0..6),
         ) {
             let params =
-                NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0).unwrap();
+                NetworkParams::new(roster::types::FounderKeys::held_by_nobody(), vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0).unwrap();
             let mut state = RosterState::from_parts(
                 NetworkId::from_bytes([7; 32]),
                 params,
@@ -801,7 +804,6 @@ mod full_only {
                 keys: Vec::new(),
                 name: format!("d{n}"),
                 role: Role::Member,
-                founder: false,
                 added_by: OperationId::from_bytes(*blake3::hash(&n.to_be_bytes()).as_bytes()),
                 capabilities: Vec::new(),
             };

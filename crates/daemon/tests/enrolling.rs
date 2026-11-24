@@ -44,7 +44,20 @@ fn invite_into(state: &roster::state::RosterState, url: &str) -> Record {
         groups: Vec::new(),
         ipv4: None,
     };
-    Record::issue(url, state.network, state.params.ipv4_range(), invited, 1, 1_000_000)
+    // Anchored to the founding admin's attestation key, as that admin issues it.
+    let anchor = state
+        .devices
+        .iter()
+        .find(|(device, _)| state.is_admin(device))
+        .and_then(|(_, record)| {
+            record
+                .keys
+                .iter()
+                .find(|entry| entry.purpose == roster::types::KeyPurpose::Attestation)
+                .map(roster::types::KeyEntry::key_id)
+        })
+        .expect("an admin's attestation key");
+    Record::issue(url, state.network, state.params.ipv4_range(), anchor, invited, 1, 1_000_000)
         .expect("issues")
 }
 
@@ -188,6 +201,7 @@ fn founded(paths: &Paths, relay: &str) -> roster::state::RosterState {
     found(
         paths,
         &Founding {
+            founder: roster::types::FounderKeys::held_by_nobody(),
             name: "nas".to_owned(),
             suffix: "peerfectly.internal".to_owned(),
             relay: Some(relay.to_owned()),
@@ -319,12 +333,22 @@ async fn a_device_whose_key_is_out_of_reach_still_proves_it_holds_it() {
         }
         (roster.heads(), log)
     };
-    let (core, _name) =
-        admitting::admission_core(&applicant, &record.invited, &admin, &state, heads, false)
-            .expect("prepares");
+    let (core, _name) = admitting::admission_core(
+        &applicant,
+        &record.invited,
+        &daemon::signing::Author::of(&admin),
+        &state,
+        heads,
+        false,
+    )
+    .expect("prepares");
     let admission = admin.sign_operation(&core).expect("signs");
     log.push(admission.clone());
-    let delivery = Delivery { operations: log, pieces: Vec::new(), snapshot: None, base: None };
+    // With the root the invite's anchor signs over it.
+    let mut over = roster::roster::Roster::new();
+    enrollment::adopt::fill(&mut over, None, &log, &[]).expect("fills");
+    let snapshot = Some(daemon::snapshots::sign_over_heads(&over, &admin).expect("signs"));
+    let delivery = Delivery { operations: log, pieces: Vec::new(), snapshot, base: None };
     assert!(delivered(&url, &record, &applicant, &delivery).await, "it adopted the network");
 
     let joined = tokio::time::timeout(A_STEP, task)
@@ -368,9 +392,7 @@ async fn a_replacement_is_one_batch_built_on_its_revocation() {
     let added = OperationCore::new(
         2,
         admin.signing_key().algorithm(),
-        OperationBody::AddDevice(
-            old.device_spec("laptop", Role::Member, false, vec![]).expect("spec"),
-        ),
+        OperationBody::AddDevice(old.device_spec("laptop", Role::Member, vec![]).expect("spec")),
         roster.heads(),
         admin.signing_key().key_id(),
         roster.state().expect("derives").network,
@@ -399,13 +421,18 @@ async fn a_replacement_is_one_batch_built_on_its_revocation() {
         name: taken.name.clone(),
         reason: "replaced by a device admitted under the name `laptop`".to_owned(),
     };
-    let revocation =
-        daemon::revoking::core(&expulsion, &admin, &state, roster.heads()).expect("a revocation");
+    let revocation = daemon::revoking::core(
+        &expulsion,
+        &daemon::signing::Author::of(&admin),
+        &state,
+        roster.heads(),
+    )
+    .expect("a revocation");
     let after = roster.preview(core::slice::from_ref(&revocation)).expect("previews");
     let (admission, spec_name) = admitting::admission_core(
         &applicant,
         &record.invited,
-        &admin,
+        &daemon::signing::Author::of(&admin),
         &after.state,
         after.heads.clone(),
         true,
@@ -439,14 +466,14 @@ async fn a_replacement_is_one_batch_built_on_its_revocation() {
         Log::at(admin_paths.roster()).append(artifact).expect("appends");
         assert!(roster.offer_bytes(artifact).is_accepted(), "taken in order");
     }
+    let root = daemon::snapshots::sign_over_heads(&roster, &admin).expect("the root follows");
     let delivery = Delivery {
         operations: Log::at(admin_paths.roster()).read().expect("reads"),
         pieces: Vec::new(),
-        snapshot: None,
+        snapshot: Some(root.clone()),
         base: None,
     };
     assert!(delivered(&url, &record, &applicant, &delivery).await, "it adopted the network");
-    let root = daemon::snapshots::sign_over_heads(&roster, &admin).expect("the root follows");
     assert!(roster.offer_snapshot(&root).is_accepted(), "and so is the root over both");
 
     let joined = tokio::time::timeout(A_STEP, task)

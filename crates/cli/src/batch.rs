@@ -80,11 +80,16 @@ fn network_of(core: &OperationCore) -> NetworkId {
 }
 
 /// The network label the person typed, if they typed one.
-fn typed_label(asked: &Command) -> Option<&str> {
+pub(crate) fn typed_label(asked: &Command) -> Option<&str> {
     match asked {
+        Command::AsFounder(inner) => typed_label(inner),
+        Command::Recover { network, .. } | Command::ReplaceFounder { network, .. } => {
+            network.as_deref()
+        }
         Command::Found { label, .. } => Some(label.as_str()),
         Command::Revoke { network, .. }
         | Command::RevokeVoiding { network, .. }
+        | Command::RevokeFrom { network, .. }
         | Command::ChangeRelay { network, .. }
         | Command::SetAnchors { network, .. }
         | Command::AdmitBatch { network, .. }
@@ -113,13 +118,20 @@ fn typed_label(asked: &Command) -> Option<&str> {
 /// A command that is not one of the acts below imposes no expectation.
 pub(crate) fn matches_what_was_asked(command: &Command, core: &OperationCore) -> bool {
     match command {
-        Command::Revoke { reason, .. } | Command::RevokeVoiding { reason, .. } => matches!(
+        Command::Revoke { reason, .. }
+        | Command::RevokeVoiding { reason, .. }
+        | Command::RevokeFrom { reason, .. } => matches!(
             &core.body,
             OperationBody::RevokeDevice { reason: signed, .. } if signed == reason.trim()
         ),
-        Command::Found { name, .. } => matches!(
+        // And the founder's keys are the ones made from the words this terminal
+        // showed: a daemon that named others would found a network the person's
+        // words cannot repair.
+        Command::Found { name, founder, .. } => matches!(
             &core.body,
-            OperationBody::CreateNetwork { device, .. } if is_named(&device.name, name)
+            OperationBody::CreateNetwork { device, params }
+                if is_named(&device.name, name)
+                    && daemon::control::FounderPublic::of(&params.founder) == *founder
         ),
         Command::Rename { name, .. } => matches!(
             &core.body,
@@ -202,6 +214,156 @@ fn is_named(signed: &str, typed: &str) -> bool {
 ///
 /// Why it is not, in words for the person — and nothing is signed.
 pub(crate) fn holds_together(
+    asked: &Command,
+    wanted: &SignaturesWanted,
+) -> Result<Vec<Read>, String> {
+    if let Command::AsFounder(inner) = asked {
+        return holds_together_as_founder(inner, wanted);
+    }
+    if matches!(asked, Command::Recover { .. } | Command::ReplaceFounder { .. }) {
+        return holds_together_as_founder(asked, wanted);
+    }
+    if wanted.founder.is_some() {
+        return Err("the daemon asked for the founder's signature on an act you did not ask the \
+                    founder to sign"
+            .to_owned());
+    }
+    holds_together_as_asked(asked, wanted)
+}
+
+/// The same, for an act the person asked the founder's words to sign: the act
+/// as it would be, every operation in it authored by the founder's key, or — the
+/// second batch of such an act — the founder's root over it, alone.
+fn holds_together_as_founder(
+    asked: &Command,
+    wanted: &SignaturesWanted,
+) -> Result<Vec<Read>, String> {
+    let founder = wanted
+        .founder
+        .as_ref()
+        .ok_or_else(|| "the daemon asked for this device's key, not the founder's".to_owned())?
+        .keys()?;
+    let author = founder.signing_id();
+    if let [item] = wanted.items.as_slice()
+        && let Some(Read::Snapshot(body)) = read(item)
+    {
+        return if body.author == author {
+            Ok(vec![Read::Snapshot(body)])
+        } else {
+            Err("the root to sign does not name the founder as its signer".to_owned())
+        };
+    }
+    let read = match asked {
+        Command::Recover { revoke, .. } => recovery_holds_together(revoke.len(), wanted)?,
+        _ => holds_together_as_asked(asked, wanted)?,
+    };
+    let all_founders = read.iter().all(|item| match item {
+        Read::Operation(core) => core.author == author,
+        Read::Snapshot(body) => body.author == author,
+        Read::Possession => false,
+    });
+    if !all_founders {
+        return Err("an act to sign does not name the founder as its author".to_owned());
+    }
+    Ok(read)
+}
+
+/// A recovery's batch: the revocations of the admins named, then, on a device
+/// that was not an admin, the admission of its new identity as an admin, its
+/// IPv4 address where the batch had room, and the revocation of its old
+/// identity, last, where it still counted — a chain, nothing else.
+fn recovery_holds_together(named: usize, wanted: &SignaturesWanted) -> Result<Vec<Read>, String> {
+    let read: Vec<Read> =
+        wanted.items.iter().map(read).collect::<Option<_>>().ok_or_else(|| {
+            "the daemon asked for a signature over something this command could not read".to_owned()
+        })?;
+    let operations: Vec<&OperationCore> = read
+        .iter()
+        .filter_map(|item| match item {
+            Read::Operation(core) => Some(core.as_ref()),
+            _ => None,
+        })
+        .collect();
+    if operations.len() != read.len() || operations.is_empty() {
+        return Err("a recovery is operations only".to_owned());
+    }
+    for pair in operations.windows(2) {
+        if let [before, after] = pair
+            && !after.parents.contains(&before.id())
+        {
+            return Err("the acts of the recovery do not follow one another".to_owned());
+        }
+    }
+    let revocations = operations
+        .iter()
+        .take_while(|core| matches!(core.body, OperationBody::RevokeDevice { .. }))
+        .count();
+    let rest = operations.get(revocations..).unwrap_or_default();
+    let admits_an_admin = |core: &&OperationCore| matches!(&core.body, OperationBody::AddDevice(spec) if spec.role == roster::types::Role::Admin);
+    // The address the new identity is given, where the batch had room: an
+    // IPv4 address set on the device just admitted, nothing else changed.
+    let addresses_it = |admission: &&OperationCore, settings: &&OperationCore| {
+        matches!(
+            (&admission.body, &settings.body),
+            (OperationBody::AddDevice(spec), OperationBody::SetDevice { device, change })
+                if spec.device_id().ok() == Some(*device)
+                    && matches!(change.ipv4, Some(Some(_)))
+                    && change.mode.is_none()
+                    && change.groups.is_none()
+                    && change.relay.is_none()
+        )
+    };
+    // The address the old identity held, given to the new one once the old is
+    // revoked, comes last of all (offline-founder design §20).
+    let (rest, kept_address) = match rest.split_last() {
+        Some((last, before))
+            if matches!(last.body, OperationBody::SetDevice { .. })
+                && before.last().is_some_and(|core| {
+                    matches!(core.body, OperationBody::RevokeDevice { .. })
+                }) =>
+        {
+            (before, Some(last))
+        }
+        _ => (rest, None),
+    };
+    // The old identity's revocation, last, of a device other than the one
+    // admitted.
+    let (admitting, replaced) = match rest.split_last() {
+        Some((last, before)) if matches!(last.body, OperationBody::RevokeDevice { .. }) => {
+            (before, Some(last))
+        }
+        _ => (rest, None),
+    };
+    let admitted = admitting.first().and_then(|core| match &core.body {
+        OperationBody::AddDevice(spec) => spec.device_id().ok(),
+        _ => None,
+    });
+    let replaced_is_another = replaced.is_none_or(|core| {
+        !admitting.is_empty()
+            && matches!(&core.body, OperationBody::RevokeDevice { device, .. } if Some(*device) != admitted)
+    });
+    let shape = revocations == named
+        && replaced_is_another
+        && match (admitting, kept_address) {
+            ([], None) => true,
+            ([only], None) => admits_an_admin(only),
+            ([admission, settings], None) => {
+                admits_an_admin(admission) && addresses_it(admission, settings)
+            }
+            ([admission], Some(kept)) => {
+                replaced.is_some() && admits_an_admin(admission) && addresses_it(admission, kept)
+            }
+            _ => false,
+        };
+    if !shape {
+        return Err("the recovery holds acts that are not the revocations asked for and this \
+                    device's admission as an admin"
+            .to_owned());
+    }
+    Ok(read)
+}
+
+fn holds_together_as_asked(
     asked: &Command,
     wanted: &SignaturesWanted,
 ) -> Result<Vec<Read>, String> {
@@ -380,12 +542,8 @@ fn operation(core: &OperationCore, network: &str, asked: &Command) -> Described 
                     .to_owned(),
             }
         }
-        OperationBody::Promote { device, founder } => Described {
-            act: format!(
-                "make {} an admin{}",
-                short(device),
-                if *founder { " and a founder" } else { "" }
-            ),
+        OperationBody::Promote { device } => Described {
+            act: format!("make {} an admin", short(device)),
             consequence: "it will be able to admit and revoke devices".to_owned(),
         },
         OperationBody::Demote { device } => {

@@ -90,6 +90,8 @@ pub enum Error {
     /// device is a member: there is nothing to sign with, and nothing is made in
     /// its place.
     NoSigningKey,
+    /// Words given as the founder's were refused, for the reason given.
+    FounderWords(crate::founder::WordsRefusal),
     /// A roster check refused the value.
     Roster(roster::Error),
 }
@@ -115,6 +117,7 @@ impl Error {
             Self::WrongPassphraseOrAltered => "wrong_passphrase_or_altered",
             Self::UnacceptableStretch => "unacceptable_stretch",
             Self::NoSigningKey => "no_signing_key",
+            Self::FounderWords(_) => "founder_words",
             Self::Roster(_) => "roster",
         }
     }
@@ -202,6 +205,7 @@ impl fmt::Display for Error {
             Self::NoSigningKey => {
                 f.write_str("this device holds no signing key: it is a member of this network")
             }
+            Self::FounderWords(refusal) => write!(f, "{refusal}"),
             Self::Roster(inner) => write!(f, "roster: {inner}"),
         }
     }

@@ -33,23 +33,35 @@ fn root_at(
     (root, state)
 }
 
+/// The root of what `label` covers, signed by the key `by`, following
+/// `previous`.
+fn root_by(
+    history: &History,
+    label: &str,
+    by: &roster::sign::Ed25519Signer,
+    previous: Option<(&Snapshot, &RosterState)>,
+) -> (Snapshot, RosterState) {
+    let covered = history.covered_dag(&[label]);
+    let state = derive(&covered).unwrap();
+    let id = history.id(label);
+    let depth = covered.depth(covered.position(&id).unwrap());
+    let root = Snapshot::over(
+        &state,
+        Covering { heads: vec![id], depths: vec![depth] },
+        by.key_id(),
+        previous,
+    )
+    .unwrap();
+    (root, state)
+}
+
 /// A network with two admins (1 and 9) and two members (2 and 3).
 fn founded() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin9", 1, &["g"], OperationBody::AddDevice(device(9, "pc", Role::Admin, false)));
-    history.op(
-        "m2",
-        1,
-        &["admin9"],
-        OperationBody::AddDevice(device(2, "sensor", Role::Member, false)),
-    );
-    history.op(
-        "m3",
-        1,
-        &["m2"],
-        OperationBody::AddDevice(device(3, "camera", Role::Member, false)),
-    );
+    history.founder_op("admin9", &["g"], OperationBody::AddDevice(device(9, "pc", Role::Admin)));
+    history.op("m2", 1, &["admin9"], OperationBody::AddDevice(device(2, "sensor", Role::Member)));
+    history.op("m3", 1, &["m2"], OperationBody::AddDevice(device(3, "camera", Role::Member)));
     history
 }
 
@@ -219,7 +231,7 @@ fn a_branch_set_aside_that_grows_heavier_is_switched_to() {
 fn a_root_signed_by_an_admin_a_sibling_demoted_is_refused() {
     let mut history = founded();
     let (base, base_state) = root_at(&history, "m3", 1, None);
-    history.op("demote9", 1, &["m3"], OperationBody::Demote { device: device_id(9) });
+    history.founder_op("demote9", &["m3"], OperationBody::Demote { device: device_id(9) });
     history.op(
         "rename3",
         9,
@@ -247,8 +259,10 @@ fn a_root_signed_by_a_member_is_refused() {
         [0x42; 32],
         Covering { heads: base.heads.clone(), depths: base.depths.clone() },
         vec![],
-        base_state.leaf(&member).unwrap(),
-        MembershipProof::of(&base_state, &member).unwrap(),
+        roster::snapshot::RootSigner::Device {
+            leaf: base_state.leaf(&member).unwrap(),
+            proof: MembershipProof::of(&base_state, &member).unwrap(),
+        },
         signer(2).key_id(),
         base.network,
     )
@@ -339,4 +353,95 @@ fn a_root_following_one_not_remembered_needs_the_chain() {
     assert_eq!(view.offer(&third), RootOutcome::NeedsChain);
     assert_eq!(view.offer(&second), RootOutcome::Adopted);
     assert_eq!(view.offer(&third), RootOutcome::Adopted);
+}
+
+// ---------------------------------------------------------------------------
+// Roots the founder signs
+// ---------------------------------------------------------------------------
+
+/// A recovery, as a light member sees it: the founder's root revokes the stolen
+/// admin and admits a new one, and the new admin's next root is accepted. The
+/// revoked admin can sign nothing the member believes after it.
+#[test]
+fn a_light_member_follows_a_recovery() {
+    let mut history = founded();
+    let (r20, r20_state) = root_at(&history, "m3", 1, None);
+    let mut view = LightView::starting_from(&r20, 16);
+
+    // The founder revokes admin 9 and admits a new admin, 7.
+    history.founder_op(
+        "revoke9",
+        &["m3"],
+        OperationBody::RevokeDevice { device: device_id(9), reason: "stolen".into() },
+    );
+    history.founder_op(
+        "admin7",
+        &["revoke9"],
+        OperationBody::AddDevice(device(7, "phone", Role::Admin)),
+    );
+    let (r21, r21_state) =
+        root_by(&history, "admin7", &support::founder_signer(), Some((&r20, &r20_state)));
+    assert!(r21.signer_device().is_none(), "the founder is not a device");
+    assert_eq!(view.offer(&r21), RootOutcome::Adopted);
+
+    history.op(
+        "rename3",
+        7,
+        &["admin7"],
+        OperationBody::Rename { device: device_id(3), name: "cam".into() },
+    );
+    let (r22, _) = root_at(&history, "rename3", 7, Some((&r21, &r21_state)));
+    assert_eq!(view.offer(&r22), RootOutcome::Adopted, "the admin the founder admitted signs");
+
+    // The revoked admin, signing on from where it was, is not believed.
+    history.op(
+        "rename2",
+        9,
+        &["m3"],
+        OperationBody::Rename { device: device_id(2), name: "x".into() },
+    );
+    let (forged, _) = root_at(&history, "rename2", 9, Some((&r20, &r20_state)));
+    assert_ne!(view.offer(&forged), RootOutcome::Adopted, "revoked by the founder's root");
+}
+
+/// A key the `founder` leaf of the root it follows does not hold signs no root,
+/// however well formed: the old founder's, after a replacement, or anybody's.
+#[test]
+fn a_root_signed_by_a_key_that_is_not_the_founders_is_refused() {
+    let mut history = founded();
+    let (r20, r20_state) = root_at(&history, "m3", 1, None);
+    let mut view = LightView::starting_from(&r20, 16);
+
+    let mut next = support::params();
+    next.founder = support::next_founder_keys();
+    history.founder_op("replace", &["m3"], OperationBody::SetNetwork(next));
+    let (r21, r21_state) =
+        root_by(&history, "replace", &support::founder_signer(), Some((&r20, &r20_state)));
+    assert_eq!(view.offer(&r21), RootOutcome::Adopted, "the founder replaced itself");
+
+    history.op(
+        "rename3",
+        1,
+        &["replace"],
+        OperationBody::Rename { device: device_id(3), name: "cam".into() },
+    );
+    // Built as the old founder would: a founder signer naming the old keys,
+    // proved against r21, which holds the new ones.
+    let covered = history.covered_dag(&["rename3"]);
+    let state = derive(&covered).unwrap();
+    let id = history.id("rename3");
+    let depth = covered.depth(covered.position(&id).unwrap());
+    let proof = roster::snapshot::FounderProof::of(&r21_state).unwrap();
+    let stale = Snapshot::new(
+        r21.generation + 1,
+        vec![r21.root],
+        state.root(),
+        Covering { heads: vec![id], depths: vec![depth] },
+        state.delta_from(&r21_state),
+        roster::snapshot::RootSigner::Founder { keys: support::founder_keys(), proof },
+        support::founder_signer().key_id(),
+        state.network,
+    )
+    .unwrap();
+    assert_eq!(view.offer(&stale), RootOutcome::Refused(RootRefusal::SignerNotProved));
 }

@@ -44,18 +44,20 @@ impl Admin {
             [0xa0; 32],
             roster::snapshot::Covering { heads, depths },
             Vec::new(),
-            roster::leaf::DeviceLeaf {
-                record: self
-                    .identity
-                    .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
-                    .unwrap()
-                    .into_record(roster::id::OperationId::from_bytes([1; 32]))
-                    .unwrap(),
-                settings: roster::leaf::DeviceSettings::default(),
-            },
-            roster::membership::MembershipProof {
-                devices: roster::merkle::Proof { siblings: Vec::new() },
-                parameters: [0; 32],
+            roster::snapshot::RootSigner::Device {
+                leaf: roster::leaf::DeviceLeaf {
+                    record: self
+                        .identity
+                        .device_spec("pc", roster::types::Role::Admin, Vec::new())
+                        .unwrap()
+                        .into_record(roster::id::OperationId::from_bytes([1; 32]))
+                        .unwrap(),
+                    settings: roster::leaf::DeviceSettings::default(),
+                },
+                proof: roster::membership::MembershipProof {
+                    devices: roster::merkle::Proof { siblings: Vec::new() },
+                    parameters: [0; 32],
+                },
             },
             self.identity.signing_key().key_id(),
             self.network,
@@ -65,7 +67,13 @@ impl Admin {
 }
 
 fn params() -> NetworkParams {
-    NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "home.internal", 2_592_000).unwrap()
+    NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "home.internal",
+        2_592_000,
+    )
+    .unwrap()
 }
 
 fn operation(core: &OperationCore) -> ToSign {
@@ -87,6 +95,7 @@ fn batch(network: &str, items: Vec<ToSign>) -> SignaturesWanted {
         network: network.to_owned(),
         items,
         keys: None,
+        founder: None,
     }
 }
 
@@ -103,9 +112,7 @@ fn revocation(admin: &Admin, parents: Vec<OperationId>) -> OperationCore {
 fn admission(admin: &Admin, parents: Vec<OperationId>) -> OperationCore {
     let joiner = NodeIdentity::generate().unwrap();
     admin.core(
-        OperationBody::AddDevice(
-            joiner.device_spec("laptop", Role::Member, false, Vec::new()).unwrap(),
-        ),
+        OperationBody::AddDevice(joiner.device_spec("laptop", Role::Member, Vec::new()).unwrap()),
         parents,
     )
 }
@@ -231,10 +238,8 @@ fn acts_that_do_not_follow_one_another_are_refused() {
 #[test]
 fn an_act_other_than_the_one_asked_for_is_refused() {
     let admin = Admin::new();
-    let promotion = admin.core(
-        OperationBody::Promote { device: DeviceId::from_bytes([0x11; 32]), founder: false },
-        Vec::new(),
-    );
+    let promotion =
+        admin.core(OperationBody::Promote { device: DeviceId::from_bytes([0x11; 32]) }, Vec::new());
     let refused =
         holds_together(&revoking(None), &batch("casa", vec![operation(&promotion)])).unwrap_err();
     assert!(refused.contains("not the act that was asked for"), "{refused}");
@@ -355,10 +360,11 @@ fn a_revocation_must_carry_the_reason_typed() {
 #[test]
 fn a_founding_typed_in_upper_case_is_the_one_asked_for() {
     let admin = Admin::new();
-    let founder = admin.identity.device_spec("laptop", Role::Admin, true, Vec::new()).unwrap();
+    let founder = admin.identity.device_spec("laptop", Role::Admin, Vec::new()).unwrap();
     let founding =
         admin.core(OperationBody::CreateNetwork { device: founder, params: params() }, Vec::new());
     let asked = |name: &str| Command::Found {
+        founder: daemon::control::FounderPublic::of(&roster::types::FounderKeys::held_by_nobody()),
         label: "casa".to_owned(),
         name: name.to_owned(),
         suffix: "home.internal".to_owned(),
@@ -407,7 +413,7 @@ fn said(item: &Read, asked: &Command) -> String {
 fn every_kind_says_what_it_does_and_what_follows() {
     let admin = Admin::new();
 
-    let founder = admin.identity.device_spec("desktop", Role::Admin, true, Vec::new()).unwrap();
+    let founder = admin.identity.device_spec("desktop", Role::Admin, Vec::new()).unwrap();
     let founding =
         admin.core(OperationBody::CreateNetwork { device: founder, params: params() }, Vec::new());
     let text = said(&Read::Operation(Box::new(founding)), &Command::Confirm);
@@ -423,7 +429,7 @@ fn every_kind_says_what_it_does_and_what_follows() {
     assert!(text.contains("reach the devices in casa"), "{text}");
 
     let device = DeviceId::from_bytes([0x11; 32]);
-    let promote = admin.core(OperationBody::Promote { device, founder: false }, Vec::new());
+    let promote = admin.core(OperationBody::Promote { device }, Vec::new());
     let text = said(&Read::Operation(Box::new(promote)), &Command::Confirm);
     assert!(text.contains("an admin") && text.contains("admit and revoke"), "{text}");
 
@@ -531,4 +537,204 @@ fn a_network_being_joined_is_called_that() {
     let shown = listed(&read, "", &Command::Waiting);
     assert!(shown.starts_with("the network being joined: a proof"), "{shown}");
     assert!(holds_together(&Command::Waiting, &batch("", vec![proof()])).is_ok());
+}
+
+// ---- the founder's acts ----------------------------------------------------
+
+/// The founder's words of these tests, and an operation authored by them.
+struct Founder {
+    key: identity::founder::FounderKey,
+    network: NetworkId,
+}
+
+impl Founder {
+    fn new() -> Self {
+        Self {
+            key: identity::founder::FounderKey::generate().unwrap(),
+            network: NetworkId::from_bytes([0x42; 32]),
+        }
+    }
+
+    fn core(&self, body: OperationBody, parents: Vec<OperationId>) -> OperationCore {
+        OperationCore::new(
+            1_735_689_600_000,
+            roster::types::Algorithm::Ed25519,
+            body,
+            parents,
+            self.key.keys().signing_id(),
+            self.network,
+        )
+        .unwrap()
+    }
+
+    fn wanted(&self, items: Vec<ToSign>) -> SignaturesWanted {
+        SignaturesWanted {
+            founder: Some(daemon::control::FounderPublic::of(&self.key.keys())),
+            ..batch("home", items)
+        }
+    }
+}
+
+fn recovering(named: &[&str]) -> Command {
+    Command::Recover {
+        network: Some("home".to_owned()),
+        revoke: named.iter().map(|name| Target::Name((*name).to_owned())).collect(),
+    }
+}
+
+/// A recovery's chain on a member: the admin named, the new identity admitted
+/// as an admin, where the batch has room its address, and the old identity
+/// revoked last.
+fn recovery_chain(
+    founder: &Founder,
+    address: Option<roster::leaf::SettingsChange>,
+) -> Vec<OperationCore> {
+    let revoke_admin = founder.core(
+        OperationBody::RevokeDevice {
+            device: DeviceId::from_bytes([0x11; 32]),
+            reason: "x".to_owned(),
+        },
+        Vec::new(),
+    );
+    let new = NodeIdentity::generate().unwrap();
+    let spec = new.device_spec("phone", Role::Admin, Vec::new()).unwrap();
+    let device = spec.device_id().unwrap();
+    let admit = founder.core(OperationBody::AddDevice(spec), vec![revoke_admin.id()]);
+    let mut chain = vec![revoke_admin, admit];
+    if let Some(change) = address {
+        let parent = chain.last().unwrap().id();
+        chain.push(founder.core(OperationBody::SetDevice { device, change }, vec![parent]));
+    }
+    let parent = chain.last().unwrap().id();
+    chain.push(founder.core(
+        OperationBody::RevokeDevice {
+            device: DeviceId::from_bytes([0x22; 32]),
+            reason: "y".to_owned(),
+        },
+        vec![parent],
+    ));
+    chain
+}
+
+fn an_address() -> roster::leaf::SettingsChange {
+    roster::leaf::SettingsChange { ipv4: Some(Some([0, 0, 0, 3])), ..Default::default() }
+}
+
+#[test]
+fn a_recovery_holds_together_with_or_without_the_new_identitys_address() {
+    let founder = Founder::new();
+    for address in [None, Some(an_address())] {
+        let chain = recovery_chain(&founder, address);
+        let wanted = founder.wanted(chain.iter().map(operation).collect());
+        assert!(holds_together(&recovering(&["nas"]), &wanted).is_ok());
+    }
+}
+
+/// The address the old identity held comes after its revocation, and only
+/// there: given to the new identity, nothing else changed.
+#[test]
+fn a_recovery_keeping_the_old_address_gives_it_after_the_revocation() {
+    let founder = Founder::new();
+    let mut chain = recovery_chain(&founder, None);
+    let device = match &chain.get(1).unwrap().body {
+        OperationBody::AddDevice(spec) => spec.device_id().unwrap(),
+        other => panic!("the admission, not {other:?}"),
+    };
+    let parent = chain.last().unwrap().id();
+    chain.push(
+        founder.core(OperationBody::SetDevice { device, change: an_address() }, vec![parent]),
+    );
+    let wanted = founder.wanted(chain.iter().map(operation).collect());
+    assert!(holds_together(&recovering(&["nas"]), &wanted).is_ok());
+
+    // Of another device, or more than the address, it is refused.
+    let mut other = chain.clone();
+    other.pop();
+    let parent = other.last().unwrap().id();
+    other.push(founder.core(
+        OperationBody::SetDevice { device: DeviceId::from_bytes([0x33; 32]), change: an_address() },
+        vec![parent],
+    ));
+    let wanted = founder.wanted(other.iter().map(operation).collect());
+    assert!(holds_together(&recovering(&["nas"]), &wanted).is_err());
+}
+
+#[test]
+fn a_recovery_that_changes_more_than_the_address_is_refused() {
+    let founder = Founder::new();
+    let more =
+        roster::leaf::SettingsChange { mode: Some(roster::leaf::Mode::Light), ..an_address() };
+    let removed = roster::leaf::SettingsChange { ipv4: Some(None), ..Default::default() };
+    for change in [more, removed] {
+        let chain = recovery_chain(&founder, Some(change));
+        let wanted = founder.wanted(chain.iter().map(operation).collect());
+        assert!(holds_together(&recovering(&["nas"]), &wanted).is_err());
+    }
+}
+
+#[test]
+fn a_recovery_revoking_other_than_the_admins_named_is_refused() {
+    let founder = Founder::new();
+    let chain = recovery_chain(&founder, None);
+    let wanted = founder.wanted(chain.iter().map(operation).collect());
+    assert!(holds_together(&recovering(&["nas"]), &wanted).is_ok());
+    for named in [&[][..], &["nas", "desk"][..]] {
+        assert!(holds_together(&recovering(named), &wanted).is_err(), "{named:?}");
+    }
+}
+
+/// The revocation that ends the chain is the old identity's: one of the
+/// device just admitted would leave the network without the admin it was for.
+#[test]
+fn a_recovery_revoking_the_device_it_admits_is_refused() {
+    let founder = Founder::new();
+    let new = NodeIdentity::generate().unwrap();
+    let spec = new.device_spec("phone", Role::Admin, Vec::new()).unwrap();
+    let device = spec.device_id().unwrap();
+    let admit = founder.core(OperationBody::AddDevice(spec), Vec::new());
+    let revoke = founder
+        .core(OperationBody::RevokeDevice { device, reason: "y".to_owned() }, vec![admit.id()]);
+    let wanted = founder.wanted(vec![operation(&admit), operation(&revoke)]);
+    assert!(holds_together(&recovering(&[]), &wanted).is_err());
+}
+
+#[test]
+fn a_recovery_admitting_a_member_is_refused() {
+    let founder = Founder::new();
+    let revoke = founder.core(
+        OperationBody::RevokeDevice {
+            device: DeviceId::from_bytes([0x11; 32]),
+            reason: "x".to_owned(),
+        },
+        Vec::new(),
+    );
+    let joiner = NodeIdentity::generate().unwrap();
+    let admit = founder.core(
+        OperationBody::AddDevice(joiner.device_spec("phone", Role::Member, Vec::new()).unwrap()),
+        vec![revoke.id()],
+    );
+    let wanted = founder.wanted(vec![operation(&revoke), operation(&admit)]);
+    assert!(holds_together(&recovering(&["nas"]), &wanted).is_err());
+}
+
+#[test]
+fn an_act_the_founder_signs_must_be_authored_by_the_founder() {
+    let founder = Founder::new();
+    let admin = Admin::new();
+    let asked = Command::AsFounder(Box::new(revoking(Some("home"))));
+    let by_the_founder = founder.core(
+        OperationBody::RevokeDevice {
+            device: DeviceId::from_bytes([0x11; 32]),
+            reason: "sold".to_owned(),
+        },
+        Vec::new(),
+    );
+    assert!(holds_together(&asked, &founder.wanted(vec![operation(&by_the_founder)])).is_ok());
+    let by_the_admin = revocation(&admin, Vec::new());
+    assert!(holds_together(&asked, &founder.wanted(vec![operation(&by_the_admin)])).is_err());
+    // And the founder is never asked for an act the person did not ask it to sign.
+    assert!(
+        holds_together(&revoking(Some("home")), &founder.wanted(vec![operation(&by_the_founder)]))
+            .is_err()
+    );
 }

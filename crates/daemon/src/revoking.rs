@@ -177,16 +177,16 @@ pub(crate) fn find(
 /// When the operation cannot be built.
 pub fn core(
     expulsion: &Expulsion,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
 ) -> Result<OperationCore, String> {
     OperationCore::new(
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::RevokeDevice { device: expulsion.device, reason: expulsion.reason.clone() },
         heads,
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map_err(|cause| cause.to_string())
@@ -203,7 +203,7 @@ pub fn sign(
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
 ) -> Result<Vec<u8>, String> {
-    let core = core(expulsion, identity, state, heads)?;
+    let core = core(expulsion, &crate::signing::Author::of(identity), state, heads)?;
     identity.sign_operation(&core).map_err(|cause| crate::control::declined(&cause))
 }
 
@@ -221,6 +221,7 @@ mod tests {
         let founder = std::sync::Arc::new(NodeIdentity::generate().expect("generates"));
         let joiner = std::sync::Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             None::<String>,
             "example.internal",
@@ -232,7 +233,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -248,7 +249,7 @@ mod tests {
             2,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("laptop", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("laptop", Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             founder.signing_key().key_id(),

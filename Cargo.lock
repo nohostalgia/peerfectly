@@ -432,11 +432,13 @@ version = "0.5.3"
 dependencies = [
  "async-trait",
  "daemon",
+ "getrandom 0.4.3",
  "identity",
  "light-node",
  "roster",
  "serialport",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -680,6 +682,7 @@ dependencies = [
  "transport-convesso",
  "tunnel",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -1453,12 +1456,14 @@ name = "identity"
 version = "0.5.3"
 dependencies = [
  "argon2",
+ "blake3",
  "chacha20poly1305",
  "getrandom 0.4.3",
  "minicbor",
  "p256",
  "proptest",
  "roster",
+ "sha2",
  "tempfile",
  "windows-sys 0.61.2",
  "zeroize",
@@ -3668,6 +3673,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg",
  "wintun",
+ "zeroize",
 ]
 
 [[package]]

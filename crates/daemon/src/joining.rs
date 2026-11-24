@@ -543,8 +543,19 @@ async fn one_exchange(mut channel: Channel, asking: &Asking<'_>) -> Result<Excha
 
     // Delivery proves nothing. What arrived must admit this device's own keys,
     // and be signed by an admin — and a base it rests on must make its root.
+    // And it must come with a root the invite's anchor signed over a state
+    // admitting this device: that, and not the network id alone, is what ties
+    // it to the invite, since a compacted network's id is only its own claim.
     let adopted = base.clone().and_then(|base| {
-        adopt::adopt_on(base, &operations, &pieces, identity).map_err(|cause| cause.to_string())
+        adopt::adopt_anchored(
+            base,
+            &operations,
+            &pieces,
+            snapshot.as_deref(),
+            &invite.anchor,
+            identity,
+        )
+        .map_err(|cause| cause.to_string())
     });
     // Only the network the invite named. Somebody who learned the secret and
     // dialled first could deliver a roster of another network, with this device
@@ -682,6 +693,7 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
             roster::id::NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
         )
         .expect("issues");
 
@@ -709,6 +721,7 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
             roster::id::NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
         )
         .expect("issues")
     }
@@ -745,6 +758,7 @@ mod tests {
     fn delivered() -> (Vec<Vec<u8>>, Vec<u8>) {
         let founder = identity::NodeIdentity::generate().expect("generates");
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             2_592_000,
@@ -755,7 +769,7 @@ mod tests {
             founder.signing_key().algorithm(),
             roster::types::OperationBody::CreateNetwork {
                 device: founder
-                    .device_spec("nas", roster::types::Role::Admin, true, vec![])
+                    .device_spec("nas", roster::types::Role::Admin, vec![])
                     .expect("spec"),
                 params,
             },

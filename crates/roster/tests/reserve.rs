@@ -26,7 +26,7 @@ use support::{History, device, device_id};
 fn filled_with_non_revocations(count: usize) -> (Dag, History) {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
 
     let mut parent = "add2".to_owned();
     // Two are already held: the genesis and the add.
@@ -77,7 +77,7 @@ fn another_operation_is_refused_when_its_share_is_full() {
         "another",
         1,
         &[parent.as_str()],
-        OperationBody::AddDevice(device(9, "late", Role::Member, false)),
+        OperationBody::AddDevice(device(9, "late", Role::Member)),
     );
 
     let refusal = dag.insert(history.verified("another")).expect_err("the share is full");

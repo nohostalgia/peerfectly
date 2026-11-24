@@ -35,9 +35,13 @@ impl Network {
     /// A network of the founder (full) and `names` (light), with a root.
     fn founded(names: &[&str]) -> (Self, Vec<NodeIdentity>) {
         let founder = NodeIdentity::generate().unwrap();
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .unwrap();
         let mut network = Self {
             roster: Roster::new(),
             founder,
@@ -45,13 +49,13 @@ impl Network {
             parents: Vec::new(),
             seq: 0,
         };
-        let device = network.founder.device_spec("nas", Role::Admin, true, vec![]).unwrap();
+        let device = network.founder.device_spec("nas", Role::Admin, vec![]).unwrap();
         network.act(OperationBody::CreateNetwork { device, params });
         let members: Vec<NodeIdentity> =
             names.iter().map(|_| NodeIdentity::generate().unwrap()).collect();
         for (member, name) in members.iter().zip(names) {
             network.act(OperationBody::AddDevice(
-                member.device_spec(*name, Role::Member, false, vec![]).unwrap(),
+                member.device_spec(*name, Role::Member, vec![]).unwrap(),
             ));
         }
         network.root();
@@ -88,9 +92,7 @@ impl Network {
     /// Admits one more device, and signs a root over it.
     fn admit_another(&mut self, name: &str) -> Vec<u8> {
         let other = NodeIdentity::generate().unwrap();
-        self.act(OperationBody::AddDevice(
-            other.device_spec(name, Role::Member, false, vec![]).unwrap(),
-        ));
+        self.act(OperationBody::AddDevice(other.device_spec(name, Role::Member, vec![]).unwrap()));
         self.root()
     }
 
@@ -342,7 +344,7 @@ fn a_member_is_found_by_asking_the_members_in_session() {
 /// A board's keys, as it makes them: its signing, transport and attestation
 /// keys, public halves.
 fn keys_of(board: &NodeIdentity) -> Vec<roster::types::KeyEntry> {
-    board.device_spec("board", Role::Member, false, vec![]).unwrap().keys
+    board.device_spec("board", Role::Member, vec![]).unwrap().keys
 }
 
 /// A board provisioned before it is admitted: it starts from the network's
@@ -376,9 +378,8 @@ fn a_board_provisioned_before_its_admission_joins_once_admitted() {
     assert!(!engine.member().is_admitted());
 
     // Admitted, in a batch of one; the root after it pushed.
-    network.act(OperationBody::AddDevice(
-        board.device_spec("board", Role::Member, false, vec![]).unwrap(),
-    ));
+    network
+        .act(OperationBody::AddDevice(board.device_spec("board", Role::Member, vec![]).unwrap()));
     let newer = network.root();
     engine.root_pushed(network.full(), &newer, 2);
     let mut renewed = false;
@@ -418,9 +419,8 @@ fn a_renewal_nobody_answered_is_asked_again_by_itself() {
     )
     .unwrap();
     let mut engine = Engine::new(member);
-    network.act(OperationBody::AddDevice(
-        board.device_spec("board", Role::Member, false, vec![]).unwrap(),
-    ));
+    network
+        .act(OperationBody::AddDevice(board.device_spec("board", Role::Member, vec![]).unwrap()));
     let newer = network.root();
 
     // Every question goes unanswered until each one runs out.
@@ -486,9 +486,8 @@ fn a_board_takes_no_leaf_naming_other_keys_than_it_made() {
         DEFAULT_BUDGET,
     )
     .unwrap();
-    network.act(OperationBody::AddDevice(
-        board.device_spec("board", Role::Member, false, vec![]).unwrap(),
-    ));
+    network
+        .act(OperationBody::AddDevice(board.device_spec("board", Role::Member, vec![]).unwrap()));
     let newer = network.root();
     assert!(member.offer_root(&newer).is_ok());
     let evidence = network.roster.evidence_for(&board.device_id()).unwrap();

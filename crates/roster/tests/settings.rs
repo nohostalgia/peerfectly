@@ -14,12 +14,12 @@ use support::{History, device, device_id};
 fn founded() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
     history.op(
         "member3",
         1,
         &["admin2"],
-        OperationBody::AddDevice(device(3, "sensor", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "sensor", Role::Member)),
     );
     history
 }
@@ -148,12 +148,7 @@ fn promoting_a_light_device_does_nothing() {
         &["member3"],
         set(3, SettingsChange { mode: Some(Mode::Light), ..SettingsChange::default() }),
     );
-    history.op(
-        "promote",
-        1,
-        &["light"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
+    history.founder_op("promote", &["light"], OperationBody::Promote { device: device_id(3) });
     let state = loaded(&history).state().unwrap();
     assert_eq!(state.devices.get(&device_id(3)).unwrap().role, Role::Member);
     assert_eq!(state.settings_of(&device_id(3)).mode, Mode::Light);
@@ -193,12 +188,7 @@ fn a_race_between_promotion_and_light_is_decided_by_the_later() {
         &["member3"],
         OperationBody::Rename { device: device_id(3), name: "s".into() },
     );
-    history.op(
-        "promote",
-        2,
-        &["rename"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
+    history.founder_op("promote", &["rename"], OperationBody::Promote { device: device_id(3) });
     let forward = roster::state::derive(&history.dag()).unwrap();
     let record = forward.devices.get(&device_id(3)).unwrap();
     let mode = forward.settings_of(&device_id(3)).mode;
@@ -221,7 +211,12 @@ fn a_race_between_promotion_and_light_is_decided_by_the_later() {
 fn delta_of(mut history: History, act: &str, body: OperationBody) -> Vec<roster::id::DeviceId> {
     let before = roster::state::derive(&history.dag()).unwrap();
     let last = history.labels().last().cloned().unwrap();
-    history.op(act, 1, &[last.as_str()], body);
+    // An act on an admin is the founder's to sign.
+    if matches!(body, OperationBody::Demote { .. } | OperationBody::Promote { .. }) {
+        history.founder_op(act, &[last.as_str()], body);
+    } else {
+        history.op(act, 1, &[last.as_str()], body);
+    }
     roster::state::derive(&history.dag()).unwrap().delta_from(&before)
 }
 
@@ -276,11 +271,8 @@ fn a_settings_change_is_in_the_delta() {
 
 #[test]
 fn an_admission_is_not_in_the_delta() {
-    let delta = delta_of(
-        founded(),
-        "add4",
-        OperationBody::AddDevice(device(4, "new", Role::Member, false)),
-    );
+    let delta =
+        delta_of(founded(), "add4", OperationBody::AddDevice(device(4, "new", Role::Member)));
     assert!(delta.is_empty(), "an admission invalidates no earlier proof: {delta:?}");
 }
 
@@ -303,15 +295,15 @@ fn the_founder_holds_the_first_host_and_the_next_is_the_second() {
 #[test]
 fn the_lowest_free_offsets_are_given() {
     let mut history = founded();
-    history.op("two", 1, &["member3"], set(2, offset(2)));
+    // Device 2 is an admin: its address is the founder's to set.
+    history.founder_op("two", &["member3"], set(2, offset(2)));
     history.op("three", 1, &["two"], set(3, offset(4)));
     let state = loaded(&history).state().unwrap();
     assert_eq!(state.free_offsets(1), Some(3_u32.to_be_bytes()), "the gap at 3");
     assert_eq!(state.free_offsets(2), Some(5_u32.to_be_bytes()), "3 alone is too narrow");
 
-    history.op(
+    history.founder_op(
         "revoke",
-        1,
         &["three"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "sold".into() },
     );
@@ -324,7 +316,7 @@ fn the_lowest_free_offsets_are_given() {
 fn a_full_block_gives_none() {
     let mut history = History::new();
     let params = support::params().in_ipv4_range("10.0.0.0/28".parse().unwrap());
-    history.genesis_with("g", 1, device(1, "phone", Role::Admin, true), params);
+    history.genesis_with("g", 1, device(1, "phone", Role::Admin), params);
     let mut previous = "g".to_owned();
     for seed in 2..=14_u8 {
         let label = format!("add{seed}");
@@ -333,7 +325,7 @@ fn a_full_block_gives_none() {
             &label,
             1,
             &[previous.as_str()],
-            OperationBody::AddDevice(device(seed, &format!("d{seed}"), Role::Member, false)),
+            OperationBody::AddDevice(device(seed, &format!("d{seed}"), Role::Member)),
         );
         history.op(&given, 1, &[label.as_str()], set(seed, offset(u32::from(seed))));
         previous = given;
@@ -348,18 +340,8 @@ fn a_full_block_gives_none() {
 #[test]
 fn two_admins_admitting_at_once_settle_one_offset_and_the_loser_is_given_the_next() {
     let mut history = founded();
-    history.op(
-        "four",
-        1,
-        &["member3"],
-        OperationBody::AddDevice(device(4, "a", Role::Member, false)),
-    );
-    history.op(
-        "five",
-        2,
-        &["member3"],
-        OperationBody::AddDevice(device(5, "b", Role::Member, false)),
-    );
+    history.op("four", 1, &["member3"], OperationBody::AddDevice(device(4, "a", Role::Member)));
+    history.op("five", 2, &["member3"], OperationBody::AddDevice(device(5, "b", Role::Member)));
     history.op("give4", 1, &["four"], set(4, offset(2)));
     history.op("give5", 2, &["five"], set(5, offset(2)));
     let state = loaded(&history).state().unwrap();

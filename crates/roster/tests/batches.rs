@@ -123,7 +123,7 @@ fn a_device_twice_in_one_batch_is_refused() {
 fn founded() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
     history
 }
 
@@ -227,12 +227,7 @@ fn a_header_whose_count_understates_its_tree_never_completes() {
 #[test]
 fn an_operation_after_an_incomplete_batch_waits_with_it() {
     let (mut history, entries) = with_header();
-    history.op(
-        "after",
-        1,
-        &["batch"],
-        OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
-    );
+    history.op("after", 1, &["batch"], OperationBody::AddDevice(device(3, "phone", Role::Member)));
     let mut roster = loaded(&history);
     assert_eq!(roster.state().unwrap().devices.len(), 2);
     for piece in pieces_of(&history.id("batch"), &entries).unwrap() {
@@ -253,8 +248,8 @@ fn only_a_bounded_number_of_batches_wait_at_once() {
     let authors: Vec<u8> = (1..=u8::try_from(MAX_INCOMPLETE_BATCHES + 1).unwrap()).collect();
     for author in authors.iter().skip(1) {
         let label = format!("admin{author}");
-        let body = OperationBody::AddDevice(device(*author, "pc", Role::Admin, false));
-        history.op(&label, 1, &[parent.as_str()], body);
+        let body = OperationBody::AddDevice(device(*author, "pc", Role::Admin));
+        history.founder_op(&label, &[parent.as_str()], body);
         parent = label;
     }
     for author in &authors {
@@ -288,9 +283,9 @@ fn one_duplicate_in_five_hundred_is_skipped_and_reported_and_the_rest_stand() {
         ipv4: Some(entries.get(9).unwrap().ipv4),
         ..roster::leaf::SettingsChange::default()
     };
-    history.op(
+    // Device 2 is an admin, so its settings are the founder's to change.
+    history.founder_op(
         "address",
-        1,
         &["single"],
         OperationBody::SetDevice { device: support::device_id(2), change: holder },
     );
@@ -408,11 +403,13 @@ fn revoking_an_admin_keeps_its_whole_batches_and_reports_what_it_voids() {
     history.op("whole", 2, &["admin2"], OperationBody::AdmitBatch(whole));
     let (founders_entries, founders) = lot(7);
     history.op("founders", 1, &["admin2"], OperationBody::AdmitBatch(founders));
+    // A rename of a device of its own batch: an admin renames members only.
+    let renamed = whole_entries.first().unwrap().device_id().unwrap();
     history.op(
         "on-top",
         2,
         &["founders", "whole"],
-        OperationBody::Rename { device: support::device_id(2), name: "laptop".to_owned() },
+        OperationBody::Rename { device: renamed, name: "laptop".to_owned() },
     );
     let (_, partial) = lot(6);
     history.op("partial", 2, &["on-top"], OperationBody::AdmitBatch(partial));
@@ -480,12 +477,11 @@ fn the_incomplete_batches_declare_a_bounded_number_of_entries_between_them() {
     // the bound, and the third is refused before anything is stored.
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
-    history.op(
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
+    history.founder_op(
         "admin3",
-        1,
         &["admin2"],
-        OperationBody::AddDevice(device(3, "pc", Role::Admin, false)),
+        OperationBody::AddDevice(device(3, "pc", Role::Admin)),
     );
     for author in 1..=3_u8 {
         history.op(

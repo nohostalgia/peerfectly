@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use enrollment::exchange::Message;
 use enrollment::limits;
-use identity::NodeIdentity;
 use roster::sign::PublicKey;
 use roster::state::RosterState;
 use roster::types::{OperationBody, OperationCore, Role};
@@ -284,7 +283,7 @@ async fn reach(endpoint: &Admitting, key: &PublicKey, relay: &str) -> Result<Cha
 pub fn admission_core(
     applicant: &Applicant,
     invited: &crate::invites::Invited,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
     keeping_the_name: bool,
@@ -295,10 +294,10 @@ pub fn admission_core(
         // The minute it was signed, on this device's clock. Nothing reads it as
         // a sequence; the roster defines it as a time for display.
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::AddDevice(spec),
         heads,
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map_err(|cause| cause.to_string())?;
@@ -319,7 +318,7 @@ pub fn admission_core(
 /// not one of the block's hosts.
 pub fn settings_core(
     invited: &crate::invites::Invited,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     admission: &OperationCore,
 ) -> Result<Option<OperationCore>, Refusal> {
@@ -361,10 +360,10 @@ pub fn settings_core(
     };
     OperationCore::new(
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::SetDevice { device, change },
         vec![admission.id()],
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map(Some)
@@ -477,7 +476,7 @@ fn identity_spec(
     // role the admin chose when inviting; the name it proposed is a suggestion.
     let proposed = admitted_name(&invited.name);
     let name = if keeping_the_name { proposed } else { unused_name(&proposed, state) };
-    roster::types::DeviceSpec::new(keys, name, invited.role, false, vec![])
+    roster::types::DeviceSpec::new(keys, name, invited.role, vec![])
         .map_err(|cause| cause.to_string())
 }
 
@@ -550,6 +549,7 @@ mod tests {
     use roster::types::Role;
 
     use super::*;
+    use identity::NodeIdentity;
 
     /// A device introducing itself, proposing a name.
     fn applicant(joining: &NodeIdentity, name: &str) -> Applicant {
@@ -575,6 +575,7 @@ mod tests {
 
     fn state_with(names: &[&str]) -> RosterState {
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             2_592_000,
@@ -590,7 +591,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -612,7 +613,7 @@ mod tests {
                 u64::try_from(index).unwrap_or(0).saturating_add(2),
                 founder.signing_key().algorithm(),
                 OperationBody::AddDevice(
-                    device.device_spec(*name, Role::Member, false, vec![]).expect("spec"),
+                    device.device_spec(*name, Role::Member, vec![]).expect("spec"),
                 ),
                 parents.clone(),
                 founder.signing_key().key_id(),
@@ -639,7 +640,6 @@ mod tests {
         let spec = identity_spec(&asking, &invited("laptop", Role::Member), &state, false)
             .expect("builds");
         assert_eq!(spec.role, Role::Member, "never an admin because it asked");
-        assert!(!spec.founder);
         assert!(spec.capabilities.is_empty());
         assert_eq!(spec.name, "laptop", "the record's name, not the one proposed");
 
@@ -775,13 +775,15 @@ mod tests {
         let (admission, _) = admission_core(
             &applicant(&joining, "board"),
             invited,
-            &admin,
+            &crate::signing::Author::of(&admin),
             state,
             Vec::new(),
             false,
         )
         .expect("builds");
-        let settings = settings_core(invited, &admin, state, &admission)?.expect("settings");
+        let settings =
+            settings_core(invited, &crate::signing::Author::of(&admin), state, &admission)?
+                .expect("settings");
         let OperationBody::SetDevice { change, .. } = settings.body else { panic!("a set_device") };
         Ok(change.ipv4.flatten().map(u32::from_be_bytes))
     }
@@ -816,6 +818,7 @@ mod tests {
     #[test]
     fn a_full_block_admits_ipv6_only() {
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             0,
@@ -827,7 +830,7 @@ mod tests {
         let mut state = state_of(params, &names);
         // The founder holds the first host; the thirteen others the rest.
         let members: Vec<_> =
-            state.devices.keys().filter(|device| !state.is_founder(device)).collect();
+            state.devices.keys().filter(|device| !state.is_admin(device)).collect();
         for (offset, device) in (2_u32..).zip(members) {
             let settings = roster::leaf::DeviceSettings {
                 ipv4: Some(offset.to_be_bytes()),
@@ -841,12 +844,16 @@ mod tests {
         let (admission, _) = admission_core(
             &applicant(&joining, "board"),
             &asked,
-            &admin,
+            &crate::signing::Author::of(&admin),
             &state,
             Vec::new(),
             false,
         )
         .expect("builds");
-        assert!(settings_core(&asked, &admin, &state, &admission).expect("made").is_none());
+        assert!(
+            settings_core(&asked, &crate::signing::Author::of(&admin), &state, &admission)
+                .expect("made")
+                .is_none()
+        );
     }
 }

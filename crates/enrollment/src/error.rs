@@ -55,6 +55,10 @@ pub enum Error {
     /// The operation admitting this device was not signed by an admin.
     NotSignedByAdmin,
 
+    /// The network came without a root signed by the invite's anchor over a
+    /// state admitting this device ([`crate::invite::Invite::anchor`]).
+    NotAnchored,
+
     /// The delivered roster does not derive to a usable state.
     RosterUnusable(roster::Error),
 
@@ -99,10 +103,16 @@ impl fmt::Display for Error {
             Self::NotSignedByAdmin => {
                 f.write_str("the admission was not signed by an admin of that network")
             }
+            Self::NotAnchored => f.write_str(
+                "the network came without a root signed by whoever issued the invite, over a \
+                 state that admits this device: it cannot be told apart from one somebody else \
+                 made, so it was not taken",
+            ),
             // A field this build does not read: the network was made by a build
             // whose roster carried it, and is founded again rather than read half.
             Self::RosterUnusable(roster::Error::UnknownField) => f.write_str(
-                "the delivered network was made by an older build, whose roster this one does                  not read: found it again with this build",
+                "the delivered network was made by an older build, whose roster this one does \
+                 not read: found it again with this build",
             ),
             Self::RosterUnusable(cause) => {
                 write!(f, "the delivered network is not usable: {cause}")

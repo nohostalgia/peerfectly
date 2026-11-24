@@ -143,7 +143,7 @@ fn leaf(seed: u8, address: Option<u8>) -> DeviceLeaf {
 
 /// The leaf of fixture device `seed` in `role`.
 fn leaf_as(seed: u8, address: Option<u8>, role: Role) -> DeviceLeaf {
-    let record = device(seed, &format!("d{seed}"), role, false)
+    let record = device(seed, &format!("d{seed}"), role)
         .into_record(OperationId::from_bytes([seed; 32]))
         .unwrap();
     let settings =

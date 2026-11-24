@@ -1,4 +1,4 @@
-# Roster wire format, version `roster/v1`
+# Roster wire format, version `roster/v2`
 
 This document is the specification a second implementation works from. If this
 file and the Rust code disagree, that is a bug in one of them; the test-vector
@@ -117,7 +117,7 @@ the operation you cannot read might be a revocation.
 | `create_network` | `{ "device": DeviceSpec, "params": NetworkParams }` |
 | `add_device` | A `DeviceSpec` map directly |
 | `revoke_device` | `{ "device": bstr(32), "reason": tstr }` |
-| `promote` | `{ "device": bstr(32), "founder": bool }` |
+| `promote` | `{ "device": bstr(32) }` |
 | `demote` | `{ "device": bstr(32) }` |
 | `rename` | `{ "name": tstr, "device": bstr(32) }` |
 | `set_network` | A `NetworkParams` map directly |
@@ -134,10 +134,11 @@ happened to trigger first.
 
 ```text
 DeviceSpec = { "keys": [ KeyEntry ... ], "name": tstr, "role": tstr,
-               "founder": bool, "capabilities": [ tstr ... ] }
+               "capabilities": [ tstr ... ] }
 ```
 
-`role` is `"admin"` or `"member"`. `founder` is required, never omitted.
+`role` is `"admin"` or `"member"`. A device carries no founder flag: the founder
+is not a device (§11). A `founder` key in a `DeviceSpec` is an unknown field.
 
 ### KeyEntry
 
@@ -154,7 +155,7 @@ here so later capabilities do not invent one:
 
 ```text
 DeviceRecord = { "id": bstr(32), "keys": [...], "name": tstr, "role": tstr,
-                 "founder": bool, "added_by": bstr(32), "capabilities": [...] }
+                 "added_by": bstr(32), "capabilities": [...] }
 ```
 
 A `DeviceSpec` in a body carries neither `id` nor `added_by`: both are derived,
@@ -184,9 +185,12 @@ NetworkParams = {
   ? "policy": [ Rule ... ],
   "suffix": tstr,
   ? "anchors": [ bstr(32) ... ],
+  "founder": Founder,
   ? "leaving": Leaving,
   ? "snapshot_window": uint
 }
+
+Founder = { "signing": bstr(32), "transport": bstr(32) }
 
 Rule = { "to": tstr, "from": tstr }
 
@@ -197,13 +201,13 @@ Leaving = {
 ```
 
 Key order is length-first: `ula` (3 bytes), `ipv4` (4), `relay` (5), `policy`
-and `suffix` (6, `p` first), `anchors` and `leaving` (7, `a` first),
-`snapshot_window` (15). Alphabetical order would produce bytes a conforming
-decoder refuses.
+and `suffix` (6, `p` first), `anchors`, `founder` and `leaving` (7, in that
+order), `excluded` (8), `snapshot_window` (15). Alphabetical order would produce
+bytes a conforming decoder refuses.
 
-These eight are the whole of `NetworkParams`. A map carrying any other key is
-refused as `unknown_field` (§1), never read past. Three entries are required —
-`ula`, `relay`, `suffix` — and each optional key present adds one. Each optional key is left out when absent,
+These are the whole of `NetworkParams`. A map carrying any other key is refused
+as `unknown_field` (§1), never read past. Four entries are required — `ula`,
+`relay`, `suffix`, `founder` — and each optional key present adds one. Each optional key is left out when absent,
 never written empty, so parameters without it encode as they did before it
 existed.
 
@@ -383,7 +387,7 @@ device with a wrong clock must still be able to administer its own network.
 The signature covers
 
 ```text
-u16be(len) || "roster/v1"  ||
+u16be(len) || "roster/v2"  ||
 u16be(len) || network_id   ||
 u16be(len) || op_type      ||
 u16be(len) || core_bytes
@@ -394,7 +398,8 @@ Each variable-length component is preceded by its length as a big-endian
 the component after it and produce the same signing input as a different,
 legitimate tuple.
 
-`"roster/v1"` is the format's version boundary. Changing the encoding means
+`"roster/v2"` is the format's version boundary: an operation signed under
+`roster/v1` fails here as a bad signature, never as a misread. Changing the encoding means
 changing this string, which invalidates every existing signature by
 construction rather than by convention.
 
@@ -475,21 +480,34 @@ likely to produce in its whole life, and every revocation must name a device tha
 was really added, so the reserve cannot be filled with revocations of devices
 nobody created.
 
-## 11. The founder flag
+## 11. The founder key
 
-`founder` is a required boolean on `DeviceSpec`, `DeviceRecord`, and the
-`promote` body, and it is covered by the signature.
+The founder is **not a device**. It is two Ed25519 public keys in the `founder`
+parameter leaf (§33), both derived from 12 words (or 24) a person keeps and no
+device stores:
 
-The governing rule is a **self-revocable founder set**: the admin named by
-`create_network` is a founder, an admin may grant founder status to another key,
-and a `revoke_device` or `demote` targeting a founder is valid only when the
-author is the target. This blocks a compromised co-admin from expelling the
-owner while still allowing a deliberate handover.
+- the **signing** key authors operations and roots, with the key id of its value
+  as `author`, like any key;
+- the **transport** key opens a founder session (transport), which carries the
+  roster and nothing else, and signs nothing.
 
-**That rule is not enforced at this version.** Enforcing it requires knowing
-whether a target is a founder, which requires derived roster state. This
-capability guarantees only that the flag is present, explicit, and signed;
-enforcement arrives with conflict resolution.
+They are distinct, and no device may carry either: a `DeviceSpec` declaring one
+is `key_reuse`, in a `create_network` when it is decoded, in an `add_device` or
+a batch entry when it is judged (§15).
+
+Its authority is unconditional. It has no record, so no operation revokes,
+demotes or promotes it, and the causal authorship rule (§15 rule 2) never voids
+what it signs. Only an operation it authored changes the `founder` leaf; an
+admin's `set_network` that differs there leaves the leaf as it was. It may author
+every operation type but `create_network`, which its founding admin signs.
+
+**Only the founder key governs admins.** An operation that gives the admin role —
+an `add_device` or a batch entry with the admin role, a `promote` — or that names
+a device which is an admin in the operation's ancestor state — a `revoke_device`,
+`demote`, `rename` or `set_device` — is authorised only when the founder key
+authors it (§15 rule 1). An admin signing one, itself named included, is without
+authority. Admins govern members: they admit, revoke, rename and set members,
+admit batches of members, and change the parameters other than `founder`.
 
 ## 12. Test vectors
 
@@ -542,11 +560,14 @@ A function of the operation set alone. Timestamps never enter it.
 An operation is valid when **both** hold:
 
 1. **Ancestor-relative authority.** Its author held the admin role in the state
-   derived from that operation's *own causal ancestors* — never current state.
-   Anything else would make demoting an admin retroactively void everything they
-   ever wrote.
+   derived from that operation's *own causal ancestors* — never current state —
+   or is the founder's signing key that state's `founder` leaf holds; and where
+   the operation gives the admin role or names an admin there, its author is the
+   founder key (§11). Anything else would make demoting an admin retroactively
+   void everything they ever wrote.
 2. **The causal authorship rule.** It is *not* causally concurrent with an
-   operation that demoted or revoked its author's device.
+   operation that demoted or revoked its author's device. The founder has no
+   device, so nothing it signs is voided by this rule.
 
 Rule 2 closes what rule 1 alone leaves open. An ex-admin can anchor a new
 operation to parents from before losing authority, where ancestor-derived state
@@ -561,18 +582,26 @@ valid. Only concurrent work is void. An honest operation still in flight when it
 author is revoked is therefore voided too — which fails safe: a device is not
 added, rather than an unaccountable one being admitted.
 
-**Validity is a fixpoint, not a single pass.** Rule 2 makes an operation's verdict
-depend on *concurrent* operations, whose own verdicts may depend back on it — two
-admins demoting each other is the smallest case. It is computed in rounds:
-everything starts valid, each round recomputes every verdict from the previous
-round's set, and **an operation once marked invalid is never restored.** That last
-clause is what terminates the computation instead of oscillating, and it settles
-mutual demotion the safe way: both demotions void, both admins keep their roles,
-a person resolves it deliberately. Each round reads only the previous round's set,
-so no verdict depends on visit order.
+**Validity is one pass, in two stages.** Rule 2 makes an operation's verdict
+depend on *concurrent* operations. While admins could remove admins, that made
+validity a fixpoint: two admins demoting each other at once, each demotion's
+verdict depending on the other's. Now only the founder key removes an admin, and
+rule 2 never voids the founder key's work, so no removal's verdict depends on an
+operation it could void. Validity is computed once:
+
+1. in causal order (every parent before its children), rule 1 and every check
+   but rule 2. What survives is *authorised*;
+2. rule 2, against the authorised removals only. A removal nobody was entitled to
+   make — a member's revocation of an admin, an admin's of an admin — removes
+   nothing and voids nothing.
+
+The states stage 1 resolves still count work stage 2 voids. That is sound
+because what stage 2 voids is a removed admin's work on members, and authority is
+never a member's. No verdict depends on visit order.
 
 The founding operation bootstraps the rule: its author must be one of the signing
-keys of the device it declares, and that device must be an admin and a founder.
+keys of the device it declares, that device must be an admin, and none of its
+keys may be one of the founder's keys the parameters name.
 
 ## 16. Conflict rules
 
@@ -594,7 +623,9 @@ root commits to.
 a `promote` on one device are concurrent, the result is member. Where they are
 causally ordered, the deeper one wins, so a `promote` descending from a `demote`
 is a deliberate re-promotion and grants admin. Demotion is therefore reversible;
-revocation is not.
+revocation is not. Since only the founder key promotes or demotes (§11), two
+concurrent ones are the founder's equivocation, judged before this rule: neither
+stands.
 
 **Rule 3 — last-writer-wins, deterministic tie-break.** Greater causal depth wins;
 at equal depth, the greater operation id, compared as bytes. Arbitrary, but
@@ -624,15 +655,14 @@ Where two concurrent `add_device` operations name the same device id — the sam
 signing key, a different transport key — the whole record comes from the winner
 under rule 3, rather than being spliced from both.
 
-Founder status is granted and never withdrawn: a founder leaves by revoking
-itself, not by ceasing to be one.
+## 17. The founder's leaf changes only by the founder
 
-## 17. Founder enforcement
-
-A `revoke_device` or `demote` targeting a founder is valid **only when its author
-is that same device**. Founder-ness is judged in the same ancestor-relative state
-as authority. This blocks a compromised co-admin from expelling the owner, while
-leaving a founder able to retire its own key.
+`set_network` resolves per leaf (rule 3), and the `founder` leaf is the one leaf
+an admin cannot write: a change there by any author but the founder key its own
+ancestors name is ignored, and the operation's other leaves stand. The founder
+replaces itself with a `set_network` it signs, after which the old key is nobody's:
+an operation anchored after the replacement and signed by the old key is
+`unauthorized_author`.
 
 ## 18. Admission is not derivation
 
@@ -752,10 +782,12 @@ the graph the operations live in. The encoded type keeps its old name,
 
 ```text
 Snapshot = { "root": bstr(32), "delta": [ bstr(32) ... ],
-             "heads": [ bstr(32) ... ], "proof": MembershipProof,
-             "author": bstr(32), "depths": [ uint ... ],
-             "signer": DeviceLeaf, "network": bstr(32),
+             "heads": [ bstr(32) ... ], "author": bstr(32),
+             "depths": [ uint ... ], "signer": Signer, "network": bstr(32),
              "previous": [ bstr(32) ... ], "generation": uint }
+Signer   = { "device": { "leaf": DeviceLeaf, "proof": MembershipProof } }
+         / { "founder": { "keys": Founder, "proof": FounderProof } }
+FounderProof = { "devices": bstr(32), "parameters": MerkleProof }
 SignedSnapshot = { "sig": bstr(64), "body": bstr }
 ```
 
@@ -767,8 +799,7 @@ SignedSnapshot = { "sig": bstr(64), "body": bstr }
 | `heads` | The covered set: every causal ancestor of these, with the heads themselves |
 | `depths` | The causal depth of each head |
 | `delta` | The devices whose leaves differ from the first root it follows: what a light member looks at for revocations |
-| `signer` | The signer's device leaf |
-| `proof` | That leaf's membership proof (§35) against the first root in `previous`, or against `root` itself when there is none |
+| `signer` | Who signed, with its proof against the first root in `previous`, or against `root` itself when there is none: an admin's device leaf and its membership proof (§35), or the founder's keys and the proof of the `founder` leaf in the parameters tree beside the devices tree's root |
 | `author` | The key id that signed |
 | `network` | So a root cannot be lifted between networks |
 
@@ -786,12 +817,12 @@ is debounced.
 
 ## 23. Root signatures
 
-Roots sign under the tag `"roster-snapshot/v1"`, framed exactly as the operation
+Roots sign under the tag `"roster-snapshot/v2"`, framed exactly as the operation
 envelope is — each variable-length component preceded by its length as a
 big-endian `u16`:
 
 ```text
-u16be(len) || "roster-snapshot/v1" ||
+u16be(len) || "roster-snapshot/v2" ||
 u16be(len) || network_id           ||
 u16be(len) || body_bytes
 ```
@@ -819,7 +850,9 @@ state cannot be reproduced, so nothing has been checked.
 
 A light member holds no operations. It checks a root against the root before
 it: the signer's leaf must prove against that root and name an admin there, and
-no root it holds may have revoked or demoted the signer since. It keeps one
+no root it holds may have revoked or demoted the signer since. A root the founder
+signed is checked the same way by its `founder` leaf, which must prove against
+the root before and hold the key that signed; no delta can name the founder. It keeps one
 current root and its own proof against it.
 
 ### The bootstrapping limit — accepted, not mitigated
@@ -902,7 +935,7 @@ every depth in the covered set, and each phase composes:
 | Roles | Covered and later operations are causally ordered, never concurrent |
 | Last-writer-wins | A held value always outranks a covered one on depth |
 | Settings | A device starts from the settings its base leaf holds, where that admission still stands |
-| Founders | Monotone union |
+| The founder leaf | A parameter leaf like the others: its latest founder-signed writer outranks the base |
 | Ancestor-relative authority | The state of an operation's ancestors is the base plus the held operations between |
 
 Covered heads are retained as anchors and **excluded from derivation**: their
@@ -1017,6 +1050,7 @@ value = BLAKE3-derive("peerfectly parameter leaf v1", value bytes)
 
 | Name | Value |
 |---|---|
+| `founder` | the founder's keys, `Founder` (§5); always present |
 | `prefix` | the ULA prefix, `bstr` |
 | `suffix` | the DNS suffix, `tstr` |
 | `ipv4` | the IPv4 range, `bstr(5)` |

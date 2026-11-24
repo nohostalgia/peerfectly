@@ -152,6 +152,7 @@ impl Network {
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
         let third = Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             relay,
             "example.internal",
@@ -163,7 +164,7 @@ impl Network {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -178,7 +179,7 @@ impl Network {
             2,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("joiner", Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             founder.signing_key().key_id(),
@@ -191,7 +192,7 @@ impl Network {
             3,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                third.device_spec("third", Role::Member, false, vec![]).expect("spec"),
+                third.device_spec("third", Role::Member, vec![]).expect("spec"),
             ),
             vec![add.id()],
             founder.signing_key().key_id(),

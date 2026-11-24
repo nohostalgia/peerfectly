@@ -45,12 +45,12 @@ fn body_strategy() -> impl Strategy<Value = Body> {
 fn build_body(shape: Body, other: &NodeIdentity) -> OperationBody {
     match shape {
         Body::Add => OperationBody::AddDevice(
-            other.device_spec("device", Role::Member, false, vec![]).expect("spec"),
+            other.device_spec("device", Role::Member, vec![]).expect("spec"),
         ),
         Body::Rename(tag) => {
             OperationBody::Rename { device: other.device_id(), name: format!("n{tag}") }
         }
-        Body::Promote => OperationBody::Promote { device: other.device_id(), founder: false },
+        Body::Promote => OperationBody::Promote { device: other.device_id() },
         Body::Revoke => OperationBody::RevokeDevice {
             device: other.device_id(),
             reason: "generated".to_owned(),
@@ -65,7 +65,7 @@ proptest! {
         let identity = NodeIdentity::generate().expect("generates");
         let role = if admin { Role::Admin } else { Role::Member };
         let spec = identity
-            .device_spec(name, role, admin, vec![Capability::new("serves").expect("short")])
+            .device_spec(name, role, vec![Capability::new("serves").expect("short")])
             .expect("builds");
 
         prop_assert_eq!(spec.device_id().expect("has a signing key"), identity.device_id());
@@ -74,8 +74,8 @@ proptest! {
             1,
             identity.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: identity.device_spec("phone", Role::Admin, true, vec![]).expect("spec"),
-                params: NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
+                device: identity.device_spec("phone", Role::Admin, vec![]).expect("spec"),
+                params: NetworkParams::new(roster::types::FounderKeys::held_by_nobody(), vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
                     .expect("valid"),
             },
             vec![],
@@ -134,8 +134,8 @@ proptest! {
             identity.signing_key().public_key().as_bytes().to_vec()
         );
         prop_assert_eq!(
-            loaded.device_spec(name.clone(), Role::Member, false, vec![]).expect("spec"),
-            identity.device_spec(name, Role::Member, false, vec![]).expect("spec")
+            loaded.device_spec(name.clone(), Role::Member, vec![]).expect("spec"),
+            identity.device_spec(name, Role::Member, vec![]).expect("spec")
         );
     }
 

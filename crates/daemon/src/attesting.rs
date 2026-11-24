@@ -146,12 +146,13 @@ mod tests {
     fn founded() -> (Roster, NodeIdentity) {
         let founder = NodeIdentity::generate().expect("generates");
         let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "home.internal",
             roster::limits::DEFAULT_SNAPSHOT_WINDOW,
         )
         .expect("valid");
-        let device = founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec");
+        let device = founder.device_spec("nas", Role::Admin, vec![]).expect("spec");
         let core = OperationCore::new(
             1_757_000_040_000,
             founder.signing_key().algorithm(),

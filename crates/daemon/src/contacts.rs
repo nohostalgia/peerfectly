@@ -273,6 +273,8 @@ mod tests {
             ("conflicts.rs", include_str!("conflicts.rs")),
             ("connectivity.rs", include_str!("connectivity.rs")),
             ("demoting.rs", include_str!("demoting.rs")),
+            ("notices.rs", include_str!("notices.rs")),
+            ("recovering.rs", include_str!("recovering.rs")),
             ("discovery.rs", include_str!("discovery.rs")),
             ("drawing.rs", include_str!("drawing.rs")),
             ("endpoints.rs", include_str!("endpoints.rs")),

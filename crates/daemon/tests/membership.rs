@@ -134,10 +134,25 @@ async fn revoking_a_device_closes_its_session_without_a_restart() {
     })
     .await;
 
+    // Told, once, as its session closed: a notice of its revocation, outside
+    // any session (offline-founder design §16).
+    within("the revoked device hears its revocation as its session closes", async || {
+        joiner.take_heard().contains(&revoke_bytes)
+    })
+    .await;
+
     assert!(
         founder.connect(&network.joiner.transport_key().public_key()).await.is_err(),
         "and it cannot reconnect"
     );
+
+    // And the revoked device was told before it was cut off: an honest one
+    // that holds its own revocation stops acting on an authority it no longer
+    // has, and hands the revocation to whoever it reaches after.
+    within("the revoked device holds its own revocation", async || {
+        joiner.state().await.is_ok_and(|state| state.revoked.contains(&joiner_device))
+    })
+    .await;
 }
 
 /// Nothing changes the roster except through the one point that speaks.
@@ -220,25 +235,29 @@ async fn a_name_two_admins_gave_away_is_never_revoked_by_guessing() {
         (core.id(), sign_operation(&core, author.signer()).unwrap())
     };
 
-    let (desk_id, admit_desk) = sign(
-        &network.founder,
+    // The second admin is the founder's words' to admit.
+    let words = common::the_founders_words();
+    let admitting = OperationCore::new(
+        1_757_000_040_000,
+        roster::types::Algorithm::Ed25519,
+        OperationBody::AddDevice(desk.device_spec("desk", Role::Admin, vec![]).unwrap()),
         vec![genesis.id()],
-        OperationBody::AddDevice(desk.device_spec("desk", Role::Admin, false, vec![]).unwrap()),
-    );
+        words.keys().signing_id(),
+        net,
+    )
+    .unwrap();
+    let (desk_id, admit_desk) =
+        (admitting.id(), sign_operation(&admitting, words.signer()).unwrap());
     // Concurrent: each admin, from the same point, admits a device it calls `phone`.
     let (_, by_founder) = sign(
         &network.founder,
         vec![desk_id],
-        OperationBody::AddDevice(
-            kept_phone.device_spec("phone", Role::Member, false, vec![]).unwrap(),
-        ),
+        OperationBody::AddDevice(kept_phone.device_spec("phone", Role::Member, vec![]).unwrap()),
     );
     let (_, by_desk) = sign(
         &desk,
         vec![desk_id],
-        OperationBody::AddDevice(
-            stolen_phone.device_spec("phone", Role::Member, false, vec![]).unwrap(),
-        ),
+        OperationBody::AddDevice(stolen_phone.device_spec("phone", Role::Member, vec![]).unwrap()),
     );
     let everything = vec![network.genesis.clone(), admit_desk, by_founder, by_desk];
 

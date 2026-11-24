@@ -120,6 +120,12 @@ pub fn authenticate(
 /// a lookup ignoring purpose would let a signing key open a session — the
 /// cross-protocol confusion the separation exists to prevent.
 pub fn authorize(state: &RosterState, key: &KeyId) -> Result<DeviceId> {
+    // The founder's transport key opens a founder session, whatever the roster
+    // says about any device: it carries the roster and nothing else, and its
+    // peer is the founder, never a device.
+    if *key == state.params.founder.transport_id() {
+        return Ok(founder_peer(state));
+    }
     let record =
         state.device_for_key_of_purpose(key, KeyPurpose::Transport).ok_or(Error::NotAMember)?;
 
@@ -159,6 +165,23 @@ pub fn authenticate_by_shown(
         return Err(Error::NotAMember);
     }
     Ok(device)
+}
+
+/// The peer a founder session reports: the founder's transport key's id, which
+/// is no device's id — a device's id is its signing key's — so nothing above
+/// the transport takes it for a member.
+#[must_use]
+pub fn founder_peer(state: &RosterState) -> DeviceId {
+    DeviceId::from_bytes(*state.params.founder.transport_id().as_bytes())
+}
+
+/// Whether a session's peer is the founder, as the state now names it.
+///
+/// A founder session ends when the `founder` leaf stops naming its key, as a
+/// member's ends when the member stops being one.
+#[must_use]
+pub fn is_founder_peer(state: &RosterState, peer: &DeviceId) -> bool {
+    *peer == founder_peer(state)
 }
 
 /// Whether a device is still a member of the network the state describes.

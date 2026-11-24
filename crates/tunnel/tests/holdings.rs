@@ -24,7 +24,7 @@ fn crowded() -> History {
     history.genesis_with(
         "g",
         1,
-        device(1, "phone", Role::Admin, true),
+        device(1, "phone", Role::Admin),
         params().in_ipv4_range("10.0.0.0/28".parse().expect("allowed")),
     );
     let mut previous = "g".to_owned();
@@ -34,7 +34,7 @@ fn crowded() -> History {
             &label,
             1,
             &[previous.as_str()],
-            OperationBody::AddDevice(device(seed, &format!("d{seed}"), Role::Member, false)),
+            OperationBody::AddDevice(device(seed, &format!("d{seed}"), Role::Member)),
         );
         // Offsets 1 to 14, then round again: the later claim keeps each.
         let offset = u32::from(seed.saturating_sub(2)).rem_euclid(14).saturating_add(1);
@@ -112,10 +112,11 @@ fn founded_in(range: &str, members: &[u8]) -> History {
     history.genesis_with(
         "g",
         1,
-        device(1, "phone", Role::Admin, true),
+        device(1, "phone", Role::Admin),
         params().in_ipv4_range(range.parse().expect("allowed")),
     );
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    // Only the founder admits an admin (offline-founder design §14).
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
     let mut previous = "admin2".to_owned();
     for seed in members {
         let label = format!("add{seed}");
@@ -123,7 +124,7 @@ fn founded_in(range: &str, members: &[u8]) -> History {
             &label,
             1,
             &[previous.as_str()],
-            OperationBody::AddDevice(device(*seed, &format!("d{seed}"), Role::Member, false)),
+            OperationBody::AddDevice(device(*seed, &format!("d{seed}"), Role::Member)),
         );
         previous = label;
     }
@@ -179,12 +180,7 @@ fn a_revoked_devices_offset_is_free_for_the_next() {
         &["five"],
         OperationBody::RevokeDevice { device: device_id(5), reason: "sold".into() },
     );
-    history.op(
-        "next",
-        1,
-        &["revoke"],
-        OperationBody::AddDevice(device(6, "next", Role::Member, false)),
-    );
+    history.op("next", 1, &["revoke"], OperationBody::AddDevice(device(6, "next", Role::Member)));
     history.op("six", 1, &["next"], assign(6, 4_u32.to_be_bytes()));
     assert_eq!(holdings_of(&history).of(&device_id(6)), Some([10, 0, 0, 4].into()));
 }
@@ -235,7 +231,7 @@ fn crowded_with(alone: &[u8], batch: &[u8], assigned: &[(u8, u8)]) -> roster::st
         .iter()
         .filter(|seed| !alone.contains(seed))
         .map(|seed| {
-            let spec = device(*seed, &format!("b{seed}"), Role::Member, false);
+            let spec = device(*seed, &format!("b{seed}"), Role::Member);
             roster::batch::BatchEntry {
                 keys: spec.keys,
                 name: format!("b{seed}"),

@@ -131,6 +131,10 @@ pub struct Record {
     pub withdrawn: bool,
     /// Requests refused for asking the other role, newest last.
     pub refused: Vec<Refused>,
+    /// The root the founder signed over this invite's admission, where the
+    /// invite is anchored to the founder: what its device is given with the
+    /// network, since nothing here can sign as the founder after.
+    pub root: Option<Vec<u8>>,
 }
 
 /// Where an invite stands.
@@ -185,6 +189,7 @@ impl Record {
         relay: &str,
         network: roster::id::NetworkId,
         block: roster::types::Ipv4Range,
+        anchor: roster::id::KeyId,
         invited: Invited,
         now: u64,
         lifetime: u64,
@@ -194,7 +199,7 @@ impl Record {
                 cause: "an admin is a full member: it cannot be invited light".to_owned(),
             });
         }
-        let invite = Invite::issue(relay, network, block)
+        let invite = Invite::issue(relay, network, block, anchor)
             .map_err(|cause| Error::Refused { cause: cause.to_string() })?;
         Ok(Self {
             invite,
@@ -203,6 +208,7 @@ impl Record {
             request: None,
             withdrawn: false,
             refused: Vec::new(),
+            root: None,
         })
     }
 
@@ -268,6 +274,29 @@ impl Invites {
     /// ones whose device is dialled to deliver it.
     pub fn delivering(&self, now: u64) -> impl Iterator<Item = &Record> {
         self.records.iter().filter(move |record| record.standing(now) == Standing::Approved)
+    }
+
+    /// Keeps `root`, signed by `author`, with every invite anchored to that
+    /// key whose device is approved, not yet given the network, and admitted
+    /// by the state the root commits to (`admits`). Whether anything changed.
+    pub fn keep_root(
+        &mut self,
+        author: &roster::id::KeyId,
+        root: &[u8],
+        now: u64,
+        admits: impl Fn(&Request) -> bool,
+    ) -> bool {
+        let mut changed = false;
+        for record in &mut self.records {
+            if record.invite.anchor != *author || record.standing(now) != Standing::Approved {
+                continue;
+            }
+            if record.request.as_ref().is_some_and(&admits) {
+                record.root = Some(root.to_vec());
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Keeps a new invite.
@@ -429,6 +458,10 @@ struct Kept {
     /// Written only once one was refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     refused: Vec<KeptRefused>,
+    /// The founder's root over the admission, in hexadecimal: written only
+    /// where there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
 }
 
 /// A refused request as the file keeps it.
@@ -575,6 +608,13 @@ impl InviteFile {
                         .map_err(|_| self.failure("a refused request whose word does not read"))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let root = one
+                .root
+                .map(|hex| {
+                    roster::hex::decode(&hex)
+                        .ok_or_else(|| self.failure("a root that is not hexadecimal"))
+                })
+                .transpose()?;
             records.push(Record {
                 invite,
                 invited: Invited { name: one.name, role, mode, groups, ipv4 },
@@ -582,6 +622,7 @@ impl InviteFile {
                 request,
                 withdrawn: one.withdrawn,
                 refused,
+                root,
             });
         }
         Ok(Invites { records })
@@ -645,6 +686,7 @@ impl InviteFile {
                         at: seen.at,
                     })
                     .collect(),
+                root: record.root.as_deref().map(roster::hex::encode),
             })
             .collect();
         serde_json::to_vec_pretty(&kept).map_err(|cause| self.failure(&cause.to_string()))
@@ -677,6 +719,7 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:4433",
             roster::id::NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
             invited(),
             NOW,
             DEFAULT_LIFETIME_SECS,
@@ -785,6 +828,7 @@ mod tests {
                 "k@relay:1",
                 roster::id::NetworkId::from_bytes([7; 32]),
                 roster::types::Ipv4Range::DEFAULT,
+                roster::id::KeyId::from_bytes([3; 32]),
                 light_admin,
                 NOW,
                 60

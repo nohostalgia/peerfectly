@@ -48,6 +48,8 @@ minicbor = { version = "2.3.0", features = ["alloc"] }
 # Without their `std` defaults, so the roster builds for a microcontroller
 # (`no_std` + `alloc`); a crate that runs on an operating system asks for `std`.
 blake3 = { version = "1.8.7", default-features = false }
+# The checksum of the founder's words (BIP39): the first byte of a SHA-256.
+sha2 = { version = "0.11.1", default-features = false }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
 signature = "3.0.0"
