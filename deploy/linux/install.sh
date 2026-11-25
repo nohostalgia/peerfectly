@@ -19,6 +19,8 @@ set -eu
 # Filled in by package.sh, from the programs it packed.
 VERSION='@VERSION@'
 GLIBC_FLOOR='@GLIBC_FLOOR@'
+# The machine the programs were built for: x86_64 or aarch64.
+ARCH='@ARCH@'
 
 BIN=/usr/local/bin
 UNIT=peerfectlyd.service
@@ -149,12 +151,12 @@ check() {
     fi
 
     machine=$(uname -m)
-    if [ "$machine" != x86_64 ]; then
-        problem "these programs are built for x86_64, and this machine is $machine"
+    if [ "$machine" != "$ARCH" ]; then
+        problem "these programs are built for $ARCH, and this machine is $machine: take the $machine archive"
     fi
 
     MISSING=''
-    if [ -f "$HERE/peerfectlyd" ] && [ -f "$HERE/peerfectly" ] && [ "$machine" = x86_64 ]; then
+    if [ -f "$HERE/peerfectlyd" ] && [ -f "$HERE/peerfectly" ] && [ "$machine" = "$ARCH" ]; then
         if command -v ldd >/dev/null 2>&1; then
             look_at peerfectlyd
             look_at peerfectly
@@ -195,7 +197,7 @@ tpm_plugin_present() {
     elif [ -x /sbin/ldconfig ]; then
         /sbin/ldconfig -p 2>/dev/null | grep -q 'libtss2-tcti-device\.so\.0 '
     else
-        for directory in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64; do
+        for directory in "/lib/$ARCH-linux-gnu" "/usr/lib/$ARCH-linux-gnu" /lib64 /usr/lib64; do
             [ -e "$directory/libtss2-tcti-device.so.0" ] && return 0
         done
         return 1

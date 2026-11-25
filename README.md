@@ -7,7 +7,7 @@ Your devices, on one private network, reachable by name from wherever they are: 
 from your phone on mobile data, your desktop from your laptop in a hotel. No account to make, no
 server that runs your network for you.
 
-> **Status: pre-release (0.4).** Things may still change before 1.0.
+> **Status: pre-release (0.6).** Things may still change before 1.0.
 
 ## What makes it different
 
@@ -17,6 +17,10 @@ in**.
 - **Only your own devices can admit a device.** Every membership change is an operation signed by
   an admin device of your network, and every device checks the signatures itself. There is no
   coordination server that holds a list and could add a key to it.
+- **Twelve words rule the admins, and no device holds them.** Founding a network shows its
+  founder's words once. Only they add, demote or revoke an admin, and revoking a stolen admin with
+  them undoes its acts from the one you choose. Lose a device and nothing that governs the network
+  goes with it; a member holds no signing key at all.
 - **No account.** There is no login, and no identity provider whose compromise would hand someone
   your network. A device's identity is a set of keys it made itself. On Windows and Linux an admin's
   signing key lives in the TPM where there is one, and on a phone in its keystore.
@@ -37,7 +41,7 @@ in**.
   devices to each other.
 - **Not finished.** It runs a household's handful of devices as it runs a fleet of thousands, but
   some things don't exist yet: access rules per port or service, sharing between separate people's
-  networks, more than one relay per network, recovery when the only admin is lost, macOS and iOS.
+  networks, more than one relay per network, macOS and iOS.
 
 ## How it works, briefly
 
@@ -71,7 +75,7 @@ The exact formats are written down next to the code that reads them: see the `FO
 | Platform | State |
 |---|---|
 | Windows 10/11 (x64) | daemon as a service, command line, notification-area icon, MSI installer |
-| Linux (x86_64, systemd, glibc 2.34+) | daemon as a systemd service, command line, install script |
+| Linux (x86_64 and aarch64, systemd, glibc 2.34+) | daemon as a systemd service, command line, install script |
 | Android | a client exists; it is not in this repository |
 | macOS, iOS | not yet |
 
@@ -85,11 +89,12 @@ Download the package for your machine from the
 **Windows.** Run the `.msi`. It isn't code-signed yet, so SmartScreen will warn that the publisher
 is unknown: *More info → Run anyway*.
 
-**Linux.** Unpack the archive and run its install script:
+**Linux.** Take the archive for your machine, `x86_64` or `aarch64` (64-bit ARM, a Raspberry Pi
+4 or 5 on a 64-bit system among them), unpack it and run its install script:
 
 ```sh
-tar xzf peerfectly-0.5.3-linux-x86_64.tar.gz
-sudo ./peerfectly-0.5.3-linux-x86_64/install.sh
+tar xzf peerfectly-0.6.0-linux-x86_64.tar.gz
+sudo ./peerfectly-0.6.0-linux-x86_64/install.sh
 ```
 
 The script checks everything it needs before it writes anything, and tells you which packages are
@@ -104,17 +109,17 @@ built it, from which commit, on which runner. To check that a file came out of t
 release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify peerfectly-0.5.3-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+gh attestation verify peerfectly-0.6.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
 ```
 
 That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
 it won't quiet SmartScreen.
 
-**Coming from 0.4.** This version changes the roster's format, and a network made by 0.4 can't be
-carried over: **every network has to be founded again.** Install the new version on every device,
-found the network again on its admin, and invite each device back. A device that held a 0.4 network
-reports it as one it can't carry; `peerfectly forget <network>` (as administrator) clears it away.
-### A network in four commands
+**Coming from 0.5.** This version changes the roster's format: **every network has to be founded
+again**, and every board takes new firmware. Install the new version on every device, found the
+network again on its admin, keep the founder's words, and invite each device back. A device that
+held an older network reports it as one it can't carry; `peerfectly forget <network>` (as
+administrator) clears it away. `peerfectly` and `peerfectlyd` speak one protocol: replace both.
 
 You need a relay. Run your own with [`deploy/server`](deploy/server/README.md), or use one you trust.
 
@@ -124,8 +129,12 @@ On the first device, which becomes the admin:
 peerfectly found home --relay https://relay.example --name laptop
 ```
 
-It asks the relay's host which key its relay has and asks you to confirm it, then makes the
-network's signing key. On Windows that key goes in the TPM, behind Windows Hello. On Linux it goes in the TPM,
+It asks the relay's host which key its relay has and asks you to confirm it. Then it shows the
+network's **founder's words**, 12 of them, once, and asks for three back: write them down and keep
+them where no device is. They are typed only to act on an admin (`--founder`), to recover the
+network when its admins are gone (`peerfectly recover`), or to replace themselves; whoever holds
+them controls the network's admins, and lost they cannot be recovered. Then it makes the network's
+signing key. On Windows that key goes in the TPM, behind Windows Hello. On Linux it goes in the TPM,
 or a sealed file where there is none, behind a passphrase.
 
 Invite the second device from the admin:
@@ -138,7 +147,7 @@ It prints a QR code and an invite, open for a day (`--expires 30m|24h|7d`), and 
 second device:
 
 ```sh
-peerfectly join peerfectly-invite-v1:… --name nas
+peerfectly join peerfectly-invite-v3:… --name nas
 ```
 
 It prints its key's fingerprint and returns. The admin's daemon takes the device's request on its

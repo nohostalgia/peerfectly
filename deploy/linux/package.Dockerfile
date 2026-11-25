@@ -8,6 +8,8 @@
 
 # The testbed's base, so that what is shipped is what is tested. It also fixes
 # the oldest C library the programs run on, which the install script is told.
+# Built natively for the machine it runs on, x86_64 or aarch64: the image is
+# published for both, and the archive is named after the one it was built on.
 FROM rust:1.95-bookworm AS build
 # `libtss2-dev` for `tss-esapi`, which links the system's TSS.
 RUN apt-get update \
@@ -31,17 +33,19 @@ RUN set -eu; \
                    inside && $1 == "version" { gsub(/["\r]/, "", $3); print $3; exit }' Cargo.toml); \
     floor=$(objdump -T /out/peerfectlyd /out/peerfectly | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' \
             | sort -uV | tail -n 1); \
-    name="peerfectly-$version-linux-x86_64"; \
+    arch=$(uname -m); \
+    name="peerfectly-$version-linux-$arch"; \
     mkdir -p "/pack/$name" /dist; \
     install -m 0755 /out/peerfectlyd /out/peerfectly "/pack/$name/"; \
     install -m 0644 deploy/linux/peerfectlyd.service "/pack/$name/"; \
-    sed -e "s/@VERSION@/$version/" -e "s/@GLIBC_FLOOR@/$floor/" deploy/linux/install.sh \
+    sed -e "s/@VERSION@/$version/" -e "s/@GLIBC_FLOOR@/$floor/" -e "s/@ARCH@/$arch/" \
+        deploy/linux/install.sh \
         > "/pack/$name/install.sh"; \
     chmod 0755 "/pack/$name/install.sh"; \
     (cd "/pack/$name" && sha256sum peerfectlyd peerfectly peerfectlyd.service install.sh > SHA256SUMS); \
     tar --sort=name --owner=0 --group=0 --numeric-owner -C /pack -czf "/dist/$name.tar.gz" "$name"; \
     (cd /dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"); \
-    echo "$name: glibc $floor or later"
+    echo "$name: $arch, glibc $floor or later"
 
 FROM scratch AS dist
 COPY --from=pack /dist/ /
