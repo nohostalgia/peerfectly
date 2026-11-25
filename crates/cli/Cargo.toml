@@ -18,12 +18,14 @@ light-node = { path = "../light-node" }
 # among those the system lists.
 serialport = { version = "4.10.1", default-features = false }
 async-trait.workspace = true
+# The founder's words: made, shown and checked at founding, read back to sign.
+identity = { path = "../identity" }
+zeroize.workspace = true
+getrandom.workspace = true
 # `signal`: Ctrl+C on a waiting join abandons it in the daemon too.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
 
 [dev-dependencies]
-# Operations to read, signed as a device would.
-identity = { path = "../identity" }
 
 [lints]
 workspace = true

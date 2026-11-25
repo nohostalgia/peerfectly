@@ -111,7 +111,7 @@ fn what_a_full_member_holds_per_device() {
 
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
     let most = usize::try_from(roster::limits::MAX_BATCH_ENTRIES).unwrap();
     let mut lots = Vec::new();
     let mut parent = "admin2".to_owned();
@@ -172,8 +172,10 @@ fn what_a_full_member_holds_per_device() {
             state.root(),
             roster::snapshot::Covering { heads: vec![head], depths: vec![depth] },
             Vec::new(),
-            state.leaf(&signer).unwrap(),
-            roster::membership::MembershipProof::of(&state, &signer).unwrap(),
+            roster::snapshot::RootSigner::Device {
+                leaf: state.leaf(&signer).unwrap(),
+                proof: roster::membership::MembershipProof::of(&state, &signer).unwrap(),
+            },
             author,
             history.network(),
         )

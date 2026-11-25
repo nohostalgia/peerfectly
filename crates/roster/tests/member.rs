@@ -16,24 +16,9 @@ use support::{History, device, device_id, signer};
 fn history() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "two",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
-    history.op(
-        "three",
-        1,
-        &["two"],
-        OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
-    );
-    history.op(
-        "four",
-        1,
-        &["three"],
-        OperationBody::AddDevice(device(4, "sensor", Role::Member, false)),
-    );
+    history.op("two", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("three", 1, &["two"], OperationBody::AddDevice(device(3, "phone", Role::Member)));
+    history.op("four", 1, &["three"], OperationBody::AddDevice(device(4, "sensor", Role::Member)));
     history
 }
 

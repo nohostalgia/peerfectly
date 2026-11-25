@@ -53,14 +53,19 @@ impl Fixture {
     fn found() -> Self {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
-        let params =
-            NetworkParams::new(ULA.to_vec(), "example.internal", 2_592_000).expect("valid");
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            ULA.to_vec(),
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
 
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -75,7 +80,7 @@ impl Fixture {
             2,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("joiner", Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             founder.signing_key().key_id(),
@@ -132,7 +137,7 @@ impl Fixture {
             3,
             self.founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                third.device_spec("printer", Role::Member, false, vec![]).expect("spec"),
+                third.device_spec("printer", Role::Member, vec![]).expect("spec"),
             ),
             self.roster().heads(),
             self.founder.signing_key().key_id(),
@@ -148,7 +153,7 @@ impl Fixture {
             3,
             self.founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                device.device_spec("newcomer", Role::Member, false, vec![]).expect("spec"),
+                device.device_spec("newcomer", Role::Member, vec![]).expect("spec"),
             ),
             self.roster().heads(),
             self.founder.signing_key().key_id(),
@@ -1047,6 +1052,12 @@ async fn a_revocation_closes_the_session_it_revokes() {
 
 /// A revocation arriving *from a peer* takes effect the same way. A node that
 /// only enforced its own revocations would keep a device its network had removed.
+///
+/// The revoked side learns it is out and leaves the session to its peer: the
+/// founder, holding the revocation, closes it. Whether a device is admitted is
+/// its peers' to decide (offline-founder design §22): a revoked device that
+/// closed every session itself closed the one bringing it back when the
+/// founder voided its revocation.
 #[tokio::test]
 async fn a_revocation_that_arrives_from_a_peer_also_closes_the_session() {
     let (fixture, founder, joiner, dialled, accepted) = pair().await;
@@ -1074,9 +1085,9 @@ async fn a_revocation_that_arrives_from_a_peer_also_closes_the_session() {
         "the joiner learned it is out"
     );
     assert_eq!(
-        joiner.node.session_count().await,
+        founder.node.session_count().await,
         0,
-        "and dropped the session rather than keeping it open to a network it has left"
+        "and the founder, which holds the revocation, closed the session"
     );
 }
 

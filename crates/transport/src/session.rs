@@ -202,7 +202,52 @@ pub trait Transport: Send + Sync {
     /// (18.1). The default ignores it, which is right for a transport whose
     /// peers all hold a roster.
     fn catch_up_by(&self, _catching: CatchingUp) {}
+
+    /// The devices this node holds as revoked, each by its transport key, with
+    /// the revocation that names it (offline-founder design §16).
+    ///
+    /// Such a key is admitted where it would otherwise be refused, and only to
+    /// be refused as revoked and sent its revocation, at most once an hour. A
+    /// key no device ever held is refused as before. Given again at every
+    /// change, and held as given: the last list replaces the one before.
+    ///
+    /// The default ignores it, which is right for a transport that cannot tell
+    /// a refused peer anything.
+    fn tell_revoked(&self, _revoked: Vec<Revoked>) {}
+
+    /// Sends a device a revocation of itself, outside any session, and waits
+    /// for it to say it read it.
+    ///
+    /// # Errors
+    ///
+    /// When the device cannot be reached or does not answer in time. The
+    /// default cannot send one at all.
+    async fn notify(&self, _peer: &PublicKey, _revocation: Vec<u8>) -> Result<()> {
+        Err(crate::error::Error::PeerUnreachable {
+            cause: Some("this transport cannot carry a notice".to_owned()),
+        })
+    }
+
+    /// Where a notice this node receives goes: the bytes of a revocation, which
+    /// nothing below has judged. The handler judges it before acting on
+    /// anything it says.
+    ///
+    /// The default drops them.
+    fn on_notice(&self, _handler: NoticeHandler) {}
 }
+
+/// A device held as revoked, as the transport is told it
+/// ([`Transport::tell_revoked`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revoked {
+    /// Its transport key, the ed25519 public key's bytes.
+    pub transport: Vec<u8>,
+    /// The revocation that names it, as signed.
+    pub revocation: Vec<u8>,
+}
+
+/// What receives a notice's bytes ([`Transport::on_notice`]).
+pub type NoticeHandler = std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
 /// The roots a node holding a roster took after the one named, as the bytes
 /// [`CatchingUp::take`] reads, in no more than the bytes given: what the

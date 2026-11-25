@@ -34,14 +34,19 @@ impl Fixture {
     fn found() -> Self {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
-        let params =
-            NetworkParams::new(ULA.to_vec(), "example.internal", 2_592_000).expect("valid");
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            ULA.to_vec(),
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
 
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -56,7 +61,7 @@ impl Fixture {
             2,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("joiner", Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             founder.signing_key().key_id(),

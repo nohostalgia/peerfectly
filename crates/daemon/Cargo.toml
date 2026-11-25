@@ -8,6 +8,8 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# The founder's transport key, overwritten once its session ends.
+zeroize.workspace = true
 roster = { path = "../roster" }
 # A light member's protocol, which this daemon runs where it is one.
 light-node = { path = "../light-node" }
@@ -48,7 +50,8 @@ sha2 = "0.11"
 # Splitting an `https://` relay host into a host and a port. Hand-parsing this
 # would get IPv6 literals wrong, and getting them wrong means connecting
 # somewhere else.
-url = "2.5"
+# 2.5.9 or later: RUSTSEC-2026-0592, a stack overflow in `Url::origin()`.
+url = "2.5.9"
 # DNS wire format. Parsing a query and building an answer by hand is a
 # well-known source of bugs, and this sits in the resolution path of every name
 # under the suffix. Not a cryptographic primitive, so no rule forbids a
@@ -74,7 +77,9 @@ qrcode = { version = "0.14.1", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # The machine's time zone, so a time a person reads is their own and not seconds
 # since 1970. Already in the tree through `wmi`, with `iana-time-zone`.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Dates in the person's time zone, read from the system on every platform. In
+# place of chrono, unmaintained since RUSTSEC-2026-0543.
+jiff = "1"
 
 [dev-dependencies]
 # A convesso relay in this process, for the enrolment tests.

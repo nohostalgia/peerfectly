@@ -342,8 +342,9 @@ mod tests {
             1,
             identity.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: identity.device_spec("phone", Role::Admin, true, vec![]).expect("spec"),
+                device: identity.device_spec("phone", Role::Admin, vec![]).expect("spec"),
                 params: roster::types::NetworkParams::new(
+                    roster::types::FounderKeys::held_by_nobody(),
                     vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
                     "example.internal",
                     2_592_000,
@@ -394,7 +395,7 @@ mod tests {
         let key = identity.signing_key().public_key();
         let operation = prepare_operation(&core(&identity), &key);
         let record = identity
-            .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
+            .device_spec("pc", roster::types::Role::Admin, Vec::new())
             .expect("a device")
             .into_record(core(&identity).id())
             .expect("a record");
@@ -404,10 +405,15 @@ mod tests {
             [0xa0; 32],
             roster::snapshot::Covering { heads: vec![core(&identity).id()], depths: vec![0] },
             vec![],
-            roster::leaf::DeviceLeaf { record, settings: roster::leaf::DeviceSettings::default() },
-            roster::membership::MembershipProof {
-                devices: roster::merkle::Proof { siblings: vec![] },
-                parameters: [0; 32],
+            roster::snapshot::RootSigner::Device {
+                leaf: roster::leaf::DeviceLeaf {
+                    record,
+                    settings: roster::leaf::DeviceSettings::default(),
+                },
+                proof: roster::membership::MembershipProof {
+                    devices: roster::merkle::Proof { siblings: vec![] },
+                    parameters: [0; 32],
+                },
             },
             identity.signing_key().key_id(),
             NetworkId::from_bytes([7; 32]),

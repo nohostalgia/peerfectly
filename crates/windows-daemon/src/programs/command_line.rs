@@ -19,6 +19,7 @@ fn run() -> std::process::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("tray") {
         return start_the_tray();
     }
+    crate::platform::console::echo_back_on();
     cli::Cli {
         channel: &Pipe,
         custody: &KeyStore,
@@ -74,6 +75,11 @@ struct KeyStore;
 
 #[cfg(windows)]
 impl cli::Custody for KeyStore {
+    /// A word of the founder's, read at the console with echo off.
+    fn read_hidden(&self, prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
+        crate::platform::console::ask(prompt).map_err(|cause| cause.to_string())
+    }
+
     /// Whether this console may sign at all: a network's key is the machine's,
     /// and the machine's key store lets only administrators use it. Asked first,
     /// so a person is refused before an invite is issued or a code is shown,

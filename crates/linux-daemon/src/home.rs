@@ -84,9 +84,81 @@ pub fn who_else_can_write(steps: &[Step]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a chosen state directory is spelled plainly: from `/`, through named
+/// directories only — no `.`, no `..`, no prefix, and not `/` itself.
+///
+/// **Only a plain path has the ancestors the checks look at.** `..` would have
+/// them judge directories the path does not end up under.
+///
+/// # Errors
+///
+/// When it is not, naming it.
+pub fn judge_plain(path: &Path) -> Result<(), String> {
+    use std::path::Component;
+    let mut components = path.components();
+    let starts_at_root = matches!(components.next(), Some(Component::RootDir));
+    let named_only = components.clone().all(|part| matches!(part, Component::Normal(_)));
+    if !starts_at_root || !named_only || components.next().is_none() {
+        return Err(format!(
+            "{} is not a plain absolute path: a state directory is named from / through \
+             directories only, with no `.` or `..`",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// One directory above a chosen state directory, as found **without following
+/// links**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Above {
+    /// A directory, with its owner and mode.
+    Directory(Step),
+    /// A symbolic link.
+    Link(PathBuf),
+    /// Something that is neither.
+    NotADirectory(PathBuf),
+    /// Nothing is there.
+    Missing(PathBuf),
+    /// It could not be read, for this reason.
+    Unreadable(PathBuf, String),
+}
+
+/// What is wrong on the way from a chosen state directory up to `/`, in words.
+///
+/// Empty is the only answer the state is kept under. Stricter than the
+/// executable's location ([`who_else_can_write`] over [`steps_to`]): a link
+/// anywhere is refused, since the directories it leads through are not the
+/// ones the path names, and a directory that cannot be read is refused rather
+/// than left unjudged.
+#[must_use]
+pub fn judge_above(found: &[Above]) -> Vec<String> {
+    found
+        .iter()
+        .flat_map(|above| match above {
+            Above::Directory(step) => who_else_can_write(core::slice::from_ref(step)),
+            Above::Link(path) => vec![format!(
+                "{} is a symbolic link, and a state directory is reached through real \
+                 directories only",
+                path.display()
+            )],
+            Above::NotADirectory(path) => vec![format!("{} is not a directory", path.display())],
+            Above::Missing(path) => vec![format!(
+                "{} does not exist, and only the state directory itself is made",
+                path.display()
+            )],
+            Above::Unreadable(path, cause) => vec![format!(
+                "{} could not be read ({cause}), so who can write it is unknown",
+                path.display()
+            )],
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 pub use self::real::{
-    home_for_this_machine, home_under, steps_to, who_else_can_write_where_this_runs,
+    above, home_at, home_for_this_machine, home_under, judge_existing_state, steps_to,
+    who_else_can_write_where_this_runs,
 };
 
 #[cfg(target_os = "linux")]
@@ -94,7 +166,7 @@ mod real {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     use std::path::Path;
 
-    use super::{STATE, Step, judge_state, who_else_can_write};
+    use super::{Above, STATE, Step, judge_above, judge_plain, judge_state, who_else_can_write};
 
     /// The machine's networks, under [`STATE`].
     ///
@@ -104,6 +176,70 @@ mod real {
     /// be.
     pub fn home_for_this_machine() -> daemon::Result<daemon::networks::Home> {
         home_under(Path::new(STATE))
+    }
+
+    /// The machine's networks, under a directory somebody chose (`--state`).
+    ///
+    /// Judged before anything is made: the path is plain ([`judge_plain`]) and
+    /// every directory above it is root's alone ([`judge_above`]). Then as
+    /// [`home_under`] — which makes only the last component, so a missing parent
+    /// has already been refused rather than made with the umask.
+    ///
+    /// # Errors
+    ///
+    /// When any of that does not hold, naming each thing found.
+    pub fn home_at(root: &Path) -> daemon::Result<daemon::networks::Home> {
+        let failed = |cause: String| daemon::Error::State { path: root.to_path_buf(), cause };
+        judge_plain(root).map_err(failed)?;
+        let wrong = judge_above(&above(root));
+        if !wrong.is_empty() {
+            return Err(failed(wrong.join("; ")));
+        }
+        home_under(root)
+    }
+
+    /// A chosen state directory that must already be there — the command line's
+    /// check before it reads or writes a key under it: plain, root's alone all
+    /// the way up, and itself a real directory only root can enter.
+    ///
+    /// # Errors
+    ///
+    /// When any of that does not hold, naming each thing found.
+    pub fn judge_existing_state(root: &Path) -> Result<(), String> {
+        judge_plain(root)?;
+        let wrong = judge_above(&above(root));
+        if !wrong.is_empty() {
+            return Err(wrong.join("; "));
+        }
+        let found = std::fs::symlink_metadata(root)
+            .map_err(|cause| format!("{}: {cause}", root.display()))?;
+        if !found.is_dir() {
+            return Err(format!("{} is not a directory", root.display()));
+        }
+        judge_state(root, found.uid(), found.mode())
+    }
+
+    /// Every directory above `path`, up to `/`, as found without following
+    /// links.
+    #[must_use]
+    pub fn above(path: &Path) -> Vec<Above> {
+        path.ancestors()
+            .skip(1)
+            .map(|directory| {
+                let at = directory.to_path_buf();
+                match std::fs::symlink_metadata(directory) {
+                    Ok(found) if found.file_type().is_symlink() => Above::Link(at),
+                    Ok(found) if !found.is_dir() => Above::NotADirectory(at),
+                    Ok(found) => {
+                        Above::Directory(Step { path: at, owner: found.uid(), mode: found.mode() })
+                    }
+                    Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+                        Above::Missing(at)
+                    }
+                    Err(cause) => Above::Unreadable(at, cause.to_string()),
+                }
+            })
+            .collect()
     }
 
     /// The same, at a path the caller names — for tests, which cannot use the
@@ -217,5 +353,71 @@ mod tests {
             named.iter().any(|line| line.contains("every account can write /tmp")),
             "sticky is not enough"
         );
+    }
+
+    /// A chosen state directory is named from `/` through directories only.
+    #[test]
+    fn a_chosen_state_directory_is_spelled_plainly() {
+        assert!(judge_plain(Path::new("/data/peerfectly")).is_ok());
+        for crooked in ["data/peerfectly", "/data/../etc", "../peerfectly", "/", "", "./x"] {
+            let said = judge_plain(Path::new(crooked)).unwrap_err();
+            assert!(said.contains("not a plain absolute path"), "{crooked}: {said}");
+        }
+    }
+
+    /// **On a real disk**: a chosen directory under `/tmp`, which every account
+    /// can write, is refused before anything is made; so is one whose parent
+    /// does not exist, which is not made either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_chosen_directory_is_judged_on_the_disk_before_anything_is_made() {
+        let shared = tempfile::tempdir_in("/tmp").unwrap();
+        let under_tmp = shared.path().join("state");
+        let said = home_at(&under_tmp).map(|_| ()).unwrap_err().to_string();
+        assert!(said.contains("every account can write /tmp"), "{said}");
+        assert!(!under_tmp.exists(), "nothing made");
+
+        let orphan = shared.path().join("missing").join("state");
+        let said = home_at(&orphan).map(|_| ()).unwrap_err().to_string();
+        assert!(said.contains("does not exist"), "{said}");
+        assert!(!shared.path().join("missing").exists(), "the parent is not made");
+    }
+
+    /// The Home Assistant add-on's layout: `/` and `/data`, root's, 755.
+    #[test]
+    fn root_only_directories_above_are_clean() {
+        let found =
+            [Above::Directory(step("/data", 0, 0o40755)), Above::Directory(step("/", 0, 0o40755))];
+        assert!(judge_above(&found).is_empty());
+    }
+
+    /// **Everything that is not a directory only root can write is named**: a
+    /// group or another account that can write, a sticky world-writable
+    /// directory, a link, something missing, something unreadable.
+    #[test]
+    fn whatever_else_is_above_is_named() {
+        let found = [
+            Above::Directory(step("/srv/shared", 0, 0o40775)),
+            Above::Directory(step("/srv", 1000, 0o40755)),
+            Above::Directory(step("/tmp", 0, 0o41777)),
+            Above::Link(PathBuf::from("/data")),
+            Above::NotADirectory(PathBuf::from("/file")),
+            Above::Missing(PathBuf::from("/gone")),
+            Above::Unreadable(PathBuf::from("/hidden"), "permission denied".to_owned()),
+            Above::Directory(step("/", 0, 0o40755)),
+        ];
+        let named = judge_above(&found);
+        assert_eq!(7, named.len(), "{named:?}");
+        for expected in [
+            "its group can write /srv/shared",
+            "uid 1000 owns /srv",
+            "every account can write /tmp",
+            "/data is a symbolic link",
+            "/file is not a directory",
+            "/gone does not exist",
+            "/hidden could not be read (permission denied)",
+        ] {
+            assert!(named.iter().any(|line| line.contains(expected)), "{expected}: {named:?}");
+        }
     }
 }

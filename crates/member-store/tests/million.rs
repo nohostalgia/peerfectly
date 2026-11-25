@@ -89,7 +89,6 @@ fn leaf(n: u32) -> DeviceLeaf {
         keys,
         name: format!("sensor-{n}"),
         role: Role::Member,
-        founder: false,
         added_by: OperationId::from_bytes([1; 32]),
         capabilities: Vec::new(),
     };
@@ -110,7 +109,13 @@ fn transport_key(leaf: &DeviceLeaf) -> roster::id::KeyId {
 fn a_million_devices_load_and_answer_within_64_mb() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("base.redb");
-    let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "fleet.internal", 0).unwrap();
+    let params = NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "fleet.internal",
+        0,
+    )
+    .unwrap();
     let skeleton = RosterState::empty(NetworkId::from_bytes([7; 32]), params);
 
     let started = Instant::now();

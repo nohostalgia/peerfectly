@@ -62,6 +62,7 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 pub mod adopt;
+pub mod base32;
 pub mod error;
 pub mod exchange;
 pub mod invite;

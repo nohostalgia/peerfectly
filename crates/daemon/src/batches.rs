@@ -159,7 +159,7 @@ mod tests {
 
     fn device(name: &str) -> BatchDevice {
         let board = NodeIdentity::generate().unwrap();
-        let spec = board.device_spec(name, roster::types::Role::Member, false, vec![]).unwrap();
+        let spec = board.device_spec(name, roster::types::Role::Member, vec![]).unwrap();
         let hex_of = |purpose: KeyPurpose| {
             spec.keys
                 .iter()
@@ -178,16 +178,20 @@ mod tests {
 
     /// A network in `block` whose founder holds the first host.
     fn state_in(block: &str) -> RosterState {
-        let params = NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0)
-            .unwrap()
-            .in_ipv4_range(block.parse().unwrap());
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            0,
+        )
+        .unwrap()
+        .in_ipv4_range(block.parse().unwrap());
         let founder = DeviceId::from_bytes([1; 32]);
         let record = roster::types::DeviceRecord {
             id: founder,
             keys: Vec::new(),
             name: "nas".to_owned(),
             role: roster::types::Role::Admin,
-            founder: true,
             added_by: roster::id::OperationId::from_bytes([0; 32]),
             capabilities: Vec::new(),
         };

@@ -102,7 +102,6 @@
 //!     keys,
 //!     "laptop",
 //!     Role::Member,
-//!     false,
 //!     vec![Capability::new("serves")?],
 //! )?;
 //!

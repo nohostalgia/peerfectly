@@ -6,7 +6,7 @@
 //! Every signature covers
 //!
 //! ```text
-//! "roster/v1" || network_id || op_type || canonical_core
+//! "roster/v2" || network_id || op_type || canonical_core
 //! ```
 //!
 //! not the core alone. Without the prefix, a signature valid in one context is
@@ -43,7 +43,7 @@ use alloc::borrow::Cow;
 /// This is the format's version boundary. A change to the encoding is a change
 /// to this string, which invalidates every existing signature by construction
 /// rather than by convention.
-pub const DOMAIN_TAG: &str = "roster/v1";
+pub const DOMAIN_TAG: &str = "roster/v2";
 
 /// Builds the byte string a signature covers.
 ///

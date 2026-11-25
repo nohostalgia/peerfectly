@@ -38,14 +38,18 @@ impl Fixture {
     /// Founds a network with one admin.
     pub fn found() -> Self {
         let founder = Arc::new(NodeIdentity::generate().expect("generates"));
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .expect("valid");
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -87,7 +91,7 @@ impl Fixture {
     /// Adds a member device and returns its identity.
     pub fn add_member(&mut self, name: &str) -> Arc<NodeIdentity> {
         let joiner = Arc::new(NodeIdentity::generate().expect("generates"));
-        let spec = joiner.device_spec(name, Role::Member, false, vec![]).expect("spec");
+        let spec = joiner.device_spec(name, Role::Member, vec![]).expect("spec");
         self.author(OperationBody::AddDevice(spec));
         self.members.push(Arc::clone(&joiner));
         joiner
@@ -132,11 +136,20 @@ impl Fixture {
         self.author(OperationBody::Rename { device, name: name.to_owned() })
     }
 
-    /// Appends `count` further operations, each renaming the founder.
+    /// Appends `count` further operations, each changing the network's suffix.
+    ///
+    /// Not a rename of the founding admin: only the founder key acts on an
+    /// admin, and this fixture's admin signs everything.
     pub fn extend(&mut self, count: usize) {
-        let founder = self.founder.device_id();
         for index in 0..count {
-            self.rename(founder, &format!("founder-{index}"));
+            let params = NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
+                vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+                format!("n{index}.example.internal"),
+                2_592_000,
+            )
+            .expect("valid");
+            self.author(OperationBody::SetNetwork(params));
         }
     }
 
@@ -212,8 +225,10 @@ impl Fixture {
             state.root(),
             roster::snapshot::Covering { heads, depths },
             Vec::new(),
-            state.leaf(&device).expect("a member"),
-            roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            roster::snapshot::RootSigner::Device {
+                leaf: state.leaf(&device).expect("a member"),
+                proof: roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            },
             author,
             self.network,
         )
@@ -250,7 +265,16 @@ impl Fixture {
         let core = OperationCore::new(
             tag.wrapping_add(1000),
             self.founder.signing_key().algorithm(),
-            OperationBody::Rename { device: self.founder.device_id(), name: name.to_owned() },
+            // A suffix change: a rename of the admin is the founder key's alone.
+            OperationBody::SetNetwork(
+                NetworkParams::new(
+                    roster::types::FounderKeys::held_by_nobody(),
+                    vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+                    format!("{name}.example.internal"),
+                    2_592_000,
+                )
+                .expect("valid"),
+            ),
             vec![parent],
             self.founder.signing_key().key_id(),
             self.network,

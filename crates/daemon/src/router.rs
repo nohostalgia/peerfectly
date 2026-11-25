@@ -219,6 +219,7 @@ mod tests {
     /// A state of these devices, some in its base and some laid by a batch.
     fn state_of(base: &[u8], batch: &[u8]) -> roster::state::RosterState {
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             0,

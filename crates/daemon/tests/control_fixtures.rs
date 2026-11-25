@@ -44,6 +44,8 @@ fn report() -> Report {
         id: "3d4e-5f6a-7b8c-9d0e".to_owned(),
         admin: true,
         custody: daemon::control::Custody::KeyStore,
+        key_until_settled: false,
+        revoked_by: None,
         owner_taken: false,
         // A network confirmed within the time it allows.
         confirmation: None,
@@ -69,7 +71,7 @@ fn report() -> Report {
                 device: nas.clone(),
                 pairs: 1,
                 first: Branch { does: Act::Founds, depth: None },
-                second: Branch { does: Act::Promotes(nas.clone(), true), depth: None },
+                second: Branch { does: Act::Promotes(nas.clone()), depth: None },
             },
             Accused {
                 device: nas.clone(),
@@ -107,6 +109,7 @@ fn report() -> Report {
                 path: Some(daemon::control::Path::Relay),
                 standing: Standing::Current,
                 last_contact: Contact::Recorded { at: at(1_757_700_000) },
+                admin: true,
             },
             Peer {
                 name: "laptop.home.internal".to_owned(),
@@ -121,6 +124,7 @@ fn report() -> Report {
                 path: None,
                 standing: Standing::Current,
                 last_contact: Contact::NoneRecorded,
+                admin: false,
             },
         ],
         // A page of a larger network: the rest are asked after the cursor.
@@ -146,6 +150,9 @@ fn report() -> Report {
         id: "4e5f-6a7b-8c9d-0e1f".to_owned(),
         admin: false,
         custody: daemon::control::Custody::KeyStore,
+        key_until_settled: false,
+        // Revoked there, so a renderer has the line to draw.
+        revoked_by: Some("laptop [0a1b-2c3d-4e5f-6a7b]".to_owned()),
         owner_taken: false,
         // And one this device has not been able to confirm, so a renderer of
         // the report has both to draw.
@@ -179,6 +186,7 @@ fn report() -> Report {
             path: Some(daemon::control::Path::Direct),
             standing: Standing::LastKnown { at: at(1_757_600_000) },
             last_contact: Contact::Recorded { at: at(1_757_600_000) },
+            admin: false,
         }],
         peer_count: 1,
         reachable_count: 0,
@@ -194,6 +202,7 @@ fn report() -> Report {
             cause: daemon::control::Trouble::IdentityWillNotOpen,
         }],
         admin_refusal: None,
+        state_directory: None,
         waiting_on: None,
         note: Some("the other machine confirmed the relay".to_owned()),
         elsewhere: 0,
@@ -211,6 +220,7 @@ fn outcomes() -> Vec<Outcome> {
             unusable: Vec::new(),
             note: Some("one network on this machine belongs to somebody else, and none to you".to_owned()),
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             // What the second person on a desktop is shown. Zero on a phone,
             // which has one person — and in the fixture precisely because the
@@ -237,12 +247,13 @@ fn outcomes() -> Vec<Outcome> {
                 device: named(None, "2c3d-4e5f-6a7b-8c9d"),
                 revocations: vec![
                     Revocation {
-                        by: named(Some("nas"), "0a1b-2c3d-4e5f-6a7b"),
+                        by: Some(named(Some("nas"), "0a1b-2c3d-4e5f-6a7b")),
                         reason: "stolen on the train".to_owned(),
                         signer_clock: Signed::At { time: at(1_757_000_000) },
                     },
                     Revocation {
-                        by: named(Some("laptop"), "1b2c-3d4e-5f6a-7b8c"),
+                        // The founder's, which no device signed.
+                        by: None,
                         reason: "lost".to_owned(),
                         signer_clock: Signed::NotRecorded,
                     },
@@ -284,6 +295,7 @@ fn outcomes() -> Vec<Outcome> {
                     standing: "open".to_owned(),
                     expires_at: 1_758_300_000,
                     request: None,
+                    refused: Vec::new(),
                 },
                 daemon::control::InviteLine {
                     network: "casa".to_owned(),
@@ -302,7 +314,9 @@ fn outcomes() -> Vec<Outcome> {
                             "100.64.0.0/10 overlaps 100.64.12.0/22, a subnet this device is on"
                                 .to_owned(),
                         ],
+                        admin: true,
                     }),
+                    refused: Vec::new(),
                 },
             ],
             joins: vec![daemon::control::JoinLine {
@@ -343,6 +357,8 @@ fn outcomes() -> Vec<Outcome> {
                     payload: vec![0xa2],
                 },
             ],
+            keys: None,
+            founder: None,
         }),
         // A key the daemon cannot make, because making it asks a person and the
         // daemon has no desktop. Never produced on a phone, and mirrored for the
@@ -351,6 +367,7 @@ fn outcomes() -> Vec<Outcome> {
             id: "k18f3a".to_owned(),
             name: "peerfectly.casa.signing".to_owned(),
             network: "casa".to_owned(),
+            keys: None,
         }),
         // Somebody else's, on a machine that holds networks for two people.
         // Never produced on a phone, and mirrored for the same reason as above.
@@ -389,6 +406,45 @@ fn outcomes() -> Vec<Outcome> {
                 port: 8000,
             }],
         },
+        // A network's history: the founder's revocation, then an admin's
+        // admission that took no effect.
+        Outcome::History(daemon::control::History {
+            network: "casa".to_owned(),
+            entries: vec![
+                daemon::control::HistoryEntry {
+                    at: 1_768_867_200_000,
+                    by: None,
+                    does: Act::Revokes(named(Some("laptop"), "0a1b-2c3d-4e5f-6a7b")),
+                    no_effect: None,
+                    id: "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f".to_owned(),
+                },
+                daemon::control::HistoryEntry {
+                    at: 1_768_867_100_000,
+                    by: Some(named(Some("laptop"), "0a1b-2c3d-4e5f-6a7b")),
+                    does: Act::Admits(named(Some("tv"), "1b2c-3d4e-5f6a-7b8c")),
+                    no_effect: Some("concurrent with author removal".to_owned()),
+                    id: "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e".to_owned(),
+                },
+            ],
+            complete_from: 1_768_867_000_000,
+            compacted: true,
+        }),
+        // A batch the founder's words sign: the surface asks for them.
+        Outcome::NeedsSignatures(daemon::control::SignaturesWanted {
+            id: "18f3a-3".to_owned(),
+            key: "founder".to_owned(),
+            network: "casa".to_owned(),
+            items: vec![daemon::control::ToSign {
+                kind: daemon::control::SigningKind::Operation,
+                message: vec![0x00, 0x7f],
+                payload: vec![0xa1, 0x02],
+            }],
+            keys: None,
+            founder: Some(daemon::control::FounderPublic {
+                signing: "11".repeat(32),
+                transport: "22".repeat(32),
+            }),
+        }),
         Outcome::Failed { message: "the adapter would not come up".to_owned(), left_behind: vec!["a route".to_owned()] },
     ]
 }
@@ -483,12 +539,19 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
         Command::Withdraw { network: casa(), name: "tv".to_owned() },
         Command::Approve { network: casa(), name: "tv".to_owned(), replace: false },
         Command::Reject { network: casa(), name: "tv".to_owned() },
-        Command::Join { invite: "peerfectly-invite-v1:abc".to_owned(), name: "phone".to_owned() },
+        Command::Join {
+            invite: "peerfectly-invite-v1:abc".to_owned(),
+            name: "phone".to_owned(),
+            admin: false,
+        },
         Command::CancelJoin { label: "joining".to_owned() },
         Command::Confirm,
         Command::Abandon,
         Command::Forget { label: "casa".to_owned(), last_admin: false },
         Command::Found {
+            founder: daemon::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "casa".to_owned(),
             name: "pixel".to_owned(),
             suffix: "casa.internal".to_owned(),
@@ -507,11 +570,38 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
             target: daemon::control::Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()),
             reason: "stolen".to_owned(),
         },
+        Command::RevokeFrom {
+            network: casa(),
+            target: daemon::control::Target::Name("laptop".to_owned()),
+            reason: "stolen".to_owned(),
+            from: "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e".to_owned(),
+            again: vec!["0a1b-2c3d-4e5f-6a7b".to_owned()],
+        },
         Command::SetAnchors {
             network: casa(),
             anchors: vec![daemon::control::Target::Name("nas".to_owned())],
         },
         Command::ChangeRelay { network: casa(), relay: "r.example".to_owned(), immediately: false },
+        Command::Demote {
+            network: casa(),
+            target: daemon::control::Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()),
+        },
+        Command::AsFounder(Box::new(Command::Demote {
+            network: casa(),
+            target: daemon::control::Target::Name("laptop".to_owned()),
+        })),
+        Command::Recover {
+            network: casa(),
+            revoke: vec![daemon::control::Target::Name("laptop".to_owned())],
+        },
+        Command::ReplaceFounder {
+            network: casa(),
+            founder: daemon::control::FounderPublic {
+                signing: "11".repeat(32),
+                transport: "22".repeat(32),
+            },
+        },
+        Command::History { network: casa(), by: Some("founder".to_owned()) },
     ]
     .into_iter()
     .map(|command| {

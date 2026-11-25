@@ -62,6 +62,7 @@ pub mod conflicts;
 pub mod connectivity;
 pub(crate) mod contacts;
 pub mod control;
+pub(crate) mod demoting;
 pub(crate) mod describing;
 pub(crate) mod discovery;
 pub mod drawing;
@@ -83,6 +84,7 @@ pub(crate) mod names;
 pub(crate) mod neighbours;
 pub mod networks;
 pub mod node;
+pub(crate) mod notices;
 pub mod relay;
 pub(crate) mod renaming;
 pub mod resolving;
@@ -95,6 +97,7 @@ pub(crate) mod service;
 
 // A light member's rules, which a full member's answers follow too.
 pub(crate) use light_node::{channel, seeking};
+pub(crate) mod recovering;
 pub mod signing;
 #[cfg(test)]
 mod simulator;

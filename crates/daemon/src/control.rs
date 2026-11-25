@@ -296,8 +296,8 @@ pub enum Act {
     Admits(Named),
     /// Revokes a device.
     Revokes(Named),
-    /// Makes a device an admin, and a founder if the flag says so.
-    Promotes(Named, bool),
+    /// Makes a device an admin.
+    Promotes(Named),
     /// Makes an admin a member.
     Demotes(Named),
     /// Gives a device a new name.
@@ -330,10 +330,7 @@ impl fmt::Display for Act {
             Self::Founds => f.write_str("the founding of this network"),
             Self::Admits(device) => write!(f, "admission of {device}"),
             Self::Revokes(device) => write!(f, "revocation of {device}"),
-            Self::Promotes(device, false) => write!(f, "promotion of {device} to admin"),
-            Self::Promotes(device, true) => {
-                write!(f, "promotion of {device} to admin and founder")
-            }
+            Self::Promotes(device) => write!(f, "promotion of {device} to admin"),
             Self::Demotes(device) => write!(f, "demotion of {device} to member"),
             // Once the rename is in force here, the name the device goes by
             // is the new one: by id alone then, not "renaming of studio to
@@ -439,6 +436,10 @@ pub struct Peer {
     pub standing: Standing,
     /// When this device last had a session with it that spoke.
     pub last_contact: Contact,
+    /// Whether the roster makes it an admin: what an admin is offered to
+    /// demote. Written only when it is one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 /// A device this device holds as revoked.
@@ -459,8 +460,8 @@ pub struct Revoked {
 /// One signed revocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revocation {
-    /// The admin that signed it.
-    pub by: Named,
+    /// The admin that signed it, or `None` for the founder.
+    pub by: Option<Named>,
     /// Why, as that admin wrote it.
     pub reason: String,
     /// What the revoking device's clock said. A claim, not a fact about when.
@@ -522,6 +523,10 @@ pub enum Custody {
     /// the report must be able to tell that from a key that never leaves the
     /// hardware.
     Passphrase,
+    /// Nowhere: this device is a member of the network, and keeps only the
+    /// public half of its signing key, from which its id derives. The private
+    /// half signed the join's proof and was cleared.
+    None,
 }
 
 impl fmt::Display for Custody {
@@ -530,6 +535,7 @@ impl fmt::Display for Custody {
             Self::KeyStore => f.write_str("in this machine's key store"),
             Self::HeldHere => f.write_str("in a file on this device"),
             Self::Passphrase => f.write_str("in a file sealed with a passphrase"),
+            Self::None => f.write_str("none: this device is a member, and holds no signing key"),
         }
     }
 }
@@ -578,6 +584,16 @@ pub struct Network {
     pub admin: bool,
     /// Where this device keeps this network's signing key.
     pub custody: Custody,
+    /// Whether that key is one this device keeps only until its demotion is
+    /// settled: it was an admin, is a member now, and destroys the key once the
+    /// demotion is beneath the roster's base, where nothing can void it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub key_until_settled: bool,
+    /// Who revoked this device from it, where it holds its own revocation:
+    /// "the founder", or an admin by name and short id (offline-founder design
+    /// §16). It issues no invite and signs nothing as an admin there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<String>,
     /// Whether this network was taken from somebody rather than always this
     /// person's.
     ///
@@ -905,6 +921,11 @@ pub struct Report {
     /// was refused.
     pub admin_refusal: Option<String>,
 
+    /// Where the daemon keeps its state, when it was told to keep it somewhere
+    /// other than its platform's default. `None` at the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_directory: Option<String>,
+
     /// What this daemon holds waiting on this person, in words: a founding or a
     /// move stopped on a relay's key, a join, an admission at the code. `None`
     /// when nothing waits, or when what waits is somebody else's.
@@ -968,6 +989,12 @@ pub struct KeyWanted {
     /// The network it is for, which is what a person will be shown — empty
     /// while it is being joined, when it has no name here yet.
     pub network: String,
+
+    /// Where the key is to be kept, where the platform keeps keys in a
+    /// directory of the daemon's: the command line uses this one and no other,
+    /// after judging it. `None` is the platform's default place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
 }
 
 /// Everything one act needs signed by a key held outside this process.
@@ -1013,6 +1040,16 @@ pub struct SignaturesWanted {
     pub network: String,
     /// What is to be signed, in the order it takes effect.
     pub items: Vec<ToSign>,
+
+    /// Where the key is kept, as in [`KeyWanted::keys`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
+
+    /// The founder's keys, when this batch is the founder's to sign: the
+    /// surface asks for the words, checks the key they make is this one, and
+    /// signs with it. `None` for a batch this device's own key signs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub founder: Option<FounderPublic>,
 }
 
 /// The most items one batch may hold.
@@ -1222,6 +1259,13 @@ impl Command {
     #[must_use]
     pub fn needs(&self) -> Needs {
         match self {
+            // Whoever the act inside needs: signing as the founder changes who
+            // signs, not who may ask.
+            Self::AsFounder(inner) => inner.needs(),
+            Self::Recover { network, .. }
+            | Self::ReplaceFounder { network, .. }
+            | Self::FounderSession { network, .. } => Needs::TheOwnerOf(network.clone()),
+            Self::History { network, .. } => Needs::TheOwnerOf(network.clone()),
             // Reading. What comes back is bounded by what the reader may see.
             Self::Status | Self::Waiting => Needs::Nobody,
             // Opening a session with a member, as `peers` does with each.
@@ -1252,9 +1296,11 @@ impl Command {
             | Self::Reject { network, .. }
             | Self::Revoke { network, .. }
             | Self::RevokeVoiding { network, .. }
+            | Self::RevokeFrom { network, .. }
             | Self::StageBatch { network, .. }
             | Self::AdmitBatch { network, .. }
             | Self::Rename { network, .. }
+            | Self::Demote { network, .. }
             | Self::SetAnchors { network, .. }
             | Self::SetIpv4Block { network, .. }
             | Self::GiveIpv4 { network, .. }
@@ -1281,6 +1327,80 @@ impl Command {
             // The machine's.
             Self::Stop | Self::TakeOwnership { .. } => Needs::TheMachine,
         }
+    }
+}
+
+/// A network's history, as `history` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// What this machine calls the network.
+    pub network: String,
+    /// The operations held, newest first.
+    pub entries: Vec<HistoryEntry>,
+    /// When the list is complete from, in milliseconds since the epoch as the
+    /// oldest operation held says: earlier acts are in the state and no longer
+    /// listed.
+    pub complete_from: u64,
+    /// Whether anything was compacted away, so that `complete_from` is not the
+    /// founding.
+    pub compacted: bool,
+}
+
+/// One operation of a history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// When its author said it was written, in milliseconds since the epoch:
+    /// the author's claim, not a fact.
+    pub at: u64,
+    /// The device that signed it, or `None` for the founder.
+    pub by: Option<Named>,
+    /// What it does.
+    pub does: Act,
+    /// `None` where it took effect; otherwise the roster's reason it took none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_effect: Option<String>,
+    /// The operation's id, in hex: what a founder revocation names as the
+    /// first act it voids ([`Command::RevokeFrom`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+}
+
+/// The founder's two public keys, as the control protocol carries them: hex,
+/// 32 bytes each.
+///
+/// Public halves only. The words, and the private keys they make, stay in the
+/// process that asked a person for them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FounderPublic {
+    /// The signing key.
+    pub signing: String,
+    /// The transport key.
+    pub transport: String,
+}
+
+impl FounderPublic {
+    /// The keys, as hex.
+    #[must_use]
+    pub fn of(keys: &roster::types::FounderKeys) -> Self {
+        Self {
+            signing: roster::hex::encode(keys.signing()),
+            transport: roster::hex::encode(keys.transport()),
+        }
+    }
+
+    /// The keys these are.
+    ///
+    /// # Errors
+    ///
+    /// When either is not 32 bytes of hex, or the two are the same key.
+    pub fn keys(&self) -> Result<roster::types::FounderKeys, String> {
+        let read = |text: &str| -> Result<[u8; 32], String> {
+            roster::hex::decode(text)
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| "the founder's key is not 32 bytes of hex".to_owned())
+        };
+        roster::types::FounderKeys::new(read(&self.signing)?, read(&self.transport)?)
+            .map_err(|_| "the founder's two keys are the same key".to_owned())
     }
 }
 
@@ -1434,6 +1554,15 @@ pub enum Command {
         invite: String,
         /// The name this device proposes for itself. The admin's record decides.
         name: String,
+        /// Whether the person joins this device as an admin. Without it the
+        /// device joins as a member: it makes its signing key in memory, proves
+        /// it, and clears it, and asks nobody for anything. With it the key is
+        /// made in the custody this platform gives an admin's. The invite must
+        /// make the same role, or the admin's daemon refuses the request.
+        ///
+        /// Written only when set, so that a member's join reads as it always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        admin: bool,
     },
 
     /// Confirm whatever is waiting on this device's own person: a **founding**
@@ -1491,6 +1620,12 @@ pub enum Command {
     /// is invisible to it until it restarts. That restart is what this exists to
     /// remove.
     Found {
+        /// The founder's two public keys, derived from the words the person was
+        /// shown and checked before this was sent.
+        ///
+        /// Required, with no default: a surface that does not make the words
+        /// cannot found a network, rather than found one nobody can repair.
+        founder: FounderPublic,
         /// What this device will call the network it is about to create.
         ///
         /// Local to this machine: it names the folder the network is kept in and
@@ -1527,6 +1662,63 @@ pub enum Command {
         #[serde(default)]
         window_days: Option<u32>,
     },
+
+    /// Replace the founder's keys with the ones made from new words: signed by
+    /// the founder's current words, after the new ones were shown and checked.
+    ReplaceFounder {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The new founder's public keys.
+        founder: FounderPublic,
+    },
+
+    /// The operations this device holds, newest first, by who signed them and
+    /// with what effect. A reading command: it signs nothing.
+    History {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// Only those one author signed: a device by name or short id, or
+        /// `founder`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+    },
+
+    /// Open a founder session for the act that follows, where this device has
+    /// no session with a full member: with the founder's transport key, to a
+    /// member, syncing the roster first so the act is built on what the
+    /// network holds now.
+    ///
+    /// The transport key alone, as hex: it opens a session and signs nothing.
+    /// Held only until the founder's act ends, or a few minutes, then dropped.
+    FounderSession {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The founder's transport key's seed, hex.
+        transport: String,
+    },
+
+    /// Make this device an admin of the network with the founder's words,
+    /// revoking the admins named.
+    ///
+    /// On a device that is already an admin, only the revocations. On a member,
+    /// or a device the network revoked, a fresh admin identity for this device,
+    /// admitted by the founder, the old one revoked in the same batch.
+    Recover {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The admins to revoke, by name or short id. At most two.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        revoke: Vec<Target>,
+    },
+
+    /// The act inside, signed with the founder's words instead of this device's
+    /// key: an admin's act on a device that holds no admin key, or one whose
+    /// admins are gone.
+    ///
+    /// Everything about the act is as it would be: what it does, what it is
+    /// refused for, the batch shown. Only who signs changes, and with it the
+    /// checks that are about this device's own key.
+    AsFounder(Box<Command>),
 
     /// Expel a device from the network.
     ///
@@ -1591,6 +1783,41 @@ pub enum Command {
         target: Target,
         /// As [`Command::Revoke`]'s.
         reason: String,
+    },
+
+    /// The founder's revocation of an admin that voids its acts from one the
+    /// person chose (offline-founder design §15): that act, every act of the
+    /// admin it does not rest on, and what rests on them. Sent only as the
+    /// founder's ([`Command::AsFounder`]), after the person saw which acts.
+    RevokeFrom {
+        /// As [`Command::Revoke`]'s.
+        network: Option<String>,
+        /// As [`Command::Revoke`]'s.
+        target: Target,
+        /// As [`Command::Revoke`]'s.
+        reason: String,
+        /// The first act voided, by its id in hex, as `history` lists it.
+        from: String,
+        /// Devices the voiding brings back that the founder revokes again in
+        /// the same act, each by the short id `history` names it with: the
+        /// devices the voided acts revoked (offline-founder design §22).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        again: Vec<String>,
+    },
+
+    /// Make an admin of the network a member.
+    ///
+    /// Named as [`Command::Revoke`] names it, exactly, by name or by id. Nothing
+    /// is signed for a device that is already a member, or for the network's
+    /// only admin, this device included; whether this admin may demote that one
+    /// (a founder) is the roster's, and refused in its words. The device keeps
+    /// its signing key until the demotion is settled beneath the roster's base,
+    /// and then destroys it.
+    Demote {
+        /// Which network, or `None` when only one could be meant.
+        network: Option<String>,
+        /// The admin, by the name it answers to or by its id.
+        target: Target,
     },
 
     /// Give a device a new name.
@@ -1811,6 +2038,11 @@ impl Command {
     /// as revoking: it takes arguments.
     pub const RENAME_USAGE: &'static str = "peerfectly rename <name> <new name> [--network N]\n       \
                                              peerfectly rename --id <id> <new name> [--network N]";
+
+    /// The usage line for demoting, listed with the commands for the same
+    /// reason as revoking: it takes arguments.
+    pub const DEMOTE_USAGE: &'static str = "peerfectly demote <name> [--network N]\n       \
+                                             peerfectly demote --id <id> [--network N]";
 
     /// The usage line for withdrawing an invite.
     pub const WITHDRAW_USAGE: &'static str = "peerfectly withdraw <name> [--network N]";
@@ -2173,6 +2405,30 @@ impl Command {
         Ok(Self::Rename { network, target, name: (*name).clone() })
     }
 
+    /// Reads a demotion from the words after `demote`.
+    ///
+    /// # Errors
+    ///
+    /// When no device is named, when `--id` is given nothing, or when anything
+    /// else is said beside the device and the network.
+    pub fn demotion(words: &[String]) -> core::result::Result<Self, String> {
+        let usage = || format!("usage: {}", Self::DEMOTE_USAGE);
+        let (target, after) = match words.first().map(String::as_str) {
+            Some("--id") => {
+                let id = words.get(1).ok_or_else(usage)?;
+                (Target::Id(id.clone()), 2)
+            }
+            Some(name) if !name.starts_with("--") => (Target::Name(name.to_owned()), 1),
+            _ => return Err(usage()),
+        };
+        let network = match words.get(after..).unwrap_or(&[]) {
+            [] => None,
+            [flag, network] if flag == "--network" => Some(network.clone()),
+            _ => return Err(usage()),
+        };
+        Ok(Self::Demote { network, target })
+    }
+
     /// Reads a command name.
     ///
     /// # Errors
@@ -2228,6 +2484,7 @@ impl Command {
             | Self::Address { .. }
             | Self::Exposed { .. }
             | Self::Pending { .. }
+            | Self::History { .. }
             | Self::Waiting
             | Self::Up { .. }
             | Self::Down { .. } => false,
@@ -2247,7 +2504,9 @@ impl Command {
             | Self::StageBatch { .. }
             | Self::AdmitBatch { .. }
             | Self::RevokeVoiding { .. }
+            | Self::RevokeFrom { .. }
             | Self::Rename { .. }
+            | Self::Demote { .. }
             | Self::SetAnchors { .. }
             | Self::SetIpv4Block { .. }
             | Self::GiveIpv4 { .. }
@@ -2258,6 +2517,10 @@ impl Command {
             | Self::Expose { .. }
             | Self::Unexpose { .. }
             | Self::KeyMade { .. }
+            | Self::AsFounder(_)
+            | Self::Recover { .. }
+            | Self::ReplaceFounder { .. }
+            | Self::FounderSession { .. }
             | Self::NotSigned { .. } => true,
         }
     }
@@ -2271,6 +2534,9 @@ impl Command {
         match Self::parse(word, None) {
             Ok(command) => command.needs_an_administrator(),
             Err(_) if word == "exposed" => Self::Exposed { network: None }.needs_an_administrator(),
+            Err(_) if word == "history" => {
+                Self::History { network: None, by: None }.needs_an_administrator()
+            }
             Err(_) => true,
         }
     }
@@ -2327,7 +2593,15 @@ impl Command {
     /// arm by arm so that a new command has to decide.
     #[must_use]
     pub fn logged(&self) -> Option<(&'static str, Option<&str>)> {
+        if let Self::AsFounder(inner) = self {
+            return inner.logged();
+        }
         let (word, network) = match self {
+            Self::AsFounder(_) => return None,
+            Self::Recover { network, .. } => ("recover", network.as_deref()),
+            Self::ReplaceFounder { network, .. } => ("founder replace", network.as_deref()),
+            Self::History { .. } => return None,
+            Self::FounderSession { network, .. } => ("founder session", network.as_deref()),
             Self::Status
             | Self::Peers { .. }
             | Self::Revoked { .. }
@@ -2351,12 +2625,13 @@ impl Command {
             Self::Join { .. } => ("join", None),
             Self::Forget { label, .. } => ("forget", Some(label.as_str())),
             Self::Found { label, .. } => ("found", Some(label.as_str())),
-            Self::Revoke { network, .. } | Self::RevokeVoiding { network, .. } => {
-                ("revoke", network.as_deref())
-            }
+            Self::Revoke { network, .. }
+            | Self::RevokeVoiding { network, .. }
+            | Self::RevokeFrom { network, .. } => ("revoke", network.as_deref()),
             Self::StageBatch { network, .. } => ("stage batch", network.as_deref()),
             Self::AdmitBatch { network, .. } => ("admit batch", network.as_deref()),
             Self::Rename { network, .. } => ("rename", network.as_deref()),
+            Self::Demote { network, .. } => ("demote", network.as_deref()),
             Self::SetAnchors { network, .. } => ("set-anchors", network.as_deref()),
             Self::SetIpv4Block { network, .. } => ("ipv4 block", network.as_deref()),
             Self::GiveIpv4 { network, .. } => ("ipv4 give", network.as_deref()),
@@ -2381,6 +2656,7 @@ impl Outcome {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Reported(_) => "reported",
+            Self::History(_) => "history",
             Self::Done => "done",
             Self::Provisioning(_) => "provisioning",
             Self::Peers(_) => "peers",
@@ -2582,6 +2858,22 @@ pub struct InviteLine {
     /// The request that arrived through it, if one has.
     #[serde(default)]
     pub request: Option<RequestLine>,
+    /// Requests that arrived asking the role this invite does not make, and
+    /// were refused without using it: each device was told which role the
+    /// invite makes. Newest last, and only the last few.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<RefusedLine>,
+}
+
+/// A request an invite refused for asking the other role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedLine {
+    /// The fingerprint of the signing key it presented, which its screen shows.
+    pub fingerprint: String,
+    /// What the device was told: `invite-makes-admin` or `invite-makes-member`.
+    pub word: String,
+    /// When it was last refused, in seconds since the epoch.
+    pub at: u64,
 }
 
 /// A request that arrived through an invite: what a person reviews before
@@ -2604,6 +2896,10 @@ pub struct RequestLine {
     /// who may move the network first. Unproved, and deciding nothing.
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Whether the invite admits it as an admin, which only the founder's
+    /// words approve (offline-founder design §14).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 /// One of this device's own joins, waiting.
@@ -2647,6 +2943,9 @@ pub struct PendingList {
 pub enum Outcome {
     /// The command succeeded, with a report.
     Reported(Report),
+
+    /// A network's history: the operations held, newest first.
+    History(History),
     /// The command succeeded and there is nothing to say.
     Done,
 
@@ -2915,6 +3214,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -2933,6 +3233,8 @@ mod tests {
             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
             admin: true,
             custody: Custody::HeldHere,
+            key_until_settled: false,
+            revoked_by: None,
             owner_taken: false,
             confirmation: None,
             arrived: None,
@@ -2951,6 +3253,7 @@ mod tests {
                 path: Some(Path::Relay),
                 standing,
                 last_contact: Contact::NoneRecorded,
+                admin: false,
             }],
             peer_count: 0,
             reachable_count: 0,
@@ -3256,7 +3559,7 @@ mod tests {
             Command::Stop,
             Command::TakeOwnership { network: None },
             Command::Forget { label: "casa".to_owned(), last_admin: false },
-            Command::Join { invite: String::new(), name: "laptop".to_owned() },
+            Command::Join { invite: String::new(), name: "laptop".to_owned(), admin: false },
             Command::Approve { network: None, name: "laptop".to_owned(), replace: false },
             Command::Reject { network: None, name: "laptop".to_owned() },
             Command::Withdraw { network: None, name: "laptop".to_owned() },
@@ -3404,6 +3707,7 @@ mod tests {
             Command::Join {
                 invite: "peerfectly-invite-v1:abcdef".to_owned(),
                 name: "board".to_owned(),
+                admin: false,
             },
             Command::Confirm,
             Command::Abandon,
@@ -3464,7 +3768,13 @@ mod tests {
                         id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
                     }),
                     conflicts: Vec::new(),
+                    admin: false,
                 }),
+                refused: vec![RefusedLine {
+                    fingerprint: "9F00-1E2D-3C4B-5A69-7887".to_owned(),
+                    word: "invite-makes-admin".to_owned(),
+                    at: 1_799_985_000,
+                }],
             }],
             joins: vec![JoinLine {
                 label: "network".to_owned(),
@@ -3500,6 +3810,8 @@ mod tests {
                 },
                 ToSign { kind: SigningKind::Snapshot, message: vec![0x01], payload: vec![0xa2] },
             ],
+            keys: None,
+            founder: None,
         });
 
         let bytes = serde_json::to_vec(&sent).expect("encodes");
@@ -3522,6 +3834,35 @@ mod tests {
             wanted.items.get(1).expect("two").kind,
             "in the order they take effect"
         );
+    }
+
+    /// **Where the keys are travels with every request for one, and a request
+    /// from a daemon that never said is the default place**: a command line and
+    /// a daemon from releases either side of the field still agree.
+    #[test]
+    fn where_the_keys_are_travels_and_its_absence_is_the_default() {
+        let wanted = KeyWanted {
+            id: "7".to_owned(),
+            name: "peerfectly.home.signing".to_owned(),
+            network: String::new(),
+            keys: Some("/data/peerfectly/keys".to_owned()),
+        };
+        let bytes = serde_json::to_vec(&Outcome::NeedsKey(wanted.clone())).expect("encodes");
+        let back: Outcome = serde_json::from_slice(&bytes).expect("decodes");
+        assert_eq!(Outcome::NeedsKey(wanted), back);
+
+        let older = KeyWanted {
+            id: "8".to_owned(),
+            name: "peerfectly.home.signing".to_owned(),
+            network: String::new(),
+            keys: None,
+        };
+        let written = serde_json::to_string(&Outcome::NeedsKey(older)).expect("encodes");
+        assert!(!written.contains("keys"), "absent, as an older daemon writes it: {written}");
+        let Outcome::NeedsKey(read) = serde_json::from_str(&written).expect("decodes") else {
+            panic!("the shape must survive")
+        };
+        assert_eq!(None, read.keys);
     }
 
     /// The fields a struct in this file declares, in order.
@@ -3558,6 +3899,12 @@ mod tests {
     /// passphrase is wanted — and says nothing of what is being signed. A daemon
     /// lying about it can make a person type another network's passphrase, which
     /// unlocks nothing; it cannot make an act look like another act.
+    ///
+    /// **`keys` is not shown to anybody.** It is where the key is kept, which the
+    /// command line judges as a directory before it uses it (`linux-daemon`'s
+    /// `judge_existing_state`): a daemon lying about it can point at a directory
+    /// that is root's alone or at nothing, and either way signs nothing it was
+    /// not asked to.
     #[test]
     fn a_wanted_batch_describes_itself_only_by_its_bytes() {
         assert_eq!(
@@ -3572,6 +3919,8 @@ mod tests {
                 "pub key: String,",
                 "pub network: String,",
                 "pub items: Vec<ToSign>,",
+                "pub keys: Option<String>,",
+                "pub founder: Option<FounderPublic>,",
             ],
             fields_of("SignaturesWanted"),
             "a batch carries its items, whose key, and which network that key is for — \
@@ -3786,7 +4135,7 @@ mod tests {
         let revoked = vec![Revoked {
             device: named(hostile, 4),
             revocations: vec![Revocation {
-                by: named(hostile, 5),
+                by: Some(named(hostile, 5)),
                 reason: hostile.to_owned(),
                 signer_clock: Signed::NotRecorded,
             }],
@@ -3828,11 +4177,18 @@ mod tests {
         let revoked = vec![
             Revoked {
                 device: named("laptop", 4),
-                revocations: vec![Revocation {
-                    by: named("nas", 5),
-                    reason: "left on a train".to_owned(),
-                    signer_clock: Signed::At { time: then },
-                }],
+                revocations: vec![
+                    Revocation {
+                        by: Some(named("nas", 5)),
+                        reason: "left on a train".to_owned(),
+                        signer_clock: Signed::At { time: then },
+                    },
+                    Revocation {
+                        by: None,
+                        reason: "lost device".to_owned(),
+                        signer_clock: Signed::At { time: then },
+                    },
+                ],
                 last_contact: Contact::NoneRecorded,
             },
             Revoked {
@@ -3849,6 +4205,7 @@ mod tests {
         assert!(said.contains("the revoking device's clock said 2025-09-0"), "{drawn}");
         assert!(!said.contains("1757000000"), "{drawn}");
         assert!(said.contains("left on a train"), "{drawn}");
+        assert!(said.contains("by the founder: \"lost device\""), "the founder, named: {drawn}");
         assert!(said.contains("0606-0606-0606-0606] (no name held here)"), "{drawn}");
         assert!(
             !drawn.contains("revoked at"),
@@ -4061,6 +4418,28 @@ mod tests {
         assert!(Command::renaming(&words("laptop my laptop")).is_err(), "a name of two words");
         assert!(Command::renaming(&words("--id")).is_err(), "an id flag with nothing after it");
         assert!(Command::renaming(&[]).is_err());
+    }
+
+    #[test]
+    fn a_demotion_is_read_by_name_or_by_id_and_nothing_else() {
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+
+        assert_eq!(
+            Command::demotion(&words("desk --network casa")).unwrap(),
+            Command::Demote {
+                network: Some("casa".to_owned()),
+                target: Target::Name("desk".to_owned()),
+            }
+        );
+        assert_eq!(
+            Command::demotion(&words("--id 0a1b-2c3d-4e5f-6a7b")).unwrap(),
+            Command::Demote { network: None, target: Target::Id("0a1b-2c3d-4e5f-6a7b".to_owned()) }
+        );
+        assert!(Command::demotion(&words("desk now")).is_err(), "nothing beside the device");
+        assert!(Command::demotion(&words("--id")).is_err(), "an id flag with nothing after it");
+        assert!(Command::demotion(&words("--network casa")).is_err(), "no device");
+        assert!(Command::demotion(&[]).is_err());
+        assert!(Command::word_needs_an_administrator("demote"), "an act that signs");
     }
 
     /// A rename waiting to reach every device is listed after it is in force

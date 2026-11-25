@@ -18,11 +18,16 @@
 //!
 //! ```text
 //! Snapshot = { "root": bstr(32), "delta": [ bstr(32) ... ],
-//!              "heads": [ bstr(32) ... ], "proof": MembershipProof,
-//!              "author": bstr(32), "depths": [ uint ... ],
-//!              "signer": DeviceLeaf, "network": bstr(32),
+//!              "heads": [ bstr(32) ... ], "author": bstr(32),
+//!              "depths": [ uint ... ], "signer": Signer, "network": bstr(32),
 //!              "previous": [ bstr(32) ... ], "generation": uint }
+//! Signer   = { "device": { "leaf": DeviceLeaf, "proof": MembershipProof } }
+//!          / { "founder": { "keys": FounderKeys, "proof": FounderProof } }
 //! ```
+//!
+//! A root is signed by an admin, proved by its leaf, or by the founder, proved
+//! by the `founder` parameter leaf: either way against the root it follows, so
+//! a member holding no roster stores no key of anybody's to check one.
 //!
 //! `author` names the key that signed, exactly as an operation's does. Without
 //! it a verifier has to try every admin key in turn, which conflates two quite
@@ -51,23 +56,143 @@ use crate::leaf::DeviceLeaf;
 use crate::limits;
 use crate::membership::MembershipProof;
 use crate::merkle::Hash;
+use crate::merkle::Proof;
 use crate::prelude::*;
 use crate::sign::{PublicKey, Signer};
 use crate::state::RosterState;
+use crate::types::FounderKeys;
 
 /// Field names of a snapshot body, in canonical order.
-pub const SNAPSHOT_SCHEMA: &[&str] = &[
-    "root",
-    "delta",
-    "heads",
-    "proof",
-    "author",
-    "depths",
-    "signer",
-    "network",
-    "previous",
-    "generation",
-];
+pub const SNAPSHOT_SCHEMA: &[&str] =
+    &["root", "delta", "heads", "author", "depths", "signer", "network", "previous", "generation"];
+
+/// The two ways a root can be signed, as the `signer` map's one key.
+pub const ROOT_SIGNER_SCHEMA: &[&str] = &["device", "founder"];
+/// An admin signer: its leaf and the proof of it.
+pub const DEVICE_SIGNER_SCHEMA: &[&str] = &["leaf", "proof"];
+/// The founder as signer: its keys and the proof of their leaf.
+pub const FOUNDER_SIGNER_SCHEMA: &[&str] = &["keys", "proof"];
+/// A founder proof: the devices root beside the parameter proof.
+pub const FOUNDER_PROOF_SCHEMA: &[&str] = &["devices", "parameters"];
+
+/// A proof that the founder's keys are the `founder` parameter of a state root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FounderProof {
+    /// The root of the devices tree, the parameters tree's sibling.
+    pub devices: Hash,
+    /// The `founder` leaf's proof within the parameters tree.
+    pub parameters: Proof,
+}
+
+impl FounderProof {
+    /// The proof of the founder's keys in `state`.
+    #[must_use]
+    pub fn of(state: &RosterState) -> Option<Self> {
+        let parameters =
+            state.params.tree().prove(&crate::parameters::Parameter::position("founder"))?;
+        Some(Self { devices: state.devices_tree().root(), parameters })
+    }
+
+    /// Whether `keys` are the founder of the state `root` of `network`.
+    #[must_use]
+    pub fn verifies(&self, root: &Hash, network: &NetworkId, keys: &FounderKeys) -> bool {
+        let leaf = crate::parameters::Parameter::Founder(*keys);
+        let Some(parameters_root) = self
+            .parameters
+            .root_for(&crate::parameters::Parameter::position("founder"), &leaf.value_hash())
+        else {
+            return false;
+        };
+        RosterState::root_of(network, &self.devices, &parameters_root) == *root
+    }
+
+    fn encode(&self, writer: &mut Writer) {
+        writer.map(2);
+        writer.key("devices").bytes(&self.devices);
+        writer.key("parameters");
+        self.parameters.encode(writer);
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self> {
+        let mut map = reader.map(FOUNDER_PROOF_SCHEMA)?;
+        let devices = hash(map.key("devices")?)?;
+        let parameters = Proof::decode(map.key("parameters")?)?;
+        map.finish()?;
+        Ok(Self { devices, parameters })
+    }
+}
+
+/// Who signed a root, and the proof of their authority against the root it
+/// follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSigner {
+    /// An admin, by its leaf as the root it follows holds it.
+    Device {
+        /// The admin's leaf.
+        leaf: DeviceLeaf,
+        /// The leaf's proof.
+        proof: MembershipProof,
+    },
+    /// The founder, by its keys as the root it follows holds them.
+    Founder {
+        /// The founder's keys.
+        keys: FounderKeys,
+        /// The proof of their leaf.
+        proof: FounderProof,
+    },
+}
+
+impl RootSigner {
+    fn encode(&self, writer: &mut Writer) {
+        writer.map(1);
+        match self {
+            Self::Device { leaf, proof } => {
+                writer.key("device").map(2);
+                writer.key("leaf");
+                leaf.encode(writer);
+                writer.key("proof");
+                proof.encode(writer);
+            }
+            Self::Founder { keys, proof } => {
+                writer.key("founder").map(2);
+                writer.key("keys");
+                keys.encode(writer);
+                writer.key("proof");
+                proof.encode(writer);
+            }
+        }
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self> {
+        let mut map = reader.map_with_optional(ROOT_SIGNER_SCHEMA, ROOT_SIGNER_SCHEMA)?;
+        let device = match map.optional_key("device")? {
+            Some(value) => {
+                let mut inner = value.map(DEVICE_SIGNER_SCHEMA)?;
+                let leaf = DeviceLeaf::decode(inner.key("leaf")?)?;
+                let proof = MembershipProof::decode(inner.key("proof")?)?;
+                inner.finish()?;
+                Some(Self::Device { leaf, proof })
+            }
+            None => None,
+        };
+        let founder = match map.optional_key("founder")? {
+            Some(value) => {
+                let mut inner = value.map(FOUNDER_SIGNER_SCHEMA)?;
+                let keys = FounderKeys::decode(inner.key("keys")?)?;
+                let proof = FounderProof::decode(inner.key("proof")?)?;
+                inner.finish()?;
+                Some(Self::Founder { keys, proof })
+            }
+            None => None,
+        };
+        map.finish()?;
+        match (device, founder) {
+            (Some(signer), None) | (None, Some(signer)) => Ok(signer),
+            // Exactly one: a root signed by two is no spelling the format has.
+            _ => Err(Error::MissingField),
+        }
+    }
+}
 
 /// Field names of the signed snapshot wrapper, in canonical order.
 pub const SIGNED_SNAPSHOT_SCHEMA: &[&str] = &["sig", "body"];
@@ -76,7 +201,7 @@ pub const SIGNED_SNAPSHOT_SCHEMA: &[&str] = &["sig", "body"];
 ///
 /// Distinct from the operation tag so that neither kind of signature can be
 /// made to verify as the other.
-pub const SNAPSHOT_DOMAIN_TAG: &str = "roster-snapshot/v1";
+pub const SNAPSHOT_DOMAIN_TAG: &str = "roster-snapshot/v2";
 
 /// Builds the byte string a snapshot signature covers.
 ///
@@ -131,11 +256,9 @@ pub struct Snapshot {
     /// as it was: revoked, or changed in any way. Sorted, without repeats.
     /// Admissions are not listed: they invalidate no earlier proof.
     pub delta: Vec<DeviceId>,
-    /// The signer's leaf, as the root it follows holds it.
-    pub signer: DeviceLeaf,
-    /// The proof of [`Self::signer`] against the first previous root, or
+    /// Who signed, with the proof of it against the first previous root, or
     /// against [`Self::root`] when there is none.
-    pub proof: MembershipProof,
+    pub signer: RootSigner,
     /// The id of the key that signed, one of [`Self::signer`]'s keys.
     pub author: KeyId,
     /// The network this snapshot belongs to.
@@ -167,8 +290,7 @@ impl Snapshot {
         root: Hash,
         covering: Covering,
         delta: Vec<DeviceId>,
-        signer: DeviceLeaf,
-        proof: MembershipProof,
+        signer: RootSigner,
         author: KeyId,
         network: NetworkId,
     ) -> Result<Self> {
@@ -192,21 +314,16 @@ impl Snapshot {
         if !strictly_ascending(&previous) || !strictly_ascending(&delta) {
             return Err(Error::NonCanonical);
         }
-        if !signer.record.keys.iter().any(|entry| entry.key_id() == author) {
+        let names_author = match &signer {
+            RootSigner::Device { leaf, .. } => {
+                leaf.record.keys.iter().any(|entry| entry.key_id() == author)
+            }
+            RootSigner::Founder { keys, .. } => keys.signing_id() == author,
+        };
+        if !names_author {
             return Err(Error::AuthorKeyMismatch);
         }
-        Ok(Self {
-            generation,
-            previous,
-            root,
-            depths,
-            heads,
-            delta,
-            signer,
-            proof,
-            author,
-            network,
-        })
+        Ok(Self { generation, previous, root, depths, heads, delta, signer, author, network })
     }
 
     /// The snapshot of `state` covering `covering`, signed by the device
@@ -227,12 +344,18 @@ impl Snapshot {
         previous: Option<(&Self, &RosterState)>,
     ) -> Result<Self> {
         let proved_in = previous.map_or(state, |(_, before)| before);
-        let device = proved_in.device_holding(&author).ok_or(Error::UnauthorizedAuthor)?;
-        let signer = proved_in.leaf(&device).ok_or(Error::UnauthorizedAuthor)?;
-        if signer.record.role != crate::types::Role::Admin {
-            return Err(Error::UnauthorizedAuthor);
-        }
-        let proof = MembershipProof::of(proved_in, &device).ok_or(Error::UnauthorizedAuthor)?;
+        let signer = if proved_in.is_founder_key(&author) {
+            let proof = FounderProof::of(proved_in).ok_or(Error::UnauthorizedAuthor)?;
+            RootSigner::Founder { keys: proved_in.params.founder, proof }
+        } else {
+            let device = proved_in.device_holding(&author).ok_or(Error::UnauthorizedAuthor)?;
+            let leaf = proved_in.leaf(&device).ok_or(Error::UnauthorizedAuthor)?;
+            if leaf.record.role != crate::types::Role::Admin {
+                return Err(Error::UnauthorizedAuthor);
+            }
+            let proof = MembershipProof::of(proved_in, &device).ok_or(Error::UnauthorizedAuthor)?;
+            RootSigner::Device { leaf, proof }
+        };
         let (generation, previous_roots, delta) = match previous {
             Some((before, before_state)) => (
                 before.generation.saturating_add(1),
@@ -248,18 +371,61 @@ impl Snapshot {
             covering,
             delta,
             signer,
-            proof,
             author,
             state.network,
         )
     }
 
-    /// Whether the signer is proved an admin against `previous_root` — the
-    /// first root this one follows, or its own root when it follows none.
+    /// Whether the signer is proved, against `previous_root` — the first root
+    /// this one follows, or its own root when it follows none — an admin, or
+    /// the founder.
     #[must_use]
     pub fn signer_proved(&self, previous_root: &Hash) -> bool {
-        self.signer.record.role == crate::types::Role::Admin
-            && self.proof.verifies(previous_root, &self.network, &self.signer)
+        match &self.signer {
+            RootSigner::Device { leaf, proof } => {
+                leaf.record.role == crate::types::Role::Admin
+                    && proof.verifies(previous_root, &self.network, leaf)
+            }
+            RootSigner::Founder { keys, proof } => {
+                proof.verifies(previous_root, &self.network, keys)
+            }
+        }
+    }
+
+    /// The admin that signed, or `None` for a root the founder signed.
+    #[must_use]
+    pub const fn signer_leaf(&self) -> Option<&DeviceLeaf> {
+        match &self.signer {
+            RootSigner::Device { leaf, .. } => Some(leaf),
+            RootSigner::Founder { .. } => None,
+        }
+    }
+
+    /// The id of the admin that signed, or `None` for the founder.
+    #[must_use]
+    pub fn signer_device(&self) -> Option<DeviceId> {
+        self.signer_leaf().map(|leaf| leaf.record.id)
+    }
+
+    /// The key [`Self::author`] names, as the signer carries it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnauthorizedAuthor`] when the signer carries no such key.
+    pub fn named_key(&self) -> Result<PublicKey> {
+        match &self.signer {
+            RootSigner::Device { leaf, .. } => leaf
+                .record
+                .keys
+                .iter()
+                .find(|entry| entry.key_id() == self.author)
+                .ok_or(Error::UnauthorizedAuthor)
+                .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone())),
+            RootSigner::Founder { keys, .. } => {
+                let entry = keys.signing_entry();
+                PublicKey::new(entry.alg, entry.value)
+            }
+        }
     }
 
     /// The root the signer's proof is against: the first previous root, or
@@ -290,7 +456,7 @@ impl Snapshot {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
-        writer.map(10);
+        writer.map(9);
         writer.key("root").bytes(&self.root);
         writer.key("delta").array(self.delta.len() as u64);
         for device in &self.delta {
@@ -300,8 +466,6 @@ impl Snapshot {
         for head in &self.heads {
             writer.bytes(head.as_bytes());
         }
-        writer.key("proof");
-        self.proof.encode(&mut writer);
         writer.key("author").bytes(self.author.as_bytes());
         writer.key("depths").array(self.depths.len() as u64);
         for depth in &self.depths {
@@ -348,7 +512,6 @@ impl Snapshot {
             heads.push(OperationId::decode(heads_reader)?);
         }
 
-        let proof = MembershipProof::decode(map.key("proof")?)?;
         let author = KeyId::decode(map.key("author")?)?;
 
         let depths_reader = map.key("depths")?;
@@ -358,7 +521,7 @@ impl Snapshot {
             depths.push(depths_reader.u64()?);
         }
 
-        let signer = DeviceLeaf::decode(map.key("signer")?)?;
+        let signer = RootSigner::decode(map.key("signer")?)?;
         let network = NetworkId::decode(map.key("network")?)?;
 
         let previous_reader = map.key("previous")?;
@@ -379,7 +542,6 @@ impl Snapshot {
             Covering { heads, depths },
             delta,
             signer,
-            proof,
             author,
             network,
         )

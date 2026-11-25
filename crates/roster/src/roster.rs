@@ -74,6 +74,18 @@ pub struct UrgentAnchor {
     pub voided: Vec<(OperationId, OperationBody)>,
 }
 
+/// Why a founder revocation cannot void from the act chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoidingRefused {
+    /// The act is not held here, or was not signed by the device named.
+    NotItsAct,
+    /// The founder's own act, not a revocation, rests on what would be voided.
+    /// Left out of the revocation's ancestry it would be concurrent with the
+    /// revocation: two acts of one author at once, of which only revocations
+    /// hold. Voiding from a later act keeps it.
+    FounderRestsOn(OperationId),
+}
+
 /// A batch's header, verified, waiting for the rest of its entries.
 #[derive(Debug, Clone)]
 struct Incomplete {
@@ -604,6 +616,20 @@ impl Roster {
         self.snapshot_state.as_ref()
     }
 
+    /// The state the accepted root commits to: the one kept when it was
+    /// verified, or, for a root accepted before the operations it covers were
+    /// held, derived from them now that they are. `None` where they are still
+    /// not all held.
+    #[must_use]
+    pub fn held_root_state(&self) -> Option<RosterState> {
+        if let Some(state) = &self.snapshot_state {
+            return Some(state.clone());
+        }
+        let held = self.snapshot.as_ref()?;
+        let state = self.derive_covered_state(held)?;
+        (state.root() == held.body().root).then_some(state)
+    }
+
     /// Whether the accepted snapshot was verified against held operations.
     #[must_use]
     pub const fn snapshot_is_verified(&self) -> bool {
@@ -866,13 +892,7 @@ impl Roster {
         if let Some(key) = found {
             return Some(key);
         }
-        raw.body()
-            .signer
-            .record
-            .keys
-            .iter()
-            .find(|entry| entry.key_id() == author)
-            .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok())
+        raw.body().named_key().ok()
     }
 
     /// Whether a snapshot's signer holds the admin role.
@@ -880,10 +900,15 @@ impl Roster {
         let signer = snapshot.signer();
         // A root is signed with the admin's attestation key, which asks nobody;
         // a key of either purpose names its device.
-        if let Some(state) = self.current()
-            && let Some(device) = state.device_holding(&signer)
-        {
-            return state.is_admin(&device) && !state.revoked.contains(&device);
+        if let Some(state) = self.current() {
+            // The founder signs a root as it signs an operation: by the key the
+            // state's `founder` leaf names.
+            if state.is_founder_key(&signer) {
+                return true;
+            }
+            if let Some(device) = state.device_holding(&signer) {
+                return state.is_admin(&device) && !state.revoked.contains(&device);
+            }
         }
         let body = snapshot.body();
         body.signer_proved(&body.proved_against())
@@ -1689,6 +1714,96 @@ impl Roster {
         UrgentAnchor { heads: kept, voided }
     }
 
+    /// The anchor of a founder revocation of `target` that voids `from`, every
+    /// act of `target` that is not an ancestor of `from`, and what rests on
+    /// them (offline-founder design §15).
+    ///
+    /// Everything else held is an ancestor of the revocation, so what other
+    /// authors signed stands: the causal authorship rule voids only the work of
+    /// the device removed. What only had effect through a voided act loses it.
+    ///
+    /// # Errors
+    ///
+    /// [`VoidingRefused::NotItsAct`] when `from` is not held or not `target`'s;
+    /// [`VoidingRefused::FounderRestsOn`] when an act of the founder other than
+    /// a revocation rests on what would be left out.
+    pub fn voiding_anchor(
+        &self,
+        target: &DeviceId,
+        from: &OperationId,
+    ) -> core::result::Result<UrgentAnchor, VoidingRefused> {
+        let state = self.current().ok_or(VoidingRefused::NotItsAct)?;
+        let by_target = |author: &KeyId| state.device_holding(author).as_ref() == Some(target);
+        let operations = self.dag.operations();
+        let chosen = self.dag.position(from).ok_or(VoidingRefused::NotItsAct)?;
+        if !operations.get(chosen).is_some_and(|operation| by_target(&operation.core().author)) {
+            return Err(VoidingRefused::NotItsAct);
+        }
+
+        // In causal order, every parent before its children: an operation is
+        // left out when it is the chosen act, an act of the target's that the
+        // chosen one does not rest on, or rests on one left out.
+        let mut left_out = vec![false; operations.len()];
+        for (index, operation) in operations.iter().enumerate() {
+            let seeded = index == chosen
+                || (by_target(&operation.core().author) && !self.dag.is_ancestor(index, chosen));
+            let rests = operation.core().parents.iter().any(|parent| {
+                self.dag
+                    .position(parent)
+                    .is_some_and(|at| left_out.get(at).copied().unwrap_or(false))
+            });
+            if let Some(slot) = left_out.get_mut(index) {
+                *slot = seeded || rests;
+            }
+        }
+
+        let mut voided = Vec::new();
+        for (index, operation) in operations.iter().enumerate() {
+            if !left_out.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let author = &operation.core().author;
+            let revokes = matches!(operation.body(), OperationBody::RevokeDevice { .. });
+            if state.is_founder_key(author) && !revokes {
+                return Err(VoidingRefused::FounderRestsOn(operation.id()));
+            }
+            if by_target(author) {
+                voided.push((operation.id(), operation.body().clone()));
+            }
+        }
+        let mut waiting: Vec<&Incomplete> = self
+            .incomplete
+            .values()
+            .filter(|waiting| by_target(&waiting.operation.core().author))
+            .collect();
+        waiting.sort_by_key(|waiting| waiting.operation.id());
+        for waiting in waiting {
+            voided.push((waiting.operation.id(), waiting.operation.body().clone()));
+        }
+
+        // The kept operations are closed under ancestry, so their heads are
+        // those no kept operation names as a parent.
+        let mut named: HashSet<OperationId> = HashSet::new();
+        for (index, operation) in operations.iter().enumerate() {
+            if !left_out.get(index).copied().unwrap_or(true) {
+                named.extend(operation.core().parents.iter().copied());
+            }
+        }
+        let mut heads: Vec<OperationId> = operations
+            .iter()
+            .enumerate()
+            .filter(|(index, operation)| {
+                !left_out.get(*index).copied().unwrap_or(true) && !named.contains(&operation.id())
+            })
+            .map(|(_, operation)| operation.id())
+            .collect();
+        heads.sort_unstable();
+        if heads.is_empty() {
+            heads = self.dag.heads();
+        }
+        Ok(UrgentAnchor { heads, voided })
+    }
+
     /// The batches whose header is in and whose entries are not all in yet.
     #[must_use]
     pub fn awaiting_pieces(&self) -> Vec<OperationId> {
@@ -1864,7 +1979,9 @@ impl Roster {
                 &resolved
             }
         };
-        if crate::state::unauthorized_author(ancestor_state, &raw.core().author).is_some() {
+        if crate::state::unauthorized_act(ancestor_state, &raw.core().author, &raw.core().body)
+            .is_some()
+        {
             return Some(Error::UnauthorizedAuthor);
         }
 
@@ -1959,6 +2076,16 @@ impl Roster {
                 crate::types::OperationBody::Promote { device, .. } => admin_devices.push(*device),
                 _ => {}
             }
+            // A founder key, current or replaced, is an author this check cannot
+            // rule out: the state its operation's ancestors imply decides.
+            let founder = match &operation.core().body {
+                crate::types::OperationBody::CreateNetwork { params, .. }
+                | crate::types::OperationBody::SetNetwork(params) => Some(params.founder),
+                _ => None,
+            };
+            if founder.is_some_and(|keys| keys.signing_id() == *author) {
+                return false;
+            }
         }
 
         !keys_of.iter().any(|(id, signing)| {
@@ -1984,15 +2111,47 @@ impl Roster {
                 .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok());
         }
         let state = self.current()?;
-        let record = state.device_for_key(&raw.core().author)?;
-        record
-            .keys
-            .iter()
-            .find(|entry| {
-                entry.purpose == crate::types::KeyPurpose::Signing
-                    && entry.key_id() == raw.core().author
-            })
-            .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok())
+        // The founder's key, as the state names it now or as any operation held
+        // named it: a key since replaced still verifies what it signed before,
+        // and derivation judges whether it was the founder's there.
+        let author = raw.core().author;
+        let founders = core::iter::once(state.params.founder).chain(
+            self.dag.operations().iter().filter_map(|operation| match &operation.core().body {
+                crate::types::OperationBody::CreateNetwork { params, .. }
+                | crate::types::OperationBody::SetNetwork(params) => Some(params.founder),
+                _ => None,
+            }),
+        );
+        for founder in founders {
+            if founder.signing_id() == author {
+                let entry = founder.signing_entry();
+                return PublicKey::new(entry.alg, entry.value).ok();
+            }
+        }
+        let signs = |entry: &&crate::types::KeyEntry| {
+            entry.purpose == crate::types::KeyPurpose::Signing && entry.key_id() == author
+        };
+        if let Some(record) = state.device_for_key(&author) {
+            return record
+                .keys
+                .iter()
+                .find(signs)
+                .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok());
+        }
+        // A device the state no longer holds — revoked since — whose admission
+        // is still among the operations held: its operation is verified and
+        // admitted, and derivation judges it, as every node holding the
+        // revocation in another order does. Refused here instead, two nodes
+        // would hold different graphs for the same operations.
+        self.dag.operations().iter().find_map(|operation| match &operation.core().body {
+            crate::types::OperationBody::AddDevice(spec)
+            | crate::types::OperationBody::CreateNetwork { device: spec, .. } => spec
+                .keys
+                .iter()
+                .find(signs)
+                .and_then(|entry| PublicKey::new(entry.alg, entry.value.clone()).ok()),
+            _ => None,
+        })
     }
 
     /// Whether an operation is anchored too far behind the local frontier.
@@ -2132,6 +2291,10 @@ fn attestation_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<
 /// The public key a root names as its author: a signing or attestation key of
 /// some device in `state`.
 fn root_key_of(state: &RosterState, author: &crate::id::KeyId) -> Option<PublicKey> {
+    if state.is_founder_key(author) {
+        let entry = state.params.founder.signing_entry();
+        return PublicKey::new(entry.alg, entry.value).ok();
+    }
     let signs = |purpose| {
         matches!(purpose, crate::types::KeyPurpose::Signing | crate::types::KeyPurpose::Attestation)
     };

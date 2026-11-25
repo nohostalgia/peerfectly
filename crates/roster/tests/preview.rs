@@ -69,14 +69,14 @@ fn a_genesis_previews_over_an_empty_roster() {
 fn a_revocation_then_an_admission_previews_as_signed() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history.op(
         "r",
         1,
         &["a"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "replaced".to_owned() },
     );
-    history.op("n", 1, &["r"], OperationBody::AddDevice(device(3, "laptop", Role::Member, false)));
+    history.op("n", 1, &["r"], OperationBody::AddDevice(device(3, "laptop", Role::Member)));
     previews_what_signing_makes(&history, &["g", "a"], &["r", "n"]);
 
     let base = holding(&history, &["g", "a"]);
@@ -102,8 +102,8 @@ fn a_settings_change_previews_as_signed() {
 fn a_preview_keeps_the_heads_it_does_not_touch() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(3, "tablet", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(3, "tablet", Role::Member)));
     history.op(
         "c",
         1,
@@ -118,7 +118,7 @@ fn a_preview_keeps_the_heads_it_does_not_touch() {
 fn a_preview_refuses_an_operation_without_its_parents() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history.op(
         "b",
         1,
@@ -135,7 +135,7 @@ fn a_preview_refuses_an_operation_without_its_parents() {
 fn a_preview_leaves_the_roster_as_it_was() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
 
     let base = holding(&history, &["g"]);
     let heads: Vec<OperationId> = base.heads();

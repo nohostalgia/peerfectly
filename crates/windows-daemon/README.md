@@ -103,10 +103,10 @@ matches no device is answered as non-existent; a query from outside is *refused*
 so a rule letting the wrong things through shows up as a refusal rather than as
 this daemon quietly resolving the internet.
 
-## `unsafe`, eight times, and why the count is the wrong measure
+## `unsafe`, nine times, and why the count is the wrong measure
 
 The design began by saying `unsafe` would be confined to one module. That premise
-was wrong eight times over, and each time the honest answer was the same.
+was wrong nine times over, and each time the honest answer was the same.
 
 | Module | Calls | Why no safe wrapper exists |
 |---|---|---|
@@ -118,6 +118,7 @@ was wrong eight times over, and each time the honest answer was the same.
 | `platform/who.rs` | 19 | who is at each end of a pipe: `interprocess` gives the process id and stops |
 | `platform/desktop.rs` | 5 | the tray's dark menus are an undocumented export found by ordinal, the elevation prompt is the shell's, and the tray's start-up messages need a message window |
 | `programs/daemon.rs` | 1 | the service callback the control manager passes a raw argument vector |
+| `platform/console.rs` | 4 | a console's echo: off for a passphrase-like prompt, and back on at every start where an interrupted one left it off |
 
 Each carries its own `#[allow(unsafe_code, reason = ...)]`, and a scan asserts no
 ninth place has any.
@@ -242,6 +243,50 @@ machine — which is the property being bought. The daemon knows which networks
 *this* device holds, which is free and local; it keeps no record of whether a
 device in one network is a device in another, because such a record on a stolen
 machine hands over exactly the map the separation exists to deny.
+
+## A member holds no signing key
+
+A device joins as a **member** unless the person passes `--admin`: `peerfectly join <invite>`
+makes the signing key in memory, signs the join's proof of possession with it, and clears it
+before anything is written. Nothing goes to the key store and no dialog appears. A member never
+signs with that key again — sessions, sync, renewals and attestations use other keys — so it keeps
+only the public half, from which its id and address derive, and the report says it holds none.
+
+`peerfectly join <invite> --admin` makes the key in the key store, as founding does, and needs an
+invite made with `invite --admin`. A machine whose key store cannot protect a key refuses `--admin`
+before anything is made, and joins as a member. A join asking for the role the invite does not make
+is refused by the admin's daemon, which keeps the invite open; the request is listed as refused on
+the admin's side, and the join's line says which role to ask for on the device's.
+
+Only the founder's words act on an admin: admitting, demoting, revoking, renaming or setting one
+takes `--founder`, and an admin's own key governs members only. `peerfectly demote <device>
+--founder` makes an admin a member, and the demoted device destroys its key in the key store at
+once. Nothing is signed for a member or for the network's only admin. A member wanted as an admin
+is invited again with `--admin` and approved with `--replace --founder`. `peerfectly revoke <admin>
+<reason> --founder` lists the admin's acts still held and asks from which to void them, then the
+devices that come back, any of which it revokes again in the same act. A revoked device is told by
+the member it was talking to, by any member it dials, or at the end of the founder's act, with no
+timer; its `status` says by whom, it invites nobody, and an admin destroys its signing key. Up, it
+keeps no tunnel and carries the roster alone, so that it is a member again by itself if the founder
+voids the revocation; one the founder's words signed is final, and the device is invited again.
+
+Update the admins' machines first: an admin's daemon from before this release admits a new member
+as it always did, but cannot take a request from a device joining as an admin. An identity written
+by this release for a member cannot be read by an older one.
+
+## The founder's words
+
+A network's founder is 12 words the person keeps, not a device. `peerfectly found` shows them once,
+checks three, and clears the console; the genesis names the two keys they make, and the command line
+checks the bytes it signs name those keys. The words are read back on one line, each in full or by
+its first four letters (24, from a network founded before, are read too), shown as typed and cleared
+from the console once read, never from arguments or the environment, and signed with in the command
+line: the daemon is given only the founder's transport key, for a founder session, and only while
+one is open. `platform::console`, the one other place with `unsafe` for the console's mode, turns
+the echo back on at every start where an interrupted prompt left it off: a console's mode outlives
+the program that set it. `--founder` on an act,
+`recover`, `founder replace` and `history` are the commands; the first three need an elevated
+console, `history` does not.
 
 ## One act, one batch, one look before Windows asks
 

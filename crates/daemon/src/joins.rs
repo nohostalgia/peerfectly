@@ -49,6 +49,17 @@ pub struct Join {
     /// then, and carried in the request for the admin approving it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<String>,
+    /// Whether the person joined this device as an admin: its request is then
+    /// an admin's (`introduce-admin`). Absent from a join kept before there
+    /// were two, which was a member's request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
+    /// The role the admin's daemon last said the invite makes, when it refused
+    /// this request for asking the other (`invite-makes-admin` or
+    /// `invite-makes-member`). Kept so the person sees it after a restart; it
+    /// decides nothing, since anyone holding the invite could have said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// The file and its signature, as written.
@@ -140,6 +151,8 @@ mod tests {
             started_at: 1_800_000_000,
             requested_at: None,
             conflicts: Vec::new(),
+            admin: false,
+            refused: None,
         }
     }
 

@@ -252,13 +252,36 @@ pub fn proof_from(
     Ok(proof)
 }
 
+/// What a person waiting is told when the admin's daemon refused the request
+/// for asking the wrong role, with what to do.
+///
+/// Said in this device's own words: the other side sent one fixed word, and
+/// nothing it chose is shown.
+#[must_use]
+pub fn mismatch_words(mismatch: enrollment::exchange::Mismatch) -> String {
+    match mismatch {
+        enrollment::exchange::Mismatch::InviteMakesAdmin => {
+            "the admin's daemon says this invite makes an admin, and this device is joining as a \
+             member. Cancel this join and join again with --admin. Until then it goes on waiting."
+                .to_owned()
+        }
+        enrollment::exchange::Mismatch::InviteMakesMember => {
+            "the admin's daemon says this invite makes a member, and this device is joining as an \
+             admin. Cancel this join and join again without --admin. Until then it goes on \
+             waiting."
+                .to_owned()
+        }
+    }
+}
+
 /// Runs a join until it ends: admitted, or cancelled.
 ///
 /// Registers at the invite's relay under the rendezvous key and under this
 /// device's own transport key, and answers every exchange either brings, one at
 /// a time. A refused exchange is recorded and the join goes on. `kept` is
 /// called with the moment the admin's daemon said it has the request, so it is
-/// kept across a restart.
+/// kept across a restart; `refused` with the role the admin's daemon said the
+/// invite makes, when it refused the request for asking the other.
 ///
 /// # Errors
 ///
@@ -270,6 +293,7 @@ pub async fn run(
     identity: &NodeIdentity,
     reporting: &Reporting,
     kept: impl Fn(u64) + Send + Sync,
+    refused: impl Fn(enrollment::exchange::Mismatch) + Send + Sync,
 ) -> Result<Joined, Refusal> {
     let invite = enrollment::Invite::from_text(&join.invite).map_err(|cause| cause.to_string())?;
     if !Log::at(paths.roster()).read().map_err(|cause| cause.to_string())?.is_empty() {
@@ -282,6 +306,11 @@ pub async fn run(
         .ok_or_else(|| "the join holds no proof of its signing key".to_owned())?;
     if let Some(at) = join.requested_at {
         reporting.reached(Progress::Requested { at });
+    }
+    if let Some(mismatch) =
+        join.refused.as_deref().and_then(|word| enrollment::exchange::Mismatch::parse(word).ok())
+    {
+        reporting.refused(&mismatch_words(mismatch));
     }
 
     let rendezvous = Waiting::at_rendezvous(&invite.rendezvous_seed(), &invite.relay)
@@ -310,13 +339,23 @@ pub async fn run(
                     tokio::time::sleep(PACE).await;
                     continue;
                 };
-                match one_exchange(channel, identity, &proof, &invite, &join.name, &join.conflicts)
-                    .await
-                {
+                let asking = Asking {
+                    identity,
+                    proof: &proof,
+                    invite: &invite,
+                    name: &join.name,
+                    conflicts: &join.conflicts,
+                    admin: join.admin,
+                };
+                match one_exchange(channel, &asking).await {
                     Ok(Exchanged::Received) => {
                         let at = crate::state::wall_seconds();
                         reporting.reached(Progress::Requested { at });
                         kept(at);
+                    }
+                    Ok(Exchanged::Refused(mismatch)) => {
+                        reporting.refused(&mismatch_words(mismatch));
+                        refused(mismatch);
                     }
                     Ok(Exchanged::Delivered(delivered)) => return delivered,
                     Err(refusal) => reporting.refused(&refusal),
@@ -341,6 +380,8 @@ pub async fn run(
 enum Exchanged {
     /// The admin's daemon has the request.
     Received,
+    /// The admin's daemon did not keep it: the invite makes the other role.
+    Refused(enrollment::exchange::Mismatch),
     /// The network, checked.
     Delivered(Box<Delivered>),
 }
@@ -391,16 +432,22 @@ fn delivered_before(
     Ok(Joined { suffix: state.params.suffix.clone(), devices: state.devices.len() })
 }
 
+/// What this device says of itself in every exchange of one join.
+#[derive(Clone, Copy)]
+struct Asking<'a> {
+    identity: &'a NodeIdentity,
+    proof: &'a Possession,
+    invite: &'a enrollment::Invite,
+    name: &'a str,
+    conflicts: &'a [String],
+    /// Whether the request is an admin's.
+    admin: bool,
+}
+
 /// One exchange, from the channel opening to the request received or a network
 /// believed.
-async fn one_exchange(
-    mut channel: Channel,
-    identity: &NodeIdentity,
-    proof: &Possession,
-    invite: &enrollment::Invite,
-    name: &str,
-    conflicts: &[String],
-) -> Result<Exchanged, Refusal> {
+async fn one_exchange(mut channel: Channel, asking: &Asking<'_>) -> Result<Exchanged, Refusal> {
+    let Asking { identity, proof, invite, name, conflicts, admin } = *asking;
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let material = channel.material().map_err(|cause| cause.to_string())?;
 
@@ -420,7 +467,14 @@ async fn one_exchange(
         transport_possession,
         conflicts: conflicts.to_vec(),
     };
-    send(&mut channel, &Message::Introduce(introduction), deadline).await?;
+    // A member's request is today's `introduce`, byte for byte, so admins on an
+    // older release still take it; an admin's is its own kind.
+    let request = if admin {
+        Message::IntroduceAdmin(introduction)
+    } else {
+        Message::Introduce(introduction)
+    };
+    send(&mut channel, &request, deadline).await?;
 
     // The request received, and nothing more; or the state the admitting
     // side's roster rests on, where it was compacted, and the pieces of its
@@ -433,6 +487,9 @@ async fn one_exchange(
         match receive(&mut channel, deadline).await? {
             Message::Received if parts == 0 && batch_parts == 0 => {
                 return Ok(Exchanged::Received);
+            }
+            Message::Refused(mismatch) if parts == 0 && batch_parts == 0 => {
+                return Ok(Exchanged::Refused(mismatch));
             }
             Message::Batch { pieces: part } => {
                 batch_parts = batch_parts.saturating_add(1);
@@ -486,8 +543,19 @@ async fn one_exchange(
 
     // Delivery proves nothing. What arrived must admit this device's own keys,
     // and be signed by an admin — and a base it rests on must make its root.
+    // And it must come with a root the invite's anchor signed over a state
+    // admitting this device: that, and not the network id alone, is what ties
+    // it to the invite, since a compacted network's id is only its own claim.
     let adopted = base.clone().and_then(|base| {
-        adopt::adopt_on(base, &operations, &pieces, identity).map_err(|cause| cause.to_string())
+        adopt::adopt_anchored(
+            base,
+            &operations,
+            &pieces,
+            snapshot.as_deref(),
+            &invite.anchor,
+            identity,
+        )
+        .map_err(|cause| cause.to_string())
     });
     // Only the network the invite named. Somebody who learned the secret and
     // dialled first could deliver a roster of another network, with this device
@@ -625,6 +693,7 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
             roster::id::NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
         )
         .expect("issues");
 
@@ -652,6 +721,7 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:443",
             roster::id::NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
         )
         .expect("issues")
     }
@@ -688,6 +758,7 @@ mod tests {
     fn delivered() -> (Vec<Vec<u8>>, Vec<u8>) {
         let founder = identity::NodeIdentity::generate().expect("generates");
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             2_592_000,
@@ -698,7 +769,7 @@ mod tests {
             founder.signing_key().algorithm(),
             roster::types::OperationBody::CreateNetwork {
                 device: founder
-                    .device_spec("nas", roster::types::Role::Admin, true, vec![])
+                    .device_spec("nas", roster::types::Role::Admin, vec![])
                     .expect("spec"),
                 params,
             },

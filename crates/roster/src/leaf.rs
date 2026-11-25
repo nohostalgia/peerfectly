@@ -458,7 +458,6 @@ mod tests {
             keys,
             name: "sensore-1".into(),
             role: Role::Member,
-            founder: false,
             added_by: OperationId::from_bytes([7; 32]),
             capabilities: vec![],
         }

@@ -315,7 +315,6 @@ impl BatchEntry {
             self.keys.clone(),
             self.name.clone(),
             crate::types::Role::Member,
-            false,
             Vec::new(),
         )
     }
@@ -336,7 +335,6 @@ impl BatchEntry {
             keys: self.keys.clone(),
             name: self.name.clone(),
             role: crate::types::Role::Member,
-            founder: false,
             capabilities: Vec::new(),
         }
     }

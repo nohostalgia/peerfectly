@@ -99,6 +99,22 @@ impl Request {
     }
 }
 
+/// How many refused requests one invite keeps: the newest. Anyone holding the
+/// invite can make the same refusal happen as often as they are dialled, so
+/// what is kept is bounded, and a refusal already kept is not kept twice.
+pub const MOST_REFUSALS_KEPT: usize = 4;
+
+/// A request refused for asking the role an invite does not make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The fingerprint of the signing key it presented, and proved.
+    pub fingerprint: String,
+    /// What the device was told the invite makes.
+    pub mismatch: enrollment::exchange::Mismatch,
+    /// When it was last refused, in seconds since the epoch.
+    pub at: u64,
+}
+
 /// One invite and what it is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -113,6 +129,12 @@ pub struct Record {
     pub request: Option<Request>,
     /// Whether the admin withdrew it.
     pub withdrawn: bool,
+    /// Requests refused for asking the other role, newest last.
+    pub refused: Vec<Refused>,
+    /// The root the founder signed over this invite's admission, where the
+    /// invite is anchored to the founder: what its device is given with the
+    /// network, since nothing here can sign as the founder after.
+    pub root: Option<Vec<u8>>,
 }
 
 /// Where an invite stands.
@@ -167,6 +189,7 @@ impl Record {
         relay: &str,
         network: roster::id::NetworkId,
         block: roster::types::Ipv4Range,
+        anchor: roster::id::KeyId,
         invited: Invited,
         now: u64,
         lifetime: u64,
@@ -176,7 +199,7 @@ impl Record {
                 cause: "an admin is a full member: it cannot be invited light".to_owned(),
             });
         }
-        let invite = Invite::issue(relay, network, block)
+        let invite = Invite::issue(relay, network, block, anchor)
             .map_err(|cause| Error::Refused { cause: cause.to_string() })?;
         Ok(Self {
             invite,
@@ -184,6 +207,8 @@ impl Record {
             expires_at: now.saturating_add(lifetime),
             request: None,
             withdrawn: false,
+            refused: Vec::new(),
+            root: None,
         })
     }
 
@@ -251,6 +276,29 @@ impl Invites {
         self.records.iter().filter(move |record| record.standing(now) == Standing::Approved)
     }
 
+    /// Keeps `root`, signed by `author`, with every invite anchored to that
+    /// key whose device is approved, not yet given the network, and admitted
+    /// by the state the root commits to (`admits`). Whether anything changed.
+    pub fn keep_root(
+        &mut self,
+        author: &roster::id::KeyId,
+        root: &[u8],
+        now: u64,
+        admits: impl Fn(&Request) -> bool,
+    ) -> bool {
+        let mut changed = false;
+        for record in &mut self.records {
+            if record.invite.anchor != *author || record.standing(now) != Standing::Approved {
+                continue;
+            }
+            if record.request.as_ref().is_some_and(&admits) {
+                record.root = Some(root.to_vec());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Keeps a new invite.
     pub fn add(&mut self, record: Record) {
         self.records.push(record);
@@ -270,6 +318,37 @@ impl Invites {
             return false;
         }
         record.request = Some(Request { applicant, arrived_at: now, decision: Decision::Waiting });
+        true
+    }
+
+    /// Records that a request asking the other role arrived through the open
+    /// invite with `secret`, and was refused. The invite stays open, and no
+    /// request is kept.
+    ///
+    /// Whether it is new: the same device refused for the same reason again
+    /// only has its time moved on.
+    pub fn refused(
+        &mut self,
+        secret: &[u8; enrollment::invite::SECRET_LEN],
+        fingerprint: String,
+        mismatch: enrollment::exchange::Mismatch,
+        now: u64,
+    ) -> bool {
+        let Some(record) = self.with_secret(secret) else { return false };
+        if record.standing(now) != Standing::Open {
+            return false;
+        }
+        if let Some(seen) = record
+            .refused
+            .iter_mut()
+            .find(|seen| seen.fingerprint == fingerprint && seen.mismatch == mismatch)
+        {
+            seen.at = now;
+            return false;
+        }
+        record.refused.push(Refused { fingerprint, mismatch, at: now });
+        let excess = record.refused.len().saturating_sub(MOST_REFUSALS_KEPT);
+        record.refused.drain(..excess);
         true
     }
 
@@ -376,6 +455,21 @@ struct Kept {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<KeptRequest>,
     withdrawn: bool,
+    /// Written only once one was refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused: Vec<KeptRefused>,
+    /// The founder's root over the admission, in hexadecimal: written only
+    /// where there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+}
+
+/// A refused request as the file keeps it.
+#[derive(Debug, Serialize, Deserialize)]
+struct KeptRefused {
+    fingerprint: String,
+    word: String,
+    at: u64,
 }
 
 /// A request as the file keeps it.
@@ -501,12 +595,34 @@ impl InviteFile {
                 .map(KeptRequest::read)
                 .transpose()
                 .map_err(|cause| self.failure(cause))?;
+            let refused = one
+                .refused
+                .into_iter()
+                .map(|seen| {
+                    enrollment::exchange::Mismatch::parse(&seen.word)
+                        .map(|mismatch| Refused {
+                            fingerprint: seen.fingerprint,
+                            mismatch,
+                            at: seen.at,
+                        })
+                        .map_err(|_| self.failure("a refused request whose word does not read"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let root = one
+                .root
+                .map(|hex| {
+                    roster::hex::decode(&hex)
+                        .ok_or_else(|| self.failure("a root that is not hexadecimal"))
+                })
+                .transpose()?;
             records.push(Record {
                 invite,
                 invited: Invited { name: one.name, role, mode, groups, ipv4 },
                 expires_at: one.expires_at,
                 request,
                 withdrawn: one.withdrawn,
+                refused,
+                root,
             });
         }
         Ok(Invites { records })
@@ -561,6 +677,16 @@ impl InviteFile {
                 expires_at: record.expires_at,
                 request: record.request.as_ref().map(KeptRequest::of),
                 withdrawn: record.withdrawn,
+                refused: record
+                    .refused
+                    .iter()
+                    .map(|seen| KeptRefused {
+                        fingerprint: seen.fingerprint.clone(),
+                        word: seen.mismatch.as_str().to_owned(),
+                        at: seen.at,
+                    })
+                    .collect(),
+                root: record.root.as_deref().map(roster::hex::encode),
             })
             .collect();
         serde_json::to_vec_pretty(&kept).map_err(|cause| self.failure(&cause.to_string()))
@@ -593,6 +719,7 @@ mod tests {
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a@relay.example:4433",
             roster::id::NetworkId::from_bytes([7; 32]),
             roster::types::Ipv4Range::DEFAULT,
+            roster::id::KeyId::from_bytes([3; 32]),
             invited(),
             NOW,
             DEFAULT_LIFETIME_SECS,
@@ -701,6 +828,7 @@ mod tests {
                 "k@relay:1",
                 roster::id::NetworkId::from_bytes([7; 32]),
                 roster::types::Ipv4Range::DEFAULT,
+                roster::id::KeyId::from_bytes([3; 32]),
                 light_admin,
                 NOW,
                 60

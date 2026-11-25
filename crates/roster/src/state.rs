@@ -6,42 +6,29 @@
 //! nodes holding the same operations would derive different households, and a
 //! revoked laptop would stay reachable on one of them.
 //!
-//! # Validity is a fixpoint, not a single pass
+//! # Validity is one pass, in two stages
 //!
-//! Ancestor-relative validity alone would be a plain topological pass: an
-//! operation's authority comes from its own ancestors, which always precede it.
+//! Ancestor-relative validity alone is a plain topological pass: an operation's
+//! authority comes from its own ancestors, which always precede it.
 //!
-//! The causal authorship rule breaks that. An operation is void if it is
-//! *concurrent* with the removal of its author's authority, and a concurrent
-//! operation has no ordering relative to it — the removal may sit at a higher
-//! index, or a lower one, and its own validity may in turn depend on the
-//! operation being judged. Two admins demoting each other simultaneously is the
-//! smallest case: each demotion's validity depends on the other's.
+//! The causal authorship rule is the one that looks sideways: an operation is
+//! void if it is *concurrent* with the removal of its author's authority. While
+//! admins could remove admins, that made validity a fixpoint — two admins
+//! demoting each other at once, each demotion's validity depending on the
+//! other's — computed in rounds whose marks were never restored, so that both
+//! stayed. A stolen admin could use that to stay an admin.
 //!
-//! So validity is computed by rounds. Every operation starts valid; each round
-//! recomputes the whole verdict from the previous round's set and marks the
-//! failures; **an operation once marked invalid is never restored.** That last
-//! clause is what makes it terminate rather than oscillate, and it settles the
-//! mutual-demotion case the safe way: both demotions are void and both admins
-//! keep their roles, leaving a person to resolve it deliberately.
+//! **Only the founder key governs admins** ([`unauthorized_act`]), and nothing
+//! voids the founder key's work. So a removal's validity never depends on an
+//! operation it could void, and one pass decides everything:
+//! 1. in causal order, every rule but the causal authorship one. What survives
+//!    is *authorised*: written by an author entitled to write it;
+//! 2. the causal authorship rule, against the authorised removals only.
 //!
-//! Each round reads only the previous round's set, so no operation's verdict
-//! depends on the order operations are visited within a round.
-//!
-//! # A round has two stages, and the order of them is the point
-//!
-//! Within a round, every rule but the causal authorship one is applied first.
-//! What survives that is *authorised*: written by an author entitled to write it.
-//! Only then is the causal authorship rule applied, and only **authorised**
-//! removals count as removals.
-//!
-//! Marks are permanent, so an operation voided by a removal that later turns out
-//! to be void itself would never come back — the two stages are what stop that
-//! from arising. Before they existed, a revocation that had no effect at all
-//! still took its concurrent neighbours down with it: a member's revocation of an
-//! admin, or an admin's revocation of a founder, silently voided the work of the
-//! device it named. An act nobody was entitled to make is not a removal, and
-//! removes nothing.
+//! The order of the stages is still the point. A revocation that had no effect
+//! must not take its concurrent neighbours down with it: a member's revocation
+//! of an admin, or an admin's of an admin, removes nothing, because nobody was
+//! entitled to make it.
 
 use crate::prelude::*;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -235,10 +222,10 @@ impl RosterState {
         self.devices.get(device).is_some_and(|record| record.role == Role::Admin)
     }
 
-    /// Whether a device is a founder.
+    /// Whether `author` is the founder's signing key in this state.
     #[must_use]
-    pub fn is_founder(&self, device: &DeviceId) -> bool {
-        self.devices.get(device).is_some_and(|record| record.founder)
+    pub fn is_founder_key(&self, author: &KeyId) -> bool {
+        self.params.founder.signing_id() == *author
     }
 
     /// The device holding a given signing key.
@@ -370,10 +357,9 @@ pub enum Invalidity {
     /// The operation is causally concurrent with the removal of its author's
     /// authority.
     ConcurrentWithAuthorRemoval,
-    /// A `revoke_device` or `demote` targeted a founder other than its author.
-    FounderProtected,
-    /// The founding operation did not declare its own author as an admin
-    /// founder.
+    /// An `add_device` declared a key that is one of the founder's.
+    FounderKeyReused,
+    /// The founding operation did not declare its own author as an admin.
     MalformedGenesis,
     /// Its author signed two causally concurrent operations — two histories from
     /// one identity — and neither branch is granted effect.
@@ -390,7 +376,7 @@ impl Invalidity {
             Self::UnauthorizedAuthor => "unauthorized_author",
             Self::ConcurrentWithAuthorRemoval => "concurrent_with_author_removal",
             Self::Equivocated => "equivocated",
-            Self::FounderProtected => "founder_protected",
+            Self::FounderKeyReused => "key_reuse",
             Self::MalformedGenesis => "missing_genesis",
         }
     }
@@ -401,7 +387,7 @@ impl From<Invalidity> for Error {
         match value {
             Invalidity::UnauthorizedAuthor => Self::UnauthorizedAuthor,
             Invalidity::ConcurrentWithAuthorRemoval => Self::ConcurrentWithAuthorRemoval,
-            Invalidity::FounderProtected => Self::FounderProtected,
+            Invalidity::FounderKeyReused => Self::KeyReuse,
             Invalidity::MalformedGenesis => Self::MissingGenesis,
             Invalidity::Equivocated => Self::Equivocated,
         }
@@ -593,7 +579,7 @@ fn judge_within(
     let mut reasons: Vec<Option<Invalidity>> = vec![None; count];
 
     // The founding operation stands or falls on its own: it must declare its
-    // own author as an admin founder, since there is no earlier state to
+    // own author as an admin, since there is no earlier state to
     // consult. A graph resting on a snapshot has no founding operation to
     // check; the snapshot was checked when it was accepted.
     if let Some(genesis) = base.genesis
@@ -604,72 +590,67 @@ fn judge_within(
 
     let within = |index: usize| scope.is_none_or(|mask| mask.get(index).copied().unwrap_or(false));
 
-    loop {
-        let valid_now: Vec<bool> = reasons
-            .iter()
-            .enumerate()
-            .map(|(index, reason)| reason.is_none() && within(index))
-            .collect();
-        let mut newly_invalid: Vec<(usize, Invalidity)> = Vec::new();
-        // What each operation's ancestors imply, against this round's valid
-        // set: fixed for the round, so computed once and shared by every rule.
-        let eligible: Vec<bool> = valid_now
-            .iter()
-            .enumerate()
-            .map(|(index, valid)| *valid && !dag.is_covered(index))
-            .collect();
-        let mut memo = Memo::new(resolver);
-
-        // Every rule but the causal authorship one, which needs this answer
-        // before it can be asked. An operation is *authorised* when its author
-        // was entitled to write it — which is what decides whether it counts as
-        // a removal below, and is a different question from whether it survived
-        // being concurrent with somebody else's.
-        let mut authorised = valid_now.clone();
-        for index in 0..count {
-            if !valid_now.get(index).copied().unwrap_or(false) {
-                continue;
-            }
-            // The foundation is not judged: the genesis bootstraps the rule, and
-            // a covered head was judged before the snapshot that covers it was
-            // accepted.
-            if base.genesis == Some(index) || dag.is_covered(index) {
-                continue;
-            }
-            if let Some(reason) = judge_one(dag, base, index, &eligible, scope, &mut memo) {
-                newly_invalid.push((index, reason));
-                if let Some(slot) = authorised.get_mut(index) {
-                    *slot = false;
-                }
-            }
+    // First every rule but the causal authorship one, in causal order: a parent
+    // always has a lower index, so when an operation is judged, every ancestor's
+    // verdict is final and the state its ancestors imply is the one it will
+    // always imply. An operation is *authorised* when its author was entitled
+    // to write it — which is what decides whether it counts as a removal below,
+    // and is a different question from whether it survived being concurrent with
+    // somebody else's.
+    let mut authorised: Vec<bool> = (0..count).map(within).collect();
+    // What ancestor states are resolved over: the authorised operations, less
+    // covered heads, whose effects the base already holds. An entry above the
+    // index being judged is no ancestor of it and is never read.
+    let mut eligible: Vec<bool> = (0..count)
+        .map(|index| authorised.get(index).copied().unwrap_or(false) && !dag.is_covered(index))
+        .collect();
+    let mut memo = Memo::new(resolver);
+    for index in 0..count {
+        if !authorised.get(index).copied().unwrap_or(false) {
+            continue;
         }
-
-        // Then the causal authorship rule, against the removals that were
-        // somebody's to make. An operation already failing another rule is left
-        // with the reason it failed, which is the more specific complaint.
-        for index in 0..count {
-            if !authorised.get(index).copied().unwrap_or(false) {
-                continue;
-            }
-            if base.genesis == Some(index) || dag.is_covered(index) {
-                continue;
-            }
-            let Some(author) = author_of(dag, base, index, &eligible, &mut memo) else { continue };
-            if let Some(reason) = voided_by_concurrent_removal(dag, index, author, &authorised) {
-                newly_invalid.push((index, reason));
-            }
+        // The foundation is not judged: the genesis bootstraps the rule, and a
+        // covered head was judged before the snapshot that covers it was
+        // accepted.
+        if base.genesis == Some(index) || dag.is_covered(index) {
+            continue;
         }
-
-        if newly_invalid.is_empty() {
-            break;
-        }
-        for (index, reason) in newly_invalid {
+        if let Some(reason) = judge_one(dag, base, index, &eligible, scope, &mut memo) {
             if let Some(slot) = reasons.get_mut(index) {
-                // Never restored once marked: this is what makes the rounds
-                // terminate instead of oscillating between two operations that
-                // invalidate each other.
                 *slot = Some(reason);
             }
+            if let Some(slot) = authorised.get_mut(index) {
+                *slot = false;
+            }
+            if let Some(slot) = eligible.get_mut(index) {
+                *slot = false;
+            }
+        }
+    }
+
+    // Then the causal authorship rule, against the removals that were somebody's
+    // to make. One pass is the whole of it: only the founder key removes an
+    // admin, and nothing voids the founder key's work, so no removal here can be
+    // undone by what it voids. A removal of a member names no author of
+    // anything. The states the first stage resolved still count work this stage
+    // voids, and that is sound for the same reason: what it voids is an admin's
+    // work on members, and authority is never a member's.
+    let mut voided: Vec<(usize, Invalidity)> = Vec::new();
+    for index in 0..count {
+        if !authorised.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if base.genesis == Some(index) || dag.is_covered(index) {
+            continue;
+        }
+        let Some(author) = author_of(dag, base, index, &eligible, &mut memo) else { continue };
+        if let Some(reason) = voided_by_concurrent_removal(dag, index, author, &authorised) {
+            voided.push((index, reason));
+        }
+    }
+    for (index, reason) in voided {
+        if let Some(slot) = reasons.get_mut(index) {
+            *slot = Some(reason);
         }
     }
 
@@ -679,10 +660,10 @@ fn judge_within(
 /// Checks the founding operation against itself.
 fn judge_genesis(dag: &Dag, genesis: usize) -> Option<Invalidity> {
     let operation = dag.operation(genesis)?;
-    let OperationBody::CreateNetwork { device, .. } = &operation.core().body else {
+    let OperationBody::CreateNetwork { device, params } = &operation.core().body else {
         return Some(Invalidity::MalformedGenesis);
     };
-    if device.role != Role::Admin || !device.founder {
+    if device.role != Role::Admin || device.reuses(&params.founder) {
         return Some(Invalidity::MalformedGenesis);
     }
     // The author must be one of the signing keys of the device it declares,
@@ -789,7 +770,7 @@ pub fn extend(
         OperationBody::CreateNetwork { .. } | OperationBody::AdmitBatch(_) => {}
         OperationBody::RevokeDevice { device, .. } => {
             if let Some(held) = next.devices.get(device) {
-                if held.record.role == Role::Admin || held.record.founder {
+                if held.record.role == Role::Admin {
                     return None;
                 }
                 next.devices.remove(device);
@@ -801,6 +782,11 @@ pub fn extend(
         OperationBody::Promote { .. } | OperationBody::Demote { .. } => return None,
         OperationBody::AddDevice(spec) => {
             let Ok(id) = spec.device_id() else { return Some(next) };
+            // A device carrying a founder key is refused by judgement; it never
+            // reaches here, but nothing is added on its strength if it does.
+            if spec.reuses(&next.params.founder) {
+                return Some(next);
+            }
             // The first add wins: a second add changes a device that is already
             // a member not at all. An add extending every head follows every
             // revocation held, so a revoked device is admitted again.
@@ -815,7 +801,6 @@ pub fn extend(
                     keys: spec.keys.clone(),
                     name: spec.name.clone(),
                     role: spec.role,
-                    founder: spec.founder,
                     added_by: operation.id(),
                     capabilities: spec.capabilities.clone(),
                 },
@@ -824,7 +809,17 @@ pub fn extend(
         OperationBody::Rename { device, name } => {
             next.devices.modify(device, |record| record.name.clone_from(name));
         }
-        OperationBody::SetNetwork(params) => next.params = params.clone(),
+        OperationBody::SetNetwork(params) => {
+            // Only the founder changes the founder's keys: an admin's change
+            // leaves them as they were, and its other parameters stand.
+            let founder = if next.is_founder_key(&operation.core().author) {
+                params.founder
+            } else {
+                next.params.founder
+            };
+            next.params = params.clone();
+            next.params.founder = founder;
+        }
         OperationBody::SetDevice { device, change } => {
             if change.mode.is_some() || change.ipv4.is_some() {
                 return None;
@@ -860,10 +855,15 @@ fn keep_member_anchors(state: &mut RosterState) {
 /// written down: a device can anchor an operation *before its own admission*, so
 /// that the state its ancestors imply does not name it at all. Answering "no
 /// invalidity" there — which is what falling through used to do — let any member
-/// author anything it liked, founder protection included, by anchoring at the
+/// author anything it liked, revoking every admin included, by anchoring at the
 /// founding operation.
 #[must_use]
 pub fn unauthorized_author(state: &RosterState, author: &KeyId) -> Option<Invalidity> {
+    // The founder's key is an authority, not a device: nothing revokes or
+    // demotes it, so it is entitled in every state that names it.
+    if state.is_founder_key(author) {
+        return None;
+    }
     let Some(device) = state.device_for_key(author) else {
         return Some(Invalidity::UnauthorizedAuthor);
     };
@@ -871,6 +871,46 @@ pub fn unauthorized_author(state: &RosterState, author: &KeyId) -> Option<Invali
         return Some(Invalidity::UnauthorizedAuthor);
     }
     None
+}
+
+/// Whether an operation's author lacks the authority **this** operation
+/// requires, in the state its ancestors imply.
+///
+/// [`unauthorized_author`], and then the one rule that depends on the act: only
+/// the founder key governs admins. An operation that gives the admin role, or
+/// that names a device which is an admin there, is the founder's to sign; an
+/// admin signing one, itself named included, is without authority. Admins
+/// govern members.
+///
+/// What follows from it is what keeps validity a single pass: authority is
+/// given and taken away only by the founder key, whose work nothing voids, so
+/// no removal's validity can depend on an operation it might itself void.
+#[must_use]
+pub fn unauthorized_act(
+    state: &RosterState,
+    author: &KeyId,
+    body: &OperationBody,
+) -> Option<Invalidity> {
+    if let Some(reason) = unauthorized_author(state, author) {
+        return Some(reason);
+    }
+    if state.is_founder_key(author) {
+        return None;
+    }
+    let governs_an_admin = match body {
+        OperationBody::AddDevice(spec) => spec.role == Role::Admin,
+        OperationBody::Promote { .. } => true,
+        OperationBody::RevokeDevice { device, .. }
+        | OperationBody::Demote { device }
+        | OperationBody::Rename { device, .. }
+        | OperationBody::SetDevice { device, .. } => state.is_admin(device),
+        // A batch admits members only; the parameters' founder leaf is guarded
+        // where it is applied.
+        OperationBody::CreateNetwork { .. }
+        | OperationBody::AdmitBatch(_)
+        | OperationBody::SetNetwork(_) => false,
+    };
+    governs_an_admin.then_some(Invalidity::UnauthorizedAuthor)
 }
 
 /// Judges one non-genesis operation against the currently-valid set.
@@ -911,25 +951,18 @@ fn judge_one(
     // already accounts for, so the two together are the same set.
     let ancestor_state = ancestor_state(dag, base, eligible, index, memo)?;
 
-    if let Some(reason) = unauthorized_author(ancestor_state, &operation.core().author) {
+    if let Some(reason) =
+        unauthorized_act(ancestor_state, &operation.core().author, &operation.core().body)
+    {
         return Some(reason);
     }
-    // Present, admin and unrevoked, by the check above.
-    let author_id = match ancestor_state.device_for_key(&operation.core().author) {
-        Some(device) => device.id,
-        None => return Some(Invalidity::UnauthorizedAuthor),
-    };
 
-    // Founder protection, judged in the same ancestor-relative state: only a
-    // founder may retire itself, and no admin may retire another.
-    if let Some(target) = Dag::target_of(&operation.core().body) {
-        let removes_authority = matches!(
-            operation.core().body,
-            OperationBody::RevokeDevice { .. } | OperationBody::Demote { .. }
-        );
-        if removes_authority && ancestor_state.is_founder(&target) && target != author_id {
-            return Some(Invalidity::FounderProtected);
-        }
+    // No device carries a founder key: it would be a device the network could
+    // neither revoke nor tell apart from the founder.
+    if let OperationBody::AddDevice(spec) = &operation.core().body
+        && spec.reuses(&ancestor_state.params.founder)
+    {
+        return Some(Invalidity::FounderKeyReused);
     }
 
     None
@@ -944,9 +977,8 @@ fn judge_one(
 /// **Only an authorised removal counts.** `authorised` says which operations are
 /// valid by every rule *except* this one — which is exactly the question "was
 /// this act one its author was entitled to make". A removal that was not is no
-/// removal at all: a member's revocation of an admin, or an admin's revocation of
-/// a founder, has no effect on the device it names, and must have none on
-/// anything else either. Reading the running valid set here instead would let an
+/// removal at all: a member's revocation of an admin has no effect on the device
+/// it names, and must have none on anything else either. Reading the running valid set here instead would let an
 /// operation that is itself void take the work of others down with it, and the
 /// marks are permanent, so nothing would ever bring them back.
 fn voided_by_concurrent_removal(
@@ -1154,7 +1186,6 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
                     keys: record.keys.clone(),
                     name: record.name.clone(),
                     role: record.role,
-                    founder: record.founder,
                     capabilities: record.capabilities.clone(),
                 },
                 record.added_by,
@@ -1168,13 +1199,17 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
         if let OperationBody::AdmitBatch(header) = &operation.core().body {
             let Some(layer) = dag.batch_layer(&operation.id()) else { continue };
             let rank = Rank::new(dag.depth(index), operation.id());
-            let skips = skipped_by(layer, header, ancestor_state(dag, base, mask, index, memo)?);
+            let held = ancestor_state(dag, base, mask, index, memo)?;
+            let founder = held.params.founder;
+            let skips = skipped_by(layer, header, held);
             let named: Vec<(DeviceId, crate::batch::BatchEntry)> = touched
                 .iter()
                 .filter_map(|device| layer.entry(device).map(|entry| (*device, entry)))
                 .collect();
             for (id, entry) in named {
-                if skips.contains(&id) {
+                // No device carries a founder key, a batch's no more than one
+                // admitted alone.
+                if skips.contains(&id) || entry.keys.iter().any(|key| founder.holds(&key.value)) {
                     continue;
                 }
                 if let Some(address) = entry.ipv4 {
@@ -1220,24 +1255,6 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
     // known: a device's decisions in rank order (`settle_role_and_mode`).
     let mut roles: BTreeMap<DeviceId, Role> = BTreeMap::new();
 
-    // Founder status is granted and never withdrawn: a founder leaves by
-    // revoking itself, not by ceasing to be one.
-    let mut founders: BTreeSet<DeviceId> = BTreeSet::new();
-    for (device, (_, spec, _)) in &added {
-        if spec.founder {
-            founders.insert(*device);
-        }
-    }
-    for (index, operation) in selected(dag, mask) {
-        if let OperationBody::Promote { device, founder: true } = &operation.core().body {
-            let Some((_, _, added_by)) = added.get(device) else { continue };
-            if !applies_to(dag, dag.position(added_by), index) {
-                continue;
-            }
-            founders.insert(*device);
-        }
-    }
-
     // Rule 3: last-writer-wins by causal depth, ties broken by the greater
     // operation id. Arbitrary, but identical everywhere.
     let mut names: BTreeMap<DeviceId, (Rank, String)> = BTreeMap::new();
@@ -1282,9 +1299,15 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
             let rank = Rank::new(dag.depth(index), operation.id());
             let wanted = leaf_values(new_params);
             let had = leaf_values(&before);
+            let by_founder = before.founder.signing_id() == operation.core().author;
             for name in PARAMETER_NAMES {
                 let value = wanted.get(name).cloned();
                 if value == had.get(name).cloned() {
+                    continue;
+                }
+                // Only the founder changes the founder's keys. An admin's
+                // `set_network` that differs there leaves them as they were.
+                if *name == "founder" && !by_founder {
                     continue;
                 }
                 if leaves.get(name).is_none_or(|(existing, _)| rank > *existing) {
@@ -1363,7 +1386,6 @@ fn resolve_in(dag: &Dag, base: &Base, mask: &[bool], memo: &mut Memo) -> Option<
                 keys: spec.keys,
                 name,
                 role: roles.get(&device).copied().unwrap_or(spec.role),
-                founder: founders.contains(&device),
                 added_by,
                 capabilities: spec.capabilities,
             },
@@ -1786,7 +1808,6 @@ mod reference {
                         keys: record.keys.clone(),
                         name: record.name.clone(),
                         role: record.role,
-                        founder: record.founder,
                         capabilities: record.capabilities.clone(),
                     },
                     record.added_by,
@@ -1799,13 +1820,17 @@ mod reference {
             // ancestors hold: those are skipped, and the rest stand.
             if let OperationBody::AdmitBatch(header) = &operation.core().body {
                 let rank = Rank::new(dag.depth(index), operation.id());
+                let held = ancestor_state(dag, base, mask, index, memo)?;
+                let founder = held.params.founder;
                 let skips = crate::batch::skipped_among(
-                    ancestor_state(dag, base, mask, index, memo)?,
+                    held,
                     header,
                     dag.batch_devices(&operation.id()).map(|(device, entry)| (device, entry.ipv4)),
                 );
                 for (id, entry) in dag.batch_devices(&operation.id()) {
-                    if skips.contains_key(&id) {
+                    if skips.contains_key(&id)
+                        || entry.keys.iter().any(|key| founder.holds(&key.value))
+                    {
                         continue;
                     }
                     if let Some(address) = entry.ipv4 {
@@ -1851,24 +1876,6 @@ mod reference {
         // known: a device's decisions in rank order (`settle_role_and_mode`).
         let mut roles: BTreeMap<DeviceId, Role> = BTreeMap::new();
 
-        // Founder status is granted and never withdrawn: a founder leaves by
-        // revoking itself, not by ceasing to be one.
-        let mut founders: BTreeSet<DeviceId> = BTreeSet::new();
-        for (device, (_, spec, _)) in &added {
-            if spec.founder {
-                founders.insert(*device);
-            }
-        }
-        for (index, operation) in selected(dag, mask) {
-            if let OperationBody::Promote { device, founder: true } = &operation.core().body {
-                let Some((_, _, added_by)) = added.get(device) else { continue };
-                if !applies_to(dag, dag.position(added_by), index) {
-                    continue;
-                }
-                founders.insert(*device);
-            }
-        }
-
         // Rule 3: last-writer-wins by causal depth, ties broken by the greater
         // operation id. Arbitrary, but identical everywhere.
         let mut names: BTreeMap<DeviceId, (Rank, String)> = BTreeMap::new();
@@ -1913,9 +1920,14 @@ mod reference {
                 let rank = Rank::new(dag.depth(index), operation.id());
                 let wanted = leaf_values(new_params);
                 let had = leaf_values(&before);
+                let by_founder = before.founder.signing_id() == operation.core().author;
                 for name in PARAMETER_NAMES {
                     let value = wanted.get(name).cloned();
                     if value == had.get(name).cloned() {
+                        continue;
+                    }
+                    // Only the founder changes the founder's keys.
+                    if *name == "founder" && !by_founder {
                         continue;
                     }
                     if leaves.get(name).is_none_or(|(existing, _)| rank > *existing) {
@@ -2001,7 +2013,6 @@ mod reference {
                     keys: spec.keys,
                     name,
                     role: roles.get(&device).copied().unwrap_or(spec.role),
-                    founder: founders.contains(&device),
                     added_by,
                     capabilities: spec.capabilities,
                 },

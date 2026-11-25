@@ -128,6 +128,10 @@
       {
         "Found": {
           "devices": null,
+          "founder": {
+            "signing": "8bdd9ea1bd41a308391f9eb449e1f3293899ebe7fb0074b8433a988adf1ecdb6",
+            "transport": "16cb557b4f346c970b5de90183af7d00846228bcde4f3e7fa1fe4c56161a9072"
+          },
           "ipv4_range": null,
           "label": "casa",
           "name": "pixel",
@@ -164,6 +168,22 @@
     ],
     [
       {
+        "RevokeFrom": {
+          "again": [
+            "0a1b-2c3d-4e5f-6a7b"
+          ],
+          "from": "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e",
+          "network": "casa",
+          "reason": "stolen",
+          "target": {
+            "Name": "laptop"
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
         "SetAnchors": {
           "anchors": [
             {
@@ -184,6 +204,64 @@
         }
       },
       true
+    ],
+    [
+      {
+        "Demote": {
+          "network": "casa",
+          "target": {
+            "Id": "0a1b-2c3d-4e5f-6a7b"
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
+        "AsFounder": {
+          "Demote": {
+            "network": "casa",
+            "target": {
+              "Name": "laptop"
+            }
+          }
+        }
+      },
+      true
+    ],
+    [
+      {
+        "Recover": {
+          "network": "casa",
+          "revoke": [
+            {
+              "Name": "laptop"
+            }
+          ]
+        }
+      },
+      true
+    ],
+    [
+      {
+        "ReplaceFounder": {
+          "founder": {
+            "signing": "1111111111111111111111111111111111111111111111111111111111111111",
+            "transport": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
+        "History": {
+          "by": "founder",
+          "network": "casa"
+        }
+      },
+      false
     ]
   ],
   "outcomes": [
@@ -234,13 +312,10 @@
                 "second": {
                   "depth": null,
                   "does": {
-                    "Promotes": [
-                      {
-                        "id": "0a1b-2c3d-4e5f-6a7b",
-                        "name": "nas"
-                      },
-                      true
-                    ]
+                    "Promotes": {
+                      "id": "0a1b-2c3d-4e5f-6a7b",
+                      "name": "nas"
+                    }
                   }
                 }
               },
@@ -351,6 +426,7 @@
             "peers": [
               {
                 "address": "fd00::2",
+                "admin": true,
                 "id": "0a1b-2c3d-4e5f-6a7b",
                 "ipv4": {
                   "Held": "100.64.0.2"
@@ -482,6 +558,7 @@
             "reachable_count": 0,
             "relay": null,
             "relay_leaving": null,
+            "revoked_by": "laptop [0a1b-2c3d-4e5f-6a7b]",
             "revoked_count": 0,
             "standing": {
               "LastKnown": {
@@ -524,6 +601,7 @@
         "peers": [
           {
             "address": "fd00::2",
+            "admin": true,
             "id": "0a1b-2c3d-4e5f-6a7b",
             "ipv4": {
               "Held": "100.64.0.2"
@@ -589,10 +667,7 @@
                 }
               },
               {
-                "by": {
-                  "id": "1b2c-3d4e-5f6a-7b8c",
-                  "name": "laptop"
-                },
+                "by": null,
                 "reason": "lost",
                 "signer_clock": "NotRecorded"
               }
@@ -644,6 +719,7 @@
             "name": "tablet",
             "network": "casa",
             "request": {
+              "admin": true,
               "arrived_at": 1758190000,
               "conflicts": [
                 "100.64.0.0/10 overlaps 100.64.12.0/22, a subnet this device is on"
@@ -768,6 +844,65 @@
             "protocol": "Tcp"
           }
         ]
+      }
+    },
+    {
+      "History": {
+        "compacted": true,
+        "complete_from": 1768867000000,
+        "entries": [
+          {
+            "at": 1768867200000,
+            "by": null,
+            "does": {
+              "Revokes": {
+                "id": "0a1b-2c3d-4e5f-6a7b",
+                "name": "laptop"
+              }
+            },
+            "id": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+          },
+          {
+            "at": 1768867100000,
+            "by": {
+              "id": "0a1b-2c3d-4e5f-6a7b",
+              "name": "laptop"
+            },
+            "does": {
+              "Admits": {
+                "id": "1b2c-3d4e-5f6a-7b8c",
+                "name": "tv"
+              }
+            },
+            "id": "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e",
+            "no_effect": "concurrent with author removal"
+          }
+        ],
+        "network": "casa"
+      }
+    },
+    {
+      "NeedsSignatures": {
+        "founder": {
+          "signing": "1111111111111111111111111111111111111111111111111111111111111111",
+          "transport": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "id": "18f3a-3",
+        "items": [
+          {
+            "kind": "Operation",
+            "message": [
+              0,
+              127
+            ],
+            "payload": [
+              161,
+              2
+            ]
+          }
+        ],
+        "key": "founder",
+        "network": "casa"
       }
     },
     {

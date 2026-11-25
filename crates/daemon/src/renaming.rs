@@ -71,16 +71,16 @@ pub fn resolve(state: &RosterState, target: &Target, given: &str) -> Result<Rena
 /// When the operation cannot be built.
 pub fn core(
     renaming: &Renaming,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
 ) -> Result<OperationCore, String> {
     OperationCore::new(
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::Rename { device: renaming.device, name: renaming.to.clone() },
         heads,
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map_err(|cause| cause.to_string())
@@ -97,7 +97,7 @@ pub fn sign(
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
 ) -> Result<Vec<u8>, String> {
-    let core = core(renaming, identity, state, heads)?;
+    let core = core(renaming, &crate::signing::Author::of(identity), state, heads)?;
     identity.sign_operation(&core).map_err(|cause| crate::control::declined(&cause))
 }
 
@@ -114,6 +114,7 @@ mod tests {
     fn network(others: &[&str]) -> (RosterState, std::sync::Arc<NodeIdentity>) {
         let founder = std::sync::Arc::new(NodeIdentity::generate().expect("generates"));
         let params = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             None::<String>,
             "example.internal",
@@ -124,7 +125,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("nas", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -149,7 +150,7 @@ mod tests {
                 u64::try_from(at).expect("small").saturating_add(2),
                 founder.signing_key().algorithm(),
                 OperationBody::AddDevice(
-                    device.device_spec(*name, Role::Member, false, vec![]).expect("spec"),
+                    device.device_spec(*name, Role::Member, vec![]).expect("spec"),
                 ),
                 heads.clone(),
                 founder.signing_key().key_id(),
@@ -245,7 +246,8 @@ mod tests {
         let (state, founder) = network(&[]);
         let renaming =
             resolve(&state, &Target::Name("laptop".to_owned()), "studio").expect("resolves");
-        let core = core(&renaming, &founder, &state, vec![]).expect("builds");
+        let core =
+            core(&renaming, &crate::signing::Author::of(&founder), &state, vec![]).expect("builds");
         assert_eq!(
             core.body,
             OperationBody::Rename { device: id_of(&state, "laptop"), name: "studio".to_owned() }

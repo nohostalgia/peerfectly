@@ -1,7 +1,8 @@
 # stranded-join
 
 `roster.log` is a real roster log, written by a device: the Linux testbed's node `a`, founding
-`prova` on the testbed's convesso relay and admitting `b`, on 2026-10-20. It is used by the test
+`casa` on the testbed's convesso relay and admitting `phone` and `laptop`, on 2026-11-23. It is in
+the `roster/v2` format, which names the founder's keys in every network. It is used by the test
 `networks::a_roster_that_does_not_name_this_device_is_removed`, which exists because a built log
 would pass while proving nothing about a log a device actually wrote.
 
@@ -13,3 +14,6 @@ It is kept as it is:
   nothing;
 - a synthesised replacement would empty the test;
 - the network in the log exists only in a testbed that is torn down and rebuilt.
+
+It is replaced only when the roster's format changes, by a log written the same way: an older
+format's log is refused before the test can say anything.

@@ -27,6 +27,7 @@ const RELAY: &str = "https://relay.example.com:4433";
 /// Parameters carrying a relay.
 fn params_with_relay(relay: &str) -> NetworkParams {
     NetworkParams::with_relay(
+        support::founder_keys(),
         vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         Some(relay),
         "example.internal",
@@ -38,13 +39,8 @@ fn params_with_relay(relay: &str) -> NetworkParams {
 /// A history founded with a relay, plus a member to watch across changes.
 fn founded_with_relay() -> History {
     let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), params_with_relay(RELAY));
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "phone", Role::Member, false)),
-    );
+    history.genesis_with("g", 1, device(1, "founder", Role::Admin), params_with_relay(RELAY));
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "phone", Role::Member)));
     history
 }
 
@@ -78,6 +74,7 @@ fn the_schema_is_in_canonical_key_order() {
             "policy",
             "suffix",
             "anchors",
+            "founder",
             "leaving",
             "excluded",
             "snapshot_window"
@@ -98,7 +95,7 @@ fn parameters_with_a_relay_round_trip_through_an_operation() {
 #[test]
 fn parameters_without_a_relay_round_trip_through_an_operation() {
     let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), params());
+    history.genesis_with("g", 1, device(1, "founder", Role::Admin), params());
     assert_eq!(loaded(&history).state().expect("derives").params.relay, None);
 }
 
@@ -110,7 +107,7 @@ fn a_network_with_no_relay_is_well_formed() {
     assert!(
         loaded(&{
             let mut history = History::new();
-            history.genesis_with("g", 1, device(1, "founder", Role::Admin, true), params());
+            history.genesis_with("g", 1, device(1, "founder", Role::Admin), params());
             history
         })
         .state()
@@ -123,12 +120,22 @@ fn a_network_with_no_relay_is_well_formed() {
 /// mean "a relay whose address is nothing".
 #[test]
 fn an_empty_relay_address_is_not_absence() {
-    let absent =
-        NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 1).expect("valid");
+    let absent = NetworkParams::new(
+        support::founder_keys(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "example.internal",
+        1,
+    )
+    .expect("valid");
     assert_eq!(absent.relay, None);
 
-    let empty =
-        NetworkParams::with_relay(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], Some(""), "example.internal", 1);
+    let empty = NetworkParams::with_relay(
+        support::founder_keys(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        Some(""),
+        "example.internal",
+        1,
+    );
     match empty {
         Err(roster::Error::InvalidValue(which)) => assert!(which.contains("relay"), "{which}"),
         other => panic!("an empty relay address must be refused, got {other:?}"),
@@ -139,6 +146,7 @@ fn an_empty_relay_address_is_not_absence() {
 fn an_over_long_relay_address_is_refused_when_the_parameters_are_built() {
     let too_long = "h".repeat(roster::limits::MAX_RELAY_LEN.saturating_add(1));
     match NetworkParams::with_relay(
+        support::founder_keys(),
         vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
         Some(too_long),
         "example.internal",
@@ -154,6 +162,7 @@ fn a_relay_address_at_the_bound_is_accepted() {
     let exact = "h".repeat(roster::limits::MAX_RELAY_LEN);
     assert!(
         NetworkParams::with_relay(
+            support::founder_keys(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             Some(exact),
             "example.internal",
@@ -213,12 +222,7 @@ fn a_device_added_after_a_relay_change_is_still_a_member() {
         &["add2"],
         OperationBody::SetNetwork(params_with_relay("https://elsewhere.example")),
     );
-    history.op(
-        "add3",
-        1,
-        &["move"],
-        OperationBody::AddDevice(device(3, "laptop", Role::Member, false)),
-    );
+    history.op("add3", 1, &["move"], OperationBody::AddDevice(device(3, "laptop", Role::Member)));
 
     let state = loaded(&history).state().expect("derives");
     assert!(state.devices.contains_key(&device_id(3)), "membership is unaffected by the relay");
@@ -232,11 +236,10 @@ fn two_concurrent_relay_changes_settle_deterministically() {
     let mut history = founded_with_relay();
     // Two admins. Concurrency between different authors is what this rule is
     // about; one admin signing both branches is a fork, judged before it.
-    history.op(
+    history.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     history.op(
         "left",
@@ -291,7 +294,7 @@ fn founded_with_a_revocation() -> History {
         "add3",
         1,
         &["add2"],
-        OperationBody::AddDevice(device(3, "old-laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "old-laptop", Role::Member)),
     );
     history.op(
         "revoke3",
@@ -315,7 +318,7 @@ fn a_range_chosen_at_founding_survives_a_signed_operation() {
     history.genesis_with(
         "g",
         1,
-        device(1, "founder", Role::Admin, true),
+        device(1, "founder", Role::Admin),
         params_with_relay(RELAY).in_ipv4_range(range("10.42.0.0/16")),
     );
     let state = loaded(&history).state().expect("derives");
@@ -351,11 +354,10 @@ fn changing_the_range_does_not_change_who_belongs() {
 #[test]
 fn two_concurrent_range_changes_settle_deterministically() {
     let mut history = founded_with_relay();
-    history.op(
+    history.founder_op(
         "add9",
-        1,
         &["add2"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     history.op(
         "left",
@@ -420,8 +422,8 @@ fn concurrent_changes_to_different_parameters_both_stand() {
     use roster::parameters::Rule;
 
     let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "phone", Role::Admin, true), params_with_relay(RELAY));
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.genesis_with("g", 1, device(1, "phone", Role::Admin), params_with_relay(RELAY));
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
 
     let mut with_anchors = params_with_relay(RELAY);
     with_anchors.anchors = vec![device_id(2)];
@@ -454,8 +456,8 @@ fn concurrent_changes_to_different_parameters_both_stand() {
 #[test]
 fn a_parameter_carried_unchanged_is_not_set() {
     let mut history = History::new();
-    history.genesis_with("g", 1, device(1, "phone", Role::Admin, true), params_with_relay(RELAY));
-    history.op("admin2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
+    history.genesis_with("g", 1, device(1, "phone", Role::Admin), params_with_relay(RELAY));
+    history.founder_op("admin2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
     // Admin 1 moves the relay; admin 2, concurrently and deeper, changes only
     // the anchors and carries the old relay unchanged.
     history.op(

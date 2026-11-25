@@ -49,9 +49,14 @@ fn founding(identity: &NodeIdentity) -> OperationCore {
         1_757_000_040_000,
         identity.signing_key().algorithm(),
         OperationBody::CreateNetwork {
-            device: identity.device_spec("pixel", Role::Admin, true, vec![]).expect("spec"),
-            params: NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "home.internal", 2_592_000)
-                .expect("valid"),
+            device: identity.device_spec("pixel", Role::Admin, vec![]).expect("spec"),
+            params: NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
+                vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+                "home.internal",
+                2_592_000,
+            )
+            .expect("valid"),
         },
         vec![],
         identity.signing_key().key_id(),
@@ -65,8 +70,8 @@ fn where_the_key_lives_changes_nothing_about_the_device() {
     let (here, elsewhere) = (held(), held_elsewhere());
     assert_eq!(here.device_id(), elsewhere.device_id());
     assert_eq!(
-        here.device_spec("pixel", Role::Member, false, vec![]).expect("spec"),
-        elsewhere.device_spec("pixel", Role::Member, false, vec![]).expect("spec")
+        here.device_spec("pixel", Role::Member, vec![]).expect("spec"),
+        elsewhere.device_spec("pixel", Role::Member, vec![]).expect("spec")
     );
     assert!(elsewhere.signing_key().material().is_none(), "no private material is held");
     assert_eq!(

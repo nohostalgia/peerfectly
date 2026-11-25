@@ -409,8 +409,13 @@ mod tests {
     /// older build's parameters, or a state assembled in memory. That is
     /// exactly the case the check here exists for.
     fn params(ula: Vec<u8>) -> NetworkParams {
-        let mut params =
-            NetworkParams::new(DERIVED.to_vec(), "example.internal", 2_592_000).expect("valid");
+        let mut params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            DERIVED.to_vec(),
+            "example.internal",
+            2_592_000,
+        )
+        .expect("valid");
         params.ula = ula;
         params
     }
@@ -550,7 +555,13 @@ mod tests {
     #[test]
     fn a_prefix_that_matches_everything_is_refused() {
         assert!(
-            NetworkParams::new(Vec::new(), "example.internal", 2_592_000).is_err(),
+            NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
+                Vec::new(),
+                "example.internal",
+                2_592_000
+            )
+            .is_err(),
             "the roster refuses it first"
         );
         let empty = params(Vec::new());

@@ -752,7 +752,6 @@ impl Layer {
                 keys: entry.keys.clone(),
                 name: entry.name.clone(),
                 role: Role::Member,
-                founder: false,
                 added_by: self.batch,
                 capabilities: Vec::new(),
             },

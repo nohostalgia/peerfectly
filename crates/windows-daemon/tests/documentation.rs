@@ -72,6 +72,7 @@ fn the_unsafe_modules_are_accounted_for() {
         "platform/who.rs",
         "platform/desktop.rs",
         "programs/daemon.rs",
+        "platform/console.rs",
     ] {
         assert!(readme.contains(module), "`{module}` must be listed as an unsafe module");
     }

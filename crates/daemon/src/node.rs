@@ -56,6 +56,9 @@ use crate::router::Router;
 use crate::schedule::Schedule;
 use crate::state::Log;
 
+/// How many notices are held waiting to be judged.
+const MOST_HEARD: usize = 32;
+
 /// Something that went wrong in one part of the node.
 ///
 /// Every one is logged. The latest is also kept, so `status` can say a network
@@ -204,6 +207,15 @@ pub struct Node {
     /// When this node was built: the light member's engine counts time from
     /// it.
     born: tokio::time::Instant,
+    /// Notices of a revocation heard by the transport, not yet judged
+    /// (offline-founder design §16). Bounded: one beyond [`MOST_HEARD`] is
+    /// dropped, and the next dial brings it again.
+    heard: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// Raised when this device's own standing may have changed: its roster
+    /// started or stopped naming it, or a notice of its revocation was heard
+    /// (offline-founder design §22). The service, woken by it, decides whether
+    /// the network runs as a member or as revoked.
+    standing: Arc<tokio::sync::Notify>,
     /// Held while the log is written: appended to, or rewritten after a
     /// compaction, so that a rewrite never drops an operation appended while it
     /// was being made.
@@ -230,6 +242,9 @@ pub struct Node {
     /// The members that chose this device as a neighbour and said so, checked
     /// against the roster. Pushed to as the device's own choices are.
     in_neighbours: Mutex<BTreeSet<DeviceId>>,
+    /// The members this node reaches through a founder session: kept whatever
+    /// this node's own standing, because the session is the founder's.
+    through_founder: Mutex<BTreeSet<DeviceId>>,
     /// Packets waiting for a member whose session is being opened.
     ///
     /// A session is opened by the first packet that needs it. What arrives while
@@ -370,6 +385,8 @@ impl Node {
             upkeep: Arc::new(tokio::sync::Notify::new()),
             driving: Mutex::new(()),
             born: tokio::time::Instant::now(),
+            heard: Arc::new(std::sync::Mutex::new(Vec::new())),
+            standing: Arc::new(tokio::sync::Notify::new()),
             log_guard: Mutex::new(()),
             keeper: std::sync::OnceLock::new(),
             base: std::sync::Mutex::new(None),
@@ -378,6 +395,7 @@ impl Node {
             contacts: Mutex::new(contacts),
             contact_record,
             in_neighbours: Mutex::new(in_neighbours),
+            through_founder: Mutex::new(BTreeSet::new()),
             waiting: Mutex::new(BTreeMap::new()),
             activity: std::sync::Mutex::new(BTreeMap::new()),
             unanswered: std::sync::Mutex::new(BTreeMap::new()),
@@ -718,11 +736,24 @@ impl Node {
             self.record(
                 Severity::Problem,
                 "state",
-                "the store this network's base is kept in was changed outside this daemon:                  what it holds is not believed, and joining the network again fetches it                  from peers",
+                "the store this network's base is kept in was changed outside this daemon: \
+                 what it holds is not believed, and joining the network again fetches it                  from peers",
             )
             .await;
         }
         true
+    }
+
+    /// Why the roster gives the operation in `bytes` no effect, if it holds it
+    /// and gives it none: an act whose author may not make it is still held in
+    /// the graph, judged invalid there, and changes nothing.
+    pub async fn without_effect(&self, bytes: &[u8]) -> Option<roster::state::Invalidity> {
+        let id = roster::sign::RawOperation::decode(bytes).ok()?.id();
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        let index = dag.position(&id)?;
+        let (_, verdicts) = roster::state::derive_with_verdicts(dag).ok()?;
+        verdicts.reason(index)
     }
 
     /// The base this roster rests on: the root beneath its window and the
@@ -1308,8 +1339,46 @@ impl Node {
         self.transport.lock().await.clone()
     }
 
+    /// The notices heard since the last call, to be judged.
+    pub fn take_heard(&self) -> Vec<Vec<u8>> {
+        match self.heard.lock() {
+            Ok(mut held) => core::mem::take(&mut *held),
+            Err(poisoned) => core::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+
+    /// What is raised when this device's own standing may have changed: see
+    /// the field.
+    #[must_use]
+    pub fn standing(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.standing)
+    }
+
+    /// Whether this device is revoked in this network: its roster does not
+    /// name it, and holds its revocation (offline-founder design §22). A
+    /// notice whose revocation is not yet in the log is the service's to read.
+    pub async fn revoked_in_roster(&self) -> bool {
+        let me = self.identity.device_id();
+        self.state()
+            .await
+            .is_ok_and(|state| !state.devices.contains_key(&me) && state.revoked.contains(&me))
+    }
+
     /// Takes a started transport, which is what makes the node reachable.
     pub async fn started(&self, transport: Arc<dyn Transport>) {
+        // What it hears of its own revocation is kept to be judged, and what it
+        // holds of others' it says to them (offline-founder design §16).
+        let heard = Arc::clone(&self.heard);
+        let standing = Arc::clone(&self.standing);
+        transport.on_notice(Arc::new(move |bytes| {
+            if let Ok(mut held) = heard.lock()
+                && held.len() < MOST_HEARD
+            {
+                held.push(bytes);
+                standing.notify_one();
+            }
+        }));
+        transport.tell_revoked(crate::notices::revoked_peers(self).await.into_values().collect());
         *self.transport.lock().await = Some(transport);
         // What it shows a board, from the start: a transport starts showing
         // nothing, and was told only at the next change to the roster. A phone
@@ -1407,6 +1476,20 @@ impl Node {
     /// pieces, and a revocation naming one would wait there with it.
     pub async fn urgent_anchor(&self, target: &DeviceId) -> roster::roster::UrgentAnchor {
         self.syncer.lock().await.roster().urgent_anchor(target, crate::clock::now_ms())
+    }
+
+    /// Where a founder revocation of `target` voiding its acts from `from` is
+    /// anchored; see `Roster::voiding_anchor`.
+    ///
+    /// # Errors
+    ///
+    /// As `Roster::voiding_anchor`.
+    pub async fn voiding_anchor(
+        &self,
+        target: &DeviceId,
+        from: &roster::id::OperationId,
+    ) -> Result<roster::roster::UrgentAnchor, roster::roster::VoidingRefused> {
+        self.syncer.lock().await.roster().voiding_anchor(target, from)
     }
 
     /// How many operations the roster's graph holds: the recent window, once
@@ -1531,6 +1614,16 @@ impl Node {
                 .map_err(|_| roster::Error::InvalidValue("the light member is unreadable"));
         }
         self.syncer.lock().await.roster().state()
+    }
+
+    /// The state at `heads`, as the roster derives it: what a root over those
+    /// heads commits to.
+    ///
+    /// # Errors
+    ///
+    /// When a head is not held, or what they cover derives nothing.
+    pub async fn state_at(&self, heads: &[roster::id::OperationId]) -> roster::Result<RosterState> {
+        roster::state::state_for_parents(self.syncer.lock().await.roster().dag(), heads)
     }
 
     /// Restores a snapshot this network accepted before, with the time it was
@@ -1890,6 +1983,90 @@ impl Node {
             self.send_roster(peer, message.clone()).await;
         }
         self.spread_soon();
+    }
+
+    /// Every operation held, with the roster's verdict on it, and the founder
+    /// keys any of them named: what a history lists.
+    pub async fn held_with_verdicts(
+        &self,
+    ) -> Option<(Vec<(roster::sign::VerifiedOperation, Option<roster::state::Invalidity>)>, bool)>
+    {
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        let (_, verdicts) = roster::state::derive_with_verdicts(dag).ok()?;
+        let compacted = !matches!(dag.foundation(), Some(roster::dag::Foundation::Genesis(_)));
+        let held = dag
+            .operations()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !dag.is_covered(*index))
+            .map(|(index, operation)| (operation.clone(), verdicts.reason(index)))
+            .collect();
+        Some((held, compacted))
+    }
+
+    /// Serves a session opened with the founder's key to `peer`, a member, and
+    /// keeps it whatever this node's own standing, until
+    /// [`Self::release_founder_session`].
+    pub async fn serve_founder_session(self: &Arc<Self>, session: Box<dyn Session>) {
+        let peer = session.peer();
+        self.through_founder.lock().await.insert(peer);
+        let node = Arc::clone(self);
+        tokio::spawn(async move { node.serve(session, Opening::Dialled).await });
+    }
+
+    /// Ends every founder session this node holds.
+    pub async fn release_founder_session(&self) {
+        let peers: Vec<DeviceId> =
+            std::mem::take(&mut *self.through_founder.lock().await).into_iter().collect();
+        for peer in peers {
+            let session = self.sessions.lock().await.get(&peer).map(Arc::clone);
+            if let Some(session) = session {
+                let _closed = session.close().await;
+            }
+            self.closed(&peer).await;
+        }
+    }
+
+    /// The causal depth of every operation held.
+    pub async fn depths(&self) -> std::collections::BTreeMap<roster::id::OperationId, u64> {
+        let syncer = self.syncer.lock().await;
+        let dag = syncer.roster().dag();
+        dag.operations()
+            .iter()
+            .enumerate()
+            .map(|(index, operation)| (operation.id(), dag.depth(index)))
+            .collect()
+    }
+
+    /// The root the founder would sign over this node's heads, unsigned.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::snapshots::founder_body_over_heads`].
+    pub async fn founder_root_body(&self) -> Result<roster::snapshot::Snapshot, String> {
+        crate::snapshots::founder_body_over_heads(self.syncer.lock().await.roster())
+    }
+
+    /// Takes a root signed elsewhere — the founder's, signed by the person — as
+    /// this node's own, and sends it to every open session, as a root this
+    /// node attested would be.
+    ///
+    /// False, with nothing kept or sent, when the roster refuses it.
+    pub async fn publish_root(&self, bytes: &[u8]) -> bool {
+        if !self.syncer.lock().await.roster_mut().offer_snapshot(bytes).is_accepted() {
+            return false;
+        }
+        self.keep_snapshot(bytes).await;
+        self.refresh_evidence().await;
+        self.reconsider_carrying().await;
+        let message = roster_sync::message::Message::Snapshot(bytes.to_vec());
+        let peers: Vec<DeviceId> = self.sessions.lock().await.keys().copied().collect();
+        for peer in peers {
+            self.send_roster(peer, message.clone()).await;
+        }
+        self.spread_soon();
+        true
     }
 
     /// Works out what this device will carry, and keeps it for the packet path.
@@ -2289,12 +2466,18 @@ impl Node {
             // out. It chooses no neighbours as a light member would, and keeps
             // in touch with the full members it would be handed, so that the
             // root reaches it.
+            //
+            // A revoked device, which its roster no longer names, does the same:
+            // it dials the full members it knew, the anchors first, at its own
+            // events, and is let back in by the first that no longer holds its
+            // revocation (offline-founder design §22).
             let me = self.identity.device_id();
             let light = state
                 .devices
                 .get(&me)
                 .is_some_and(|leaf| leaf.settings.mode == roster::leaf::Mode::Light);
-            if !light {
+            let revoked = !state.devices.contains_key(&me) && state.revoked.contains(&me);
+            if !light && !revoked {
                 return Vec::new();
             }
             let recent = self.seen_lately().await;
@@ -2621,8 +2804,10 @@ impl Node {
         // It goes first, so the connection is gone before the session map that
         // names it is tidied below.
         let transport = self.transport.lock().await.clone();
-        if let Some(transport) = transport {
+        let revoked = crate::notices::revoked_peers(self).await;
+        if let Some(transport) = &transport {
             transport.update_state(state.clone()).await;
+            transport.tell_revoked(revoked.values().cloned().collect());
         }
         self.refresh_evidence().await;
         if !self.is_light() && self.become_light_if_named().await {
@@ -2662,43 +2847,74 @@ impl Node {
         self.forget_departed(&state).await;
         self.reconsider_carrying().await;
 
-        // If *this* device has been removed, every session goes — not only the
-        // ones with departed peers, because there are none: the peers are all
-        // still members and this node is not.
-        //
-        // This is not a security control. The other side enforces the revocation
-        // whatever this node does, and a compromised one would not cooperate. It
-        // is correctness for an honest node: continuing to reconcile a roster it
-        // has been removed from, and to hold sessions into a network it has left,
-        // is a node acting on an authority it no longer has.
+        // Only sessions with peers its roster no longer names go. Where *this*
+        // device is the one removed, its peers decide: each that holds the
+        // removal closes its side, and one that no longer does — the founder
+        // voided it — keeps the session that brings it back. Closing them all
+        // here closed, at the first message, the very session carrying the
+        // voiding (testbed, 2026-11-24). Its tunnel is down meanwhile, so the
+        // sessions carry the roster and nothing else (offline-founder design
+        // §22).
         let removed = !state.devices.contains_key(&self.identity.device_id());
+        // This device's own standing, said to the service when it changes.
+        let was_named = previous
+            .as_ref()
+            .map(|previous| previous.devices.contains_key(&self.identity.device_id()));
+        if was_named != Some(!removed) {
+            self.standing.notify_one();
+        }
+        let through_founder = self.through_founder.lock().await.clone();
 
+        // A founder session is kept on both ends: here, a member reached with
+        // the founder's key whatever this device's standing; there, the
+        // founder, for as long as the `founder` leaf names its key.
         let gone: Vec<DeviceId> = self
             .sessions
             .lock()
             .await
             .keys()
-            .filter(|peer| removed || !state.devices.contains_key(peer))
+            .filter(|peer| !through_founder.contains(peer))
+            .filter(|peer| !transport::auth::is_founder_peer(&state, peer))
+            .filter(|peer| !state.devices.contains_key(peer))
             .copied()
             .collect();
 
+        // A device this node was talking to when its revocation reached it is
+        // told, once, as its session closes: after the revocation was passed
+        // on to this node's sessions, by a member it knows (offline-founder
+        // design §16). One off or elsewhere is told when it next dials.
+        // A session is never held with a device already revoked, so each
+        // one found here is news.
+        if !removed
+            && !self.is_light()
+            && let Some(transport) = &transport
+        {
+            for told in gone.iter().filter_map(|peer| revoked.get(peer)) {
+                let Ok(key) = roster::sign::PublicKey::new(
+                    roster::types::Algorithm::Ed25519,
+                    told.transport.clone(),
+                ) else {
+                    continue;
+                };
+                let transport = Arc::clone(transport);
+                let revocation = told.revocation.clone();
+                tokio::spawn(async move {
+                    let _read = transport.notify(&key, revocation).await;
+                });
+            }
+        }
         for peer in gone {
             let session = self.sessions.lock().await.get(&peer).map(Arc::clone);
             if let Some(session) = session {
                 let _closed = session.close().await;
             }
             self.closed(&peer).await;
-            // This device leaving the roster is its standing, and a problem; a
-            // peer leaving it is that peer's, and an event.
-            let (severity, why) = if removed {
-                (
-                    Severity::Problem,
-                    format!("this device is no longer in the roster; session with {peer:?} closed"),
-                )
-            } else {
-                (Severity::Event, format!("{peer:?} is no longer in the roster; session closed"))
-            };
-            self.record(severity, "roster", why).await;
+            self.record(
+                Severity::Event,
+                "roster",
+                format!("{peer:?} is no longer in the roster; session closed"),
+            )
+            .await;
         }
     }
 
@@ -2808,6 +3024,12 @@ impl Node {
             return;
         };
 
+        // A founder session carries the roster and nothing else.
+        if !matches!(channel, Channel::Roster)
+            && self.state().await.is_ok_and(|state| transport::auth::is_founder_peer(&state, &peer))
+        {
+            return;
+        }
         match channel {
             Channel::Roster => self.received_roster(peer, body).await,
             Channel::Neighbour => self.received_neighbour_claim(peer).await,
@@ -3640,14 +3862,18 @@ mod borrowing {
     /// A roster signed by one founder: admissions, and a revocation of every
     /// tenth device admitted.
     fn a_history(founder: &NodeIdentity) -> Roster {
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "home.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "home.internal",
+            2_592_000,
+        )
+        .unwrap();
         let genesis = OperationCore::new(
             1_757_000_040_000,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).unwrap(),
+                device: founder.device_spec("nas", Role::Admin, vec![]).unwrap(),
                 params,
             },
             vec![],
@@ -3674,7 +3900,7 @@ mod borrowing {
                 let joiner = NodeIdentity::generate().unwrap();
                 admitted.push(joiner.device_id());
                 OperationBody::AddDevice(
-                    joiner.device_spec(format!("d{count}"), Role::Member, false, vec![]).unwrap(),
+                    joiner.device_spec(format!("d{count}"), Role::Member, vec![]).unwrap(),
                 )
             };
             let core = OperationCore::new(
@@ -3906,13 +4132,18 @@ mod replacing {
 
     fn a_node() -> (Arc<Node>, tempfile::TempDir) {
         let founder = Arc::new(NodeIdentity::generate().unwrap());
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "casa.internal", 600).unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "casa.internal",
+            600,
+        )
+        .unwrap();
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).unwrap(),
+                device: founder.device_spec("founder", Role::Admin, vec![]).unwrap(),
                 params,
             },
             vec![],
@@ -4049,6 +4280,31 @@ pub const CHANGED_OUTSIDE: &str = "the base store does not check out against its
 /// on it: a few seconds at most.
 const CHECKED_BEFORE_RESTING: usize = 50_000;
 
+/// The roster a network's directory holds, replayed as a start replays it —
+/// resting on its base where it has one, then the log, then the pieces —
+/// with no node around it.
+///
+/// `None` where the log cannot be read or its base does not check out. Every
+/// operation is offered through the roster's own verification, so nothing on
+/// the disk is believed for being there.
+pub(crate) fn replayed(paths: &crate::state::Paths) -> Option<roster::roster::Roster> {
+    let mut roster = roster::roster::Roster::new();
+    let held = crate::state::Log::at(paths.roster()).read().ok()?;
+    let held = if paths.base_snapshot().exists() {
+        let store = crate::state::open_base_store(paths).ok()?;
+        resting_on_base(&mut roster, paths, &store, held).ok()?
+    } else {
+        held
+    };
+    for operation in &held {
+        let _offered = roster.offer_bytes(operation);
+    }
+    for piece in crate::state::Log::at(paths.pieces()).read().unwrap_or_default() {
+        let _taken = roster.offer_piece(&piece);
+    }
+    Some(roster)
+}
+
 fn resting_on_base(
     roster: &mut roster::roster::Roster,
     paths: &crate::state::Paths,
@@ -4125,14 +4381,18 @@ mod batches {
 
     /// A network founded by `founder`, its genesis written to `paths`.
     fn founded(founder: &NodeIdentity, paths: &Paths) -> NetworkId {
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .unwrap();
         let genesis = OperationCore::new(
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).unwrap(),
+                device: founder.device_spec("founder", Role::Admin, vec![]).unwrap(),
                 params,
             },
             vec![],
@@ -4165,7 +4425,7 @@ mod batches {
         let entries: Vec<BatchEntry> = (0..150)
             .map(|index| {
                 let board = NodeIdentity::generate().unwrap();
-                let spec = board.device_spec("board", Role::Member, false, vec![]).unwrap();
+                let spec = board.device_spec("board", Role::Member, vec![]).unwrap();
                 BatchEntry {
                     keys: spec.keys,
                     name: format!("board-{index}"),
@@ -4216,9 +4476,13 @@ mod light {
 
     /// A founder's roster of the founder and `member`, with a root over it.
     fn founded(founder: &NodeIdentity, member: &NodeIdentity) -> (Roster, NetworkId) {
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .unwrap();
         let sign = |body, parents, network| {
             let core = OperationCore::new(
                 1,
@@ -4233,7 +4497,7 @@ mod light {
         };
         let (genesis, genesis_bytes) = sign(
             OperationBody::CreateNetwork {
-                device: founder.device_spec("nas", Role::Admin, true, vec![]).unwrap(),
+                device: founder.device_spec("nas", Role::Admin, vec![]).unwrap(),
                 params,
             },
             vec![],
@@ -4241,9 +4505,7 @@ mod light {
         );
         let network = NetworkId::from_bytes(*genesis.as_bytes());
         let (_, added) = sign(
-            OperationBody::AddDevice(
-                member.device_spec("sensor", Role::Member, false, vec![]).unwrap(),
-            ),
+            OperationBody::AddDevice(member.device_spec("sensor", Role::Member, vec![]).unwrap()),
             vec![genesis],
             network,
         );
@@ -4343,9 +4605,7 @@ mod light {
             let core = OperationCore::new(
                 ts,
                 founder.signing_key().algorithm(),
-                OperationBody::AddDevice(
-                    device.device_spec(name, Role::Member, false, vec![]).unwrap(),
-                ),
+                OperationBody::AddDevice(device.device_spec(name, Role::Member, vec![]).unwrap()),
                 roster.heads(),
                 founder.signing_key().key_id(),
                 network,
@@ -4403,9 +4663,7 @@ mod light {
             let core = OperationCore::new(
                 ts,
                 founder.signing_key().algorithm(),
-                OperationBody::AddDevice(
-                    device.device_spec(name, Role::Member, false, vec![]).unwrap(),
-                ),
+                OperationBody::AddDevice(device.device_spec(name, Role::Member, vec![]).unwrap()),
                 roster.heads(),
                 founder.signing_key().key_id(),
                 network,
@@ -4481,7 +4739,7 @@ mod light {
         let core = OperationCore::new(
             2,
             founder.signing_key().algorithm(),
-            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, false, vec![]).unwrap()),
+            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, vec![]).unwrap()),
             later.heads(),
             founder.signing_key().key_id(),
             later.state().unwrap().network,
@@ -4528,7 +4786,7 @@ mod light {
         let core = OperationCore::new(
             2,
             founder.signing_key().algorithm(),
-            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, false, vec![]).unwrap()),
+            OperationBody::AddDevice(extra.device_spec("tv", Role::Member, vec![]).unwrap()),
             heads,
             founder.signing_key().key_id(),
             later.state().unwrap().network,
@@ -4755,9 +5013,7 @@ mod light {
         let core = OperationCore::new(
             3,
             founder.signing_key().algorithm(),
-            OperationBody::AddDevice(
-                laptop.device_spec("laptop", Role::Member, false, vec![]).unwrap(),
-            ),
+            OperationBody::AddDevice(laptop.device_spec("laptop", Role::Member, vec![]).unwrap()),
             roster.heads(),
             founder.signing_key().key_id(),
             network,

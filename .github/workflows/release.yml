@@ -62,9 +62,18 @@ jobs:
           path: target/dist/*.msi
           if-no-files-found: error
 
+  # One archive per architecture, each built natively on a runner of its own:
+  # no cross-compiler, and no emulation.
   linux-package:
     needs: version
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,7 +82,7 @@ jobs:
       - run: deploy/linux/package.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux
+          name: linux-${{ matrix.arch }}
           path: target/dist/*.tar.gz
           if-no-files-found: error
 
@@ -121,6 +130,7 @@ jobs:
 
           - **Windows:** \`peerfectly-$VERSION-windows-x64.msi\`
           - **Linux (x86_64, glibc 2.34 or later):** \`peerfectly-$VERSION-linux-x86_64.tar.gz\`, then \`sudo ./install.sh\` from the unpacked folder.
+          - **Linux (ARM 64-bit, aarch64, glibc 2.34 or later), a Raspberry Pi 4 or 5 on a 64-bit system among them:** \`peerfectly-$VERSION-linux-aarch64.tar.gz\`, the same way.
 
           ## Check what you downloaded
 

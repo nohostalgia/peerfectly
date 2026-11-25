@@ -168,9 +168,9 @@ pub fn before_choosing(kind: Kind, network: &str) -> String {
     };
     if joining {
         return format!(
-            "{held}\n\nYou will type it once more in a moment, when this device proves to the \
-             admitting one that it holds this key, and again for any admin act it signs if it is \
-             ever made an admin. It cannot be recovered."
+            "{held}\n\nThis device joins as an admin. You will type it once more in a moment, \
+             when this device proves to the admitting one that it holds this key, and then every \
+             time this machine signs an admin act for the network. It cannot be recovered."
         );
     }
     format!(
@@ -308,8 +308,9 @@ mod tests {
     }
 
     /// **A network being joined has no name here yet**, and the text says so
-    /// rather than showing the placeholder it waits under — and does not tell a
-    /// joining member it will sign admin acts.
+    /// rather than showing the placeholder it waits under. Only a join as an
+    /// admin makes a key, so it says the key is asked for at the proof and for
+    /// every admin act after it.
     #[test]
     fn a_network_being_joined_is_called_that() {
         assert_eq!("Passphrase for the network being joined (TPM): ", prompt_for(Kind::Tpm, ""));
@@ -317,7 +318,8 @@ mod tests {
         assert!(why.contains("The signing key for the network being joined"), "{why}");
         let said = before_choosing(Kind::Tpm, "");
         assert!(said.contains("for the network being joined"), "{said}");
+        assert!(said.contains("joins as an admin"), "{said}");
         assert!(said.contains("proves to the admitting one"), "{said}");
-        assert!(!said.contains("every time this machine signs an admin act"), "{said}");
+        assert!(said.contains("every time this machine signs an admin act"), "{said}");
     }
 }

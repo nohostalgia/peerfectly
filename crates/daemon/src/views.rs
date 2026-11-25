@@ -105,12 +105,11 @@ impl fmt::Display for RevokedRows<'_> {
                     }
                     _ => "the revoking device recorded no time".to_owned(),
                 };
-                writeln!(
-                    f,
-                    "    by {}: \"{}\" ({clock})",
-                    revocation.by,
-                    shown(&revocation.reason)
-                )?;
+                let by = revocation
+                    .by
+                    .as_ref()
+                    .map_or_else(|| "the founder".to_owned(), ToString::to_string);
+                writeln!(f, "    by {by}: \"{}\" ({clock})", shown(&revocation.reason))?;
             }
         }
         Ok(())
@@ -201,6 +200,15 @@ impl fmt::Display for Report {
             );
             write!(f, "{block}")?;
         }
+
+        // Said only when somebody chose it: at the platform's default there is
+        // nothing a person would look for.
+        if let Some(state) = &self.state_directory {
+            writeln!(f)?;
+            let mut block = Block::headed("state".to_owned());
+            block.plain(format!("kept in {state}, as the daemon was told to."));
+            write!(f, "{block}")?;
+        }
         Ok(())
     }
 }
@@ -281,6 +289,22 @@ fn status_of(network: &Network) -> Block {
     // Where **this** device keeps the key that signs for this network. Never
     // said about a peer: this device cannot see how somebody else holds theirs.
     block.line("signing key", network.custody);
+    if network.key_until_settled {
+        block.line(
+            "",
+            "kept until this device's demotion is settled, and then destroyed: it is a member now",
+        );
+    }
+    if let Some(by) = &network.revoked_by {
+        block.line(
+            "revoked",
+            format!(
+                "by {by}: no device of the network accepts this one any more. Up, it listens: \
+                 it comes back by itself if the founder voids that revocation, otherwise by an \
+                 invite"
+            ),
+        );
+    }
 
     warnings(network, &mut block);
     block
@@ -480,6 +504,7 @@ mod tests {
             path: reachable.then_some(Path::Relay),
             standing: Standing::Current,
             last_contact: Contact::NoneRecorded,
+            admin: false,
         }
     }
 
@@ -494,6 +519,8 @@ mod tests {
             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
             admin: true,
             custody: crate::control::Custody::HeldHere,
+            key_until_settled: false,
+            revoked_by: None,
             owner_taken: false,
             confirmation: None,
             arrived: None,
@@ -568,6 +595,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -736,6 +764,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -746,6 +775,50 @@ mod tests {
         assert!(!drawn.contains("tray"), "{drawn}");
     }
 
+    /// A member holds no signing key, and a demoted device says its key goes
+    /// once the demotion is settled.
+    #[test]
+    fn a_members_key_and_a_demoted_ones_are_said() {
+        let report = |custody, key_until_settled| Report {
+            networks: vec![Network { custody, key_until_settled, ..network("casa", Vec::new()) }],
+            unusable: Vec::new(),
+            note: None,
+            admin_refusal: None,
+            state_directory: None,
+            waiting_on: None,
+            elsewhere: 0,
+            may_stop_the_daemon: true,
+            could_stop_the_daemon: false,
+        };
+        let member = report(crate::control::Custody::None, false).to_string();
+        assert!(member.contains("none: this device is a member"), "{member}");
+        let demoted = report(crate::control::Custody::KeyStore, true).to_string();
+        assert!(demoted.contains("in this machine's key store"), "{demoted}");
+        assert!(demoted.contains("kept until this device's demotion is settled"), "{demoted}");
+        let admin = report(crate::control::Custody::KeyStore, false).to_string();
+        assert!(!admin.contains("demotion"), "{admin}");
+    }
+
+    /// Where the state is, said only when somebody chose it.
+    #[test]
+    fn a_chosen_state_directory_is_said_and_the_default_is_not() {
+        let report = |state_directory: Option<String>| Report {
+            networks: Vec::new(),
+            unusable: Vec::new(),
+            note: None,
+            admin_refusal: None,
+            state_directory,
+            waiting_on: None,
+            elsewhere: 0,
+            may_stop_the_daemon: true,
+            could_stop_the_daemon: false,
+        };
+        let chosen = report(Some("/data/peerfectly".to_owned())).to_string();
+        assert!(chosen.contains("kept in /data/peerfectly"), "{chosen}");
+        let default = report(None).to_string();
+        assert!(!default.contains("kept in"), "{default}");
+    }
+
     /// A device holding nothing is a state with a remedy, not an empty report.
     #[test]
     fn a_device_with_no_network_is_told_so_by_every_view() {
@@ -754,6 +827,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,
@@ -780,6 +854,7 @@ mod tests {
                 unusable: Vec::new(),
                 note: None,
                 admin_refusal: None,
+                state_directory: None,
                 waiting_on: None,
                 elsewhere: 0,
                 may_stop_the_daemon: true,
@@ -801,6 +876,7 @@ mod tests {
             unusable: Vec::new(),
             note: None,
             admin_refusal: None,
+            state_directory: None,
             waiting_on: None,
             elsewhere: 0,
             may_stop_the_daemon: true,

@@ -16,7 +16,9 @@ Invite = {
   "net":    bstr .size 32,   ; the network id: the only network the device accepts
   "block":  bstr .size 5,    ; the network's IPv4 block: its base, then its prefix length
   "relay":  tstr,            ; the network's relay, key@host:port
-  "secret": bstr .size 16    ; random
+  "anchor": bstr .size 32,   ; the id of the key whose root the device must be given
+  "secret": bstr .size 16,   ; random
+  "suffix": tstr             ; the network's suffix, as its admin said; may be empty
 }
 ```
 
@@ -31,9 +33,24 @@ asks, where the network's addresses would coincide with its other networks or th
 subnets it is on. Nothing signs it: an invite that lied about it misleads only
 that warning, and the block a member holds is the one its roster says.
 
-The text form is `peerfectly-invite-v2:` followed by the bytes in lowercase
-hexadecimal; surrounding whitespace is ignored. A scannable code carries the
-text.
+The suffix is the network's when the invite was issued, at most 64 bytes, empty
+where the issuer did not say it. It is there for the same reason, about names: a
+device holding a network whose suffix overlaps it refuses the join before any
+request is sent. It is the issuer's word too, and the suffix of the delivered
+roster is judged again.
+
+The anchor is the id of the key that vouches for the network the device is
+given: the inviting admin's attestation key, or the founder's signing key for an
+invite opened on a member with the founder's words. The joining device adopts a
+network only with a root that key signed (see `admit` below). The secret alone
+is a bearer token, and the network id alone proves nothing once a network's
+history is compacted past its founding: the state it then rests on names its own
+keys, and anybody can make a consistent one under any id.
+
+The text form is `peerfectly-invite-v3:` followed by the bytes in base32 (RFC
+4648, lower case, no padding; either case is read, and leftover bits must be
+zero); surrounding whitespace is ignored. An invite of an earlier version is
+refused with words saying so. A scannable code carries the text.
 
 The rendezvous identity's seed is
 `BLAKE3-derive("peerfectly invite rendezvous v1", network id || secret)`: an
@@ -93,8 +110,12 @@ out of turn ends the exchange rather than being acted on.
 
 ```text
 joiner -> admin   introduce { alg, kind, name, sign, proof, trans, attest, tproof, conflicts }
+                  (or introduce-admin, the same fields, from a device joining as an admin)
 
-then, before a person has approved the request:
+then, when the request's role is not the one the invite makes:
+admin  -> joiner  refused   { kind, word }                   (the exchange ends)
+
+or, before a person has approved the request:
 admin  -> joiner  received  { kind }                         (the exchange ends)
 
 or, once a person has approved it:
@@ -115,6 +136,20 @@ name it proposes; the admin's record of the invite decides
 the name, role, mode, groups and address it is admitted with, and an admission
 whose record chose any of the last four is followed, in the same delivery, by the
 `set_device` that sets them.
+
+A device joining as a **member** sends `introduce`, and keeps no signing key: it
+made the key for the join, signed `proof` with it, and cleared it. A device
+joining as an **admin** sends `introduce-admin`, the same nine fields in the same
+order with `kind` set to `introduce-admin`, and keeps its key. They are two kinds
+rather than a field so that a member's request is byte for byte what it was before
+there were two, and an admitting side that does not know `introduce-admin`
+refuses it as it refuses any kind it does not speak.
+
+The admitting side compares the kind with the role its record of the invite
+holds. When they differ it answers `refused`, keeps nothing, and leaves the invite
+unused. `word` is exactly `invite-makes-admin` or `invite-makes-member`; any other
+value is refused. Like `received`, it proves nothing — anyone holding the invite
+could send it — so the joining device shows it and goes on waiting.
 
 `received` carries **nothing but its kind**, and proves nothing: whoever holds the
 invite can send it. It tells the joining device that its request is kept and that
@@ -144,10 +179,10 @@ embedded canonical encoding of the map above and `kind` repeats its name. An
 envelope whose `kind` disagrees with its body is refused: a reader that trusted
 the label over the contents is a reader that can be talked into the wrong branch.
 
-`admit` carries the network's current **snapshot** beside the roster, where the
-admitting side holds one. The field is optional and absence has one spelling: the
-key is not written. A `null` would be a second way to say the same thing, and two
-spellings of one fact are two things for implementations to disagree about.
+`admit` carries a **snapshot** beside the roster: a root over what it delivers.
+The field is optional on the wire and absence has one spelling: the key is not
+written. A `null` would be a second way to say the same thing, and two spellings
+of one fact are two things for implementations to disagree about.
 
 It is there because freshness is measured from the last snapshot a device
 accepted, and a device that joined without one would have accepted none — which
@@ -155,16 +190,20 @@ is the state a device reaches when it has been out of touch for longer than the
 network allows. A member that has just arrived and one that has been unreachable
 for a month must not look alike.
 
-The snapshot is **not evidence of anything**, exactly as the operations beside it
-are not. A joiner SHALL check it by the roster's own rules — signed by a device
-the delivered operations name as an admin, over heads those operations contain —
-and never because of who sent it.
+A joiner SHALL adopt the network only when the snapshot is signed by the
+invite's **anchor**, checks by the roster's own rules (signed by a founder or
+admin key of the delivered state, over heads the delivery contains, its root
+the state those heads derive to), and that state admits the joiner's own keys.
+A delivery without such a snapshot is refused like one that does not admit the
+device: nothing is written, and `outcome` says `taken: false`. The anchor's
+signature is what ties the delivery to the invite; the checks of the operations
+alone prove it consistent, not genuine.
 
-A snapshot that does not check SHALL be dropped **without refusing the roster**.
-The operations prove the membership; the snapshot only dates it, and it is
-allowed to be missing altogether. An admitting side that sends none, and one
-whose snapshot does not check, leave the joiner in the same place: a member, with
-nothing yet to measure freshness from, and told so.
+The admitting side therefore delivers its own root, made at that moment, where
+the anchor is its attestation key; and the founder's root over the admission,
+kept with the invite when it was approved, where the anchor is the founder.
+Another member holding the admission is refused, and the device waits for the
+one that invited it.
 
 ## 4. Bounds
 

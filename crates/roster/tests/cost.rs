@@ -38,7 +38,7 @@ const BATCH: usize = 200;
 fn admit_a_chain(count: usize) -> Duration {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
 
     let mut parent = "add2".to_owned();
     for step in 0..count {
@@ -99,7 +99,7 @@ fn admitting_an_honest_history_stays_linear() {
 fn refusing_a_flood_is_cheap() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
 
     let mut roster = Roster::new();
     for entry in history.entries() {

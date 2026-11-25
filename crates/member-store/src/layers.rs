@@ -232,7 +232,7 @@ impl Layers {
                     Some(after) => nodes
                         .range((core::ops::Bound::Excluded(after), core::ops::Bound::Unbounded))
                         .map_err(database)?,
-                    None => nodes.range::<[u8; 32]>(..).map_err(database)?,
+                    None => nodes.range(..).map_err(database)?,
                 };
                 let mut page = Vec::new();
                 let mut seen = 0_usize;

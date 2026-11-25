@@ -29,10 +29,9 @@ use std::time::Duration;
 
 use enrollment::exchange::Message;
 use enrollment::limits;
-use identity::NodeIdentity;
 use roster::sign::PublicKey;
 use roster::state::RosterState;
-use roster::types::{OperationBody, OperationCore};
+use roster::types::{OperationBody, OperationCore, Role};
 use transport_convesso::enrolment::{Admitting, Channel};
 
 /// Why an admission did not happen.
@@ -90,38 +89,74 @@ pub struct Taken {
 /// channel. The device is then told its request was received, and the exchange
 /// ends.
 ///
+/// The device is told whether its request was kept: received, or refused for
+/// asking a role the invite does not make (`role`, as the invite's record
+/// holds it). A refused request is not kept, and the invite stays open.
+///
 /// # Errors
 ///
 /// When the device cannot be reached, says something other than an
 /// introduction, or does not prove the keys it presents.
-pub async fn collect(invite: &enrollment::Invite) -> Result<Applicant, Refusal> {
+pub async fn collect(invite: &enrollment::Invite, role: Role) -> Result<Collected, Refusal> {
     let endpoint = Admitting::dialling().await.map_err(|cause| cause.to_string())?;
-    let outcome = take_request(&endpoint, invite).await;
+    let outcome = take_request(&endpoint, invite, role).await;
     endpoint.close().await;
     outcome
+}
+
+/// What one dial of an open invite brought.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Collected {
+    /// A request asking the role the invite makes, its keys proved.
+    Request(Applicant),
+    /// A request, its keys proved, asking the other role: refused, with the
+    /// word the device was told.
+    Refused {
+        /// The fingerprint of the signing key it presented.
+        fingerprint: String,
+        /// What the device was told the invite makes.
+        mismatch: enrollment::exchange::Mismatch,
+    },
 }
 
 async fn take_request(
     endpoint: &Admitting,
     invite: &enrollment::Invite,
-) -> Result<Applicant, Refusal> {
+    role: Role,
+) -> Result<Collected, Refusal> {
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let rendezvous = transport_convesso::enrolment::rendezvous_key(&invite.rendezvous_seed())
         .map_err(|cause| cause.to_string())?;
     let mut channel = reach(endpoint, &rendezvous, &invite.relay).await?;
     let material = channel.material().map_err(|cause| cause.to_string())?;
-    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
-        return Err("the device said something other than its request".to_owned());
+    let (introduction, asks_admin) = match receive(&mut channel, deadline).await? {
+        Message::Introduce(introduction) => (introduction, false),
+        Message::IntroduceAdmin(introduction) => (introduction, true),
+        _ => return Err("the device said something other than its request".to_owned()),
     };
+    // The proofs first: a refusal is recorded against a key the device showed
+    // it holds, never against one it only named.
     introduction
         .verify(&material, &invite.network, &rendezvous)
         .map_err(|cause| cause.to_string())?;
-    send(&mut channel, &Message::Received, deadline).await?;
+    let mismatch = match (role, asks_admin) {
+        (Role::Admin, false) => Some(enrollment::exchange::Mismatch::InviteMakesAdmin),
+        (Role::Member, true) => Some(enrollment::exchange::Mismatch::InviteMakesMember),
+        _ => None,
+    };
+    let answer = mismatch.map_or(Message::Received, Message::Refused);
+    send(&mut channel, &answer, deadline).await?;
     // Held open until the device has read it and gone, or a few seconds:
     // closed at once, the endpoint took the message with it, and the device
     // went on believing nobody had its request.
     let _gone = receive(&mut channel, RECEIVED_LINGER).await;
-    Ok(Applicant::from(&introduction))
+    Ok(match mismatch {
+        Some(mismatch) => Collected::Refused {
+            fingerprint: crate::joining::fingerprint(&introduction.signing),
+            mismatch,
+        },
+        None => Collected::Request(Applicant::from(&introduction)),
+    })
 }
 
 /// How long the exchange is held open after saying a request was received.
@@ -183,7 +218,11 @@ async fn bring(
     let deadline = Duration::from_secs(limits::EXCHANGE_DEADLINE_SECS);
     let mut channel = reach(endpoint, &destination.dialled, destination.relay).await?;
     let material = channel.material().map_err(|cause| cause.to_string())?;
-    let Message::Introduce(introduction) = receive(&mut channel, deadline).await? else {
+    // Either kind: what is checked is that it is the device admitted, and the
+    // role was settled when its request was taken.
+    let (Message::Introduce(introduction) | Message::IntroduceAdmin(introduction)) =
+        receive(&mut channel, deadline).await?
+    else {
         return Err("the device said something other than an introduction".to_owned());
     };
     if introduction.transport != *destination.transport
@@ -244,7 +283,7 @@ async fn reach(endpoint: &Admitting, key: &PublicKey, relay: &str) -> Result<Cha
 pub fn admission_core(
     applicant: &Applicant,
     invited: &crate::invites::Invited,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     heads: Vec<roster::id::OperationId>,
     keeping_the_name: bool,
@@ -255,10 +294,10 @@ pub fn admission_core(
         // The minute it was signed, on this device's clock. Nothing reads it as
         // a sequence; the roster defines it as a time for display.
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::AddDevice(spec),
         heads,
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map_err(|cause| cause.to_string())?;
@@ -279,7 +318,7 @@ pub fn admission_core(
 /// not one of the block's hosts.
 pub fn settings_core(
     invited: &crate::invites::Invited,
-    identity: &NodeIdentity,
+    author: &crate::signing::Author,
     state: &RosterState,
     admission: &OperationCore,
 ) -> Result<Option<OperationCore>, Refusal> {
@@ -321,10 +360,10 @@ pub fn settings_core(
     };
     OperationCore::new(
         crate::clock::signing_time(),
-        identity.signing_key().algorithm(),
+        author.algorithm,
         OperationBody::SetDevice { device, change },
         vec![admission.id()],
-        identity.signing_key().key_id(),
+        author.key_id,
         state.network,
     )
     .map(Some)
@@ -437,7 +476,7 @@ fn identity_spec(
     // role the admin chose when inviting; the name it proposed is a suggestion.
     let proposed = admitted_name(&invited.name);
     let name = if keeping_the_name { proposed } else { unused_name(&proposed, state) };
-    roster::types::DeviceSpec::new(keys, name, invited.role, false, vec![])
+    roster::types::DeviceSpec::new(keys, name, invited.role, vec![])
         .map_err(|cause| cause.to_string())
 }
 
@@ -510,6 +549,7 @@ mod tests {
     use roster::types::Role;
 
     use super::*;
+    use identity::NodeIdentity;
 
     /// A device introducing itself, proposing a name.
     fn applicant(joining: &NodeIdentity, name: &str) -> Applicant {
@@ -535,6 +575,7 @@ mod tests {
 
     fn state_with(names: &[&str]) -> RosterState {
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             2_592_000,
@@ -550,7 +591,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -572,7 +613,7 @@ mod tests {
                 u64::try_from(index).unwrap_or(0).saturating_add(2),
                 founder.signing_key().algorithm(),
                 OperationBody::AddDevice(
-                    device.device_spec(*name, Role::Member, false, vec![]).expect("spec"),
+                    device.device_spec(*name, Role::Member, vec![]).expect("spec"),
                 ),
                 parents.clone(),
                 founder.signing_key().key_id(),
@@ -599,7 +640,6 @@ mod tests {
         let spec = identity_spec(&asking, &invited("laptop", Role::Member), &state, false)
             .expect("builds");
         assert_eq!(spec.role, Role::Member, "never an admin because it asked");
-        assert!(!spec.founder);
         assert!(spec.capabilities.is_empty());
         assert_eq!(spec.name, "laptop", "the record's name, not the one proposed");
 
@@ -735,13 +775,15 @@ mod tests {
         let (admission, _) = admission_core(
             &applicant(&joining, "board"),
             invited,
-            &admin,
+            &crate::signing::Author::of(&admin),
             state,
             Vec::new(),
             false,
         )
         .expect("builds");
-        let settings = settings_core(invited, &admin, state, &admission)?.expect("settings");
+        let settings =
+            settings_core(invited, &crate::signing::Author::of(&admin), state, &admission)?
+                .expect("settings");
         let OperationBody::SetDevice { change, .. } = settings.body else { panic!("a set_device") };
         Ok(change.ipv4.flatten().map(u32::from_be_bytes))
     }
@@ -776,6 +818,7 @@ mod tests {
     #[test]
     fn a_full_block_admits_ipv6_only() {
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "example.internal",
             0,
@@ -787,7 +830,7 @@ mod tests {
         let mut state = state_of(params, &names);
         // The founder holds the first host; the thirteen others the rest.
         let members: Vec<_> =
-            state.devices.keys().filter(|device| !state.is_founder(device)).collect();
+            state.devices.keys().filter(|device| !state.is_admin(device)).collect();
         for (offset, device) in (2_u32..).zip(members) {
             let settings = roster::leaf::DeviceSettings {
                 ipv4: Some(offset.to_be_bytes()),
@@ -801,12 +844,16 @@ mod tests {
         let (admission, _) = admission_core(
             &applicant(&joining, "board"),
             &asked,
-            &admin,
+            &crate::signing::Author::of(&admin),
             &state,
             Vec::new(),
             false,
         )
         .expect("builds");
-        assert!(settings_core(&asked, &admin, &state, &admission).expect("made").is_none());
+        assert!(
+            settings_core(&asked, &crate::signing::Author::of(&admin), &state, &admission)
+                .expect("made")
+                .is_none()
+        );
     }
 }

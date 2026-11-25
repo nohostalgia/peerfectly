@@ -46,9 +46,9 @@ fn attempt_strategy() -> impl Strategy<Value = Attempt> {
 fn body(attempt: Attempt) -> OperationBody {
     match attempt {
         Attempt::AddDevice(seed) => {
-            OperationBody::AddDevice(device(seed, "smuggled", Role::Member, false))
+            OperationBody::AddDevice(device(seed, "smuggled", Role::Member))
         }
-        Attempt::PromoteSelf => OperationBody::Promote { device: device_id(2), founder: true },
+        Attempt::PromoteSelf => OperationBody::Promote { device: device_id(2) },
         Attempt::DemoteFounder => OperationBody::Demote { device: device_id(1) },
         Attempt::RevokeFounder => {
             OperationBody::RevokeDevice { device: device_id(1), reason: "mine now".to_owned() }
@@ -58,6 +58,7 @@ fn body(attempt: Attempt) -> OperationBody {
         }
         Attempt::SetNetwork(tag) => OperationBody::SetNetwork(
             roster::types::NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, tag, 0, 0, 0, 0, 0, 0],
                 "attacker.internal",
                 2_592_000,
@@ -85,7 +86,7 @@ proptest! {
             "addB",
             1,
             &["g"],
-            OperationBody::AddDevice(device(2, "b", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "b", Role::Member)),
         );
 
         let mut roster = Roster::new();
@@ -125,8 +126,8 @@ proptest! {
     ) {
         let mut history = History::new();
         history.genesis("g", 1);
-        history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-        history.op("addC", 1, &["addB"], OperationBody::AddDevice(device(7, "c", Role::Member, false)));
+        history.founder_op("addB", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+        history.op("addC", 1, &["addB"], OperationBody::AddDevice(device(7, "c", Role::Member)));
 
         // A mixture: some authored by an admin, some by the member, anchored in
         // two places so the graph forks.

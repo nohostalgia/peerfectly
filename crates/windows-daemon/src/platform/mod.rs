@@ -11,6 +11,7 @@
 
 pub mod adapter;
 pub mod connectivity;
+pub mod console;
 pub mod custody;
 pub mod desktop;
 pub mod driver;

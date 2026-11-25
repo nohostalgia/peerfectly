@@ -29,7 +29,7 @@
 //! use identity::{NodeIdentity, Role};
 //!
 //! let node = NodeIdentity::generate()?;
-//! let spec = node.device_spec("laptop", Role::Member, false, vec![])?;
+//! let spec = node.device_spec("laptop", Role::Member, vec![])?;
 //!
 //! // The device a node presents is built from the keys it actually holds.
 //! assert_eq!(spec.device_id()?, node.device_id());
@@ -39,6 +39,7 @@
 pub mod detached;
 pub mod encodings;
 pub mod error;
+pub mod founder;
 pub mod identity;
 pub mod passphrase;
 pub mod seal;
@@ -47,7 +48,9 @@ pub mod store;
 pub mod wrapped;
 
 pub use error::{Error, Result};
-pub use identity::{CustodianKey, NodeIdentity, PrivateKey, SigningKey, fresh_key_name};
+pub use identity::{
+    CustodianKey, NodeIdentity, PrivateKey, PublicOnlyKey, SigningKey, fresh_key_name,
+};
 pub use secret::SecretBytes;
 
 // The roster types a caller needs on the ordinary path, so a daemon depends on

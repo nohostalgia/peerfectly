@@ -3,7 +3,7 @@
 //! These are not tuning knobs. A node that raises one of them accepts
 //! operations its peers reject, which forks the network as surely as a
 //! disagreement about byte order would. They change only together with the
-//! `"roster/v1"` domain-separation tag.
+//! `"roster/v2"` domain-separation tag.
 //!
 //! The point of the bounds is that a compromised admin, who can legitimately
 //! sign operations, still cannot make a phone allocate an arbitrary amount of

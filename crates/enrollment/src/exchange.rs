@@ -183,9 +183,50 @@ pub const RECEIVED_SCHEMA: &[&str] = &["kind"];
 /// Field names of the joining device's answer.
 pub const OUTCOME_SCHEMA: &[&str] = &["kind", "taken"];
 
-/// The fields of an introduction, in canonical order.
+/// The fields of an introduction, in canonical order: a member's and an
+/// admin's alike, which differ only in their kind.
 pub const INTRODUCE_SCHEMA: &[&str] =
     &["alg", "kind", "name", "sign", "proof", "trans", "attest", "tproof", "conflicts"];
+
+/// Field names of the admitting side's refusal of a request's role.
+pub const REFUSED_SCHEMA: &[&str] = &["kind", "word"];
+
+/// Which role an invite makes, said when a request asked for the other one.
+///
+/// A fixed word, not text: the joining device shows its own sentence for it,
+/// so nothing the other side chose is shown to a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mismatch {
+    /// The invite makes an admin, and the request was a member's.
+    InviteMakesAdmin,
+    /// The invite makes a member, and the request was an admin's.
+    InviteMakesMember,
+}
+
+impl Mismatch {
+    /// The word on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InviteMakesAdmin => "invite-makes-admin",
+            Self::InviteMakesMember => "invite-makes-member",
+        }
+    }
+
+    /// The mismatch a word names.
+    ///
+    /// # Errors
+    ///
+    /// When it names none: an unknown word is refused, never read as the
+    /// nearest one.
+    pub fn parse(word: &str) -> Result<Self> {
+        match word {
+            "invite-makes-admin" => Ok(Self::InviteMakesAdmin),
+            "invite-makes-member" => Ok(Self::InviteMakesMember),
+            _ => Err(Error::Malformed("a refusal naming a role this version does not know")),
+        }
+    }
+}
 
 /// What an invited device says of itself as the exchange opens: the keys it
 /// minted for this network, the name it proposes, and proof that it holds the
@@ -244,8 +285,25 @@ impl Introduction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// Invited joiner to admitting side: what it is, and proof of it.
+    /// Invited joiner to admitting side: what it is, and proof of it. A device
+    /// joining as a member, which keeps no signing key.
     Introduce(Introduction),
+
+    /// The same, from a device joining as an admin, which keeps its signing key
+    /// in the custody its platform gives an admin's.
+    ///
+    /// Its own kind rather than a field in [`Self::Introduce`], so that a
+    /// member's request stays what it always was and an admitting side that does
+    /// not know this kind refuses it, as it refuses any kind it does not speak,
+    /// rather than admit it without checking the role.
+    IntroduceAdmin(Introduction),
+
+    /// Admitting side to joiner: the request asked for a role the invite does
+    /// not make, and was not kept. The exchange ends here.
+    ///
+    /// Proves nothing, like [`Self::Received`]: whoever holds the invite can say
+    /// it, so a joining device shows it and goes on waiting.
+    Refused(Mismatch),
 
     /// Admitting side to joiner: the request was received and is kept, pending
     /// a person's approval. The exchange ends here; nothing has been signed.
@@ -321,6 +379,8 @@ impl Message {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Introduce(_) => "introduce",
+            Self::IntroduceAdmin(_) => "introduce-admin",
+            Self::Refused(_) => "refused",
             Self::Received => "received",
             Self::Base { .. } => "base",
             Self::Batch { .. } => "batch",
@@ -333,11 +393,11 @@ impl Message {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let body = match self {
-            Self::Introduce(introduction) => {
+            Self::Introduce(introduction) | Self::IntroduceAdmin(introduction) => {
                 let mut writer = Writer::new();
                 writer.map(9);
                 writer.key("alg").str(introduction.signing.algorithm().as_str());
-                writer.key("kind").str("introduce");
+                writer.key("kind").str(self.kind());
                 writer.key("name").str(&introduction.name);
                 writer.key("sign").bytes(introduction.signing.as_bytes());
                 writer.key("proof").bytes(introduction.possession.as_bytes());
@@ -348,6 +408,13 @@ impl Message {
                 for conflict in &introduction.conflicts {
                     writer.str(conflict);
                 }
+                writer.finish()
+            }
+            Self::Refused(mismatch) => {
+                let mut writer = Writer::new();
+                writer.map(2);
+                writer.key("kind").str("refused");
+                writer.key("word").str(mismatch.as_str());
                 writer.finish()
             }
             Self::Received => {
@@ -446,11 +513,11 @@ impl Message {
     fn decode_body(kind: &str, body: &[u8], available: usize) -> Result<Self> {
         let mut reader = Reader::new(body);
         match kind {
-            "introduce" => {
+            "introduce" | "introduce-admin" => {
                 let mut map = reader.map(INTRODUCE_SCHEMA)?;
                 let algorithm =
                     roster::types::Algorithm::parse(map.key("alg")?.str(16, "algorithm")?)?;
-                if map.key("kind")?.str(16, "message kind")? != "introduce" {
+                if map.key("kind")?.str(16, "message kind")? != kind {
                     return Err(Error::Malformed("the body names a different message"));
                 }
                 let name = map
@@ -485,7 +552,7 @@ impl Message {
                 }
                 map.finish()?;
                 reader.finish()?;
-                Ok(Self::Introduce(Introduction {
+                let introduction = Introduction {
                     signing,
                     transport,
                     attestation,
@@ -493,7 +560,22 @@ impl Message {
                     possession: Possession::from_bytes(proof),
                     transport_possession: Possession::from_bytes(transport_proof),
                     conflicts,
-                }))
+                };
+                Ok(if kind == "introduce" {
+                    Self::Introduce(introduction)
+                } else {
+                    Self::IntroduceAdmin(introduction)
+                })
+            }
+            "refused" => {
+                let mut map = reader.map(REFUSED_SCHEMA)?;
+                if map.key("kind")?.str(16, "message kind")? != "refused" {
+                    return Err(Error::Malformed("the body names a different message"));
+                }
+                let mismatch = Mismatch::parse(map.key("word")?.str(32, "refusal word")?)?;
+                map.finish()?;
+                reader.finish()?;
+                Ok(Self::Refused(mismatch))
             }
             "received" => {
                 let mut map = reader.map(RECEIVED_SCHEMA)?;
@@ -695,10 +777,82 @@ mod tests {
                 snapshot: Some(vec![9, 8, 7, 6]),
             },
             Message::Admission { operations: Vec::new(), snapshot: Some(Vec::new()) },
+            Message::IntroduceAdmin(fixed_introduction()),
+            Message::Refused(Mismatch::InviteMakesAdmin),
+            Message::Refused(Mismatch::InviteMakesMember),
             Message::Received,
             Message::Outcome { taken: true },
             Message::Outcome { taken: false },
         ]
+    }
+
+    /// An introduction made from fixed keys, so its bytes are the same on every
+    /// run: what a member's request is on the wire.
+    fn fixed_introduction() -> Introduction {
+        let key = |seed| {
+            identity::PrivateKey::from_material(roster::types::Algorithm::Ed25519, [seed; 32])
+                .expect("valid")
+        };
+        let device = NodeIdentity::assemble(key(1), key(2), key(3)).expect("three keys");
+        let material = b"one exchange";
+        Introduction {
+            signing: device.signing_key().public_key(),
+            transport: device.transport_key().public_key(),
+            attestation: device.attestation_key().public_key(),
+            name: "laptop".to_owned(),
+            possession: Possession::prove(device.signing_key().signer(), material).expect("signs"),
+            transport_possession: Possession::prove(device.transport_key().signer(), material)
+                .expect("signs"),
+            conflicts: vec!["the Wi-Fi here is on 100.83.4.0/24".to_owned()],
+        }
+    }
+
+    /// A member's `introduce` as it was before admins had a kind of their own,
+    /// from [`fixed_introduction`]'s keys.
+    const INTRODUCE_BEFORE: &str = "a264626f6479590160a963616c676765643235353139646b696e6469696e74726f64756365646e616d65666c6170746f70647369676e58208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c6570726f6f665840c88078c8847e5dfde3c068f02ba94fbe109cc227bcbc49b5a1fea6d9f5b6a9206439df10ca99c2664e8860869629006cda584d98d98782ed9a17a85039fec709657472616e7358208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394666174746573745820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1667470726f6f665840a2c0dfb90b612eee22d7e2d6110cce9694e4b0160062e6899626432425a527aa6c83b5632b19ff74e669d7498ee7a14c53623d25e309c31ba5904525b3574d0269636f6e666c696374738178227468652057692d46692068657265206973206f6e203130302e38332e342e302f3234646b696e6469696e74726f64756365";
+
+    /// **A member's request is what it always was, byte for byte**, so an
+    /// admin's daemon from before this change admits new members.
+    #[test]
+    fn a_members_introduction_is_unchanged_on_the_wire() {
+        let bytes = Message::Introduce(fixed_introduction()).encode();
+        assert_eq!(INTRODUCE_BEFORE, roster::hex::encode(&bytes));
+        let before = roster::hex::decode(INTRODUCE_BEFORE).expect("hex");
+        assert_eq!(
+            Message::decode(&before).expect("decodes"),
+            Message::Introduce(fixed_introduction())
+        );
+    }
+
+    /// An admin's request is its own kind, with the same fields, and is not
+    /// read as a member's.
+    #[test]
+    fn an_admins_introduction_is_its_own_kind() {
+        let admin = Message::IntroduceAdmin(fixed_introduction());
+        let bytes = admin.encode();
+        assert_ne!(bytes, Message::Introduce(fixed_introduction()).encode());
+        assert_eq!(Message::decode(&bytes).expect("decodes"), admin);
+    }
+
+    /// A refusal carries one of two fixed words, and nothing else is read.
+    #[test]
+    fn a_refusal_is_one_of_two_words() {
+        for mismatch in [Mismatch::InviteMakesAdmin, Mismatch::InviteMakesMember] {
+            assert_eq!(Mismatch::parse(mismatch.as_str()), Ok(mismatch));
+        }
+        let unknown = {
+            let mut body = Writer::new();
+            body.map(2);
+            body.key("kind").str("refused");
+            body.key("word").str("invite-makes-king");
+            let body = body.finish();
+            let mut writer = Writer::new();
+            writer.map(2);
+            writer.key("body").bytes(&body);
+            writer.key("kind").str("refused");
+            writer.finish()
+        };
+        assert!(Message::decode(&unknown).is_err(), "an unknown word is refused");
     }
 
     #[test]
@@ -740,6 +894,7 @@ mod tests {
             ADMISSION_SCHEMA,
             OUTCOME_SCHEMA,
             BASE_SCHEMA,
+            REFUSED_SCHEMA,
         ] {
             assert!(roster::cbor::is_canonical_schema(schema), "{schema:?}");
         }

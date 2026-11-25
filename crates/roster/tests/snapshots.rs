@@ -28,7 +28,7 @@ use support::{History, SharedClock, device, device_id, params, signer};
 fn linear(length: usize) -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     let mut previous = "a".to_owned();
     for index in 0..length {
         let label = format!("n{index}");
@@ -150,7 +150,7 @@ fn the_snapshot_signing_input_carries_its_own_tag() {
         "the snapshot tag is part of the signed bytes"
     );
     assert!(
-        !input.windows(9).any(|w| w == b"roster/v1" && w.len() == 9)
+        !input.windows(9).any(|w| w == b"roster/v2" && w.len() == 9)
             || SNAPSHOT_DOMAIN_TAG.contains("roster"),
         "the tags are allowed to share a prefix, but not to be equal"
     );
@@ -182,12 +182,7 @@ fn a_snapshot_does_not_replay_across_networks() {
 fn a_snapshot_from_a_non_admin_is_refused() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
 
     let mut roster = Roster::new();
     load(&mut roster, &history);
@@ -240,6 +235,18 @@ fn a_snapshot_matching_local_derivation_is_accepted() {
     assert!(roster.snapshot_is_verified());
 }
 
+/// A full node accepts a root the founder signed, by the key its own derived
+/// `founder` leaf holds, and refuses one signed by a key that is not it.
+#[test]
+fn a_root_the_founder_signed_is_accepted() {
+    let history = linear(3);
+    let mut roster = Roster::new();
+    load(&mut roster, &history);
+
+    let bytes = history.founder_snapshot_at(&["n2"]);
+    assert_eq!(roster.offer_snapshot(&bytes), SnapshotAdmission::Accepted { seq: 1 });
+}
+
 /// The rule that stops a compromised admin rewriting history.
 #[test]
 fn a_snapshot_disagreeing_with_local_derivation_is_refused() {
@@ -252,11 +259,10 @@ fn a_snapshot_disagreeing_with_local_derivation_is_refused() {
     let liar = {
         let mut fabricated = History::new();
         fabricated.genesis("g", 1);
-        fabricated.op(
+        fabricated.founder_op(
             "add9",
-            1,
             &["g"],
-            OperationBody::AddDevice(device(9, "ghost", Role::Admin, false)),
+            OperationBody::AddDevice(device(9, "ghost", Role::Admin)),
         );
         derive(&fabricated.dag()).expect("derives").root()
     };
@@ -287,8 +293,8 @@ fn a_bootstrapping_node_may_adopt_a_snapshot_it_cannot_derive() {
 fn a_partially_covered_node_does_not_count_as_verified() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
 
     // A node holding only one of the two branches the snapshot covers.
     let mut roster = Roster::new();
@@ -418,9 +424,9 @@ fn everything_retained_after_compaction_is_signature_covered() {
 fn a_held_concurrent_operation_prevents_compaction() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     // A branch that will be concurrent with the covered region.
-    history.op("side", 1, &["a"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("side", 1, &["a"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     let mut previous = "a".to_owned();
     for index in 0..12 {
         let label = format!("n{index}");
@@ -524,7 +530,7 @@ fn admissions_arriving_in_any_order_give_one_root() {
             &label,
             1,
             &[previous.as_str()],
-            OperationBody::AddDevice(device(index, &format!("d{index}"), Role::Member, false)),
+            OperationBody::AddDevice(device(index, &format!("d{index}"), Role::Member)),
         );
         previous = label;
     }
@@ -578,8 +584,8 @@ fn later_operations_outrank_values_carried_in_the_snapshot() {
 fn revocations_inside_and_after_a_snapshot_both_hold() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     history.op(
         "rev2",
         1,
@@ -802,15 +808,9 @@ fn an_attestation_from_a_member_is_refused() {
 fn an_attestation_from_a_revoked_admin_is_refused() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "promote",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "nas", Role::Admin, false)),
-    );
-    history.op(
+    history.founder_op("promote", &["g"], OperationBody::AddDevice(device(2, "nas", Role::Admin)));
+    history.founder_op(
         "revoke",
-        1,
         &["promote"],
         OperationBody::RevokeDevice { device: device_id(2), reason: "sold".to_owned() },
     );
@@ -888,7 +888,7 @@ fn a_restored_attestation_keeps_the_age_it_had() {
 fn a_far_future_timestamp_does_not_extend_freshness() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     // An operation stamped far in the future, carried into the snapshot.
     let core = OperationCore::new(
         u64::MAX,
@@ -1034,8 +1034,10 @@ fn a_snapshot_with_no_heads_is_rejected() {
             state.root(),
             roster::snapshot::Covering { heads: vec![], depths: vec![] },
             vec![],
-            state.leaf(&device).expect("a member"),
-            roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            roster::snapshot::RootSigner::Device {
+                leaf: state.leaf(&device).expect("a member"),
+                proof: roster::membership::MembershipProof::of(&state, &device).expect("proves")
+            },
             signer(1).key_id(),
             history.network(),
         )
@@ -1070,8 +1072,10 @@ fn signing_a_snapshot_works_under_both_algorithms() {
         state.root(),
         covering(),
         vec![],
-        state.leaf(&device).expect("a member"),
-        proof.clone(),
+        roster::snapshot::RootSigner::Device {
+            leaf: state.leaf(&device).expect("a member"),
+            proof: proof.clone(),
+        },
         signer(1).key_id(),
         history.network(),
     )
@@ -1096,7 +1100,7 @@ fn signing_a_snapshot_works_under_both_algorithms() {
         .expect("a key"),
     ];
     keys.sort_by_key(roster::types::KeyEntry::order_key);
-    let phone = roster::types::DeviceSpec::new(keys, "phone", Role::Admin, false, vec![])
+    let phone = roster::types::DeviceSpec::new(keys, "phone", Role::Admin, vec![])
         .expect("a device")
         .into_record(history.id("n1"))
         .expect("a record");
@@ -1106,11 +1110,13 @@ fn signing_a_snapshot_works_under_both_algorithms() {
         state.root(),
         covering(),
         vec![],
-        roster::leaf::DeviceLeaf {
-            record: phone,
-            settings: roster::leaf::DeviceSettings::default(),
+        roster::snapshot::RootSigner::Device {
+            leaf: roster::leaf::DeviceLeaf {
+                record: phone,
+                settings: roster::leaf::DeviceSettings::default(),
+            },
+            proof,
         },
-        proof,
         p256.key_id(),
         history.network(),
     )
@@ -1133,22 +1139,12 @@ fn signing_a_snapshot_works_under_both_algorithms() {
 fn a_repeated_add_across_a_snapshot_does_not_diverge() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("s0", 1, &["g"], OperationBody::AddDevice(device(2, "member", Role::Member, false)));
+    history.op("s0", 1, &["g"], OperationBody::AddDevice(device(2, "member", Role::Member)));
     history.op("s1", 1, &["s0"], OperationBody::Rename { device: device_id(2), name: "n0".into() });
-    history.op(
-        "s2",
-        1,
-        &["s1"],
-        OperationBody::AddDevice(device(2, "member", Role::Member, false)),
-    );
-    history.op("s3", 1, &["s2"], OperationBody::Promote { device: device_id(2), founder: false });
-    history.op(
-        "s4",
-        1,
-        &["s3"],
-        OperationBody::AddDevice(device(2, "member", Role::Member, false)),
-    );
-    history.op("s5", 1, &["s4"], OperationBody::Promote { device: device_id(2), founder: false });
+    history.op("s2", 1, &["s1"], OperationBody::AddDevice(device(2, "member", Role::Member)));
+    history.founder_op("s3", &["s2"], OperationBody::Promote { device: device_id(2) });
+    history.op("s4", 1, &["s3"], OperationBody::AddDevice(device(2, "member", Role::Member)));
+    history.founder_op("s5", &["s4"], OperationBody::Promote { device: device_id(2) });
 
     let mut compacted = Roster::with_staleness_depth(1);
     load(&mut compacted, &history);
@@ -1175,7 +1171,7 @@ fn a_repeated_add_across_a_snapshot_does_not_diverge() {
 fn forked_then_long(length: usize) -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
 
     // One author, two concurrent operations: a fork, deep in the history.
     history.op(
@@ -1274,20 +1270,14 @@ fn retained_evidence_is_whole_and_verifies() {
 fn a_revocation_settles_the_question_and_releases_the_evidence() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
+    history.founder_op(
         "add9",
-        1,
         &["g"],
-        OperationBody::AddDevice(device(9, "other-admin", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "other-admin", Role::Admin)),
     );
     // Device 9 forks.
-    history.op("left", 9, &["add9"], OperationBody::AddDevice(device(2, "l", Role::Member, false)));
-    history.op(
-        "right",
-        9,
-        &["add9"],
-        OperationBody::AddDevice(device(3, "r", Role::Member, false)),
-    );
+    history.op("left", 9, &["add9"], OperationBody::AddDevice(device(2, "l", Role::Member)));
+    history.op("right", 9, &["add9"], OperationBody::AddDevice(device(3, "r", Role::Member)));
 
     let mut roster = Roster::new();
     load(&mut roster, &history);
@@ -1295,9 +1285,8 @@ fn a_revocation_settles_the_question_and_releases_the_evidence() {
 
     // The founder revokes the equivocating device, which is the remedy the
     // roster refuses to apply by itself.
-    history.op(
+    history.founder_op(
         "expel",
-        1,
         &["left", "right"],
         OperationBody::RevokeDevice {
             device: device_id(9),
@@ -1404,7 +1393,7 @@ fn a_restored_attestation_keeps_the_age_it_arrived_with() {
 fn two_admins() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin, false)));
+    history.founder_op("a", &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Admin)));
     history
 }
 
@@ -1521,8 +1510,10 @@ fn a_generation_inconsistent_with_what_it_follows_is_refused() {
             state.root(),
             roster::snapshot::Covering { heads: vec![history.id("n1")], depths: vec![2] },
             vec![],
-            state.leaf(&device).expect("a member"),
-            roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            roster::snapshot::RootSigner::Device {
+                leaf: state.leaf(&device).expect("a member"),
+                proof: roster::membership::MembershipProof::of(&state, &device).expect("proves"),
+            },
             signer(1).key_id(),
             history.network(),
         )
@@ -1591,12 +1582,7 @@ fn ten_thousand_operations_pass_without_reaching_the_ceiling() {
 fn compacting_chain(acts: usize) {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "add2",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     let mut compacted = Roster::with_staleness_depth(8);
     for entry in history.entries() {
         assert!(compacted.offer_bytes(&entry.bytes).is_accepted());
@@ -1661,11 +1647,16 @@ fn windowless() -> History {
     history.genesis_with(
         "g",
         1,
-        device(1, "phone", Role::Admin, true),
-        roster::types::NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0)
-            .expect("well-formed"),
+        device(1, "phone", Role::Admin),
+        roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            0,
+        )
+        .expect("well-formed"),
     );
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history
 }
 
@@ -1684,9 +1675,13 @@ fn a_network_with_no_window_is_fresh_after_a_year_without_attestations() {
 /// they were written, whichever way they travel.
 #[test]
 fn no_window_is_the_key_and_the_leaf_left_out() {
-    let params =
-        roster::types::NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 0)
-            .expect("well-formed");
+    let params = roster::types::NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
+        vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+        "example.internal",
+        0,
+    )
+    .expect("well-formed");
     assert!(params.leaves().iter().all(|leaf| leaf.name() != "window"));
     let back = roster::types::NetworkParams::from_leaves(params.leaves()).expect("reads back");
     assert_eq!(back, params);
@@ -1709,9 +1704,9 @@ fn an_address_taken_after_the_snapshot_leaves_its_holder_without_it() {
     };
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     history.op("b", 1, &["a"], assign(2));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     history.op(
         "d",
         1,

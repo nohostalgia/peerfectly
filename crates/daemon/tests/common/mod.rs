@@ -58,6 +58,16 @@ impl Network {
     }
 }
 
+/// The founder's words of [`a_network`], which alone act on an admin.
+#[must_use]
+pub fn the_founders_words() -> identity::founder::FounderKey {
+    identity::founder::FounderKey::from_text(
+        "legal winner thank year wave sausage worth useful legal winner thank year wave \
+         sausage worth useful legal winner thank year wave sausage worth title",
+    )
+    .expect("the words")
+}
+
 /// Builds the network, signing each operation as the founder.
 #[must_use]
 pub fn a_network() -> Network {
@@ -66,6 +76,7 @@ pub fn a_network() -> Network {
     let third = Arc::new(NodeIdentity::generate().expect("generates"));
 
     let params = NetworkParams::with_relay(
+        the_founders_words().keys(),
         vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
         None::<String>,
         "example.internal",
@@ -77,7 +88,7 @@ pub fn a_network() -> Network {
         1,
         founder.signing_key().algorithm(),
         OperationBody::CreateNetwork {
-            device: founder.device_spec("a", Role::Admin, true, vec![]).expect("spec"),
+            device: founder.device_spec("a", Role::Admin, vec![]).expect("spec"),
             params,
         },
         vec![],
@@ -91,9 +102,7 @@ pub fn a_network() -> Network {
     let add = OperationCore::new(
         2,
         founder.signing_key().algorithm(),
-        OperationBody::AddDevice(
-            joiner.device_spec("b", Role::Member, false, vec![]).expect("spec"),
-        ),
+        OperationBody::AddDevice(joiner.device_spec("b", Role::Member, vec![]).expect("spec")),
         vec![genesis.id()],
         founder.signing_key().key_id(),
         network,
@@ -104,9 +113,7 @@ pub fn a_network() -> Network {
     let add_third = OperationCore::new(
         3,
         founder.signing_key().algorithm(),
-        OperationBody::AddDevice(
-            third.device_spec("c", Role::Member, false, vec![]).expect("spec"),
-        ),
+        OperationBody::AddDevice(third.device_spec("c", Role::Member, vec![]).expect("spec")),
         vec![add.id()],
         founder.signing_key().key_id(),
         network,

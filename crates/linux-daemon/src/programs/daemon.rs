@@ -36,6 +36,13 @@ pub fn main() -> ExitCode {
     if !may_run_from_here() {
         return ExitCode::FAILURE;
     }
+    let state = match state_asked() {
+        Ok(state) => state,
+        Err(cause) => {
+            tracing::error!(%cause, "not starting");
+            return ExitCode::FAILURE;
+        }
+    };
     // Held until `main` returns, which is how long this is the only daemon.
     let _only = match crate::socket::only_one() {
         Ok(held) => held,
@@ -54,7 +61,7 @@ pub fn main() -> ExitCode {
     };
 
     let headless = std::env::args().any(|word| word == crate::HEADLESS);
-    let service = match runtime.block_on(start(headless)) {
+    let service = match runtime.block_on(start(headless, state.as_deref())) {
         Ok(service) => service,
         Err(cause) => {
             tracing::error!(%cause, "could not start");
@@ -134,27 +141,66 @@ fn may_run_from_here() -> bool {
     false
 }
 
+/// The state directory `--state` names, if it is given.
+///
+/// UTF-8 only: the command line is told the directory as text, and a path that
+/// could not be said exactly would send it to another one.
+///
+/// # Errors
+///
+/// When the flag is given without a directory, or with one that is not UTF-8.
+fn state_asked() -> Result<Option<std::path::PathBuf>, String> {
+    let mut words = std::env::args_os().skip(1);
+    while let Some(word) = words.next() {
+        if word != crate::STATE_DIRECTORY {
+            continue;
+        }
+        let Some(value) = words.next() else {
+            return Err(format!(
+                "{} needs the directory to keep the state in",
+                crate::STATE_DIRECTORY
+            ));
+        };
+        let Some(text) = value.to_str() else {
+            return Err(format!("the directory given to {} is not UTF-8", crate::STATE_DIRECTORY));
+        };
+        return Ok(Some(std::path::PathBuf::from(text)));
+    }
+    Ok(None)
+}
+
 /// Assembles the service, writes the firewall table, and brings back what was
 /// left on. Headless, as an anchor: no packet interface, no resolver and no
 /// firewall table, and every network carried all the same.
-async fn start(headless: bool) -> daemon::Result<Arc<daemon::Service>> {
+async fn start(
+    headless: bool,
+    state: Option<&std::path::Path>,
+) -> daemon::Result<Arc<daemon::Service>> {
     use daemon::connectivity::Convesso;
     use daemon::lifecycle::Lifecycle;
     use daemon::resolving::sockets::Sockets;
     use daemon::{Connectivity, Machine, Resolving, Service};
 
-    let home = crate::home::home_for_this_machine()?;
+    let home = match state {
+        Some(chosen) => crate::home::home_at(chosen)?,
+        None => crate::home::home_for_this_machine()?,
+    };
     home.create()?;
     let keys = crate::custody::keys::LinuxKeys::open(home.root())?;
+    // The report says where the state is only when it is not the default.
+    let named = |service: Service| match state {
+        Some(chosen) => service.with_state_named(chosen.display().to_string()),
+        None => service,
+    };
 
     if headless {
-        let service = Arc::new(Service::over_with_keys(
+        let service = Arc::new(named(Service::over_with_keys(
             home,
             Lifecycle::new(Arc::new(daemon::machine::Headless) as Arc<dyn Machine>),
             Arc::new(Convesso) as Arc<dyn Connectivity>,
             Arc::new(daemon::resolving::Nowhere) as Arc<dyn Resolving>,
             Arc::new(keys),
-        )?);
+        )?));
         match service.resume().await {
             Ok(true) => tracing::info!("the networks left on are on again"),
             Ok(false) => {}
@@ -165,7 +211,7 @@ async fn start(headless: bool) -> daemon::Result<Arc<daemon::Service>> {
 
     let firewall = crate::firewall::Nftables::under(home.root());
 
-    let service = Arc::new(
+    let service = Arc::new(named(
         Service::over_with_keys(
             home,
             Lifecycle::new(
@@ -176,7 +222,7 @@ async fn start(headless: bool) -> daemon::Result<Arc<daemon::Service>> {
             Arc::new(keys),
         )?
         .with_exposing(Arc::new(firewall.clone()) as Arc<dyn daemon::exposing::Exposing>),
-    );
+    ));
 
     // **Before anything comes up.** Every bring-up writes it again, and refuses
     // when it cannot; this is so the table is there, and current, from the

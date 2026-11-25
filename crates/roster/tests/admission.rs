@@ -20,9 +20,9 @@ use support::{History, device, device_id, signer};
 fn chain() -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member, false)));
-    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(4, "tablet", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(4, "tablet", Role::Member)));
     history
 }
 
@@ -113,12 +113,7 @@ fn the_pending_bound_is_enforced_and_reported() {
     history.genesis("g", 1);
     // Build more orphans than the bound allows, each hanging off an operation
     // the roster will never be given.
-    history.op(
-        "hidden",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("hidden", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     let mut labels = Vec::new();
     for index in 0..=limits::MAX_PENDING_OPERATIONS {
         let label = format!("orphan{index}");
@@ -190,12 +185,7 @@ fn a_pending_operation_with_a_bad_signature_is_rejected_on_integration() {
 fn deep_history(depth: usize) -> History {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op(
-        "anchor",
-        1,
-        &["g"],
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-    );
+    history.op("anchor", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
     let mut previous = "anchor".to_owned();
     for index in 0..depth {
         let label = format!("d{index}");
@@ -212,7 +202,7 @@ fn deep_history(depth: usize) -> History {
         "backdated",
         1,
         &["anchor"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "nas", Role::Member)),
     );
     history
 }
@@ -248,7 +238,7 @@ fn an_old_parent_beside_a_recent_one_is_stale() {
         "straddling",
         1,
         &["anchor", "d11"],
-        OperationBody::AddDevice(device(4, "printer", Role::Member, false)),
+        OperationBody::AddDevice(device(4, "printer", Role::Member)),
     );
     let mut roster = Roster::with_staleness_depth(4);
     for entry in history.entries() {
@@ -415,8 +405,8 @@ fn undecodable_bytes_are_refused_with_a_reason() {
 fn the_evidence_is_the_bytes_that_arrived() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
 
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -454,8 +444,8 @@ fn the_evidence_is_the_bytes_that_arrived() {
 fn the_evidence_verifies_under_the_accused_key() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
 
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -487,8 +477,8 @@ fn the_evidence_verifies_under_the_accused_key() {
 fn any_member_reaches_the_verdict_independently() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
-    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.op("b", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
+    history.op("c", 1, &["g"], OperationBody::AddDevice(device(3, "c", Role::Member)));
 
     // Two members, loading the same operations in opposite orders.
     let entries = history.entries();
@@ -522,9 +512,9 @@ fn the_pair_alone_does_not_settle_concurrency() {
     let mut history = History::new();
     history.genesis("g", 1);
     // A chain by one author: each anchored to its own previous operation.
-    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "a", Role::Member, false)));
-    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "b", Role::Member, false)));
-    history.op("c", 1, &["b"], OperationBody::AddDevice(device(4, "c", Role::Member, false)));
+    history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "a", Role::Member)));
+    history.op("b", 1, &["a"], OperationBody::AddDevice(device(3, "b", Role::Member)));
+    history.op("c", 1, &["b"], OperationBody::AddDevice(device(4, "c", Role::Member)));
 
     // `a` and `c` are by one author and neither names the other directly — the
     // shape a naive check on a bare pair would read as a fork.

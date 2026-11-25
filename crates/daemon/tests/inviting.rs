@@ -27,6 +27,7 @@ fn founded(paths: &Paths, relay: &str) -> (identity::NodeIdentity, roster::state
     found(
         paths,
         &Founding {
+            founder: roster::types::FounderKeys::held_by_nobody(),
             name: "nas".to_owned(),
             suffix: "peerfectly.internal".to_owned(),
             relay: Some(relay.to_owned()),
@@ -72,12 +73,14 @@ fn joining(
         started_at: 1,
         requested_at: None,
         conflicts: Vec::new(),
+        admin: false,
+        refused: None,
     };
     let (underway, reporting) = Underway::new(Progress::Registering);
     let paths = paths.clone();
     let task = tokio::spawn(async move {
         let identity = daemon::keys::PlatformKeys.identity(&paths).unwrap();
-        daemon::joining::run(&paths, &join, &identity, &reporting, |_| {}).await
+        daemon::joining::run(&paths, &join, &identity, &reporting, |_| {}, |_| {}).await
     });
     (identity, underway, task)
 }
@@ -87,7 +90,9 @@ fn joining(
 async fn requested(record: &Record) -> Applicant {
     tokio::time::timeout(A_STEP, async {
         loop {
-            if let Ok(applicant) = admitting::collect(&record.invite).await {
+            if let Ok(admitting::Collected::Request(applicant)) =
+                admitting::collect(&record.invite, record.invited.role).await
+            {
                 return applicant;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -117,9 +122,18 @@ fn admission(
     applicant: &Applicant,
     invited: &Invited,
 ) -> Vec<Vec<u8>> {
-    let (core, _name) =
-        admitting::admission_core(applicant, invited, admin, state, heads, false).unwrap();
-    let settings = admitting::settings_core(invited, admin, state, &core).unwrap();
+    let (core, _name) = admitting::admission_core(
+        applicant,
+        invited,
+        &daemon::signing::Author::of(admin),
+        state,
+        heads,
+        false,
+    )
+    .unwrap();
+    let settings =
+        admitting::settings_core(invited, &daemon::signing::Author::of(admin), state, &core)
+            .unwrap();
     core::iter::once(&core)
         .chain(settings.as_ref())
         .map(|each| admin.sign_operation(each).unwrap())
@@ -153,6 +167,23 @@ async fn delivered(
     .expect("the device is reached")
 }
 
+/// The key an invite `admin` issues is anchored to: its attestation key.
+fn anchor(admin: &identity::NodeIdentity) -> roster::id::KeyId {
+    admin.attestation_key().key_id()
+}
+
+/// The root `admin` signs over what it delivers: the whole roster, the
+/// admission among it, resting on `base` where there is one.
+fn root_over(
+    admin: &identity::NodeIdentity,
+    base: Option<enrollment::adopt::Base>,
+    operations: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut roster = roster::roster::Roster::new();
+    enrollment::adopt::fill(&mut roster, base, operations, &[]).unwrap();
+    daemon::snapshots::sign_over_heads(&roster, admin).unwrap()
+}
+
 fn invited() -> Invited {
     Invited {
         name: "sensor".to_owned(),
@@ -170,9 +201,16 @@ async fn an_invited_device_joins_as_its_invite_says() {
     let admin_home = tempfile::tempdir().unwrap();
     let admin_paths = Paths::under(admin_home.path());
     let (admin, state) = founded(&admin_paths, &url);
-    let record =
-        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
-            .unwrap();
+    let record = Record::issue(
+        &url,
+        state.network,
+        state.params.ipv4_range(),
+        anchor(&admin),
+        invited(),
+        1,
+        1_000_000,
+    )
+    .unwrap();
 
     let joiner_home = tempfile::tempdir().unwrap();
     let joiner_paths = Paths::under(joiner_home.path());
@@ -187,7 +225,8 @@ async fn an_invited_device_joins_as_its_invite_says() {
     // Approved later: the roster, as the invite's record says.
     let (heads, mut log) = held(&admin_paths);
     log.extend(admission(&admin, &state, heads, &applicant, &record.invited));
-    let delivery = Delivery { operations: log, pieces: Vec::new(), snapshot: None, base: None };
+    let snapshot = Some(root_over(&admin, None, &log));
+    let delivery = Delivery { operations: log, pieces: Vec::new(), snapshot, base: None };
     assert!(delivered(&url, &record, &applicant, &delivery).await, "it adopted the network");
     let joined = tokio::time::timeout(A_STEP, task).await.unwrap().unwrap().expect("joins");
     assert_eq!(joined.devices, 2);
@@ -204,15 +243,71 @@ async fn an_invited_device_joins_as_its_invite_says() {
     assert_eq!(settings.groups, vec![Group::new("sensori").unwrap()]);
 }
 
+/// The network itself, genuine in every operation, is still refused without a
+/// root its invite's anchor signed: that root is what ties what arrived to the
+/// invite, and a delivery that lacks it, or carries another key's, could have
+/// been made by anybody who learned the secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_network_without_its_anchors_root_is_refused() {
+    let relay = TestRelay::start().await;
+    let url = relay.written();
+    let admin_home = tempfile::tempdir().unwrap();
+    let admin_paths = Paths::under(admin_home.path());
+    let (admin, state) = founded(&admin_paths, &url);
+    // Anchored to a key that is not the admin's.
+    let elsewhere = identity::NodeIdentity::generate().unwrap();
+    let record = Record::issue(
+        &url,
+        state.network,
+        state.params.ipv4_range(),
+        anchor(&elsewhere),
+        invited(),
+        1,
+        1_000_000,
+    )
+    .unwrap();
+
+    let joiner_home = tempfile::tempdir().unwrap();
+    let joiner_paths = Paths::under(joiner_home.path());
+    let (_fresh, underway, task) = joining(&joiner_paths, &record.invite.to_text());
+    let applicant = requested(&record).await;
+    let (heads, mut log) = held(&admin_paths);
+    log.extend(admission(&admin, &state, heads, &applicant, &record.invited));
+
+    let without =
+        Delivery { operations: log.clone(), pieces: Vec::new(), snapshot: None, base: None };
+    assert!(!delivered(&url, &record, &applicant, &without).await, "no root: not taken");
+    let snapshot = Some(root_over(&admin, None, &log));
+    let another = Delivery { operations: log, pieces: Vec::new(), snapshot, base: None };
+    assert!(!delivered(&url, &record, &applicant, &another).await, "another key's root: not taken");
+    assert!(Log::at(joiner_paths.roster()).read().unwrap().is_empty(), "nothing was written");
+    tokio::time::timeout(A_STEP, async {
+        while underway.last_refusal().is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("it says why");
+    assert!(!task.is_finished(), "and goes on waiting");
+    task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leaked_secret_cannot_pull_the_device_into_another_network() {
     let relay = TestRelay::start().await;
     let url = relay.written();
     let admin_home = tempfile::tempdir().unwrap();
-    let (_admin, state) = founded(&Paths::under(admin_home.path()), &url);
-    let record =
-        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
-            .unwrap();
+    let (admin, state) = founded(&Paths::under(admin_home.path()), &url);
+    let record = Record::issue(
+        &url,
+        state.network,
+        state.params.ipv4_range(),
+        anchor(&admin),
+        invited(),
+        1,
+        1_000_000,
+    )
+    .unwrap();
 
     // Somebody who learned the secret, with a network of their own, takes the
     // request and admits the device into it.
@@ -264,13 +359,14 @@ fn compacted(
             root = daemon::snapshots::sign_over_heads(&roster, admin).expect("signs a root");
             assert!(roster.offer_snapshot(&root).is_accepted());
         }
+        // The suffix, not the admin's own name: an act on an admin is the
+        // founder key's alone.
+        let mut params = roster.state().unwrap().params;
+        params.suffix = format!("nas-{index}.internal");
         let core = roster::types::OperationCore::new(
             index.saturating_add(2),
             admin.signing_key().algorithm(),
-            roster::types::OperationBody::Rename {
-                device: admin.device_id(),
-                name: format!("nas-{index}"),
-            },
+            roster::types::OperationBody::SetNetwork(params),
             roster.heads(),
             admin.signing_key().key_id(),
             network,
@@ -294,9 +390,16 @@ async fn a_device_invited_into_a_compacted_network_rests_on_the_state_beneath_it
     let (roster, base) = compacted(&admin, &admin_paths);
     let mut window = roster.retained_operations();
     let state = roster.state().unwrap();
-    let record =
-        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
-            .unwrap();
+    let record = Record::issue(
+        &url,
+        state.network,
+        state.params.ipv4_range(),
+        anchor(&admin),
+        invited(),
+        1,
+        1_000_000,
+    )
+    .unwrap();
 
     let joiner_home = tempfile::tempdir().unwrap();
     let joiner_paths = Paths::under(joiner_home.path());
@@ -306,8 +409,8 @@ async fn a_device_invited_into_a_compacted_network_rests_on_the_state_beneath_it
     let admitted = admission(&admin, &state, roster.heads(), &applicant, &record.invited);
     let sent = window.len() + admitted.len();
     window.extend(admitted);
-    let delivery =
-        Delivery { operations: window, pieces: Vec::new(), snapshot: None, base: Some(base) };
+    let snapshot = Some(root_over(&admin, Some(base.clone()), &window));
+    let delivery = Delivery { operations: window, pieces: Vec::new(), snapshot, base: Some(base) };
     assert!(delivered(&url, &record, &applicant, &delivery).await, "it adopted the network");
     let joined = tokio::time::timeout(A_STEP, task).await.unwrap().unwrap().expect("joins");
     assert_eq!(joined.devices, 2);
@@ -336,9 +439,16 @@ async fn a_base_that_does_not_make_its_root_is_refused() {
     let state = roster.state().unwrap();
     // A state that is not the one the root commits to.
     base.state = state.clone();
-    let record =
-        Record::issue(&url, state.network, state.params.ipv4_range(), invited(), 1, 1_000_000)
-            .unwrap();
+    let record = Record::issue(
+        &url,
+        state.network,
+        state.params.ipv4_range(),
+        anchor(&admin),
+        invited(),
+        1,
+        1_000_000,
+    )
+    .unwrap();
 
     let joiner_home = tempfile::tempdir().unwrap();
     let joiner_paths = Paths::under(joiner_home.path());

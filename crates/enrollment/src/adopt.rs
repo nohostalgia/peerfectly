@@ -69,11 +69,63 @@ pub fn adopt_on(
     pieces: &[Vec<u8>],
     identity: &NodeIdentity,
 ) -> Result<Adopted> {
+    adopted_into(&mut Roster::new(), base, operations, pieces, identity)
+}
+
+/// As [`adopt_on`], and only with `root`: a root signed by `anchor` (the
+/// invite's), over heads the delivery holds, committing to a state that admits
+/// this device.
+///
+/// This is what ties the network to the invite. The checks of [`adopt_on`]
+/// prove a roster internally consistent; a network resting on a compacted base
+/// names its own keys, and a consistent one can be made by anybody under any
+/// network id. A root the anchor signed cannot.
+///
+/// # Errors
+///
+/// As [`adopt_on`], and [`Error::NotAnchored`] when there is no such root.
+pub fn adopt_anchored(
+    base: Option<Base>,
+    operations: &[Vec<u8>],
+    pieces: &[Vec<u8>],
+    root: Option<&[u8]>,
+    anchor: &roster::id::KeyId,
+    identity: &NodeIdentity,
+) -> Result<Adopted> {
+    let mut roster = Roster::new();
+    let adopted = adopted_into(&mut roster, base, operations, pieces, identity)?;
+    let root = root.ok_or(Error::NotAnchored)?;
+    let raw = roster::snapshot::RawSnapshot::decode(root).map_err(|_| Error::NotAnchored)?;
+    if raw.body().author != *anchor || raw.body().network != adopted.state.network {
+        return Err(Error::NotAnchored);
+    }
+    // Signed, by a founder or admin key of the state, and verified against
+    // that state derived here from what was delivered: only then is it held
+    // as `Accepted`.
+    if !matches!(roster.offer_snapshot(root), roster::roster::SnapshotAdmission::Accepted { .. }) {
+        return Err(Error::NotAnchored);
+    }
+    let me = DeviceId::of_signing_key(identity.signing_key().public_key().as_bytes());
+    let vouched = roster::state::state_for_parents(roster.dag(), &raw.body().heads)
+        .map_err(|_| Error::NotAnchored)?;
+    if !vouched.devices.contains_key(&me) || vouched.revoked.contains(&me) {
+        return Err(Error::NotAnchored);
+    }
+    Ok(adopted)
+}
+
+/// [`adopt_on`]'s checks, over `roster`, which is left holding what arrived.
+fn adopted_into(
+    roster: &mut Roster,
+    base: Option<Base>,
+    operations: &[Vec<u8>],
+    pieces: &[Vec<u8>],
+    identity: &NodeIdentity,
+) -> Result<Adopted> {
     let signing = identity.signing_key().public_key();
     let transport = identity.transport_key().public_key();
 
-    let mut roster = Roster::new();
-    fill(&mut roster, base, operations, pieces)?;
+    fill(roster, base, operations, pieces)?;
     let state = roster.state()?;
     let base = roster.dag().base_snapshot().cloned().zip(roster.dag().base_state().cloned());
 
@@ -215,6 +267,7 @@ mod tests {
     /// A founder, and a network that admits `joiner` if `admit` is set.
     fn network(founder: &NodeIdentity, joiner: &NodeIdentity, admit: bool) -> Vec<Vec<u8>> {
         let params = NetworkParams::with_relay(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             Some("https://relay.example:443"),
             "example.internal",
@@ -226,7 +279,7 @@ mod tests {
             1,
             founder.signing_key().algorithm(),
             OperationBody::CreateNetwork {
-                device: founder.device_spec("founder", Role::Admin, true, vec![]).expect("spec"),
+                device: founder.device_spec("founder", Role::Admin, vec![]).expect("spec"),
                 params,
             },
             vec![],
@@ -243,7 +296,7 @@ mod tests {
                 2,
                 founder.signing_key().algorithm(),
                 OperationBody::AddDevice(
-                    joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+                    joiner.device_spec("joiner", Role::Member, vec![]).expect("spec"),
                 ),
                 vec![genesis.id()],
                 founder.signing_key().key_id(),
@@ -270,7 +323,7 @@ mod tests {
         let genesis = RawOperation::decode(delivered.first().expect("genesis")).expect("decodes");
         let network = NetworkId::from_bytes(*genesis.id().as_bytes());
 
-        let mut keys = board.device_spec("board", Role::Member, false, vec![]).expect("spec").keys;
+        let mut keys = board.device_spec("board", Role::Member, vec![]).expect("spec").keys;
         keys.sort_by_key(KeyEntry::order_key);
         let entries = vec![BatchEntry {
             keys,
@@ -297,7 +350,7 @@ mod tests {
             3,
             founder.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("joiner", Role::Member, vec![]).expect("spec"),
             ),
             vec![batch.id()],
             founder.signing_key().key_id(),
@@ -358,7 +411,7 @@ mod tests {
             2,
             outsider.signing_key().algorithm(),
             OperationBody::AddDevice(
-                joiner.device_spec("joiner", Role::Member, false, vec![]).expect("spec"),
+                joiner.device_spec("joiner", Role::Member, vec![]).expect("spec"),
             ),
             vec![genesis.id()],
             outsider.signing_key().key_id(),

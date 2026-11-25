@@ -30,7 +30,7 @@ use support::{History, device, device_id};
 fn member_acting_from_before_its_own_admission(body: OperationBody) -> (Roster, RosterState) {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
     history.op("attack", 2, &["g"], body);
 
     let mut roster = Roster::new();
@@ -64,7 +64,6 @@ fn an_author_absent_from_its_own_ancestors_cannot_add_a_device() {
         3,
         "smuggled",
         Role::Member,
-        false,
     )));
     assert!(!state.devices.contains_key(&device_id(3)), "a device nobody with authority added");
     only_the_founder_and_the_member(&state);
@@ -74,15 +73,12 @@ fn an_author_absent_from_its_own_ancestors_cannot_add_a_device() {
 fn an_author_absent_from_its_own_ancestors_cannot_promote_itself() {
     let (_, state) = member_acting_from_before_its_own_admission(OperationBody::Promote {
         device: device_id(2),
-        founder: true,
     });
     only_the_founder_and_the_member(&state);
-    assert!(!state.is_founder(&device_id(2)), "and it did not make itself a founder on the way");
 }
 
-/// Founder protection sits *after* the authority check, so an author that slips
-/// past the first check never meets the second. Anchoring earlier must not be a
-/// way to reach it.
+/// Anchoring before its own admission is no way for a member to revoke an
+/// admin, the one that founded the network included.
 #[test]
 fn an_author_absent_from_its_own_ancestors_cannot_revoke_the_founder() {
     let (_, state) = member_acting_from_before_its_own_admission(OperationBody::RevokeDevice {
@@ -96,6 +92,7 @@ fn an_author_absent_from_its_own_ancestors_cannot_revoke_the_founder() {
 #[test]
 fn an_author_absent_from_its_own_ancestors_cannot_rewrite_the_network() {
     let theirs = NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
         vec![0xfd, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66],
         "attacker.internal",
         2_592_000,
@@ -114,7 +111,7 @@ fn an_author_absent_from_its_own_ancestors_cannot_rewrite_the_network() {
 #[test]
 fn an_author_absent_from_its_own_ancestors_is_unauthorised() {
     let (roster, _) = member_acting_from_before_its_own_admission(OperationBody::AddDevice(
-        device(3, "smuggled", Role::Member, false),
+        device(3, "smuggled", Role::Member),
     ));
 
     let (_, verdicts) = derive_with_verdicts(roster.dag()).expect("derives");
@@ -139,13 +136,8 @@ fn an_author_absent_from_its_own_ancestors_is_unauthorised() {
 fn an_admin_acting_where_its_authority_is_visible_is_honoured() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-    history.op(
-        "work",
-        2,
-        &["addB"],
-        OperationBody::AddDevice(device(3, "laptop", Role::Member, false)),
-    );
+    history.founder_op("addB", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+    history.op("work", 2, &["addB"], OperationBody::AddDevice(device(3, "laptop", Role::Member)));
 
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -164,14 +156,14 @@ fn an_admin_acting_where_its_authority_is_visible_is_honoured() {
 fn an_unauthorised_operation_offered_before_its_parents_is_refused_when_they_arrive() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
     // Authored by the member, anchored on `addB` — so by the time it can be
     // judged, its author is present and is plainly a member.
     history.op(
         "attack",
         2,
         &["addB"],
-        OperationBody::AddDevice(device(3, "smuggled", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "smuggled", Role::Member)),
     );
 
     let entries = history.entries();
@@ -232,7 +224,7 @@ fn derived(history: &History) -> (RosterState, Vec<(String, String)>) {
 fn a_revocation_from_a_member_voids_nothing_but_itself() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
     history.op(
         "attack",
         2,
@@ -251,20 +243,15 @@ fn a_revocation_from_a_member_voids_nothing_but_itself() {
     assert!(!state.revoked.contains(&device_id(1)), "and the founder is not revoked");
 }
 
-/// The same rule where the author *is* an admin: a revocation refused by founder
-/// protection is still no removal, so the founder's concurrent work stands.
+/// The same rule where the author holds a key that is not an admin's: a member's
+/// revocation is no removal, so the admin's concurrent work stands.
 #[test]
 fn a_revocation_refused_by_founder_protection_voids_nothing_but_itself() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
     // Concurrent: both hang off `addB`.
-    history.op(
-        "work",
-        1,
-        &["addB"],
-        OperationBody::AddDevice(device(3, "laptop", Role::Member, false)),
-    );
+    history.op("work", 1, &["addB"], OperationBody::AddDevice(device(3, "laptop", Role::Member)));
     history.op(
         "retire",
         2,
@@ -276,7 +263,7 @@ fn a_revocation_refused_by_founder_protection_voids_nothing_but_itself() {
 
     assert_eq!(
         disregarded,
-        vec![("retire".to_owned(), "founder_protected".to_owned())],
+        vec![("retire".to_owned(), "unauthorized_author".to_owned())],
         "the refused revocation, and nothing else"
     );
     assert!(
@@ -292,14 +279,14 @@ fn a_revocation_refused_by_founder_protection_voids_nothing_but_itself() {
 fn an_authorised_removal_still_voids_the_work_concurrent_with_it() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
+    history.founder_op("addB", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
     // The founder demotes B; B, not having seen it, adds a device concurrently.
-    history.op("demoteB", 1, &["addB"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("demoteB", &["addB"], OperationBody::Demote { device: device_id(2) });
     history.op(
         "backdated",
         2,
         &["addB"],
-        OperationBody::AddDevice(device(9, "backdoor", Role::Admin, false)),
+        OperationBody::AddDevice(device(9, "backdoor", Role::Member)),
     );
 
     let (state, disregarded) = derived(&history);
@@ -330,15 +317,10 @@ fn an_authorised_removal_still_voids_the_work_concurrent_with_it() {
 fn work_anchored_before_a_demotion_is_admitted_by_a_node_that_holds_the_demotion() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-    history.op("demoteB", 1, &["addB"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("addB", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+    history.founder_op("demoteB", &["addB"], OperationBody::Demote { device: device_id(2) });
     // B, not having seen the demotion, keeps working from where it was.
-    history.op(
-        "work",
-        2,
-        &["addB"],
-        OperationBody::AddDevice(device(3, "laptop", Role::Member, false)),
-    );
+    history.op("work", 2, &["addB"], OperationBody::AddDevice(device(3, "laptop", Role::Member)));
 
     let entries = history.entries();
     let mut roster = Roster::new();
@@ -364,13 +346,13 @@ fn work_anchored_before_a_demotion_is_admitted_by_a_node_that_holds_the_demotion
 fn work_descended_from_its_authors_demotion_is_refused() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-    history.op("demoteB", 1, &["addB"], OperationBody::Demote { device: device_id(2) });
+    history.founder_op("addB", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+    history.founder_op("demoteB", &["addB"], OperationBody::Demote { device: device_id(2) });
     history.op(
         "after",
         2,
         &["demoteB"],
-        OperationBody::AddDevice(device(3, "laptop", Role::Member, false)),
+        OperationBody::AddDevice(device(3, "laptop", Role::Member)),
     );
 
     let mut roster = Roster::new();
@@ -406,7 +388,7 @@ fn four_hundred_operations_from_a_member_fill_nothing() {
 
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
 
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -454,7 +436,7 @@ fn four_hundred_operations_from_a_member_fill_nothing() {
 fn a_member_is_refused_whatever_parents_it_names() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member, false)));
+    history.op("addB", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Member)));
     for step in 0..6 {
         let label = format!("s{step}");
         let parent = if step == 0 { "addB".to_owned() } else { format!("s{}", step - 1) };
@@ -462,7 +444,7 @@ fn a_member_is_refused_whatever_parents_it_names() {
             &label,
             1,
             &[parent.as_str()],
-            OperationBody::AddDevice(device(10 + step, "device", Role::Member, false)),
+            OperationBody::AddDevice(device(10 + step, "device", Role::Member)),
         );
     }
 
@@ -484,7 +466,6 @@ fn a_member_is_refused_whatever_parents_it_names() {
                 30 + u8::try_from(attempt).expect("small"),
                 "x",
                 Role::Member,
-                false,
             )),
         );
         let admission = roster.offer_bytes(&history.bytes(&label));
@@ -509,27 +490,23 @@ fn a_member_is_refused_whatever_parents_it_names() {
 fn the_kept_state_equals_derivation_after_every_admission() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "c", Role::Member)));
     history.op(
         "rename3",
         2,
         &["add3"],
         OperationBody::Rename { device: device_id(3), name: "renamed".to_owned() },
     );
-    history.op(
-        "promote3",
-        1,
-        &["rename3"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
-    history.op("demote3", 2, &["promote3"], OperationBody::Demote { device: device_id(3) });
+    history.founder_op("promote3", &["rename3"], OperationBody::Promote { device: device_id(3) });
+    history.founder_op("demote3", &["promote3"], OperationBody::Demote { device: device_id(3) });
     history.op(
         "params",
         1,
         &["demote3"],
         OperationBody::SetNetwork(
             roster::types::NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0x09, 0, 0, 0, 0, 0, 0],
                 "altro.internal",
                 2_592_000,
@@ -544,12 +521,7 @@ fn the_kept_state_equals_derivation_after_every_admission() {
         OperationBody::RevokeDevice { device: device_id(3), reason: "sold".to_owned() },
     );
     // A re-add after the revocation: a deliberate act, which admits it again.
-    history.op(
-        "readd3",
-        1,
-        &["revoke3"],
-        OperationBody::AddDevice(device(3, "c", Role::Member, false)),
-    );
+    history.op("readd3", 1, &["revoke3"], OperationBody::AddDevice(device(3, "c", Role::Member)));
 
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -595,9 +567,9 @@ fn a_revocation_gives_back_no_address_its_device_won() {
     };
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "c", Role::Member, false)));
-    history.op("add4", 1, &["add3"], OperationBody::AddDevice(device(4, "d", Role::Member, false)));
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "c", Role::Member)));
+    history.op("add4", 1, &["add3"], OperationBody::AddDevice(device(4, "d", Role::Member)));
     // Two admins assign the address at once, and an act joins the branches.
     history.op("set3", 1, &["add4"], assign(3));
     history.op("set4", 2, &["add4"], assign(4));
@@ -605,7 +577,7 @@ fn a_revocation_gives_back_no_address_its_device_won() {
         "joined",
         1,
         &["set3", "set4"],
-        OperationBody::Rename { device: device_id(2), name: "pc".to_owned() },
+        OperationBody::Rename { device: device_id(3), name: "pc".to_owned() },
     );
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -641,19 +613,14 @@ fn a_revocation_gives_back_no_address_its_device_won() {
 fn the_kept_state_equals_derivation_when_the_graph_is_not_a_chain() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin, false)));
-    history.op("left", 1, &["add2"], OperationBody::AddDevice(device(4, "l", Role::Member, false)));
-    history.op(
-        "right",
-        2,
-        &["add2"],
-        OperationBody::AddDevice(device(5, "r", Role::Member, false)),
-    );
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "b", Role::Admin)));
+    history.op("left", 1, &["add2"], OperationBody::AddDevice(device(4, "l", Role::Member)));
+    history.op("right", 2, &["add2"], OperationBody::AddDevice(device(5, "r", Role::Member)));
     history.op(
         "merge",
         1,
         &["left", "right"],
-        OperationBody::AddDevice(device(6, "m", Role::Member, false)),
+        OperationBody::AddDevice(device(6, "m", Role::Member)),
     );
 
     // Offered out of order, so the pending set holds some of it.
@@ -683,27 +650,17 @@ fn the_kept_state_equals_derivation_when_the_graph_is_not_a_chain() {
 fn a_promotion_after_a_race_re_promotes() {
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add2", 1, &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin, false)));
-    history.op(
-        "add3",
-        1,
-        &["add2"],
-        OperationBody::AddDevice(device(3, "nas", Role::Member, false)),
-    );
-    history.op("up", 1, &["add3"], OperationBody::Promote { device: device_id(3), founder: false });
-    history.op("down", 2, &["add3"], OperationBody::Demote { device: device_id(3) });
+    history.founder_op("add2", &["g"], OperationBody::AddDevice(device(2, "pc", Role::Admin)));
+    history.op("add3", 1, &["add2"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
+    history.founder_op("up", &["add3"], OperationBody::Promote { device: device_id(3) });
+    history.founder_op("down", &["add3"], OperationBody::Demote { device: device_id(3) });
     let mut roster = Roster::new();
     for entry in history.entries() {
         assert!(roster.offer_bytes(&entry.bytes).is_accepted(), "{}", entry.label);
     }
     assert!(!roster.state().unwrap().is_admin(&device_id(3)), "the race goes down");
 
-    history.op(
-        "again",
-        1,
-        &["up", "down"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
+    history.founder_op("again", &["up", "down"], OperationBody::Promote { device: device_id(3) });
     assert!(roster.offer_bytes(&history.bytes("again")).is_accepted());
     assert!(roster.state().unwrap().is_admin(&device_id(3)), "and the later promotion raises it");
 }
@@ -721,14 +678,9 @@ fn a_promotion_voided_for_being_light_does_not_come_back() {
     };
     let mut history = History::new();
     history.genesis("g", 1);
-    history.op("add3", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member, false)));
+    history.op("add3", 1, &["g"], OperationBody::AddDevice(device(3, "nas", Role::Member)));
     history.op("light", 1, &["add3"], mode(true));
-    history.op(
-        "up",
-        1,
-        &["light"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
+    history.founder_op("up", &["light"], OperationBody::Promote { device: device_id(3) });
     history.op("full", 1, &["up"], mode(false));
     let mut roster = Roster::new();
     for entry in history.entries() {
@@ -738,12 +690,7 @@ fn a_promotion_voided_for_being_light_does_not_come_back() {
     assert!(!state.is_admin(&device_id(3)), "the promotion while light stays void");
     assert_eq!(state.settings_of(&device_id(3)).mode, roster::leaf::Mode::Full);
 
-    history.op(
-        "again",
-        1,
-        &["full"],
-        OperationBody::Promote { device: device_id(3), founder: false },
-    );
+    history.founder_op("again", &["full"], OperationBody::Promote { device: device_id(3) });
     assert!(roster.offer_bytes(&history.bytes("again")).is_accepted());
     assert!(roster.state().unwrap().is_admin(&device_id(3)), "promoted again once full");
 }

@@ -1517,3 +1517,200 @@ scenario, `a` finds its TPM usable at every start and reaches the board after ea
   log says "the TPM can hold signing keys" at each start. Seen in the same run and not about the
   TPM: once, after the first kill and a minute of quiet, `a` took 19 s to reach the board (0-1 s
   the other times).
+
+## S8. The state kept in a directory somebody chose (`--state`)
+
+`linux-state-directory` 3.1. In the testbed: `a` and the relay from compose, and a node `d` started
+by hand from the node image with a volume at `/data` (root, 755) and `peerfectlyd --state
+/data/peerfectly`. `a` founds `casa` on `https://relay:8444`, invites `d`; on `d`, `peerfectly join
+<invite>` (no TPM, so a sealed key); `a` approves. Then `d`'s container is removed and made again on
+the same volume, and last `/data` is made `root:users 775` and `d` restarted.
+
+**Expect**: `d` makes `/data/peerfectly` with mode 700 and nothing under `/var/lib/peerfectly`; the
+command line makes the key under `/data/peerfectly/keys`; `status` shows `kept in
+/data/peerfectly`; after the new container, the same machine key, identity and device id, `casa` up
+on its own and `a` reached; with `/data` group-writable, the daemon does not start and names it.
+
+**Result**: run, 2026-11-22, in the testbed, passed.
+- `/data/peerfectly` `drwx------ root root`; `/var/lib/peerfectly` absent throughout.
+- The key: `/data/peerfectly/keys/peerfectly.joining.<…>.signing.sealed`, `0600`.
+- `d` admitted as `d.casa.internal [d938-7eaf-0701-6acb]`, member, `100.84.0.2`; ping to `a` 0%
+  loss. After the container was removed and made again: `machine.key` and `networks/casa/identity`
+  with the same SHA-256 as before, the same device id, `casa   up (now)`, ping to `a` 0% loss.
+- With `/data` `root:users 775`: `ERROR could not start cause=/data/peerfectly: its group can write
+  /data`, exit 1. Put back to 755, it started.
+- Seen once at the restart and not about this change: `the roster refused it:
+  snapshot_sequence_regressed` from `roster-sync`, the network up and reached regardless.
+- Before: `cargo clippy -p linux-daemon --all-targets -- -D warnings` clean on Linux and, with
+  `daemon`, `cli` and `windows-daemon`, on Windows; the library's tests on Linux, 67 passed, the new
+  `home` and `command_line` ones among them, then `home` again with the test on the disk, 7 passed.
+
+## S9. A member keeps no signing key; demoting an admin (`members-hold-no-signing-key`)
+
+`members-hold-no-signing-key` 5.1. In the testbed, rebuilt from this code: `a` (TPM) founds `casa` on
+`https://relay:8444` and invites `phone` as a member; on `b`, `peerfectly join <invite>` run with no
+terminal (`docker compose exec -T`, stdin empty); `a` approves. Then `a` invites `desk` with
+`--admin`, and `c` (no TPM) joins it first without `--admin`, then cancels and joins with `--admin`;
+`a` approves. `a` demotes `desk`; then signs 80 renames, so the roster compacts past the demotion.
+
+**Expect**: `b` asked nothing, a member holding no signing key after a restart, its keys directory
+empty; the wrong role refused on both sides with the invite left open; `c` an admin with a sealed
+key; after the demotion `c` a member that still holds its key and says until when; once compacted,
+the key gone and `status` saying none; demoting the only admin, and a member, signing nothing.
+
+**Result**: run, 2026-11-22, in the testbed, passed.
+- `b`: the join printed `this device joins as a member: it keeps no signing key, and nothing is
+  asked`, and asked nothing. Admitted as `phone.casa.internal [0553-a2f3-0b11-ffd7]`, member,
+  `100.89.0.2`; `signing key  none: this device is a member, and holds no signing key`;
+  `/var/lib/peerfectly/keys` empty. Ping to `a` 0% loss. The same after the container restarted.
+- `c` without `--admin`: on `a`, `desk (casa): open … refused …: the key 49AF-816D-2EC4-B159-B640
+  asked to join as a member, and this invite makes an admin`; on `c`, `last: the admin's daemon says
+  this invite makes an admin, and this device is joining as a member. Cancel this join and join
+  again with --admin. Until then it goes on waiting.`
+- `c` with `--admin`: a passphrase chosen twice and the proof signed with the key just made;
+  admitted as `desk.casa.internal [5d4d-e29d-a63e-457c]`, admin, `signing key  in a file sealed with
+  a passphrase`, the file `keys/peerfectly.joining.<…>.signing.sealed`; `was-admin` noted.
+- `sudo peerfectly demote desk` on `a`: one act, `make 5d4d-e29d-a63e-457c a member`, one TPM
+  passphrase. On `c`: `member`, the key file still there, and `kept until this device's demotion is
+  settled, and then destroyed`.
+- `peerfectly demote a`: `a [a4c4-0a0d-e0f0-436a] is this network's only admin: … Nothing was
+  signed.`; `peerfectly demote phone`: `… is already a member. Nothing was signed.`
+- After the 80 renames: `c` held `base.redb` and `base.snapshot`, logged `this device was demoted,
+  and the demotion is settled: its signing key for this network was destroyed, and it holds none, as
+  a member`; `keys` empty, `was-admin` gone, `signing key  none`. After a restart the same, and a
+  ping to `a` 0% loss.
+- Seen on `a` during the renames, one every four seconds, and not about this change: `[state]
+  …/snapshot: No such file or directory (os error 2)` from the fourth on, and once
+  `snapshot_sequence_regressed`. Both writers of `snapshot` and `snapshot_at` go through
+  `state::replace_file`, whose temporary is always `<file>.new`, so two at once can move each
+  other's away; the files are there and the network ran throughout. Reported separately.
+- Before: on Windows `cargo clippy` with `-D warnings` clean for `identity`, `enrollment`, `daemon`,
+  `cli` and `windows-daemon`, and their tests passing; on Linux `linux-daemon`'s clippy clean and its
+  library's tests, 69, passing, the member's identity test among them.
+
+## S10. The founder's words: founding, founder acts, recovery, replacement, history (`offline-founder`)
+
+`offline-founder` 8.1. In the testbed, rebuilt from this code, driven from the host through a
+terminal (`script`), which answers the prompts and keeps the words shown in a scratch file outside
+the repository:
+1. `a` founds `casa` on `https://relay:8444`;
+2. `b` joins as the member `phone`, and `c` as the admin `laptop`;
+3. on `b`, a member, `revoke laptop stolen --founder`;
+4. `history` on `b`;
+5. on `b`, `founder replace casa`, then `rename a anew --founder` with the old words;
+6. on `b`, `revoke a stolen --founder`;
+7. on `a`, revoked and not yet aware of it, `recover casa`;
+8. on `b`, still a member, `recover casa`;
+9. `anchor` joins as the member `nas`, approved by the recovered `a`;
+10. on `anchor`, a member, `invite desk --admin --founder`;
+11. `c`, revoked as `laptop`, forgets `casa` and joins with that invite as `desk --admin`;
+12. on `anchor`, `approve desk --founder`.
+
+**Expect**:
+- the words are shown once, three of them asked back, and the terminal cleared;
+- every founder act is signed by the words, followed by the founder's root;
+- a member signs nothing without the words;
+- after the replacement, the old words sign nothing;
+- a revoked device recovers through a founder session, and a member recovers over its own
+  sessions, each becoming an admin under a new identity with an IPv4 address and the network up;
+- an admin invite opened by a member is approved with the words;
+- the history names the founder.
+
+**Result**: run, 2026-11-23, in the testbed, passed (the third run; the first two found the faults
+listed below).
+- 1: `These 24 words are the founder's key of this network…`, then `word 5`, `word 6`, `word 12`
+  asked, then `The founder's words were cleared from this terminal and its scrollback.`; exit 0.
+- 3: `casa: 1 act to sign with the founder's words`, `revoke `laptop` (39a0-…): stolen`, a second
+  batch for the root, `the founder signed the root over it`. `a` then counts `2 devices · 1 revoked`.
+- 4: newest first, `the founder: revocation of laptop`, above `a [7f34-…]: admission of laptop`.
+- 5: the replacement (`every device in casa follows this`) and its root signed. With the old words
+  the rename was refused: `those are not this network's founder's words. Nothing was signed.`,
+  exit 1.
+- 7: `a founder session to phone [bdd9-…] carries what the founder signs next`. A new admin key was
+  made (the passphrase asked twice), one act signed (`admit `a` (414b-…) as an admin`), then its
+  root. `a` was then `a.casa.internal [414b-…], admin`, `ipv4 100.124.0.1`, and up.
+- 8: three acts:
+  1. `admit `phone` (5802-…) as an admin`;
+  2. its address;
+  3. `revoke (bdd9-…): replaced by this device's admin identity`, last.
+
+  Then the root. Both `a` and `b` counted `2 devices · 3 revoked`; a ping from `a` to `b`'s new
+  IPv4 had 0% loss. The history on `b` lists each act as `the founder: …`.
+- 9–12: `anchor` became the member `nas`, `100.124.0.2`. On it the invite was issued with
+  `--admin`. `c` asked to join, and the approval was signed with the words, then its root.
+  `c` became `desk.casa.internal [35d7-…], admin`, `100.124.0.4`. `anchor` and `c` counted
+  `4 devices · 3 revoked`. A ping from `c` to `a` had 0% loss.
+- Found by the first two runs and fixed before this one:
+  - after a recovery the network stayed down, and the new identity had no IPv4 address. The daemon
+    now raises the network where it was up, and the batch gives the new identity the lowest free
+    offset where it has room.
+  - on a member, the batch revoked the old identity first. `a` ended the session at that revocation
+    before the admission arrived, then refused the new identity it did not know. The old identity's
+    revocation now comes last.
+  - `invite --founder` was sent without the founder's mark, and a member was refused.
+- 13–16, run 2026-11-23 after design §12 and §13 (a join proved against what was held; invites v3
+  with an anchor). Every invite of the run above was v3, and every join took the anchor's root;
+  in 9–12 the member's founder invite delivered the founder's root kept at approval.
+  - 13: `c` (`desk`, an admin) taken down, so it heard nothing; on `anchor` (`nas`, a member) the
+    words revoked `desk`. `peerfectly revoked` on `anchor` lists it `by the founder: "lost"`.
+  - 14: `desk`, still `admin` in what it held, issued an invite for `nas`.
+  - 15: `anchor` joined with it, and `desk` approved replacing `nas` (`revoke (e23e-…)`,
+    `admit nas (d305-…)`). The join was refused when taken on. `peerfectly pending` on `anchor`:
+    `this device's join `joining`: it cannot go on` with `the device that signed it is revoked
+    here. Nothing was replaced`; `cancel joining` removed it.
+  - 16: `anchor` was still `nas [e23e-…], member`, holding `desk` as revoked.
+  - Found by the first run of 13–16 and fixed: the refusal reached only the daemon's log, since a
+    join finished in the background has nobody asking; and the provisional directory went with its
+    owner, so `pending` did not list it. The refused join is now kept, owner alone, until cancelled.
+- Not run here, and covered in-process instead:
+  - two admins revoking each other at once (`roster` graph tests);
+  - a stop during the identity swap (`recovering` tests);
+  - a light member following a founder root (`roster` light tests; the testbed has no light node).
+- Run again 2026-11-24, after design §14–§22 (only the founder governs admins, 12 words, one
+  revoked standing): 1–16 passed. The founding showed 12 words and asked back `word 5`, `word 7`,
+  `word 12`; in 15 the join was refused before anything was sent (§18): `this invite was issued by
+  desk [32f3-…], which this device holds as revoked in `casa`. Nothing was sent`. The first of two
+  runs failed at 7: the command line made a sealed key while the daemon held the node's software
+  TPM, a single-client socket, and the daemon refused it as made where the TPM can hold one. The
+  second passed. A kernel TPM's resource manager serves both at once; this is the testbed's.
+
+## S10b. A stolen admin's acts voided, a revoked device told and brought back (`offline-founder` §14–§22)
+
+`offline-founder` 9.12 and 9.14. In the testbed, rebuilt from this code, on a network of its own,
+`orto`, driven as in S10:
+- O1. `a` founds `orto` (12 words);
+- O2. `b` joins as the member `phone`, `anchor` as the member `nas`, `c` as the admin `laptop`;
+  `approve laptop` refused without `--founder`, then signed with it;
+- O3. on `c`, `revoke a stolen`;
+- O4. on `c`, "stolen": `rename nas mine`, then `revoke phone mine`;
+- O5. on `a`, `revoke laptop stolen --founder`, voiding `all` of its acts, revoking nobody again;
+- O6. `b` down; on `a`, `revoke phone lost --founder`; `b` up;
+- O7. on `anchor`, `recover orto`;
+- O8. on `a`, `invite laptop2`; `c`, revoked, joins with it.
+
+**Expect**: only the founder governs admins; the phone, revoked by the stolen admin, runs as revoked
+(no tunnel, the roster alone) and comes back by itself as a member, with its address, when the
+founder voids that; a device revoked while down is told when it comes up; the recovered member
+keeps its IPv4 address; a revoked device joins again with a new invite.
+
+**Result**: run, 2026-11-24, in the testbed, passed (the third run).
+- O2: `only the founder governs admins: approve it with the founder's words`, exit 1; then
+  `the founder signed the root over it`.
+- O3: `a [576f-…] is an admin, and only the founder governs admins`, exit 1, nothing signed.
+- O4: `b`'s status: `revoked by laptop [9b7d-…]`; its log: `up as revoked: no tunnel, and only the
+  roster is carried`.
+- O5: the CLI listed laptop's acts, then `These come back as members, as they were before those
+  acts:` with the phone, and `Revoke again which? [numbers / all / none]`, answered `none`. `c`
+  said `revoked by the founder`, its signing key gone; `nas` had its name back; `b` was
+  `phone.orto.internal [f4e2-…], member`, `ipv4 10.77.0.2`, and `a` pinged it.
+- O6: `b`, up again, said `revoked by the founder`.
+- O7: `ipv4 10.77.0.3` before and after; `nas.orto.internal [c9f0-…], admin`.
+- O8: `this device already holds this network, as `orto`: the join replaces it`; then
+  `laptop2.orto.internal [874e-…], member`, with an address.
+- Found by the first two runs and fixed:
+  - a full device out of its roster stopped choosing neighbours and, once down, could not come up
+    (no address), so the phone voided back never heard of it. It now runs as revoked (§22);
+  - a revoked device closed every session itself at each message, including the one carrying the
+    voiding: only its peers close sessions now;
+  - a second notice (the founder's, after an admin's) was ignored while the first was kept: it now
+    replaces it.

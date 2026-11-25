@@ -117,7 +117,7 @@ fn distinct_component_tuples_produce_distinct_signing_inputs() {
     assert_ne!(a, d, "different core bytes must produce a different signing input");
 
     // The tag is present and framed, not merely prepended.
-    assert!(a.windows(9).any(|w| w == b"roster/v1"), "the domain tag is part of the input");
+    assert!(a.windows(9).any(|w| w == b"roster/v2"), "the domain tag is part of the input");
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn a_signature_does_not_replay_across_operation_types() {
     let promote = OperationCore::new(
         demote.ts,
         demote.alg,
-        OperationBody::Promote { device: common::device_id(2), founder: false },
+        OperationBody::Promote { device: common::device_id(2) },
         demote.parents.clone(),
         demote.author,
         demote.network,
@@ -206,36 +206,53 @@ fn algorithm_substitution_fails_verification() {
     assert_eq!(raw.verify(&public_key(&p256)), Err(Error::UnknownAlgorithm));
 }
 
-/// The founder flag is covered by the signature, so it cannot be granted after
-/// the fact.
+/// A device carries no founder flag any more: an `add_device` body of the
+/// earlier format, which had one, is refused rather than read without it.
 #[test]
-fn flipping_the_founder_flag_invalidates_the_signature() {
+fn a_device_carrying_a_founder_flag_is_refused() {
+    let record = device(2, "laptop", Role::Member)
+        .into_record(OperationId::from_bytes([7; 32]))
+        .expect("a record");
+    let bytes = record.to_bytes();
+    // The earlier format's record: one more key, `founder: false`, before
+    // `added_by`.
+    let at = bytes.windows(9).position(|window| window == b"hadded_by").expect("added_by");
+    let mut old = bytes.clone();
+    let header = old.first_mut().expect("a map");
+    assert_eq!(*header, 0xa6, "six keys now");
+    *header = 0xa7;
+    let mut founder = b"gfounder".to_vec();
+    founder.push(0xf4);
+    old.splice(at..at, founder);
+    assert!(roster::types::DeviceRecord::from_bytes(&bytes).is_ok());
+    assert!(
+        roster::types::DeviceRecord::from_bytes(&old).is_err(),
+        "a founder field is not part of a device"
+    );
+}
+
+/// An operation signed under the earlier format's tag does not verify under
+/// this one: it is refused as a bad signature, never misread.
+#[test]
+fn an_operation_of_the_earlier_format_does_not_verify() {
     let signer = ed25519_signer(9);
-    let plain = OperationBody::AddDevice(device(2, "laptop", Role::Member, false));
     let core = OperationCore::new(
         1_735_689_600_000,
         Algorithm::Ed25519,
-        plain,
+        OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         vec![],
         signer.key_id(),
         network(),
     )
     .expect("well-formed");
-    let bytes = sign_operation(&core, &signer).expect("signs");
-    let signature = *RawOperation::decode(&bytes).expect("decodes").signature();
+    let core_bytes = core.encode();
+    let mut input = signing_input(&network(), OperationType::AddDevice, &core_bytes);
+    let tag = input.windows(9).position(|w| w == b"roster/v2").expect("tagged");
+    input.splice(tag..tag.saturating_add(9), b"roster/v1".iter().copied());
+    let signature: [u8; 64] = signer.sign(&input).expect("signs").try_into().expect("64 bytes");
+    let old = assemble_operation(&core_bytes, &signature);
 
-    let elevated = OperationCore::new(
-        core.ts,
-        core.alg,
-        OperationBody::AddDevice(device(2, "laptop", Role::Member, true)),
-        core.parents.clone(),
-        core.author,
-        core.network,
-    )
-    .expect("well-formed");
-    let forged = assemble_operation(&elevated.encode(), &signature);
-
-    let raw = RawOperation::decode(&forged).expect("structurally fine");
+    let raw = RawOperation::decode(&old).expect("structurally fine");
     assert_eq!(raw.verify(&public_key(&signer)), Err(Error::SignatureInvalid));
 }
 
@@ -490,7 +507,7 @@ fn replace_first(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
 
 #[test]
 fn a_device_with_a_distinct_key_for_each_purpose_is_accepted() {
-    let spec = device(20, "nas", Role::Member, false);
+    let spec = device(20, "nas", Role::Member);
     assert_eq!(spec.keys.len(), 3);
     assert!(spec.keys.iter().any(|k| k.purpose == KeyPurpose::Signing));
     assert!(spec.keys.iter().any(|k| k.purpose == KeyPurpose::Transport));
@@ -531,7 +548,7 @@ fn reusing_one_key_value_for_two_purposes_is_rejected() {
         };
         let keys = sorted(vec![signing, reused, third]);
         assert_eq!(
-            DeviceSpec::new(keys, "clone", Role::Member, false, vec![]).map(|_| ()),
+            DeviceSpec::new(keys, "clone", Role::Member, vec![]).map(|_| ()),
             Err(Error::KeyReuse),
             "the signing key reused as {reused_as:?}"
         );
@@ -544,7 +561,7 @@ fn reusing_one_key_value_for_two_purposes_is_rejected() {
 fn a_device_without_an_attestation_key_is_rejected() {
     let keys = sorted(vec![signing_entry(26), transport_entry(126)]);
     assert_eq!(
-        DeviceSpec::new(keys, "cannot attest", Role::Member, false, vec![]).map(|_| ()),
+        DeviceSpec::new(keys, "cannot attest", Role::Member, vec![]).map(|_| ()),
         Err(Error::MissingAttestationKey)
     );
 }
@@ -553,7 +570,7 @@ fn a_device_without_an_attestation_key_is_rejected() {
 fn a_device_without_a_signing_key_is_rejected() {
     let keys = vec![transport_entry(23)];
     assert_eq!(
-        DeviceSpec::new(keys, "transport only", Role::Member, false, vec![]).map(|_| ()),
+        DeviceSpec::new(keys, "transport only", Role::Member, vec![]).map(|_| ()),
         Err(Error::MissingSigningKey)
     );
 }
@@ -563,7 +580,7 @@ fn an_unsorted_key_list_is_rejected() {
     let mut keys = sorted(vec![signing_entry(24), transport_entry(124)]);
     keys.reverse();
     assert_eq!(
-        DeviceSpec::new(keys, "unsorted", Role::Member, false, vec![]).map(|_| ()),
+        DeviceSpec::new(keys, "unsorted", Role::Member, vec![]).map(|_| ()),
         Err(Error::KeyOrdering),
         "an unordered key list would give one device two encodings"
     );
@@ -574,7 +591,7 @@ fn an_over_long_device_name_is_rejected() {
     let keys = sorted(vec![signing_entry(25), transport_entry(125), attestation_entry(225)]);
     let long = "n".repeat(roster::limits::MAX_NAME_LEN.saturating_add(1));
     assert_eq!(
-        DeviceSpec::new(keys, long, Role::Member, false, vec![]).map(|_| ()),
+        DeviceSpec::new(keys, long, Role::Member, vec![]).map(|_| ()),
         Err(Error::LimitExceeded("device name length"))
     );
 }
@@ -794,12 +811,12 @@ fn network_parameters_round_trip() {
 }
 
 #[test]
-fn a_create_network_admin_is_a_founder() {
+fn a_create_network_admin_is_an_admin_and_names_the_founder() {
     let body = common::body_of(OperationType::CreateNetwork);
     match body {
-        OperationBody::CreateNetwork { device: spec, .. } => {
-            assert!(spec.founder, "the founding admin is a founder");
+        OperationBody::CreateNetwork { device: spec, params } => {
             assert_eq!(spec.role, Role::Admin);
+            assert!(!spec.reuses(&params.founder), "no device carries a founder key");
         }
         other => panic!("expected create_network, got {other:?}"),
     }

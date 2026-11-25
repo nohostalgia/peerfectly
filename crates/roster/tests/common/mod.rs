@@ -76,30 +76,25 @@ pub fn sorted(mut keys: Vec<KeyEntry>) -> Vec<KeyEntry> {
 }
 
 /// A device with one key of each purpose.
-pub fn device(seed: u8, name: &str, role: Role, founder: bool) -> DeviceSpec {
+pub fn device(seed: u8, name: &str, role: Role) -> DeviceSpec {
     let keys = sorted(vec![
         signing_entry(seed),
         transport_entry(seed.wrapping_add(100)),
         attestation_entry(seed.wrapping_add(200)),
     ]);
-    DeviceSpec::new(
-        keys,
-        name,
-        role,
-        founder,
-        vec![Capability::new("serves").expect("short capability")],
-    )
-    .expect("well-formed device")
+    DeviceSpec::new(keys, name, role, vec![Capability::new("serves").expect("short capability")])
+        .expect("well-formed device")
 }
 
 /// The device id of the fixture device with the given seed.
 pub fn device_id(seed: u8) -> DeviceId {
-    device(seed, "fixture", Role::Member, false).device_id().expect("device has a signing key")
+    device(seed, "fixture", Role::Member).device_id().expect("device has a signing key")
 }
 
 /// Fixture network parameters.
 pub fn params() -> NetworkParams {
     NetworkParams::new(
+        roster::types::FounderKeys::held_by_nobody(),
         vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         "example.internal",
         30 * 24 * 60 * 60,
@@ -111,17 +106,15 @@ pub fn params() -> NetworkParams {
 pub fn body_of(op_type: OperationType) -> OperationBody {
     match op_type {
         OperationType::CreateNetwork => OperationBody::CreateNetwork {
-            device: device(1, "phone", Role::Admin, true),
+            device: device(1, "phone", Role::Admin),
             params: params(),
         },
-        OperationType::AddDevice => {
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false))
-        }
+        OperationType::AddDevice => OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         OperationType::RevokeDevice => OperationBody::RevokeDevice {
             device: device_id(2),
             reason: "lost on a train".to_owned(),
         },
-        OperationType::Promote => OperationBody::Promote { device: device_id(2), founder: false },
+        OperationType::Promote => OperationBody::Promote { device: device_id(2) },
         OperationType::Demote => OperationBody::Demote { device: device_id(2) },
         OperationType::Rename => {
             OperationBody::Rename { device: device_id(2), name: "workstation".to_owned() }

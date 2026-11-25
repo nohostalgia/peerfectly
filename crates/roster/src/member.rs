@@ -92,17 +92,15 @@ fn signed_root(bytes: &[u8]) -> Result<Snapshot> {
 
 /// As [`signed_root`], for a root already read.
 fn signed_raw(raw: &RawSnapshot) -> Result<Snapshot> {
-    let author = raw.body().author;
-    let key = raw
-        .body()
-        .signer
-        .record
-        .keys
-        .iter()
-        .find(|entry| entry.key_id() == author)
-        .ok_or(Error::UnauthorizedAuthor)
-        .and_then(|entry| crate::sign::PublicKey::new(entry.alg, entry.value.clone()))?;
+    let key = raw.body().named_key()?;
     Ok(raw.verify(&key)?.body().clone())
+}
+
+/// The admin a member starts out calling: the signer of the root it starts
+/// from. A member starts from an admin's root, never the founder's, which names
+/// no device to call.
+fn first_contact(root: &Snapshot) -> Result<DeviceLeaf> {
+    root.signer_leaf().cloned().ok_or(Error::UnauthorizedAuthor)
 }
 
 impl LightMember {
@@ -121,7 +119,7 @@ impl LightMember {
         Ok(Self {
             network: root.network,
             view: LightView::starting_from(&root, budget),
-            contact: root.signer.clone(),
+            contact: first_contact(&root)?,
             own: Own::Admitted(own),
             params,
             peers: BTreeMap::new(),
@@ -161,7 +159,7 @@ impl LightMember {
         Ok(Self {
             network: root.network,
             view: LightView::starting_from(&root, budget),
-            contact: root.signer.clone(),
+            contact: first_contact(&root)?,
             own: Own::Awaiting { device, keys },
             params,
             peers: BTreeMap::new(),
@@ -353,8 +351,12 @@ impl LightMember {
 
     fn offer_signed(&mut self, root: &Snapshot) -> RootOutcome {
         let outcome = self.view.offer(root);
-        if matches!(outcome, RootOutcome::Adopted | RootOutcome::Switched) {
-            self.contact = root.signer.clone();
+        // A root the founder signed names no device to call: the member keeps
+        // calling the one it had.
+        if matches!(outcome, RootOutcome::Adopted | RootOutcome::Switched)
+            && let Some(leaf) = root.signer_leaf()
+        {
+            self.contact = leaf.clone();
         }
         if matches!(outcome, RootOutcome::Adopted | RootOutcome::Switched | RootOutcome::KeptAside)
         {

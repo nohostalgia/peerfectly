@@ -123,20 +123,24 @@ mod tests {
     /// A founder's roster of three members, with a root over it, and the three.
     fn rooted() -> (Roster, Vec<NodeIdentity>) {
         let founder = NodeIdentity::generate().unwrap();
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .unwrap();
         let mut roster = Roster::new();
         let mut parents = Vec::new();
         let mut network = NetworkId::from_bytes([0; 32]);
         let members: Vec<NodeIdentity> =
             (0..3).map(|_| NodeIdentity::generate().unwrap()).collect();
         let bodies = std::iter::once(OperationBody::CreateNetwork {
-            device: founder.device_spec("nas", Role::Admin, true, vec![]).unwrap(),
+            device: founder.device_spec("nas", Role::Admin, vec![]).unwrap(),
             params,
         })
         .chain(members.iter().zip(["laptop", "phone", "sensor"]).map(|(member, name)| {
-            OperationBody::AddDevice(member.device_spec(name, Role::Member, false, vec![]).unwrap())
+            OperationBody::AddDevice(member.device_spec(name, Role::Member, vec![]).unwrap())
         }))
         // The phone given the block's first host.
         .chain(std::iter::once(OperationBody::SetDevice {
@@ -340,20 +344,24 @@ mod tests {
     /// The fixture of `rooted`, with the founder that signs for it.
     fn rooted_with_founder() -> (Roster, Vec<NodeIdentity>, NodeIdentity) {
         let founder = NodeIdentity::generate().unwrap();
-        let params =
-            NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                .unwrap();
+        let params = NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
+            vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+            "example.internal",
+            2_592_000,
+        )
+        .unwrap();
         let mut roster = Roster::new();
         let mut parents = Vec::new();
         let mut network = NetworkId::from_bytes([0; 32]);
         let members: Vec<NodeIdentity> =
             (0..3).map(|_| NodeIdentity::generate().unwrap()).collect();
         let bodies = std::iter::once(OperationBody::CreateNetwork {
-            device: founder.device_spec("nas", Role::Admin, true, vec![]).unwrap(),
+            device: founder.device_spec("nas", Role::Admin, vec![]).unwrap(),
             params,
         })
         .chain(members.iter().zip(["laptop", "phone", "sensor"]).map(|(member, name)| {
-            OperationBody::AddDevice(member.device_spec(name, Role::Member, false, vec![]).unwrap())
+            OperationBody::AddDevice(member.device_spec(name, Role::Member, vec![]).unwrap())
         }));
         for (index, body) in bodies.enumerate() {
             let core = OperationCore::new(

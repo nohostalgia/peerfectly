@@ -148,7 +148,6 @@ mod tests {
             keys: Vec::new(),
             name: name.to_owned(),
             role: Role::Member,
-            founder: false,
             added_by: OperationId::from_bytes([0; 32]),
             capabilities: Vec::new(),
         }
@@ -158,6 +157,7 @@ mod tests {
         RosterState::from_parts(
             NetworkId::from_bytes([1; 32]),
             NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                 "example.internal",
                 2_592_000,

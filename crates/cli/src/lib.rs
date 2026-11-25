@@ -29,6 +29,7 @@ use std::io;
 use daemon::control::{Command, KeyWanted, Outcome};
 
 mod batch;
+pub mod words;
 
 /// How the command line reaches the daemon: one request out, one answer back.
 #[async_trait::async_trait]
@@ -83,6 +84,17 @@ pub trait Custody: Send + Sync {
     fn may_sign(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Reads one answer from the terminal without showing it: a word of the
+    /// founder's.
+    ///
+    /// # Errors
+    ///
+    /// Where this platform cannot read without showing what is typed, which is
+    /// the default: the founder's words are never read where they would show.
+    fn read_hidden(&self, _prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
+        Err("this platform cannot read the founder's words without showing them".to_owned())
+    }
 }
 
 /// A batch about to be signed, as a platform needs it to ask.
@@ -98,6 +110,10 @@ pub struct Asking<'a> {
     pub summary: &'a str,
     /// What to sign, in order.
     pub messages: &'a [&'a [u8]],
+    /// Where the daemon keeps the key, where its platform keeps keys in a
+    /// directory of the daemon's ([`daemon::control::SignaturesWanted::keys`]).
+    /// Judged by the platform before it is used.
+    pub keys: Option<&'a str>,
 }
 
 /// A key just made.
@@ -177,6 +193,9 @@ impl Default for Extras {
 /// path of its own in [`Cli::run`]. With [`Command::ALL`], every word a person
 /// can type.
 const WORDS_WITH_ARGUMENTS: &[&str] = &[
+    "recover",
+    "founder",
+    "history",
     "board",
     "found",
     "join",
@@ -196,7 +215,43 @@ const WORDS_WITH_ARGUMENTS: &[&str] = &[
     "ipv4",
     "route",
     "rename",
+    "demote",
 ];
+
+/// Whether `--founder` was given: the act is signed with the founder's words
+/// instead of this device's key.
+static AS_FOUNDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The arguments, without `--founder`, which is read once and applies to the
+/// act whatever its own options are.
+fn args() -> impl Iterator<Item = String> {
+    std::env::args().filter(|word| word != "--founder")
+}
+
+/// The act, as the founder's to sign where `--founder` was given and it is an
+/// act the founder's words sign.
+fn as_founder_where_asked(command: daemon::control::Command) -> daemon::control::Command {
+    use daemon::control::Command;
+    if !AS_FOUNDER.load(std::sync::atomic::Ordering::Relaxed) {
+        return command;
+    }
+    match command {
+        Command::Revoke { .. }
+        | Command::RevokeVoiding { .. }
+        | Command::RevokeFrom { .. }
+        | Command::Demote { .. }
+        | Command::Rename { .. }
+        | Command::Approve { .. }
+        | Command::Invite { .. }
+        | Command::ChangeRelay { .. }
+        | Command::SetAnchors { .. }
+        | Command::SetIpv4Block { .. }
+        | Command::GiveIpv4 { .. }
+        | Command::Route { .. }
+        | Command::AdmitBatch { .. } => Command::AsFounder(Box::new(command)),
+        other => other,
+    }
+}
 
 /// The command line, with what the platform gave it.
 pub struct Cli<'a> {
@@ -215,6 +270,10 @@ impl Cli<'_> {
         // on are said with the refusal.
         let invited = match &command {
             Command::Invite { name, .. } => Some(name.clone()),
+            Command::AsFounder(inner) => match inner.as_ref() {
+                Command::Invite { name, .. } => Some(name.clone()),
+                _ => None,
+            },
             _ => None,
         };
         // Refused because something already waits: the way out is said with
@@ -381,8 +440,16 @@ impl Cli<'_> {
         println!();
         println!("  admitted as:        {}", daemon::control::shown(&line.name));
         println!("  the name it asked:  {}", daemon::control::shown(&request.proposed_name));
-        println!("  its key:            {}", request.fingerprint);
-        println!("  arrived:            {}", when(request.arrived_at));
+        println!(
+            "  its key: \
+         {}",
+            request.fingerprint
+        );
+        println!(
+            "  arrived: \
+         {}",
+            when(request.arrived_at)
+        );
         println!();
         println!("Anyone holding the invite could have made this request. If you are with the");
         println!("device's person, compare the key with the one its screen shows: they must be");
@@ -425,6 +492,16 @@ impl Cli<'_> {
     async fn join(&self, command: Command) -> std::process::ExitCode {
         use std::process::ExitCode;
 
+        // Said before anything is made: which of the two this join is, and
+        // what each asks of the person.
+        if matches!(command, Command::Join { admin: true, .. }) {
+            println!("this device joins as an admin: the invite must be one made with --admin.");
+            println!("Its signing key is made now and kept, behind what this machine protects it");
+            println!("with, and asked for again when this device proves it holds it.");
+        } else {
+            println!("this device joins as a member: it keeps no signing key, and nothing is");
+            println!("asked. An invite made with --admin needs --admin here.");
+        }
         match self.ask_and_sign(command).await {
             Ok(Outcome::JoinStarted { label, fingerprint, conflicts }) => {
                 println!();
@@ -466,21 +543,33 @@ impl Cli<'_> {
     async fn invite_through_the_daemon(&self, command: Command) -> std::process::ExitCode {
         use std::process::ExitCode;
 
+        // The device's person must say the same role when joining, so the line
+        // to run says it.
+        let as_admin =
+            if matches!(command, Command::Invite { admin: true, .. }) { " --admin" } else { "" };
         // Before anything is issued: a request this process cannot sign for is a
         // person's time and an approval that cannot happen.
         if let Err(refusal) = self.custody.may_sign() {
             eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
-        match self.ask(command).await {
+        // With `--founder`, opened for the founder to approve: a member may.
+        match self.ask(as_founder_where_asked(command)).await {
             Ok(Outcome::Invited { invite, scannable, name, expires_at }) => {
                 let name = daemon::control::shown(&name).to_string();
                 println!();
                 println!("{scannable}");
                 println!("an invite for {name}. On that device, run:");
                 println!();
-                println!("  peerfectly join {invite}");
+                println!("  peerfectly join {invite}{as_admin}");
                 println!();
+                if !as_admin.is_empty() {
+                    println!(
+                        "It makes an admin: joined without --admin, the request is refused and"
+                    );
+                    println!("the invite stays open.");
+                    println!();
+                }
                 println!("or scan the code above. It is open {}.", open_for(expires_at));
                 println!();
                 println!(
@@ -527,7 +616,11 @@ impl Cli<'_> {
 
         use daemon::control::Command;
 
-        let Some(word) = std::env::args().nth(1) else {
+        AS_FOUNDER.store(
+            std::env::args().any(|word| word == "--founder"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let Some(word) = args().nth(1) else {
             eprintln!("{}{}", usage(self.extras.privileged), self.extras.usage);
             return ExitCode::FAILURE;
         };
@@ -552,8 +645,12 @@ impl Cli<'_> {
         // log by another process is invisible to it until it restarts. That restart
         // is what these two used to require.
         if word == "found" || word == "join" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
-            let built = if word == "found" { founding_from(&rest) } else { joining_from(&rest) };
+            let rest: Vec<String> = args().skip(2).collect();
+            let built = if word == "found" {
+                founding_from(&rest, &mut founder_words_shown_and_checked)
+            } else {
+                joining_from(&rest)
+            };
             let command = match built {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -576,7 +673,7 @@ impl Cli<'_> {
 
         // Approving shows the request first, and asks.
         if word == "approve" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(cause) => {
@@ -593,7 +690,7 @@ impl Cli<'_> {
         // connect. And the daemon is what goes on dialling the invited device
         // once this command has ended.
         if word == "invite" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let command = match inviting_from(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -613,7 +710,7 @@ impl Cli<'_> {
 
         // One board, on its cable: provisioned and admitted.
         if word == "board" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(cause) => {
@@ -626,7 +723,7 @@ impl Cli<'_> {
 
         // Admitting a batch file: read here, reviewed, and signed with one consent.
         if word == "admit" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(cause) => {
@@ -647,12 +744,12 @@ impl Cli<'_> {
                     return ExitCode::FAILURE;
                 }
             };
-            return runtime.block_on(self.cancel_waiting(std::env::args().nth(2)));
+            return runtime.block_on(self.cancel_waiting(args().nth(2)));
         }
 
         // Opening a port to one network, closing it, and listing what is open.
         if word == "expose" || word == "unexpose" || word == "exposed" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let command = if word == "exposed" {
                 match rest.as_slice() {
                     [] => Ok(daemon::control::Command::Exposed { network: None }),
@@ -683,7 +780,7 @@ impl Cli<'_> {
 
         // Moving a relay takes arguments and a person in the middle, like founding.
         if word == "relay" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let command = match daemon::control::Command::relay_change(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -712,7 +809,7 @@ impl Cli<'_> {
             // so this says so before it asks. The daemon refuses while an
             // enrolment for it is open, and asks again — `OnlyAdmin` — when this
             // device is its only admin.
-            let Some(label) = std::env::args().nth(2) else {
+            let Some(label) = args().nth(2) else {
                 eprintln!("usage: {FORGET_USAGE}");
                 return ExitCode::FAILURE;
             };
@@ -744,7 +841,7 @@ impl Cli<'_> {
             }
             daemon::control::Command::Forget { label, last_admin: false }
         } else if word == "revoke" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             match daemon::control::Command::revocation(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -753,7 +850,7 @@ impl Cli<'_> {
                 }
             }
         } else if word == "withdraw" || word == "reject" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             let read = if word == "withdraw" {
                 daemon::control::Command::withdrawal(&rest)
             } else {
@@ -767,7 +864,7 @@ impl Cli<'_> {
                 }
             }
         } else if word == "set-anchors" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             match daemon::control::Command::anchors_setting(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -776,7 +873,7 @@ impl Cli<'_> {
                 }
             }
         } else if word == "route" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             match daemon::control::Command::route_act(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -785,7 +882,7 @@ impl Cli<'_> {
                 }
             }
         } else if word == "ipv4" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             match daemon::control::Command::ipv4_act(&rest) {
                 Ok(command) => command,
                 Err(refusal) => {
@@ -794,8 +891,48 @@ impl Cli<'_> {
                 }
             }
         } else if word == "rename" {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
+            let rest: Vec<String> = args().skip(2).collect();
             match daemon::control::Command::renaming(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "demote" {
+            let rest: Vec<String> = args().skip(2).collect();
+            match daemon::control::Command::demotion(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "recover" {
+            let rest: Vec<String> = args().skip(2).collect();
+            match recovery_from(&rest) {
+                Ok(command) => command,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if word == "history" {
+            let rest: Vec<String> = args().skip(2).collect();
+            Command::History {
+                network: rest.first().filter(|first| !first.starts_with('-')).cloned(),
+                by: option(&rest, "--by"),
+            }
+        } else if word == "founder" {
+            let rest: Vec<String> = args().skip(2).collect();
+            if rest.first().map(String::as_str) != Some("replace") {
+                eprintln!("usage: {FOUNDER_USAGE}");
+                return ExitCode::FAILURE;
+            }
+            match founder_replacement_from(
+                rest.get(1..).unwrap_or_default(),
+                &mut founder_words_shown_and_checked,
+            ) {
                 Ok(command) => command,
                 Err(refusal) => {
                     eprintln!("{refusal}");
@@ -807,7 +944,7 @@ impl Cli<'_> {
             // A person holding one network types neither it nor anything in its
             // place; a person holding several is refused by the daemon until they do.
             let network = if Command::takes_a_network(&word) {
-                std::env::args().nth(2).filter(|first| !first.starts_with('-'))
+                args().nth(2).filter(|first| !first.starts_with('-'))
             } else {
                 None
             };
@@ -844,7 +981,15 @@ impl Cli<'_> {
             // need a signature this process must obtain, and keying that on a list
             // of which ones do is how a command added later comes to be the one that
             // does not work.
-            let answer = self.ask_and_sign(command).await;
+            // A founder's revocation of an admin first asks from which of its
+            // acts to void, before the words are asked.
+            let answer = match self.chosen_voiding(command).await {
+                Ok(Some(command)) => self.ask_and_sign(command).await,
+                Ok(None) => Ok(daemon::control::Outcome::Declined {
+                    message: "nothing was signed.".to_owned(),
+                }),
+                Err(cause) => Err(cause),
+            };
             let answer = self.when_only_admin(answer, said_yes).await;
             let answer = self.when_voiding(&asked, answer, said_yes).await;
             // `peers` lists every device, a page at a time: the report holds
@@ -948,6 +1093,110 @@ impl Cli<'_> {
         ExitCode::SUCCESS
     }
 
+    /// For a revocation signed with the founder's words: lists the acts of the
+    /// device named that are still held, and asks from which to void them
+    /// (offline-founder design §15). The command as it was where there is
+    /// nothing to choose; `None` where the person gave an answer that is none
+    /// of the choices.
+    async fn chosen_voiding(&self, command: Command) -> io::Result<Option<Command>> {
+        let as_founder = AS_FOUNDER.load(std::sync::atomic::Ordering::Relaxed);
+        let Command::Revoke { network, target, reason } = &command else {
+            return Ok(Some(command));
+        };
+        if !as_founder {
+            return Ok(Some(command));
+        }
+        let named = match target {
+            daemon::control::Target::Name(name) => name.clone(),
+            daemon::control::Target::Id(id) => id.clone(),
+        };
+        let asked = self
+            .ask(Command::History { network: network.clone(), by: Some(named.clone()) })
+            .await?;
+        let daemon::control::Outcome::History(history) = asked else {
+            return Ok(Some(command));
+        };
+        let acts: Vec<&daemon::control::HistoryEntry> =
+            history.entries.iter().filter(|entry| !entry.id.is_empty()).collect();
+        if acts.is_empty() {
+            return Ok(Some(command));
+        }
+        println!();
+        println!("{}'s acts still held here, newest first:", daemon::control::shown(&named));
+        for (number, entry) in acts.iter().enumerate() {
+            println!(
+                "  {:>2}. {}  {}",
+                number.saturating_add(1),
+                when(entry.at / 1_000),
+                entry.does
+            );
+        }
+        println!();
+        println!(
+            "The founder's revocation can void them: the act you choose and every one above it."
+        );
+        print!("Void from which? [number / all / none] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let Some(choice) = void_choice(&answer, acts.len()) else {
+            println!("That is none of the choices.");
+            return Ok(None);
+        };
+        let Some(oldest) = choice.and_then(|index| acts.get(index)) else {
+            return Ok(Some(command));
+        };
+        let voided: Vec<&&daemon::control::HistoryEntry> =
+            acts.iter().take(choice.unwrap_or(0).saturating_add(1)).collect();
+        println!();
+        println!("Voided, on every device as the revocation reaches it:");
+        for entry in &voided {
+            println!("  {}  {}", when(entry.at / 1_000), entry.does);
+        }
+        // Who its revocations kept out comes back: shown by name, and the
+        // founder may revoke them again in this same act (offline-founder
+        // design §22).
+        let returning: Vec<&daemon::control::Named> = voided
+            .iter()
+            .filter(|entry| entry.no_effect.is_none())
+            .filter_map(|entry| match &entry.does {
+                daemon::control::Act::Revokes(named) => Some(named),
+                _ => None,
+            })
+            .collect();
+        let mut again = Vec::new();
+        if !returning.is_empty() {
+            println!();
+            println!("These come back as members, as they were before those acts:");
+            for (number, named) in returning.iter().enumerate() {
+                println!("  {:>2}. {named}", number.saturating_add(1));
+            }
+            println!();
+            println!(
+                "Any of them can be revoked again in this same act, by the founder, for good."
+            );
+            print!("Revoke again which? [numbers / all / none] ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let Some(chosen) = again_choice(&answer, returning.len()) else {
+                println!("That is none of the choices.");
+                return Ok(None);
+            };
+            again = chosen
+                .into_iter()
+                .filter_map(|index| returning.get(index).map(|named| named.id.clone()))
+                .collect();
+        }
+        Ok(Some(Command::RevokeFrom {
+            network: network.clone(),
+            target: target.clone(),
+            reason: reason.clone(),
+            from: oldest.id.clone(),
+            again,
+        }))
+    }
+
     /// Puts the question a revocation that voids acts asks, before anything is
     /// signed, and sends it again with the acknowledgement on yes.
     async fn when_voiding(
@@ -995,7 +1244,8 @@ impl Cli<'_> {
             "This device is the only admin of `{}`. Once it is removed, nobody will be able to",
             daemon::control::shown(&network)
         );
-        println!("admit or revoke anything in it — a stolen device included.");
+        println!("admit or revoke anything in it — a stolen device included — unless the");
+        println!("founder's words admit a new admin from another of its devices.");
         println!();
         print!("Remove it anyway? [yes/no] ");
         if !agrees() {
@@ -1020,6 +1270,10 @@ impl Cli<'_> {
         use daemon::control::{Command, Outcome};
 
         match answer {
+            Ok(Outcome::History(history)) => {
+                print!("{}", history_listed(&history));
+                ExitCode::SUCCESS
+            }
             Ok(Outcome::Reported(report)) => {
                 match asked {
                     Command::Peers { network, .. } => {
@@ -1130,7 +1384,56 @@ impl Cli<'_> {
     ) -> std::io::Result<daemon::control::Outcome> {
         use daemon::control::{Command, Outcome};
 
+        let command = as_founder_where_asked(command);
+        let wrapped;
+        let expected = if matches!(command, Command::AsFounder(_)) {
+            wrapped = as_founder_where_asked(expected.clone());
+            &wrapped
+        } else {
+            expected
+        };
+        // The founder's key, made from the words the person typed for this act,
+        // kept for the act's batches — its own, then the root over it — and
+        // dropped, overwritten, when this returns. Read first, for an act that
+        // is the founder's: the daemon may need its transport key to reach the
+        // network at all (a founder session), before anything is prepared.
+        let mut founder: Option<identity::founder::FounderKey> = None;
+        if matches!(
+            command,
+            Command::AsFounder(_) | Command::Recover { .. } | Command::ReplaceFounder { .. }
+        ) {
+            println!(
+                "This is signed with the founder's words. Do it on one device at a time: the \
+                 same words used on two devices at once cancel each other out."
+            );
+            let key = match words::read_back(&mut std::io::stdout(), &mut std::io::stdin().lock()) {
+                Ok(key) => key,
+                Err(refusal) => return Ok(Outcome::Declined { message: refusal }),
+            };
+            let session = Command::FounderSession {
+                network: batch::typed_label(&command).map(str::to_owned),
+                transport: roster::hex::encode(key.transport_seed().expose()),
+            };
+            match self.ask(session).await? {
+                refused @ (Outcome::Failed { .. } | Outcome::NotAllowed { .. }) => {
+                    return Ok(refused);
+                }
+                Outcome::Reported(report) => {
+                    if let Some(note) = &report.note {
+                        println!("{note}");
+                    }
+                }
+                _ => {}
+            }
+            founder = Some(key);
+        }
         let mut outcome = self.ask(command).await?;
+        // What the act is, for showing and checking: the act inside, where the
+        // founder's words sign it.
+        let shown_as = match expected {
+            Command::AsFounder(inner) => inner.as_ref(),
+            other => other,
+        };
         // A key made a moment ago, still unlocked, kept for the daemon's very
         // next answer and no longer: taken out at the top of every turn and
         // dropped at the end of it unless that answer was a batch for it.
@@ -1172,23 +1475,33 @@ impl Cli<'_> {
             };
 
             println!();
-            print!("{}", batch::listed(&read, &wanted.network, expected));
+            let listed = batch::listed(&read, &wanted.network, shown_as);
+            let listed = if wanted.founder.is_some() {
+                listed.replace("with this network's admin key", "with the founder's words")
+            } else {
+                listed
+            };
+            print!("{listed}");
             println!();
 
             let messages: Vec<&[u8]> =
                 wanted.items.iter().map(|item| item.message.as_slice()).collect();
-            let signed = match made {
-                Some((name, key)) if name == wanted.key => {
+            let signed = match (&wanted.founder, made) {
+                (Some(expected_keys), _) => {
+                    self.founder_signs(&mut founder, expected_keys, &messages)
+                }
+                (None, Some((name, key))) if name == wanted.key => {
                     println!("signing with the key you have just made, without asking again.");
                     key.sign_all(&messages)
                 }
-                _ => {
-                    let summary = batch::summary(&read, &wanted.network, expected);
+                (None, _) => {
+                    let summary = batch::summary(&read, &wanted.network, shown_as);
                     self.custody.sign_all(&Asking {
                         key: &wanted.key,
                         network: &wanted.network,
                         summary: &summary,
                         messages: &messages,
+                        keys: wanted.keys.as_deref(),
                     })
                 }
             };
@@ -1213,6 +1526,43 @@ impl Cli<'_> {
 
             outcome = self.ask(Command::Signed { id: wanted.id, signatures }).await?;
         }
+    }
+
+    /// Signs every message with the founder's key: the one already made from
+    /// the words for this act, or one made now from words read without showing
+    /// them, checked to be the key the daemon names before anything is signed.
+    fn founder_signs(
+        &self,
+        held: &mut Option<identity::founder::FounderKey>,
+        expected: &daemon::control::FounderPublic,
+        messages: &[&[u8]],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let expected = expected.keys()?;
+        if held.is_none() {
+            println!(
+                "This is signed with the founder's words. Do it on one device at a time: the \
+                 same words used on two devices at once cancel each other out."
+            );
+            let key = words::read_back(&mut std::io::stdout(), &mut std::io::stdin().lock())?;
+            if key.keys() != expected {
+                return Err(
+                    "those are not this network's founder's words. Nothing was signed.".to_owned()
+                );
+            }
+            *held = Some(key);
+        }
+        let key = held.as_ref().ok_or_else(|| "no founder's key".to_owned())?;
+        if key.keys() != expected {
+            return Err(
+                "those are not this network's founder's words. Nothing was signed.".to_owned()
+            );
+        }
+        messages
+            .iter()
+            .map(|message| {
+                key.signer().sign(message).map_err(|cause| format!("the founder's key: {cause}"))
+            })
+            .collect()
     }
 
     /// Asks for a port to be opened or closed, or for what is open, and prints it.
@@ -1554,13 +1904,158 @@ impl Cli<'_> {
     }
 }
 
+/// A history, one operation a line, newest first, with when it is complete
+/// from.
+fn history_listed(history: &daemon::control::History) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "{}:", daemon::control::shown(&history.network));
+    for entry in &history.entries {
+        let by = entry.by.as_ref().map_or_else(|| "the founder".to_owned(), ToString::to_string);
+        let effect = entry
+            .no_effect
+            .as_ref()
+            .map_or_else(String::new, |why| format!("  (no effect: {why})"));
+        let _ = writeln!(out, "  {}  {by}: {}{effect}", when(entry.at / 1_000), entry.does);
+    }
+    if history.compacted {
+        let _ = writeln!(
+            out,
+            "complete from {}: acts before it are in the network's state and no longer listed.",
+            when(history.complete_from / 1_000)
+        );
+    } else {
+        let _ = writeln!(out, "complete from the founding.");
+    }
+    out
+}
+
+/// What a person answered to "void from which?", over `count` acts listed
+/// newest first: `Some(None)` for none, `Some(Some(index))` for the oldest act
+/// voided, `None` for an answer that is none of the choices.
+fn void_choice(answer: &str, count: usize) -> Option<Option<usize>> {
+    let answer = answer.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    if answer.eq_ignore_ascii_case("all") {
+        return Some(count.checked_sub(1));
+    }
+    let number: usize = answer.parse().ok()?;
+    (1..=count).contains(&number).then(|| Some(number.saturating_sub(1)))
+}
+
+/// Which of `count` devices a voiding brings back are revoked again: numbers
+/// from one, separated by spaces or commas, `all`, or `none` (or nothing).
+/// `None` for anything else.
+fn again_choice(answer: &str, count: usize) -> Option<Vec<usize>> {
+    let answer = answer.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    if answer.eq_ignore_ascii_case("all") {
+        return Some((0..count).collect());
+    }
+    let mut chosen = Vec::new();
+    for word in answer.split(|letter: char| letter == ',' || letter.is_whitespace()) {
+        if word.is_empty() {
+            continue;
+        }
+        let number: usize = word.parse().ok()?;
+        if !(1..=count).contains(&number) {
+            return None;
+        }
+        let index = number.saturating_sub(1);
+        if !chosen.contains(&index) {
+            chosen.push(index);
+        }
+    }
+    Some(chosen)
+}
+
+/// How `recover` is spelled.
+const RECOVER_USAGE: &str = "peerfectly recover [<network>] [--revoke <admin>]...";
+
+/// How `founder replace` is spelled.
+const FOUNDER_USAGE: &str = "peerfectly founder replace [<network>]";
+
+/// How `history` is spelled.
+const HISTORY_USAGE: &str = "peerfectly history [<network>] [--by <device> | --by founder]";
+
+/// What `--founder` does, said once below the commands it applies to.
+const AS_FOUNDER_USAGE: &str =
+    "  --founder, after revoke, demote, rename, approve, invite, admit, relay, set-anchors,
+    ipv4 or route, signs with the founder's words instead of this device's key, from any
+    device holding the network: an admin, a member, or one the network revoked";
+
+/// Reads `recover [<network>] [--revoke <admin>]...`.
+fn recovery_from(rest: &[String]) -> Result<daemon::control::Command, String> {
+    let mut network = None;
+    let mut revoke = Vec::new();
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--revoke" => {
+                let named = words.next().ok_or_else(|| format!("usage: {RECOVER_USAGE}"))?;
+                revoke.push(daemon::control::Target::Name(named.clone()));
+            }
+            other if other.starts_with("--") => {
+                return Err(format!(
+                    "`{other}` is not an option of recover.\nusage: {RECOVER_USAGE}"
+                ));
+            }
+            other if network.is_none() => network = Some(other.to_owned()),
+            _ => return Err(format!("usage: {RECOVER_USAGE}")),
+        }
+    }
+    Ok(daemon::control::Command::Recover { network, revoke })
+}
+
+/// Reads `founder replace [<network>]`, making the new words and checking them
+/// first: the old ones are read when the change is signed.
+fn founder_replacement_from(
+    rest: &[String],
+    founder: &mut dyn FnMut() -> Result<daemon::control::FounderPublic, String>,
+) -> Result<daemon::control::Command, String> {
+    let network = rest.first().filter(|first| !first.starts_with('-')).cloned();
+    println!(
+        "The new founder's words. The words you have now are asked for after, to sign the change."
+    );
+    Ok(daemon::control::Command::ReplaceFounder { network, founder: founder()? })
+}
+
+/// Makes the founder's words, shows them, and checks three of them, at this
+/// terminal; then clears it. The public keys go on to the daemon, and the words
+/// go nowhere: founding signs nothing with them.
+fn founder_words_shown_and_checked() -> Result<daemon::control::FounderPublic, String> {
+    let key = identity::founder::FounderKey::generate()
+        .map_err(|cause| format!("the founder's words could not be made: {cause}"))?;
+    let mut out = std::io::stdout();
+    let mut input = std::io::stdin().lock();
+    let mut pick = |count: usize| {
+        let mut bytes = [0_u8; 8];
+        // Without randomness, the positions in order: still a check.
+        if getrandom::fill(&mut bytes).is_err() {
+            return 0;
+        }
+        let count = u64::try_from(count).unwrap_or(1).max(1);
+        usize::try_from(u64::from_le_bytes(bytes).checked_rem(count).unwrap_or(0)).unwrap_or(0)
+    };
+    words::show_and_check(&mut out, &mut input, &key, &mut pick)?;
+    words::clear(&mut out).map_err(|cause| format!("the terminal failed: {cause}"))?;
+    Ok(daemon::control::FounderPublic::of(&key.keys()))
+}
+
 /// Builds the founding command from what a person typed.
 ///
 /// The parsing stays here — it is what a terminal is for — and the work goes to
 /// the daemon. A relay given as its host is asked for its key there, because
 /// that is the process that will use it and because doing it here would mean
 /// two processes talking to the relay's host about the same thing.
-fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
+fn founding_from(
+    rest: &[String],
+    founder: &mut dyn FnMut() -> Result<daemon::control::FounderPublic, String>,
+) -> Result<daemon::control::Command, String> {
     use daemon::control::Command;
 
     // The network's name, which is this machine's own name for it. The device's
@@ -1629,7 +2124,11 @@ fn founding_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         None => None,
     };
 
+    // Last, once everything typed has been read and found usable: the words are
+    // made, shown and checked only for a founding that will be asked for.
+    let founder = founder()?;
     Ok(Command::Found {
+        founder,
         label: label.clone(),
         name,
         // Composed from the network's own name so that two networks on one
@@ -1664,7 +2163,8 @@ fn joining_from(rest: &[String]) -> Result<daemon::control::Command, String> {
         .filter(|word| !word.starts_with("--"))
         .cloned()
         .ok_or_else(|| format!("usage: {JOIN_USAGE}"))?;
-    Ok(daemon::control::Command::Join { invite, name: device_name(rest)? })
+    let admin = rest.iter().any(|word| word == "--admin");
+    Ok(daemon::control::Command::Join { invite, name: device_name(rest)?, admin })
 }
 
 /// Builds the inviting command from what a person typed.
@@ -1821,7 +2321,7 @@ fn machine_name() -> Option<String> {
 }
 
 /// How `join` is spelled, in one place so the usage and the refusal agree.
-const JOIN_USAGE: &str = "peerfectly join <the invite an admin sent> [--name NAME]";
+const JOIN_USAGE: &str = "peerfectly join <the invite an admin sent> [--name NAME] [--admin]";
 
 /// How many devices of a batch file one command carries: well within what a
 /// command may hold, at a few hundred bytes a device.
@@ -1916,6 +2416,20 @@ fn pending_listed(list: &daemon::control::PendingList) -> String {
             )),
             (standing, _) => out.push_str(&format!("{name} ({network}): {standing}\n")),
         }
+        // Requests for the other role: refused, the invite left open. Told in
+        // these words, from the fixed word the record keeps.
+        for refused in &line.refused {
+            let (makes, asked) = match refused.word.as_str() {
+                "invite-makes-admin" => ("an admin", "a member"),
+                "invite-makes-member" => ("a member", "an admin"),
+                _ => continue,
+            };
+            out.push_str(&format!(
+                "  refused {}: the key {} asked to join as {asked}, and this invite makes {makes}\n",
+                when(refused.at),
+                daemon::control::shown(&refused.fingerprint)
+            ));
+        }
         out.push('\n');
     }
     for join in &list.joins {
@@ -1992,6 +2506,7 @@ fn usage(privileged: &str) -> String {
         board::BOARD_USAGE,
         REVOKE_USAGE,
         RENAME_USAGE,
+        Command::DEMOTE_USAGE,
         FORGET_USAGE,
         Command::RELAY_USAGE,
         Command::SET_ANCHORS_USAGE,
@@ -2000,15 +2515,24 @@ fn usage(privileged: &str) -> String {
         "peerfectly expose <network> tcp|udp <port>",
         "peerfectly unexpose <network> tcp|udp <port>",
         "peerfectly exposed [network]",
+        RECOVER_USAGE,
+        FOUNDER_USAGE,
+        HISTORY_USAGE,
     ] {
         out.push_str(&format!("  {line}{}\n", note(line)));
     }
+    out.push_str(&format!("\n{AS_FOUNDER_USAGE}  (needs {privileged})\n"));
     out
 }
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
+    /// Founder keys nobody holds, for parsing tests: no words are shown.
+    fn held() -> Result<daemon::control::FounderPublic, String> {
+        Ok(daemon::control::FounderPublic::of(&roster::types::FounderKeys::held_by_nobody()))
+    }
+
     use daemon::control::Command;
 
     use super::named_after;
@@ -2043,34 +2567,80 @@ mod tests {
 
     #[test]
     fn found_takes_an_ipv4_range() {
-        let command =
-            founding_from(&words("casa --suffix casa.internal --ipv4-range 10.42.0.0/16")).unwrap();
+        let command = founding_from(
+            &words("casa --suffix casa.internal --ipv4-range 10.42.0.0/16"),
+            &mut held,
+        )
+        .unwrap();
         assert_eq!(range_of(&command).as_deref(), Some("10.42.0.0/16"));
     }
 
     #[test]
     fn found_without_the_flag_asks_for_the_default() {
-        let command = founding_from(&words("casa")).unwrap();
+        let command = founding_from(&words("casa"), &mut held).unwrap();
         assert_eq!(range_of(&command), None);
     }
 
     #[test]
     fn found_takes_how_many_devices_or_a_block_and_not_both() {
-        let command = founding_from(&words("casa --devices 500")).unwrap();
+        let command = founding_from(&words("casa --devices 500"), &mut held).unwrap();
         assert!(matches!(command, Command::Found { devices: Some(500), ipv4_range: None, .. }));
-        let both = founding_from(&words("casa --devices 500 --ipv4-range 10.42.0.0/16"));
+        let both = founding_from(&words("casa --devices 500 --ipv4-range 10.42.0.0/16"), &mut held);
         assert!(both.unwrap_err().contains("one or the other"));
-        assert!(founding_from(&words("casa --devices none")).unwrap_err().contains("not a number"));
+        assert!(
+            founding_from(&words("casa --devices none"), &mut held)
+                .unwrap_err()
+                .contains("not a number")
+        );
         assert!(super::FOUND_USAGE.contains("--devices"));
     }
 
     #[test]
     fn a_range_that_is_not_allowed_is_refused_before_the_daemon_is_asked() {
-        let refusal = founding_from(&words("casa --ipv4-range 8.8.8.0/24")).unwrap_err();
+        let refusal = founding_from(&words("casa --ipv4-range 8.8.8.0/24"), &mut held).unwrap_err();
         assert!(
             refusal.contains("8.8.8.0/24") && refusal.contains("Nothing was signed"),
             "{refusal}"
         );
+    }
+
+    /// The founder's acts are in the usage, where a person who holds only the
+    /// words looks for them.
+    #[test]
+    fn the_usage_names_the_founders_acts() {
+        let usage = super::usage("Administrator");
+        for wanted in
+            ["peerfectly recover", "peerfectly founder replace", "peerfectly history", "--founder"]
+        {
+            assert!(usage.contains(wanted), "{wanted} is in the usage: {usage}");
+        }
+        let line =
+            |word: &str| usage.lines().find(|line| line.contains(word)).expect("listed").to_owned();
+        assert!(!line("peerfectly history").contains("needs"), "history needs nobody");
+        assert!(line("peerfectly recover").contains("needs Administrator"));
+    }
+
+    /// The answers to "void from which?".
+    #[test]
+    fn a_void_choice_is_a_number_all_or_none() {
+        assert_eq!(super::void_choice("2\n", 4), Some(Some(1)));
+        assert_eq!(super::void_choice("all", 4), Some(Some(3)));
+        assert_eq!(super::void_choice("", 4), Some(None));
+        assert_eq!(super::void_choice("none", 4), Some(None));
+        assert_eq!(super::void_choice("5", 4), None, "beyond the list");
+        assert_eq!(super::void_choice("0", 4), None);
+        assert_eq!(super::void_choice("later", 4), None);
+    }
+
+    #[test]
+    fn who_is_revoked_again_is_numbers_all_or_none() {
+        assert_eq!(super::again_choice("2, 1 2\n", 3), Some(vec![1, 0]));
+        assert_eq!(super::again_choice("all", 3), Some(vec![0, 1, 2]));
+        assert_eq!(super::again_choice("", 3), Some(Vec::new()));
+        assert_eq!(super::again_choice("none", 3), Some(Vec::new()));
+        assert_eq!(super::again_choice("4", 3), None, "beyond the list");
+        assert_eq!(super::again_choice("0", 3), None);
+        assert_eq!(super::again_choice("phone", 3), None);
     }
 
     #[test]
@@ -2088,10 +2658,13 @@ mod tests {
 
     #[test]
     fn a_default_founding_sets_no_window_and_one_is_taken_when_asked() {
-        assert_eq!(window_of(&founding_from(&words("casa")).unwrap()), None);
-        assert_eq!(window_of(&founding_from(&words("casa --window 7")).unwrap()), Some(7));
+        assert_eq!(window_of(&founding_from(&words("casa"), &mut held).unwrap()), None);
+        assert_eq!(
+            window_of(&founding_from(&words("casa --window 7"), &mut held).unwrap()),
+            Some(7)
+        );
         assert!(
-            founding_from(&words("casa --window 0")).is_err(),
+            founding_from(&words("casa --window 0"), &mut held).is_err(),
             "zero is no window, said as none"
         );
     }
@@ -2162,7 +2735,9 @@ mod tests {
                             id: "0b0b-0b0b-0b0b-0b0b".to_owned(),
                         }),
                         conflicts: vec!["100.83.0.0/16 overlaps 100.83.4.0/24".to_owned()],
+                        admin: false,
                     }),
+                    refused: Vec::new(),
                 },
                 InviteLine {
                     network: "casa".to_owned(),
@@ -2170,6 +2745,11 @@ mod tests {
                     standing: "used".to_owned(),
                     expires_at: 0,
                     request: None,
+                    refused: vec![daemon::control::RefusedLine {
+                        fingerprint: "1111-2222-3333-4444-5555".to_owned(),
+                        word: "invite-makes-admin".to_owned(),
+                        at: 1_800_000_000,
+                    }],
                 },
             ],
             joins: vec![JoinLine {
@@ -2189,6 +2769,12 @@ mod tests {
         assert!(shown.contains("0b0b-0b0b-0b0b-0b0b"), "the device holding the name: {shown}");
         assert!(shown.contains("its IPv4: 100.83.0.0/16 overlaps"), "what the device saw: {shown}");
         assert!(shown.contains("sensor (casa): used"), "{shown}");
+        assert!(
+            shown.contains(
+                "1111-2222-3333-4444-5555 asked to join as a member, and this invite makes an admin"
+            ),
+            "a request refused for its role: {shown}"
+        );
         assert!(shown.contains("9F00-1E2D-3C4B-5A69-7887"), "{shown}");
         assert!(shown.contains("peerfectly cancel joining"), "{shown}");
         assert_eq!(
@@ -2213,12 +2799,14 @@ mod tests {
         let written =
             "1c23b31d465a430ab24cc9e7990dd18ed67800950f7c3d035c3f6cb7747e5a89@relay.example:8443";
         for relay in [written, "relay.example", "https://relay.example:9443"] {
-            let command = founding_from(&words(&format!("casa --relay {relay}"))).unwrap();
+            let command =
+                founding_from(&words(&format!("casa --relay {relay}")), &mut held).unwrap();
             assert_eq!(Some(relay.to_owned()), relay_of(&command));
         }
-        let refusal = founding_from(&words("casa --relay relay.example:8443")).unwrap_err();
+        let refusal =
+            founding_from(&words("casa --relay relay.example:8443"), &mut held).unwrap_err();
         assert!(refusal.contains("host of its peerfectly relay container"), "{refusal}");
-        assert_eq!(None, relay_of(&founding_from(&words("casa")).unwrap()));
+        assert_eq!(None, relay_of(&founding_from(&words("casa"), &mut held).unwrap()));
     }
 
     /// An option found does not take is refused, rather than ignored and found
@@ -2227,7 +2815,8 @@ mod tests {
     fn an_option_found_does_not_take_is_refused() {
         for flags in ["--relays r.example", "--colour blue", "--now"] {
             let refusal =
-                founding_from(&words(&format!("casa --relay relay.example {flags}"))).unwrap_err();
+                founding_from(&words(&format!("casa --relay relay.example {flags}")), &mut held)
+                    .unwrap_err();
             assert!(refusal.contains("is not an option of found"), "{refusal}");
         }
         for option in super::FOUND_OPTIONS {
@@ -2261,7 +2850,7 @@ mod tests {
         assert!(super::inviting_from(&words("--light")).is_err(), "a name first");
         assert!(super::inviting_from(&words("sensor --expires many")).is_err());
 
-        let Ok(Command::Join { invite, name }) =
+        let Ok(Command::Join { invite, name, admin: false }) =
             super::joining_from(&words("peerfectly-invite-v1:00 --name board"))
         else {
             panic!("a join");
@@ -2269,6 +2858,13 @@ mod tests {
         assert_eq!(invite, "peerfectly-invite-v1:00");
         assert_eq!(name, "board");
         assert!(super::joining_from(&words("--name board")).is_err(), "an invite first");
+        assert!(
+            matches!(
+                super::joining_from(&words("peerfectly-invite-v1:00 --name board --admin")),
+                Ok(Command::Join { admin: true, .. })
+            ),
+            "--admin asks to join as an admin"
+        );
     }
 
     #[test]
@@ -2402,17 +2998,19 @@ mod custody {
             [0xa0; 32],
             roster::snapshot::Covering { heads, depths },
             Vec::new(),
-            roster::leaf::DeviceLeaf {
-                record: identity
-                    .device_spec("pc", roster::types::Role::Admin, true, Vec::new())
-                    .unwrap()
-                    .into_record(roster::id::OperationId::from_bytes([1; 32]))
-                    .unwrap(),
-                settings: roster::leaf::DeviceSettings::default(),
-            },
-            roster::membership::MembershipProof {
-                devices: roster::merkle::Proof { siblings: Vec::new() },
-                parameters: [0; 32],
+            roster::snapshot::RootSigner::Device {
+                leaf: roster::leaf::DeviceLeaf {
+                    record: identity
+                        .device_spec("pc", roster::types::Role::Admin, Vec::new())
+                        .unwrap()
+                        .into_record(roster::id::OperationId::from_bytes([1; 32]))
+                        .unwrap(),
+                    settings: roster::leaf::DeviceSettings::default(),
+                },
+                proof: roster::membership::MembershipProof {
+                    devices: roster::merkle::Proof { siblings: Vec::new() },
+                    parameters: [0; 32],
+                },
             },
             identity.signing_key().key_id(),
             network,
@@ -2427,6 +3025,8 @@ mod custody {
             key: key.to_owned(),
             network: "casa".to_owned(),
             items,
+            keys: None,
+            founder: None,
         })
     }
 
@@ -2464,12 +3064,18 @@ mod custody {
                     message: vec![7; 32],
                     payload: Vec::new(),
                 }],
+                keys: None,
+                founder: None,
             }),
             Outcome::Failed { message: "stop here".to_owned(), left_behind: Vec::new() },
         ]);
         let custody = Willing::default();
         let cli = Cli { channel: &daemon, custody: &custody, extras: Extras::default() };
-        let joining = Command::Join { invite: "an invite".to_owned(), name: "laptop".to_owned() };
+        let joining = Command::Join {
+            invite: "an invite".to_owned(),
+            name: "laptop".to_owned(),
+            admin: false,
+        };
         assert_eq!(std::process::ExitCode::FAILURE, cli.join(joining).await);
         let sent = daemon.sent();
         assert!(
@@ -2491,6 +3097,8 @@ mod custody {
                 message: vec![1, 2, 3],
                 payload: Vec::new(),
             }],
+            keys: None,
+            founder: None,
         })]);
         let cli = Cli { channel: &daemon, custody: &NoCustody, extras: Extras::default() };
 
@@ -2509,10 +3117,7 @@ mod custody {
     #[tokio::test]
     async fn another_act_is_not_signed_whatever_custody_would_do() {
         let promotion = core(
-            OperationBody::Promote {
-                device: roster::id::DeviceId::from_bytes([0x11; 32]),
-                founder: false,
-            },
+            OperationBody::Promote { device: roster::id::DeviceId::from_bytes([0x11; 32]) },
             Vec::new(),
         );
         let daemon = Scripted::answering(vec![wanted("a key", vec![operation(&promotion)])]);
@@ -2581,7 +3186,7 @@ mod custody {
         let joiner = identity::NodeIdentity::generate().unwrap();
         let admission = core(
             OperationBody::AddDevice(
-                joiner.device_spec("laptop", Role::Member, false, Vec::new()).unwrap(),
+                joiner.device_spec("laptop", Role::Member, Vec::new()).unwrap(),
             ),
             vec![revocation.id()],
         );
@@ -2608,8 +3213,9 @@ mod custody {
     #[tokio::test]
     async fn a_key_just_made_signs_its_founding_without_asking_again() {
         let identity = identity::NodeIdentity::generate().unwrap();
-        let founder = identity.device_spec("desktop", Role::Admin, true, Vec::new()).unwrap();
+        let founder = identity.device_spec("desktop", Role::Admin, Vec::new()).unwrap();
         let params = roster::types::NetworkParams::new(
+            roster::types::FounderKeys::held_by_nobody(),
             vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
             "home.internal",
             2_592_000,
@@ -2632,6 +3238,7 @@ mod custody {
                 id: "k1".to_owned(),
                 name: "peerfectly.casa.signing".to_owned(),
                 network: "casa".to_owned(),
+                keys: None,
             }),
             wanted("peerfectly.casa.signing", vec![operation(&genesis), snapshot]),
             Outcome::Done,
@@ -2639,6 +3246,9 @@ mod custody {
         let custody = Willing { unlocks: true, ..Willing::default() };
         let cli = Cli { channel: &daemon, custody: &custody, extras: Extras::default() };
         let founding = Command::Found {
+            founder: daemon::control::FounderPublic::of(
+                &roster::types::FounderKeys::held_by_nobody(),
+            ),
             label: "casa".to_owned(),
             name: "desktop".to_owned(),
             suffix: "home.internal".to_owned(),
@@ -2705,6 +3315,7 @@ mod custody {
                 id: "k1".to_owned(),
                 name: "peerfectly.casa.signing".to_owned(),
                 network: "casa".to_owned(),
+                keys: None,
             }),
             Outcome::JoinStarted {
                 label: "joining".to_owned(),
@@ -2715,7 +3326,11 @@ mod custody {
         let custody = Willing { unlocks: true, ..Willing::default() };
         let cli = Cli { channel: &daemon, custody: &custody, extras: Extras::default() };
 
-        let joining = Command::Join { invite: "an invite".to_owned(), name: "laptop".to_owned() };
+        let joining = Command::Join {
+            invite: "an invite".to_owned(),
+            name: "laptop".to_owned(),
+            admin: false,
+        };
         let outcome = cli.ask_and_sign(joining).await.unwrap();
 
         assert_eq!(
@@ -2746,6 +3361,7 @@ mod custody {
                 id: "k1".to_owned(),
                 name: "peerfectly.casa.signing".to_owned(),
                 network: "casa".to_owned(),
+                keys: None,
             }),
             wanted("peerfectly.other.signing", vec![operation(&revocation)]),
             Outcome::Done,
@@ -2801,6 +3417,7 @@ mod custody {
             id: "8".to_owned(),
             name: "peerfectly.casa.signing".to_owned(),
             network: "casa".to_owned(),
+            keys: None,
         })]);
         let cli = Cli { channel: &daemon, custody: &NoCustody, extras: Extras::default() };
 
@@ -2810,6 +3427,73 @@ mod custody {
         assert!(message.contains("cannot protect a signing key"), "{message}");
         let sent = daemon.sent();
         assert!(!sent.iter().any(|one| matches!(one, Command::KeyMade { .. })), "{sent:?}");
+    }
+
+    /// `recover` reads its network and the admins to revoke, and nothing
+    /// else: no option of another command, no second network.
+    #[test]
+    fn recover_reads_a_network_and_the_admins_named() {
+        use daemon::control::{Command, Target};
+        let words = |line: &str| line.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let read = super::recovery_from(&words("casa --revoke nas --revoke desk")).unwrap();
+        assert_eq!(
+            read,
+            Command::Recover {
+                network: Some("casa".to_owned()),
+                revoke: vec![Target::Name("nas".to_owned()), Target::Name("desk".to_owned())],
+            }
+        );
+        assert_eq!(
+            super::recovery_from(&[]).unwrap(),
+            Command::Recover { network: None, revoke: Vec::new() }
+        );
+        for refused in ["casa --admin", "casa lavoro", "casa --revoke"] {
+            assert!(super::recovery_from(&words(refused)).is_err(), "{refused}");
+        }
+    }
+
+    /// The history says who signed each act, the founder by that name, what
+    /// had no effect and why, and where it is complete from.
+    #[test]
+    fn a_history_names_the_founder_and_what_had_no_effect() {
+        use daemon::control::{Act, History, HistoryEntry, Named};
+        let history = History {
+            network: "casa".to_owned(),
+            entries: vec![
+                HistoryEntry {
+                    at: 1_735_689_600_000,
+                    by: None,
+                    does: Act::Revokes(Named {
+                        name: Some("nas".to_owned()),
+                        id: "0553-a2f3".to_owned(),
+                    }),
+                    no_effect: None,
+                    id: String::new(),
+                },
+                HistoryEntry {
+                    at: 1_735_689_500_000,
+                    by: Some(Named { name: Some("nas".to_owned()), id: "0553-a2f3".to_owned() }),
+                    does: Act::Revokes(Named {
+                        name: Some("phone".to_owned()),
+                        id: "0553-a2f3".to_owned(),
+                    }),
+                    no_effect: Some("its author was removed at the same time".to_owned()),
+                    id: String::new(),
+                },
+            ],
+            complete_from: 1_735_689_000_000,
+            compacted: true,
+        };
+        let listed = super::history_listed(&history);
+        let lines: Vec<&str> = listed.lines().collect();
+        assert!(lines.get(1).is_some_and(|line| line.contains("the founder: ")), "{listed}");
+        assert!(
+            lines.get(2).is_some_and(|line| line.contains("nas")
+                && line.contains("(no effect: its author was removed at the same time)")),
+            "{listed}"
+        );
+        assert!(listed.contains("complete from "), "{listed}");
+        assert!(listed.contains("no longer listed"), "{listed}");
     }
 }
 

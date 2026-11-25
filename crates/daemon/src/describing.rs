@@ -123,9 +123,7 @@ impl Directory {
                     .unwrap_or_default(),
             }),
             OperationBody::RevokeDevice { device, .. } => Act::Revokes(self.named(device)),
-            OperationBody::Promote { device, founder } => {
-                Act::Promotes(self.named(device), *founder)
-            }
+            OperationBody::Promote { device } => Act::Promotes(self.named(device)),
             OperationBody::Demote { device } => Act::Demotes(self.named(device)),
             OperationBody::Rename { device, name } => {
                 Act::Renames(self.named(device), name.clone())
@@ -172,6 +170,16 @@ pub(crate) fn revoked(
     let page: Vec<&DeviceId> = listed.by_ref().take(crate::control::PEERS_PAGE).collect();
     let more = listed.next().is_some();
     let next = more.then(|| page.last().map(|device| device.to_hex())).flatten();
+    // The founder's keys, the current and any it replaced: an act they signed
+    // is the founder's, not a device's, as `history` says it.
+    let founders: Vec<roster::id::KeyId> = core::iter::once(state.params.founder.signing_id())
+        .chain(valid.iter().filter_map(|operation| match operation.body() {
+            OperationBody::CreateNetwork { params, .. } | OperationBody::SetNetwork(params) => {
+                Some(params.founder.signing_id())
+            }
+            _ => None,
+        }))
+        .collect();
     let revoked = page
         .into_iter()
         .map(|device| Revoked {
@@ -182,8 +190,10 @@ pub(crate) fn revoked(
                     OperationBody::RevokeDevice { device: revoked, reason }
                         if revoked == device =>
                     {
+                        let author = operation.core().author;
                         Some(Revocation {
-                            by: directory.named(&directory.owner(&operation.core().author)),
+                            by: (!founders.contains(&author))
+                                .then(|| directory.named(&directory.owner(&author))),
                             reason: reason.clone(),
                             signer_clock: Signed::from_ts(operation.core().ts),
                         })
@@ -257,7 +267,7 @@ mod tests {
         Ed25519Signer::from_seed([seed; 32])
     }
 
-    fn device(seed: u8, name: &str, role: Role, founder: bool) -> DeviceSpec {
+    fn device(seed: u8, name: &str, role: Role) -> DeviceSpec {
         let signing = KeyEntry::new(
             Algorithm::Ed25519,
             KeyPurpose::Signing,
@@ -278,11 +288,11 @@ mod tests {
         .unwrap();
         let mut keys = vec![signing, transport, attestation];
         keys.sort_by_key(KeyEntry::order_key);
-        DeviceSpec::new(keys, name, role, founder, vec![]).unwrap()
+        DeviceSpec::new(keys, name, role, vec![]).unwrap()
     }
 
     fn id(seed: u8) -> DeviceId {
-        device(seed, "any", Role::Member, false).device_id().unwrap()
+        device(seed, "any", Role::Member).device_id().unwrap()
     }
 
     /// Signed operations addressed by label, so concurrency is exact.
@@ -293,19 +303,29 @@ mod tests {
         minutes: u64,
     }
 
+    /// The founder's words of these histories, which alone act on an admin.
+    fn the_founders_words() -> identity::founder::FounderKey {
+        identity::founder::FounderKey::from_text(
+            "legal winner thank year wave sausage worth useful legal winner thank year wave \
+             sausage worth useful legal winner thank year wave sausage worth title",
+        )
+        .unwrap()
+    }
+
     impl History {
         fn founded_by(seed: u8, name: &str) -> Self {
             let mut history = Self::default();
-            let params =
-                NetworkParams::new(vec![0xfd, 0, 0, 0, 0, 0, 0, 0], "example.internal", 2_592_000)
-                    .unwrap();
+            let params = NetworkParams::new(
+                the_founders_words().keys(),
+                vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
+                "example.internal",
+                2_592_000,
+            )
+            .unwrap();
             let core = OperationCore::new(
                 SIGNED,
                 Algorithm::Ed25519,
-                OperationBody::CreateNetwork {
-                    device: device(seed, name, Role::Admin, true),
-                    params,
-                },
+                OperationBody::CreateNetwork { device: device(seed, name, Role::Admin), params },
                 vec![],
                 signer(seed).key_id(),
                 NetworkId::from_bytes([0; 32]),
@@ -319,6 +339,23 @@ mod tests {
 
         fn op(&mut self, label: &str, author: u8, parents: &[&str], body: OperationBody) {
             self.op_at(label, author, parents, body, None);
+        }
+
+        /// An operation the founder's words sign.
+        fn founder_op(&mut self, label: &str, parents: &[&str], body: OperationBody) {
+            self.minutes = self.minutes.saturating_add(1);
+            let words = the_founders_words();
+            let core = OperationCore::new(
+                SIGNED.saturating_add(self.minutes.saturating_mul(60_000)),
+                Algorithm::Ed25519,
+                body,
+                parents.iter().map(|parent| self.id(parent)).collect(),
+                words.keys().signing_id(),
+                self.network.unwrap(),
+            )
+            .unwrap();
+            let bytes = sign_operation(&core, words.signer()).unwrap();
+            self.entries.push((label.to_owned(), core.id(), bytes));
         }
 
         fn op_at(
@@ -429,18 +466,8 @@ mod tests {
     #[test]
     fn a_member_is_named_as_it_is_now_and_a_revoked_device_as_it_was_admitted() {
         let mut history = History::founded_by(1, "nas");
-        history.op(
-            "add",
-            1,
-            &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-        );
-        history.op(
-            "add3",
-            1,
-            &["add"],
-            OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
-        );
+        history.op("add", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
+        history.op("add3", 1, &["add"], OperationBody::AddDevice(device(3, "phone", Role::Member)));
         history.op(
             "rename3",
             1,
@@ -477,17 +504,16 @@ mod tests {
     #[test]
     fn an_admin_revoked_after_revoking_is_still_named() {
         let mut history = History::founded_by(1, "nas");
-        history.op(
+        history.founder_op(
             "desk",
-            1,
             &["g"],
-            OperationBody::AddDevice(device(3, "desk", Role::Admin, false)),
+            OperationBody::AddDevice(device(3, "desk", Role::Admin)),
         );
         history.op(
             "laptop",
             3,
             &["desk"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         );
         history.op(
             "out2",
@@ -495,9 +521,8 @@ mod tests {
             &["laptop"],
             OperationBody::RevokeDevice { device: id(2), reason: "stolen".to_owned() },
         );
-        history.op(
+        history.founder_op(
             "out3",
-            1,
             &["out2"],
             OperationBody::RevokeDevice { device: id(3), reason: "left".to_owned() },
         );
@@ -512,7 +537,11 @@ mod tests {
             .find(|entry| entry.device.id == crate::control::short_id(&id(2)))
             .unwrap();
         let revocation = laptop.revocations.first().unwrap();
-        assert_eq!(name(&revocation.by), Some("desk"), "the revoking admin, though revoked since");
+        assert_eq!(
+            revocation.by.as_ref().and_then(name),
+            Some("desk"),
+            "the revoking admin, though revoked since"
+        );
         assert_eq!(revocation.reason, "stolen");
         assert!(matches!(revocation.signer_clock, Signed::At { .. }));
     }
@@ -522,17 +551,16 @@ mod tests {
     #[test]
     fn two_revocations_of_one_device_are_both_listed() {
         let mut history = History::founded_by(1, "nas");
-        history.op(
+        history.founder_op(
             "desk",
-            1,
             &["g"],
-            OperationBody::AddDevice(device(3, "desk", Role::Admin, false)),
+            OperationBody::AddDevice(device(3, "desk", Role::Admin)),
         );
         history.op(
             "laptop",
             1,
             &["desk"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         );
         history.op(
             "by-nas",
@@ -553,7 +581,7 @@ mod tests {
         let (listed, _) = revoked(&directory, &state, &held, &LastContacts::default(), None);
         let laptop = listed.first().unwrap();
         let mut by: Vec<Option<&str>> =
-            laptop.revocations.iter().map(|entry| name(&entry.by)).collect();
+            laptop.revocations.iter().map(|entry| entry.by.as_ref().and_then(name)).collect();
         by.sort_unstable();
         assert_eq!(by, vec![Some("desk"), Some("nas")]);
     }
@@ -572,13 +600,13 @@ mod tests {
             "laptop",
             1,
             &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         );
         history.op(
             "phone",
             1,
             &["laptop"],
-            OperationBody::AddDevice(device(4, "phone", Role::Member, false)),
+            OperationBody::AddDevice(device(4, "phone", Role::Member)),
         );
         history.op(
             "real",
@@ -621,13 +649,13 @@ mod tests {
             "laptop",
             1,
             &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         );
         history.op(
             "phone",
             1,
             &["laptop"],
-            OperationBody::AddDevice(device(3, "phone", Role::Member, false)),
+            OperationBody::AddDevice(device(3, "phone", Role::Member)),
         );
         history.op(
             "revoke",
@@ -702,13 +730,13 @@ mod tests {
             "laptop",
             1,
             &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         );
         history.op(
             "left",
             1,
             &["laptop"],
-            OperationBody::AddDevice(device(5, "tablet", Role::Member, false)),
+            OperationBody::AddDevice(device(5, "tablet", Role::Member)),
         );
         history.op(
             "right",
@@ -747,7 +775,7 @@ mod tests {
             "laptop",
             1,
             &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
+            OperationBody::AddDevice(device(2, "laptop", Role::Member)),
         );
         for index in 0..4u8 {
             history.op(
@@ -769,12 +797,7 @@ mod tests {
     #[test]
     fn evidence_kept_after_compaction_takes_the_same_path() {
         let mut history = History::founded_by(1, "nas");
-        history.op(
-            "a",
-            1,
-            &["g"],
-            OperationBody::AddDevice(device(2, "laptop", Role::Member, false)),
-        );
+        history.op("a", 1, &["g"], OperationBody::AddDevice(device(2, "laptop", Role::Member)));
         history.op(
             "left",
             1,

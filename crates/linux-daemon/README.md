@@ -23,7 +23,7 @@ wrongly even if it works.
 | `machine` | `daemon::Machine`, from the four above |
 | `socket` | the control socket `/run/peerfectly/control.sock`, and the lock that makes this the only daemon |
 | `who` | who is calling, from the kernel, and the person behind `sudo` from the process tree |
-| `home` | `/var/lib/peerfectly`, root's and closed, and the check that the program runs from where only root writes |
+| `home` | `/var/lib/peerfectly` or the directory `--state` names, root's and closed, and the check that the program runs from where only root writes |
 | `custody` | signing keys: in the TPM behind a passphrase, or a file sealed with one |
 | `log` | standard error, where systemd puts it in the journal |
 | `quiet` | the TSS library kept off the terminal |
@@ -74,6 +74,21 @@ keeps two capabilities and nothing else. The programs belong somewhere only root
 as `/usr/local/bin`: the daemon refuses to start otherwise, and `--allow-unsafe-location` is for a
 build directory, warned every time.
 
+**Elsewhere than `/var/lib/peerfectly`.** `peerfectlyd --state <directory>` keeps the state there
+instead — for a container that keeps only one directory across restarts, such as a Home Assistant
+add-on's `/data` (`--state /data/peerfectly`). A directory somebody chose is judged more strictly
+than the default, and the daemon does not start unless:
+
+- the path is absolute and plain: no `.`, no `..`, and no symbolic link anywhere on it;
+- every directory above it, up to `/`, is root's and writable by nobody else — a sticky
+  world-writable one included — and can be read;
+- its parent exists: only the directory itself is made, with mode `0700`.
+
+The command line does not assume the directory: the daemon names it in every request for a key or a
+signature, and the command line judges it the same way before it reads or writes a key there. Both
+programs come from one release; a command line from an older one would look for keys under
+`/var/lib/peerfectly`. `peerfectly status` says where the state is when it is not the default.
+
 ## Installing it
 
 **The archive.** From the repository, anywhere Docker runs:
@@ -82,17 +97,19 @@ build directory, warned every time.
 deploy/linux/package.sh
 ```
 
-It builds `target/dist/peerfectly-<version>-linux-x86_64.tar.gz` in a container, on the testbed's own
-base, and adds its line to `target/dist/SHA256SUMS`. Inside the archive are `peerfectlyd`, `peerfectly`, the
+It builds `target/dist/peerfectly-<version>-linux-<arch>.tar.gz` in a container, on the testbed's own
+base, for the architecture of the machine it runs on, and adds its line to `target/dist/SHA256SUMS`.
+A release carries two: `x86_64`, and `aarch64` (64-bit ARM, a Raspberry Pi 4 or 5 on a 64-bit
+system among them), each built natively. `install.sh` refuses a machine of the other one. Inside the archive are `peerfectlyd`, `peerfectly`, the
 unit, `install.sh` and their digests.
 
 **Installing.** On the server, compare the archive's digest with that line before unpacking:
 the script is about to run as root. Then:
 
 ```text
-sha256sum peerfectly-0.5.3-linux-x86_64.tar.gz
-tar xzf peerfectly-0.5.3-linux-x86_64.tar.gz
-sudo ./peerfectly-0.5.3-linux-x86_64/install.sh
+sha256sum peerfectly-0.6.0-linux-x86_64.tar.gz
+tar xzf peerfectly-0.6.0-linux-x86_64.tar.gz
+sudo ./peerfectly-0.6.0-linux-x86_64/install.sh
 ```
 
 The script **checks everything before it writes anything**, and reports every missing piece at once
@@ -123,7 +140,7 @@ programs, and the networks that were up come back up.
 **Uninstalling:**
 
 ```text
-sudo ./peerfectly-0.5.3-linux-x86_64/install.sh --uninstall
+sudo ./peerfectly-0.6.0-linux-x86_64/install.sh --uninstall
 ```
 
 It stops and disables the service and removes the unit and both programs. **It keeps
@@ -136,8 +153,17 @@ admin. Deleting `/var/lib/peerfectly` by hand removes every network at once, wit
 
 - **Anybody** may connect and ask for `status`; what they are shown is what is theirs.
 - **The owner of a network** brings it up and down with no `sudo`.
-- **Acts that sign** — founding, joining, admitting, revoking, changing settings — need the
-  network's key, which only root can reach, so they run with `sudo`, and ask for the passphrase.
+- **Joining as a member asks for nothing**: `sudo peerfectly join <invite>` makes the device's
+  signing key in memory, signs the join's proof of possession with it, and clears it before
+  anything is written. A member never signs with that key again, so it keeps only the public half,
+  from which its id and address derive, and `status` says it holds none. No passphrase, no TPM, no
+  terminal: a script or a container can join. `sudo peerfectly join <invite> --admin` joins as an
+  admin, with the key in the TPM or a sealed file as below; the invite must have been made with
+  `invite --admin`. A join that asks for the other role is refused by the admin's daemon, which
+  keeps the invite open, and the join's `pending` line says which role to ask for.
+- **Acts that sign** — founding, joining as an admin, admitting, revoking, demoting, changing
+  settings — need the network's key, which only root can reach, so they run with `sudo`, and ask
+  for the passphrase.
   **Once per act**: everything an act signs — a revocation and the admission replacing it, an act
   and the snapshot the network is then owed — arrives as one batch, is listed with what each part
   does and what follows from it, and is signed with one entry of the passphrase. The prompt names
@@ -148,6 +174,39 @@ admin. Deleting `/var/lib/peerfectly` by hand removes every network at once, wit
   Under `sudo` the act is the person's who typed it, so a network founded with
   `sudo peerfectly found` belongs to them.
 - **Exposing a port and stopping the daemon** are acts on the machine, so they need `sudo`.
+- **Only the founder's words act on an admin.** Admitting an admin, demoting, revoking, renaming or
+  setting one takes `--founder`; an admin's own key governs members only, and the command says so
+  before anything is signed. `sudo peerfectly demote <device> --founder` makes an admin a member,
+  and the demoted device destroys its signing key at once. Nothing is signed for a device that is
+  already a member or for the network's only admin. A member wanted as an admin is invited again
+  with `invite --admin` and approved with `approve <name> --replace --founder`: a member keeps no
+  key that could be made an admin's, so promoting one is not offered.
+- **Revoking a stolen admin**, `sudo peerfectly revoke <admin> <reason> --founder`, lists its acts
+  still held and asks from which to void them: what it admitted leaves, what it revoked comes back,
+  what it renamed has its name again. Other admins' acts stand. The devices that come back are
+  listed, and any of them can be revoked again in the same act, for good.
+- **A revoked device is told.** The member it was talking to sends it its revocation as it closes
+  their session, any member it dials answers with it, and the device where the founder's words
+  revoked it sends it at the act's end. Nothing waits on a timer. `status` then says "revoked by …",
+  it invites nobody, and an admin destroys its signing key.
+- **A revoked device listens.** Up, it runs with no tunnel and no address, and carries the roster
+  alone, dialling the members it knew when it starts and when the machine changes network. If the
+  founder voids the revocation, a member brings it the news and it is a member again by itself,
+  tunnel and address included. A revocation the founder's words signed is final: to come back, the
+  device is invited again, and its old keys go then. One that knows nobody left is refused by
+  everybody, and told nothing.
+
+## The founder's words
+
+`sudo peerfectly found` shows the founder's 12 words once, asks for three of them, and clears the
+terminal and its scrollback. Nothing keeps them. They sign with no passphrase — the words are the
+key — typed on one line, separated by spaces, each in full or by its first four letters (24 words,
+from a network founded before, are read too). They are shown as typed and the terminal is cleared
+once the line is read; never from arguments or the environment: `sudo peerfectly <act> --founder`,
+`sudo peerfectly recover <network> --revoke <admin>`, `sudo peerfectly founder replace <network>`.
+`peerfectly history <network>` lists who signed what and needs no `sudo`. Whoever holds the words
+controls the network's admins; lost, they cannot be recovered, and no admin can be added or removed
+again. The command line turns a terminal's echo back on where an interrupted prompt left it off.
 
 ## What each custody defends against
 

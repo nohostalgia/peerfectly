@@ -34,10 +34,9 @@ fn device_strategy() -> impl Strategy<Value = DeviceSpec> {
         any::<u8>(),
         name_strategy(),
         any::<bool>(),
-        any::<bool>(),
         proptest::collection::vec(capability_strategy(), 0..4),
     )
-        .prop_map(|(seed, name, is_admin, founder, capabilities)| {
+        .prop_map(|(seed, name, is_admin, capabilities)| {
             let signing = common::signing_entry(seed);
             let transport = common::transport_entry(seed.wrapping_add(97));
             let attestation = common::attestation_entry(seed.wrapping_add(193));
@@ -46,7 +45,6 @@ fn device_strategy() -> impl Strategy<Value = DeviceSpec> {
                 common::sorted(vec![signing, transport, attestation]),
                 name,
                 role,
-                founder,
                 capabilities,
             )
             .expect("fixture keys are distinct and every field is bounded")
@@ -66,7 +64,8 @@ fn params_strategy() -> impl Strategy<Value = NetworkParams> {
         |(tail, suffix, window)| {
             let mut ula = vec![0xfd];
             ula.extend_from_slice(&tail);
-            NetworkParams::new(ula, suffix, window).expect("bounded by the strategies")
+            NetworkParams::new(roster::types::FounderKeys::held_by_nobody(), ula, suffix, window)
+                .expect("bounded by the strategies")
         },
     )
 }
@@ -84,8 +83,7 @@ fn body_strategy() -> impl Strategy<Value = OperationBody> {
         device_strategy().prop_map(OperationBody::AddDevice),
         (device_id_strategy(), "[a-z ]{0,40}")
             .prop_map(|(device, reason)| OperationBody::RevokeDevice { device, reason }),
-        (device_id_strategy(), any::<bool>())
-            .prop_map(|(device, founder)| OperationBody::Promote { device, founder }),
+        device_id_strategy().prop_map(|device| OperationBody::Promote { device }),
         device_id_strategy().prop_map(|device| OperationBody::Demote { device }),
         (device_id_strategy(), name_strategy())
             .prop_map(|(device, name)| OperationBody::Rename { device, name }),

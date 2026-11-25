@@ -92,6 +92,26 @@ pub trait Keys: Send + Sync {
         self.identity(paths)
     }
 
+    /// Keeps a member's identity under `paths`: one that holds its signing
+    /// key's public half and nothing else of it, made by a member's join.
+    ///
+    /// Sealed as this platform seals the identity's other two keys, which a
+    /// member holds as any device does. Nothing is asked of a key store: there
+    /// is no signing key to put in one.
+    ///
+    /// Written at `path`: the network's identity file, or a file beside it that
+    /// is then moved over it, so that the identity is never half written.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be written.
+    fn keep_member(&self, path: &std::path::Path, identity: &NodeIdentity) -> Result<()> {
+        identity::store::save(identity, path).map_err(|cause| crate::error::Error::State {
+            path: path.to_path_buf(),
+            cause: cause.to_string(),
+        })
+    }
+
     /// Why this machine may not hold an admin's key, if it may not.
     ///
     /// `None` on every platform that has not said otherwise, which is the honest
@@ -113,6 +133,16 @@ pub trait Keys: Send + Sync {
         None
     }
 
+    /// Where the command line is to keep and find this machine's signing keys,
+    /// where the platform keeps them in a directory of the daemon's. Sent with
+    /// every request for a key or a signature, so the two can never look in
+    /// different places; the command line judges it before using it.
+    ///
+    /// `None` where keys live in a key store, or in the platform's default place.
+    fn keys_directory(&self) -> Option<String> {
+        None
+    }
+
     /// How this platform holds the signing key of the identity it gave.
     ///
     /// Read off the identity by default — a key somebody else holds is in a key
@@ -121,7 +151,9 @@ pub trait Keys: Send + Sync {
     /// sealed with a passphrase, says so here: the identity alone cannot tell a
     /// passphrase from hardware, and the report must.
     fn custody_of(&self, identity: &NodeIdentity) -> crate::control::Custody {
-        if identity.signing_key().custodian().is_some() {
+        if identity.signing_key().is_public_only() {
+            crate::control::Custody::None
+        } else if identity.signing_key().custodian().is_some() {
             crate::control::Custody::KeyStore
         } else {
             crate::control::Custody::HeldHere
@@ -146,7 +178,27 @@ pub trait Keys: Send + Sync {
     /// When a key that is there will not go. The network's directory is then
     /// kept, so that whatever names the key is not lost before the key is.
     fn forget(&self, paths: &Paths) -> Result<()> {
-        let _unused = paths;
+        match signing_key_named_in(paths) {
+            Some(name) => self.forget_named(paths, &name),
+            None => Ok(()),
+        }
+    }
+
+    /// Deletes the signing key called `name` from wherever this platform keeps
+    /// it outside the network's directory under `paths`.
+    ///
+    /// What [`Self::forget`] does once it has read the name, and what a demoted
+    /// device does once its identity no longer names the key: by then the name
+    /// is the one it wrote down before rewriting the identity. A key already
+    /// missing is `Ok`.
+    ///
+    /// `Ok(())` by default, where no key is kept outside the directory.
+    ///
+    /// # Errors
+    ///
+    /// When a key that is there will not go.
+    fn forget_named(&self, paths: &Paths, name: &str) -> Result<()> {
+        let _unused = (paths, name);
         Ok(())
     }
 }
@@ -250,6 +302,21 @@ mod tests {
             Some("peerfectly.casa.0011223344556677.signing".to_owned()),
             super::signing_key_named_in(&paths)
         );
+    }
+
+    /// **A member's identity is kept, read back, and said to hold no key.**
+    #[test]
+    fn a_members_identity_is_kept_and_holds_no_key() {
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = crate::state::Paths::under(scratch.path());
+        paths.create().unwrap();
+        let member = identity::NodeIdentity::generate().unwrap().without_signing_key();
+        PlatformKeys.keep_member(&paths.identity(), &member).unwrap();
+
+        let loaded = PlatformKeys.identity(&paths).unwrap();
+        assert_eq!(member.device_id(), loaded.device_id());
+        assert_eq!(crate::control::Custody::None, PlatformKeys.custody_of(&loaded));
+        assert_eq!(None, super::signing_key_named_in(&paths), "it names no key");
     }
 
     /// No identity, or one whose key is in the directory, names nothing.

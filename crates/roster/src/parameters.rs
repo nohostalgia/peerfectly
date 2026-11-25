@@ -37,8 +37,10 @@ const VALUE_CONTEXT: &str = "peerfectly parameter leaf v1";
 pub const RULE_SCHEMA: &[&str] = &["to", "from"];
 
 /// Every parameter name this format knows.
-pub const PARAMETER_NAMES: &[&str] =
-    &["ipv4", "policy", "prefix", "relays", "suffix", "window", "anchors", "leaving", "excluded"];
+pub const PARAMETER_NAMES: &[&str] = &[
+    "ipv4", "policy", "prefix", "relays", "suffix", "window", "anchors", "founder", "leaving",
+    "excluded",
+];
 
 /// A rule of the access policy: members of `from` may open sessions to
 /// members of `to`.
@@ -53,6 +55,9 @@ pub struct Rule {
 /// One parameter, as a leaf of the state tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parameter {
+    /// The founder's signing and transport keys. Always present, and changed
+    /// only by an operation the founder signed.
+    Founder(crate::types::FounderKeys),
     /// The IPv6 unique local prefix.
     Prefix(Vec<u8>),
     /// The DNS suffix.
@@ -79,6 +84,7 @@ impl Parameter {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
+            Self::Founder(_) => "founder",
             Self::Prefix(_) => "prefix",
             Self::Suffix(_) => "suffix",
             Self::Ipv4(_) => "ipv4",
@@ -108,6 +114,7 @@ impl Parameter {
     pub fn value_bytes(&self) -> Vec<u8> {
         let mut writer = Writer::new();
         match self {
+            Self::Founder(keys) => keys.encode(&mut writer),
             Self::Prefix(prefix) => {
                 writer.bytes(prefix);
             }
@@ -148,6 +155,7 @@ impl Parameter {
     pub fn decode(name: &str, value: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(value);
         let parameter = match name {
+            "founder" => Self::Founder(crate::types::FounderKeys::decode(&mut reader)?),
             "prefix" => {
                 let prefix =
                     reader.bytes(limits::MAX_ULA_PREFIX_LEN, "ula prefix length")?.to_vec();
@@ -362,6 +370,7 @@ impl NetworkParams {
     #[must_use]
     pub fn leaves(&self) -> Vec<Parameter> {
         let mut leaves = alloc::vec![
+            Parameter::Founder(self.founder),
             Parameter::Prefix(self.ula.clone()),
             Parameter::Suffix(self.suffix.clone())
         ];
@@ -408,6 +417,7 @@ impl NetworkParams {
     /// such as a relay being left with no relay to move to.
     pub fn from_leaves(leaves: Vec<Parameter>) -> Result<Self> {
         let mut seen: Vec<&'static str> = Vec::new();
+        let mut founder = None;
         let mut prefix = None;
         let mut suffix = None;
         let mut window = None;
@@ -423,6 +433,7 @@ impl NetworkParams {
             }
             seen.push(leaf.name());
             match leaf {
+                Parameter::Founder(value) => founder = Some(value),
                 Parameter::Prefix(value) => prefix = Some(value),
                 Parameter::Suffix(value) => suffix = Some(value),
                 Parameter::Window(value) => window = Some(value),
@@ -434,12 +445,12 @@ impl NetworkParams {
                 Parameter::Excluded(value) => excluded = value,
             }
         }
-        let (Some(prefix), Some(suffix)) = (prefix, suffix) else {
+        let (Some(founder), Some(prefix), Some(suffix)) = (founder, prefix, suffix) else {
             return Err(Error::MissingField);
         };
         // No window leaf is no window.
         let window = window.unwrap_or(0);
-        let mut params = Self::with_relay(prefix, relay, suffix, window)?;
+        let mut params = Self::with_relay(founder, prefix, relay, suffix, window)?;
         params.ipv4 = ipv4;
         params.anchors = anchors;
         params.policy = policy;
@@ -476,6 +487,7 @@ mod tests {
 
     fn params() -> NetworkParams {
         let mut params = NetworkParams::with_relay(
+            crate::types::FounderKeys::held_by_nobody(),
             alloc::vec![0xfd, 1, 2, 3, 4, 5, 6, 7],
             Some("aa@relay.example:443"),
             "casa.internal",

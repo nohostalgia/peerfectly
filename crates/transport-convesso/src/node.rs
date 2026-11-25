@@ -139,6 +139,9 @@ enum Out {
 /// handshake, which cannot wait, reads it at once.
 #[derive(Default)]
 struct Policy {
+    /// The founder's peer, which the access policy does not apply to: a
+    /// founder session carries the roster and nothing the policy governs.
+    founder: Option<DeviceId>,
     /// The network's rules; none lets everyone reach everyone.
     rules: Vec<roster::parameters::Rule>,
     /// This device's own groups.
@@ -151,6 +154,7 @@ impl Policy {
     /// What a roster state says.
     fn of_state(state: &RosterState, own: &DeviceId) -> Self {
         Self {
+            founder: Some(transport::auth::founder_peer(state)),
             rules: state.params.policy.clone(),
             own: state.settings_of(own).groups,
             groups: state
@@ -164,7 +168,7 @@ impl Policy {
     /// Whether `initiator`, with `shown` as its leaf where this node holds no
     /// roster, may open a session to this device.
     fn allows(&self, initiator: &DeviceId, shown: &[u8]) -> bool {
-        if self.rules.is_empty() {
+        if self.rules.is_empty() || self.founder.as_ref() == Some(initiator) {
             return true;
         }
         let groups = match self.groups.get(initiator) {
@@ -225,6 +229,10 @@ struct Shared {
     move_ends: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// Following a change of network, if one is being followed.
     following: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Where a notice read goes (`transport::Transport::on_notice`).
+    notices: std::sync::RwLock<Option<transport::session::NoticeHandler>>,
+    /// A notice sent, waiting for its peer to say it read it.
+    notice_waits: std::sync::Mutex<HashMap<PeerId, oneshot::Sender<()>>>,
 }
 
 /// A node reachable over convesso.
@@ -439,6 +447,8 @@ impl ConvessoTransport {
             readers: std::sync::Mutex::new(HashMap::new()),
             move_ends: std::sync::Mutex::new(None),
             following: std::sync::Mutex::new(None),
+            notices: std::sync::RwLock::new(None),
+            notice_waits: std::sync::Mutex::new(HashMap::new()),
         });
         ensure_readers(&shared);
         schedule_move_end(&shared, &state.params);
@@ -627,6 +637,50 @@ impl Transport for ConvessoTransport {
         }
     }
 
+    fn tell_revoked(&self, revoked: Vec<transport::session::Revoked>) {
+        if let Ok(mut members) = self.shared.members.write() {
+            members.set_revoked(revoked);
+        }
+    }
+
+    async fn notify(&self, peer: &PublicKey, revocation: Vec<u8>) -> SessionResult<()> {
+        let bytes: [u8; 32] = peer.as_bytes().try_into().map_err(|_| Error::PeerUnreachable {
+            cause: Some("the key is not 32 bytes".to_owned()),
+        })?;
+        let address = Address::parse(bytes)
+            .map_err(|cause| Error::PeerUnreachable { cause: Some(cause.to_string()) })?;
+        let shared = &self.shared;
+        // Its answer comes through this peer's reader.
+        ensure_reader(shared, address);
+        let (said, read) = oneshot::channel();
+        if let Ok(mut waits) = shared.notice_waits.lock() {
+            waits.insert(address.peer_id(), said);
+        }
+        let notice = Frame::Notice { revocation }.encode();
+        if let Err(cause) = send_framed(shared, address, notice).await {
+            if let Ok(mut waits) = shared.notice_waits.lock() {
+                waits.remove(&address.peer_id());
+            }
+            return Err(Error::PeerUnreachable { cause: Some(cause.to_string()) });
+        }
+        let answered = tokio::time::timeout(DIAL_PATIENCE, read).await;
+        if let Ok(mut waits) = shared.notice_waits.lock() {
+            waits.remove(&address.peer_id());
+        }
+        match answered {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(Error::PeerUnreachable {
+                cause: Some(format!("no answer within {}s", DIAL_PATIENCE.as_secs())),
+            }),
+        }
+    }
+
+    fn on_notice(&self, handler: transport::session::NoticeHandler) {
+        if let Ok(mut held) = self.shared.notices.write() {
+            *held = Some(handler);
+        }
+    }
+
     fn serve_roots(&self, roots: RootsAfter) {
         if let Ok(mut held) = self.shared.roots.write() {
             *held = Some(roots);
@@ -693,7 +747,7 @@ impl Transport for ConvessoTransport {
             *policy = Policy::of_state(&state, &shared.own);
         }
         if let Ok(mut members) = shared.members.write() {
-            *members = Members::from_state(&state);
+            *members = members.updated(&state);
         }
         let mut leaving = HashSet::new();
         if let Ok(mut sessions) = shared.sessions.lock() {
@@ -717,8 +771,10 @@ impl Transport for ConvessoTransport {
                     leaving.insert(live.peer);
                     continue;
                 }
+                let founders = transport::auth::is_founder_peer(&state, &live.device());
                 if live.closure().is_none()
-                    && (!transport::auth::is_member(&state, &live.device()) || !still)
+                    && ((!transport::auth::is_member(&state, &live.device()) && !founders)
+                        || !still)
                 {
                     live.shut(Error::ClosedOnMembershipLoss);
                     let close = Frame::Close { id: live.id, reason: Reason::MembershipLost };
@@ -1442,6 +1498,18 @@ fn opened(
     let (device, address) = match entry {
         Some((Ok(device), Some(address))) => (device, address),
         Some((Err(error), _)) => {
+            // A device held as revoked: refused as revoked, and told, at
+            // every dial. It dials only at its own events, so each answer
+            // costs what the dial that asked for it cost (offline-founder
+            // design §16, §22).
+            let revoked =
+                shared.members.read().ok().and_then(|members| members.revocation_of(&peer));
+            if let Some(revocation) = revoked {
+                refuse(Reason::Revoked);
+                let notice = Frame::Notice { revocation }.encode();
+                let _ = shared.outbound.send(Out::Reply(peer, notice));
+                return;
+            }
             if !(may_catch_up && held_for_roots(shared, peer, version, id, evidence)) {
                 refuse(reason_of(&error));
             }
@@ -1531,6 +1599,23 @@ async fn on_message(shared: &Arc<Shared>, peer: PeerId, data: &[u8]) {
             Some(live) => live.deliver_payload(bytes).await,
             None => unknown_session(shared, peer, id),
         },
+        // A revocation of this device, from a peer the handshake admitted: said
+        // read and handed up unjudged — the node above keeps what it has not
+        // judged in a bounded queue and checks the signature before acting on
+        // anything it says (offline-founder design §16).
+        Some(Frame::Notice { revocation }) => {
+            let _ = shared.outbound.send(Out::Reply(peer, Frame::Noticed.encode()));
+            let handler = shared.notices.read().ok().and_then(|held| held.clone());
+            if let Some(handler) = handler {
+                handler(revocation);
+            }
+        }
+        Some(Frame::Noticed) => {
+            let waiting = shared.notice_waits.lock().ok().and_then(|mut waits| waits.remove(&peer));
+            if let Some(waiting) = waiting {
+                let _ = waiting.send(());
+            }
+        }
         // A packet sent as a message is not one: ignored.
         Some(Frame::Packet { .. }) | None => {}
     }

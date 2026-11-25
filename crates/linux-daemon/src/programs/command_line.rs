@@ -8,6 +8,7 @@ use crate::custody::command_line::{LinuxCustody, Socket};
 #[must_use]
 pub fn main() -> std::process::ExitCode {
     crate::quiet::before_any_thread();
+    crate::custody::prompt::echo_back_on();
     cli::Cli {
         channel: &Socket,
         custody: &LinuxCustody::of_this_machine(),

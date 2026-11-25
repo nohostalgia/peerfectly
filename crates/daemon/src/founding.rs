@@ -27,6 +27,8 @@ pub type Refusal = String;
 /// What a person supplies to create a network.
 #[derive(Debug, Clone)]
 pub struct Founding {
+    /// The founder's keys, from the words the person keeps.
+    pub founder: roster::types::FounderKeys,
     /// The name this device takes in its own network.
     pub name: String,
     /// The DNS suffix every name in the network sits under.
@@ -268,7 +270,7 @@ pub fn genesis(
     let params = parameters(&identity, wanted)?;
 
     let spec = identity
-        .device_spec(&wanted.name, Role::Admin, true, vec![])
+        .device_spec(&wanted.name, Role::Admin, vec![])
         .map_err(|cause| cause.to_string())?;
 
     let genesis = OperationCore::new(
@@ -373,6 +375,7 @@ fn parameters(identity: &NodeIdentity, wanted: &Founding) -> Result<NetworkParam
     }
 
     let params = NetworkParams::with_relay(
+        wanted.founder,
         derived_prefix(identity),
         wanted.relay.clone(),
         wanted.suffix.clone(),
@@ -510,6 +513,7 @@ mod tests {
 
     fn wanted() -> Founding {
         Founding {
+            founder: roster::types::FounderKeys::held_by_nobody(),
             name: "nas".to_owned(),
             suffix: "peerfectly.internal".to_owned(),
             relay: Some("https://relay.example:443".to_owned()),
@@ -539,7 +543,6 @@ mod tests {
         let record = state.devices.values().next().expect("one device");
         assert_eq!(record.name, "nas");
         assert_eq!(record.role, Role::Admin);
-        assert!(record.founder, "somebody has to be, and there is nobody else");
         assert_eq!(state.params.suffix, "peerfectly.internal");
         assert_eq!(state.params.relay.as_deref(), Some("https://relay.example:443"));
     }

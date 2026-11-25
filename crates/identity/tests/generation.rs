@@ -110,7 +110,7 @@ fn the_device_id_follows_from_the_signing_key() {
 fn a_presented_specification_carries_the_identitys_own_keys() {
     let identity = NodeIdentity::generate().expect("generates");
     let spec = identity
-        .device_spec("laptop", Role::Member, false, vec![Capability::new("serves").expect("short")])
+        .device_spec("laptop", Role::Member, vec![Capability::new("serves").expect("short")])
         .expect("builds");
 
     let signing =
@@ -129,7 +129,7 @@ fn a_presented_specification_carries_the_identitys_own_keys() {
 #[test]
 fn a_specification_declares_exactly_one_key_of_each_purpose() {
     let identity = NodeIdentity::generate().expect("generates");
-    let spec = identity.device_spec("nas", Role::Member, false, vec![]).expect("builds");
+    let spec = identity.device_spec("nas", Role::Member, vec![]).expect("builds");
     assert_eq!(spec.keys.iter().filter(|e| e.purpose == KeyPurpose::Signing).count(), 1);
     assert_eq!(spec.keys.iter().filter(|e| e.purpose == KeyPurpose::Transport).count(), 1);
     for entry in &spec.keys {
@@ -143,7 +143,7 @@ fn a_specification_declares_exactly_one_key_of_each_purpose() {
 fn a_generated_identity_is_accepted_by_the_roster() {
     let founder = NodeIdentity::generate().expect("generates");
     let spec = founder
-        .device_spec("phone", Role::Admin, true, vec![Capability::new("serves").expect("short")])
+        .device_spec("phone", Role::Admin, vec![Capability::new("serves").expect("short")])
         .expect("builds");
 
     let core = OperationCore::new(
@@ -152,6 +152,7 @@ fn a_generated_identity_is_accepted_by_the_roster() {
         OperationBody::CreateNetwork {
             device: spec,
             params: NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
                 "example.internal",
                 2_592_000,
@@ -171,7 +172,6 @@ fn a_generated_identity_is_accepted_by_the_roster() {
     let state = node.state().expect("derives");
     let record = state.devices.get(&founder.device_id()).expect("the founder is present");
     assert_eq!(record.keys.len(), 3, "all three keys reached derived state");
-    assert!(record.founder);
     assert_eq!(record.role, Role::Admin);
 }
 
@@ -186,8 +186,9 @@ fn a_generated_identity_can_be_added_by_another() {
         1,
         founder.signing_key().algorithm(),
         OperationBody::CreateNetwork {
-            device: founder.device_spec("phone", Role::Admin, true, vec![]).expect("builds"),
+            device: founder.device_spec("phone", Role::Admin, vec![]).expect("builds"),
             params: NetworkParams::new(
+                roster::types::FounderKeys::held_by_nobody(),
                 vec![0xfd, 0, 0, 0, 0, 0, 0, 0],
                 "example.internal",
                 2_592_000,
@@ -206,7 +207,7 @@ fn a_generated_identity_can_be_added_by_another() {
         2,
         founder.signing_key().algorithm(),
         OperationBody::AddDevice(
-            joiner.device_spec("laptop", Role::Member, false, vec![]).expect("builds"),
+            joiner.device_spec("laptop", Role::Member, vec![]).expect("builds"),
         ),
         vec![genesis_core.id()],
         founder.signer().key_id(),
@@ -252,7 +253,7 @@ fn unused_shape(_: OperationId, _: Dag, _: RawOperation<'_>) {}
 fn a_p256_identity_orders_its_key_entries_correctly() {
     let identity = NodeIdentity::generate_with(Algorithm::P256).expect("generates");
     let spec = identity
-        .device_spec("phone", Role::Admin, true, vec![])
+        .device_spec("phone", Role::Admin, vec![])
         .expect("the entries must be in the order the roster requires");
 
     assert_eq!(spec.device_id().expect("has a signing key"), identity.device_id());
@@ -268,7 +269,7 @@ fn a_p256_identity_orders_its_key_entries_correctly() {
 fn every_signing_algorithm_produces_a_usable_specification() {
     for algorithm in [Algorithm::Ed25519, Algorithm::P256] {
         let identity = NodeIdentity::generate_with(algorithm).expect("generates");
-        let spec = identity.device_spec("device", Role::Member, false, vec![]).expect("builds");
+        let spec = identity.device_spec("device", Role::Member, vec![]).expect("builds");
         assert_eq!(spec.device_id().expect("has a signing key"), identity.device_id());
         assert_eq!(identity.signing_key().algorithm(), algorithm);
     }
