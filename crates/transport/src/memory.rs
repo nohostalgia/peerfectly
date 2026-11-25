@@ -270,7 +270,8 @@ impl Transport for MemoryTransport {
         let held = revoked
             .into_iter()
             .filter_map(|device| {
-                let key = PublicKey::new(roster::types::Algorithm::Ed25519, device.transport).ok()?;
+                let key =
+                    PublicKey::new(roster::types::Algorithm::Ed25519, device.transport).ok()?;
                 Some((key.key_id(), device.revocation))
             })
             .collect();
@@ -280,8 +281,12 @@ impl Transport for MemoryTransport {
     }
 
     async fn notify(&self, peer: &PublicKey, revocation: Vec<u8>) -> Result<()> {
-        let handler =
-            self.fabric.notices.lock().ok().and_then(|handlers| handlers.get(&peer.key_id()).cloned());
+        let handler = self
+            .fabric
+            .notices
+            .lock()
+            .ok()
+            .and_then(|handlers| handlers.get(&peer.key_id()).cloned());
         let handler = handler.ok_or(Error::PeerUnreachable { cause: None })?;
         handler(revocation);
         Ok(())

@@ -230,7 +230,7 @@ pub fn nothing_known(at: std::time::SystemTime) -> bool {
 /// the command line draws the report, not the daemon.
 #[must_use]
 pub fn when(at: std::time::SystemTime) -> String {
-    when_in(at, std::time::SystemTime::now(), &chrono::Local)
+    when_in(at, std::time::SystemTime::now(), &jiff::tz::TimeZone::system())
 }
 
 /// [`when`], with the clock and the time zone given, so a test can fix both.
@@ -242,14 +242,11 @@ pub fn when(at: std::time::SystemTime) -> String {
 /// A time that cannot be read — before 1970, or past what a date can hold — is
 /// said to be unreadable, rather than shown as a date nobody set.
 #[must_use]
-pub fn when_in<Zone: chrono::TimeZone>(
+pub fn when_in(
     at: std::time::SystemTime,
     now: std::time::SystemTime,
-    zone: &Zone,
-) -> String
-where
-    Zone::Offset: fmt::Display,
-{
+    zone: &jiff::tz::TimeZone,
+) -> String {
     let since_1970 = |time: std::time::SystemTime| {
         time.duration_since(std::time::SystemTime::UNIX_EPOCH)
             .ok()
@@ -258,10 +255,10 @@ where
     let Some(seconds) = since_1970(at) else {
         return "an unreadable time".to_owned();
     };
-    let Some(instant) = chrono::DateTime::from_timestamp(seconds, 0) else {
+    let Ok(instant) = jiff::Timestamp::from_second(seconds) else {
         return "an unreadable time".to_owned();
     };
-    let local = instant.with_timezone(zone).format("%Y-%m-%d %H:%M");
+    let local = zone.to_datetime(instant).strftime("%Y-%m-%d %H:%M");
     match since_1970(now) {
         Some(now) => format!("{local} ({})", relative(seconds.saturating_sub(now))),
         None => local.to_string(),
@@ -306,7 +303,7 @@ mod tests {
         use std::time::{Duration, SystemTime};
 
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_625_600); // 2026-09-28 20:00 UTC
-        let rome = chrono::FixedOffset::east_opt(2 * 3_600).unwrap();
+        let rome = jiff::tz::TimeZone::fixed(jiff::tz::offset(2));
         let at = |ahead: i64| {
             if ahead >= 0 {
                 now + Duration::from_secs(ahead.unsigned_abs())
@@ -338,7 +335,10 @@ mod tests {
         use std::time::{Duration, SystemTime};
 
         let before = SystemTime::UNIX_EPOCH - Duration::from_secs(60);
-        assert_eq!("an unreadable time", when_in(before, SystemTime::now(), &chrono::Utc));
+        assert_eq!(
+            "an unreadable time",
+            when_in(before, SystemTime::now(), &jiff::tz::TimeZone::UTC)
+        );
     }
 
     fn lines(block: &Block) -> Vec<String> {

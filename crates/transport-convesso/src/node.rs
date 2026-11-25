@@ -1502,7 +1502,8 @@ fn opened(
             // every dial. It dials only at its own events, so each answer
             // costs what the dial that asked for it cost (offline-founder
             // design §16, §22).
-            let revoked = shared.members.read().ok().and_then(|members| members.revocation_of(&peer));
+            let revoked =
+                shared.members.read().ok().and_then(|members| members.revocation_of(&peer));
             if let Some(revocation) = revoked {
                 refuse(Reason::Revoked);
                 let notice = Frame::Notice { revocation }.encode();

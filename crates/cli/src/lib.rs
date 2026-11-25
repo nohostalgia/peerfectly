@@ -1172,7 +1172,9 @@ impl Cli<'_> {
                 println!("  {:>2}. {named}", number.saturating_add(1));
             }
             println!();
-            println!("Any of them can be revoked again in this same act, by the founder, for good.");
+            println!(
+                "Any of them can be revoked again in this same act, by the founder, for good."
+            );
             print!("Revoke again which? [numbers / all / none] ");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             let mut answer = String::new();

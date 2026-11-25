@@ -1357,7 +1357,8 @@ async fn a_revoked_device_is_told_when_it_dials_and_when_it_is_pushed_to() {
         Err(Error::Revoked) => {}
         other => panic!("refused as revoked again, not {:?}", other.err()),
     }
-    let again = tokio::time::timeout(PATIENCE, heard.recv()).await.expect("told again").expect("read");
+    let again =
+        tokio::time::timeout(PATIENCE, heard.recv()).await.expect("told again").expect("read");
     assert_eq!(again, revocation);
 
     // Pushed: read, and said read.

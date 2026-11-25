@@ -93,6 +93,14 @@ the default: absolute, no symbolic link on the way, every directory above it roo
 nobody else, and its parent existing. The command line takes the keys directory from the daemon in
 every request and judges it the same way.
 
+## Dependencies
+
+- `chrono`, unmaintained (RUSTSEC-2026-0543), is replaced by `jiff` for the dates the command line
+  shows in the machine's time zone; they read as before.
+- `url` 2.5.9, for a stack overflow in `Url::origin()` (RUSTSEC-2026-0592). Nothing here calls it.
+- `redb` 5. A full member's base state on disk opens as before: none of its tables holds a type
+  whose encoding 5.0 changed.
+
 ## Updating
 
 - **Admins first.** An admin's daemon from before this release admits new members as it always

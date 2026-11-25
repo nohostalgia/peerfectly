@@ -1674,11 +1674,8 @@ impl Service {
             let named = network.node().state().await.is_ok_and(|state| {
                 state.devices.contains_key(&network.node().identity().device_id())
             });
-            let changed = if as_member {
-                !named && Self::revoked_standing(&network).await
-            } else {
-                named
-            };
+            let changed =
+                if as_member { !named && Self::revoked_standing(&network).await } else { named };
             if !changed {
                 continue;
             }
@@ -2703,9 +2700,12 @@ impl Service {
         let signed_by = requests.first().map(|request| request.key());
         let founder_act = match resume.label().filter(|_| after_the_act) {
             Some(label) => match self.named(label).await {
-                Ok(network) => network.node().state().await.ok().is_some_and(|state| {
-                    signed_by == Some(state.params.founder.signing_id())
-                }),
+                Ok(network) => network
+                    .node()
+                    .state()
+                    .await
+                    .ok()
+                    .is_some_and(|state| signed_by == Some(state.params.founder.signing_id())),
                 Err(_) => false,
             },
             None => false,
@@ -12644,8 +12644,7 @@ mod tests {
         let state = node.state().await.expect("derives");
         assert!(state.devices.contains_key(&desk.device_id()), "nothing was signed");
 
-        let done =
-            as_the_founder(&service, voiding(vec![crate::control::short_id(&phone)])).await;
+        let done = as_the_founder(&service, voiding(vec![crate::control::short_id(&phone)])).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
         let state = node.state().await.expect("derives");
         assert!(!state.devices.contains_key(&desk.device_id()), "the stolen admin is out");

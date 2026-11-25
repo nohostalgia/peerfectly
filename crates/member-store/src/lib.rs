@@ -501,7 +501,7 @@ impl Store {
             Some(after) => positions
                 .range((core::ops::Bound::Excluded(after), core::ops::Bound::Unbounded))
                 .map_err(database)?,
-            None => positions.range::<[u8; 32]>(..).map_err(database)?,
+            None => positions.range(..).map_err(database)?,
         };
         let mut page = Vec::with_capacity(count);
         for entry in range.take(count) {
@@ -848,7 +848,7 @@ impl MemberStore for Store {
                     core::ops::Bound::Excluded(*after.as_bytes()),
                     core::ops::Bound::Unbounded,
                 ))?,
-                None => leaves.range::<[u8; 32]>(..)?,
+                None => leaves.range(..)?,
             };
             let mut page = Vec::new();
             for entry in range.take(count) {

@@ -452,10 +452,7 @@ impl<K: Keys> Sessions<K> {
             // member carries no revocations, and is told of its own by the
             // next root it follows (offline-founder design §16).
             Some(
-                Frame::Behind { .. }
-                | Frame::Packet { .. }
-                | Frame::Notice { .. }
-                | Frame::Noticed,
+                Frame::Behind { .. } | Frame::Packet { .. } | Frame::Notice { .. } | Frame::Noticed,
             )
             | None => {}
         }
