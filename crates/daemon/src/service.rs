@@ -300,6 +300,48 @@ fn founders_alone(
     )))
 }
 
+/// Whether `record` is approved and cannot be delivered yet: its invite is
+/// anchored to a key other than this device's attestation key, the founder's,
+/// and the founder's root over its admission is not kept. A delivery without
+/// it is refused by the device (`enrollment`, *A delivery is anchored to its
+/// invite*).
+fn awaits_root(record: &crate::invites::Record, node: &Node) -> bool {
+    record.root.is_none() && record.invite.anchor != node.identity().attestation_key().key_id()
+}
+
+/// The name a recovery admits this device's new identity under: `name`, where
+/// no other live device answers to it or the one that does is revoked in the
+/// same batch; a free one where the person said to take another; otherwise
+/// the question for the person, with the device holding it.
+fn recovery_name(
+    state: &roster::state::RosterState,
+    me: &roster::id::DeviceId,
+    name: String,
+    expulsions: &[crate::revoking::Expulsion],
+    another_name: bool,
+) -> core::result::Result<String, Box<crate::control::NameHeld>> {
+    let Some(taken) = crate::admitting::holder_of(&name, state)
+        .filter(|taken| taken.device != *me)
+        .filter(|taken| !expulsions.iter().any(|expulsion| expulsion.device == taken.device))
+    else {
+        return Ok(name);
+    };
+    let instead = crate::admitting::unused_name(&name, state);
+    if another_name {
+        return Ok(instead);
+    }
+    Err(Box::new(crate::control::NameHeld {
+        network: String::new(),
+        name,
+        holder: crate::control::TakenName {
+            name: taken.name.clone(),
+            id: crate::control::short_id(&taken.device),
+        },
+        admin: state.is_admin(&taken.device),
+        instead,
+    }))
+}
+
 /// Who the act being answered names as its author, in `state`.
 fn author_in(
     identity: &identity::NodeIdentity,
@@ -587,7 +629,7 @@ pub struct Service {
     /// The networks whose signing key this daemon destroyed after a settled
     /// demotion. The identity in use still names the key until the network is
     /// opened again, so the report says what is on disk, not what is in memory.
-    settled: Mutex<BTreeSet<Label>>,
+    settled: Mutex<BTreeSet<roster::id::DeviceId>>,
     /// The transports a founder session runs on, by network, held until the
     /// founder's act ends.
     founder_carriers: Mutex<BTreeMap<Label, Arc<dyn transport::Transport>>>,
@@ -700,6 +742,8 @@ enum Unfinished {
         label: Label,
         /// The admins to revoke.
         revoke: Vec<crate::control::Target>,
+        /// Whether the person said to take another name.
+        another_name: bool,
     },
     /// A network being founded.
     Founding {
@@ -777,12 +821,6 @@ impl Service {
         // key changes.
         let _adopted = home.adopt_anything_in_the_old_shape()?;
         // An attempt the process did not live to finish holds a name and no network.
-        // A recovery stopped after its batch was decided is finished first: its
-        // new directory carries a record by then, and would otherwise be taken
-        // for a network of its own (`crate::recovering`).
-        for finished in crate::recovering::finish_interrupted(&home, keys.as_ref())? {
-            tracing::info!("finished taking up the recovered identity of `{finished}`");
-        }
         let _discarded = home.discard_every_unfounded()?;
         // And one that got as far as a roster but not as far as the record: the
         // membership is proved and only the note of which network it is was lost.
@@ -800,6 +838,18 @@ impl Service {
             }
             Err(cause) => (None, Some(cause.to_string())),
         };
+        // A recovery stopped after its batch was decided is finished, where
+        // this machine's signed note, the identity beside it and the log bear
+        // it out; any other recovering directory is left for a person, and
+        // said (`crate::recovering`).
+        let interrupted = crate::recovering::finish_interrupted(
+            &home,
+            keys.as_ref(),
+            integrity.as_ref().map(|integrity| integrity.key.as_ref()),
+        )?;
+        for finished in &interrupted.finished {
+            tracing::info!("finished taking up the recovered identity of `{finished}`");
+        }
         let recovered = match (&integrity, &lost) {
             (Some(integrity), _) => {
                 home.recover_every_unrecorded(keys.as_ref(), Some(integrity))?
@@ -817,6 +867,14 @@ impl Service {
                 detail: found.cause,
             })
             .collect();
+        broken.extend(interrupted.refused.into_iter().map(|(label, why)| Broken {
+            label,
+            cause: crate::control::Trouble::ChangedOutside,
+            detail: format!(
+                "a recovery's directory that is not believed, {why}; nothing was removed, and a \
+                 person may remove it"
+            ),
+        }));
 
         let mut carried = Vec::new();
         // A network that was just adopted has no record yet: its id is not known
@@ -1790,6 +1848,19 @@ impl Service {
         outcome
     }
 
+    /// Closes a network already lowered and out of the map, so that its files
+    /// can be copied and moved: its checkpoint written once more, its node
+    /// closed, and its stores let go of, whoever still holds them
+    /// (`recovery-repairs` design §1). Windows will not copy or remove a file
+    /// a process holds open, and elsewhere a database copied while it is open
+    /// is torn.
+    async fn close_network(network: &Arc<Network>) {
+        Self::keep_checkpoint(network, true).await;
+        network.node().close().await;
+        let paths = network.paths.clone();
+        let _closed = tokio::task::spawn_blocking(move || crate::state::close_stores(&paths)).await;
+    }
+
     /// Notes that a network knew things for certain until this moment.
     ///
     /// Written to disk as well, best effort: failing to record a time is not a
@@ -2310,7 +2381,7 @@ impl Service {
         let id = crate::control::short_id(&me);
         let arrived = self.arrived_in(network.label()).await;
 
-        let settled = self.settled.lock().await.contains(network.label());
+        let settled = self.settled.lock().await.contains(&node.identity().device_id());
         let custody = if settled { crate::control::Custody::None } else { self.custody_of(node) };
         let Ok(state) = node.state().await else {
             return crate::control::Network {
@@ -2325,6 +2396,7 @@ impl Service {
                 custody,
                 key_until_settled: false,
                 revoked_by: None,
+                shared_names: Vec::new(),
                 owner_taken: crate::state::was_taken(&network.paths),
                 // A roster that derives no state has no network to be unable to
                 // confirm. The trouble here is a different one, and reported as
@@ -2375,6 +2447,19 @@ impl Service {
             && network.paths.was_admin().exists()
             && !state.is_admin(&me);
         let revoked_by = Self::revoked_by(network).await;
+        let shared_names = node
+            .shared_names(&state)
+            .into_iter()
+            .map(|(name, holders)| crate::control::SharedName {
+                name,
+                holders: holders
+                    .iter()
+                    .map(|leaf| {
+                        crate::control::Named::new(&leaf.record.id, Some(leaf.record.name.clone()))
+                    })
+                    .collect(),
+            })
+            .collect();
         crate::control::Network {
             label,
             tunnel,
@@ -2382,6 +2467,7 @@ impl Service {
             custody,
             key_until_settled,
             revoked_by,
+            shared_names,
             owner_taken: crate::state::was_taken(&network.paths),
             confirmation: node.unconfirmed().await,
             arrived,
@@ -2763,12 +2849,14 @@ impl Service {
         }) {
             return Outcome::Done;
         }
-        // Otherwise a founder session is tried even where this device still
-        // counts itself a member: one the network revoked may not have heard
-        // so yet, and the session brings it up to date before the act is built.
-        // A member that reaches nobody now goes on without one: its own
-        // sessions carry the act once its peers are up.
-        let member = state.devices.contains_key(&node.identity().device_id());
+        // A member signs on the copy of the roster it holds, at once: the roster
+        // merges what is signed apart, and the member's own sessions carry the
+        // act once a peer is up. Only a device the network revoked needs a
+        // founder session, the one way it is heard, and only while the words
+        // that open it are in front of the person (`recovery-repairs`).
+        if state.devices.contains_key(&node.identity().device_id()) {
+            return Outcome::Done;
+        }
         let Some(seed) =
             roster::hex::decode(seed).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         else {
@@ -2818,14 +2906,23 @@ impl Service {
                 candidates.push(device);
             }
         }
-        if candidates.is_empty() && member {
-            return Outcome::Done;
+        if candidates.is_empty() {
+            return Outcome::refused(
+                "this device knows no full member of the network to carry the act, and the \
+                 network has revoked it. Nothing was signed."
+                    .to_owned(),
+            );
         }
         let carrier = match self.connectivity.start(&as_founder, state.clone()).await {
             Ok(transport) => transport,
             Err(cause) => return Outcome::refused(format!("no founder session: {cause}")),
         };
-        let mut last: Option<String> = None;
+        // Every candidate at once, and the first that answers carries the act:
+        // one after another, each offline member cost minutes on a phone whose
+        // screen waited (2026-11-25). The whole is bounded, so a person is told
+        // within it (`recovery-repairs`).
+        let mut dials = tokio::task::JoinSet::new();
+        let said = Arc::new(std::sync::Mutex::new(None::<String>));
         for device in candidates {
             let Some(key) = state.devices.get(&device).and_then(|leaf| {
                 leaf.record
@@ -2838,20 +2935,44 @@ impl Service {
             }) else {
                 continue;
             };
-            // The new transport registers at the relay as it starts: a dial
-            // before then fails, so it is tried a few times.
-            let mut reached = None;
-            for _ in 0..8 {
-                match carrier.connect(&key).await {
-                    Ok(session) => {
-                        reached = Some(session);
-                        break;
+            let carrier = Arc::clone(&carrier);
+            let said = Arc::clone(&said);
+            dials.spawn(async move {
+                // The new transport registers at the relay as it starts: a dial
+                // before then fails, so each is tried again until one answers
+                // or the bound below ends them all.
+                loop {
+                    match carrier.connect(&key).await {
+                        Ok(session) => return (device, session),
+                        Err(cause) => {
+                            if let Ok(mut said) = said.lock() {
+                                *said = Some(cause.to_string());
+                            }
+                        }
                     }
-                    Err(cause) => last = Some(cause.to_string()),
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+        }
+        let reached = tokio::time::timeout(crate::limits::FOUNDER_REACH, async {
+            while let Some(joined) = dials.join_next().await {
+                if let Ok(answered) = joined {
+                    return Some(answered);
+                }
             }
-            let Some(session) = reached else { continue };
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let last = said.lock().ok().and_then(|said| said.clone()).or_else(|| {
+            reached.is_none().then(|| {
+                format!("none answered within {}s", crate::limits::FOUNDER_REACH.as_secs())
+            })
+        });
+        // The others, still dialling, are stopped.
+        dials.abort_all();
+        if let Some((device, session)) = reached {
             node.serve_founder_session(session).await;
             // The roster from the member first: up to a few seconds, until the
             // heads stop moving.
@@ -2869,18 +2990,6 @@ impl Service {
             return Outcome::Reported(self.report().await.with_note(&format!(
                 "a founder session to {} carries what the founder signs next",
                 crate::control::Named::new(&device, name)
-            )));
-        }
-        if member {
-            // Said, not passed over: what follows rests on what this device
-            // holds, which may be behind — a peer that took a new identity is
-            // one this device cannot know.
-            return Outcome::Reported(self.report().await.with_note(&format!(
-                "no full member of the network could be reached with the founder's key{}: what \
-                 is signed now rests on what this device holds, and reaches the network once a \
-                 peer it knows is up. A device that took a new identity since is not one this \
-                 device knows: from it, invite this device again instead.",
-                last.map(|cause| format!(" (the last: {cause})")).unwrap_or_default()
             )));
         }
         Outcome::refused(format!(
@@ -3038,7 +3147,7 @@ impl Service {
         if was_admin && !node.identity().signing_key().is_public_only() {
             match self.destroy_signing_key(network).await {
                 Ok(()) => {
-                    self.settled.lock().await.insert(network.label().clone());
+                    self.settled.lock().await.insert(node.identity().device_id());
                     node.record(
                         crate::node::Severity::Event,
                         "keys",
@@ -3239,7 +3348,12 @@ impl Service {
 
     /// Makes this device an admin of a network with the founder's words: the
     /// batch, prepared for the founder to sign (`crate::recovering`).
-    async fn recover(&self, which: Option<&Label>, revoke: &[crate::control::Target]) -> Outcome {
+    async fn recover(
+        &self,
+        which: Option<&Label>,
+        revoke: &[crate::control::Target],
+        another_name: bool,
+    ) -> Outcome {
         let network = match self.which(which).await {
             Ok(network) => network,
             Err(cause) => {
@@ -3330,32 +3444,6 @@ impl Service {
             }
             None
         } else {
-            let temporary = match crate::recovering::temporary(&label) {
-                Ok(temporary) => temporary,
-                Err(cause) => return Outcome::refused(cause.to_string()),
-            };
-            let paths = self.home.paths_for(&temporary);
-            if !paths.identity().exists() {
-                if let Err(cause) = paths.create() {
-                    return Outcome::refused(cause.to_string());
-                }
-                if let Some(asked) = self
-                    .wants_a_key(
-                        &paths,
-                        Unfinished::Recovering { label: label.clone(), revoke: revoke.to_vec() },
-                    )
-                    .await
-                {
-                    return asked;
-                }
-            }
-            let new = match self.keys.identity(&paths) {
-                Ok(new) => new,
-                Err(cause) => {
-                    let _discarded = self.home.discard_unfounded(&temporary);
-                    return Outcome::refused(format!("the new admin key: {cause}"));
-                }
-            };
             // The name this device answers to, or, revoked, the one it was
             // admitted under: its admission is among the operations held.
             let admitted_as = node.held_with_verdicts().await.and_then(|(held, _)| {
@@ -3375,6 +3463,48 @@ impl Service {
                 .map(|leaf| leaf.record.name.clone())
                 .or(admitted_as)
                 .unwrap_or_else(|| label.to_string());
+            // Decided before any key is made: where another live device answers
+            // to that name, the person says what to do (`recovery-repairs`
+            // design §5). Revoked in this batch, it gives the name up.
+            let name = match recovery_name(&state, &me, name, &expulsions, another_name) {
+                Ok(name) => name,
+                Err(held) => {
+                    return Outcome::NameHeld(crate::control::NameHeld {
+                        network: label.to_string(),
+                        ..*held
+                    });
+                }
+            };
+            let temporary = match crate::recovering::temporary(&label) {
+                Ok(temporary) => temporary,
+                Err(cause) => return Outcome::refused(cause.to_string()),
+            };
+            let paths = self.home.paths_for(&temporary);
+            if !paths.identity().exists() {
+                if let Err(cause) = paths.create() {
+                    return Outcome::refused(cause.to_string());
+                }
+                if let Some(asked) = self
+                    .wants_a_key(
+                        &paths,
+                        Unfinished::Recovering {
+                            label: label.clone(),
+                            revoke: revoke.to_vec(),
+                            another_name,
+                        },
+                    )
+                    .await
+                {
+                    return asked;
+                }
+            }
+            let new = match self.keys.identity(&paths) {
+                Ok(new) => new,
+                Err(cause) => {
+                    let _discarded = self.home.discard_unfounded(&temporary);
+                    return Outcome::refused(format!("the new admin key: {cause}"));
+                }
+            };
             let spec = match new.device_spec(name, roster::types::Role::Admin, Vec::new()) {
                 Ok(spec) => spec,
                 Err(cause) => return Outcome::refused(cause.to_string()),
@@ -3464,23 +3594,50 @@ impl Service {
                 Ok(artifacts) => artifacts,
                 Err(refused) => return refused,
             };
-        for signed in &artifacts {
-            if let Err(cause) = network.node().admit_without_activating(signed).await {
+        // As one act: the new identity is admitted before the old one is
+        // revoked, and the name passes between them within it.
+        {
+            if let Err(cause) = network.node().admit_act(&artifacts).await {
                 return Outcome::Failed {
                     message: format!("the recovery was not recorded: {cause}"),
                     left_behind: Vec::new(),
                 };
             }
         }
-        let Some(_temporary) = temporary else {
+        let Some(temporary) = temporary else {
             return Outcome::Reported(self.report().await);
         };
 
-        // Decided: the batch is in the log. The rest is repeatable, and a stop
-        // is finished on the next start.
+        // Decided: the batch is in the log. The note says so, signed by this
+        // machine, before anything is copied: the rest is repeatable, and a
+        // stop is finished on the next start, where the note is believed.
+        let decided = match (&self.machine, self.keys.identity(&self.home.paths_for(&temporary))) {
+            (Some(machine), Ok(new)) => crate::recovering::write_note(
+                &self.home.paths_for(&temporary),
+                machine.as_ref(),
+                &crate::recovering::Note::new(label, &network.record.network, &new.device_id()),
+            )
+            .map_err(|cause| cause.to_string()),
+            (None, _) => Err("this machine's key is not open".to_owned()),
+            (_, Err(cause)) => Err(cause.to_string()),
+        };
+        if let Err(cause) = decided {
+            return Outcome::Failed {
+                message: format!(
+                    "the recovery is in the roster, and this device could not note that it is \
+                     taking up its new identity: {cause}. Nothing on this device was changed; \
+                     forget the network and be invited again."
+                ),
+                left_behind: Vec::new(),
+            };
+        }
+        // Closed before anything is copied: nothing still holding it keeps a
+        // file of it open, or writes to it while it moves.
         let was_up = network.running().await;
         let _lowered = Box::pin(self.lower(&network, Stop::Everything)).await;
         self.networks.lock().await.remove(label);
+        Self::close_network(&network).await;
+        drop(network);
         if let Err(cause) = crate::recovering::swap(&self.home, label, self.keys.as_ref()) {
             return Outcome::Failed {
                 message: format!(
@@ -3499,14 +3656,32 @@ impl Service {
             };
         }
         // Up again where it was up: the new identity carries it now.
-        if was_up && let Ok(taken_up) = self.named(label).await {
-            let _raised = Box::pin(self.raise(&taken_up)).await;
+        let taken_up = self.named(label).await.ok();
+        if was_up && let Some(taken_up) = &taken_up {
+            let _raised = Box::pin(self.raise(taken_up)).await;
         }
-        Outcome::Reported(
-            self.report()
-                .await
-                .with_note("this device is now the network's admin, under a new identity"),
-        )
+        // Said, so a name chosen because another device answers to the old one
+        // is not found out later.
+        let name = match &taken_up {
+            Some(network) => {
+                let node = network.node();
+                node.state().await.ok().and_then(|state| {
+                    state
+                        .devices
+                        .get(&node.identity().device_id())
+                        .map(|leaf| leaf.record.name.clone())
+                })
+            }
+            None => None,
+        };
+        let note = match name {
+            Some(name) => format!(
+                "this device is now the network's admin, under a new identity, as `{}`",
+                crate::control::shown(&name)
+            ),
+            None => "this device is now the network's admin, under a new identity".to_owned(),
+        };
+        Outcome::Reported(self.report().await.with_note(&note))
     }
 
     /// Asks the founder for the root over a founder act just carried, or hands
@@ -3641,6 +3816,17 @@ impl Service {
         });
         if kept && Self::save_invites(network, &invites).is_ok() {
             Self::keep_checkpoint(network, true).await;
+            // Delivered now, not at the next round: the device has waited for
+            // this root and nothing else (`recovery-repairs` 4.2).
+            {
+                let mut delivering = self.delivering.lock().await;
+                for record in invites.delivering(crate::state::wall_seconds()) {
+                    if record.root.is_some() {
+                        delivering.remove(&record.invite.secret);
+                    }
+                }
+            }
+            self.inviting.notify_one();
         }
     }
 
@@ -5079,8 +5265,8 @@ impl Service {
         }
 
         match held.then {
-            Unfinished::Recovering { label, revoke } => {
-                AS_FOUNDER.scope(true, self.recover(Some(&label), &revoke)).await
+            Unfinished::Recovering { label, revoke, another_name } => {
+                AS_FOUNDER.scope(true, self.recover(Some(&label), &revoke, another_name)).await
             }
             Unfinished::Founding { label, wanted } => {
                 self.finish_founding(label, *wanted, &held.by).await
@@ -5119,8 +5305,12 @@ impl Service {
                 Ok(label) => self.history(label.as_ref(), by.as_deref()).await,
                 Err(refusal) => Self::said(Err(refusal)),
             },
-            Command::Recover { network, revoke } => match Self::wanted(network) {
-                Ok(label) => AS_FOUNDER.scope(true, self.recover(label.as_ref(), &revoke)).await,
+            Command::Recover { network, revoke, another_name } => match Self::wanted(network) {
+                Ok(label) => {
+                    AS_FOUNDER
+                        .scope(true, self.recover(label.as_ref(), &revoke, another_name))
+                        .await
+                }
                 Err(refusal) => Self::said(Err(refusal)),
             },
             Command::Status => Outcome::Reported(self.report().await),
@@ -5791,7 +5981,7 @@ impl Service {
                 }
                 continue;
             }
-            if self.settled.lock().await.contains(network.label()) {
+            if self.settled.lock().await.contains(&me) {
                 continue;
             }
             // Only the founder key demotes an admin, and nothing voids its work
@@ -5804,7 +5994,7 @@ impl Service {
             }
             match self.destroy_signing_key(&network).await {
                 Ok(()) => {
-                    self.settled.lock().await.insert(network.label().clone());
+                    self.settled.lock().await.insert(me);
                     node.record(
                         crate::node::Severity::Event,
                         "keys",
@@ -6285,6 +6475,8 @@ impl Service {
                 invites.push(crate::control::InviteLine {
                     network: network.label().to_string(),
                     name: record.invited.name.clone(),
+                    awaiting_root: record.standing(now) == crate::invites::Standing::Approved
+                        && awaits_root(record, network.node()),
                     standing: record.standing(now).as_str().to_owned(),
                     expires_at: record.expires_at,
                     request,
@@ -6431,7 +6623,15 @@ impl Service {
         for network in self.all().await {
             let Ok(invites) = Self::invites_of(&network).await else { continue };
             let open: Vec<crate::invites::Record> = invites.open(now).cloned().collect();
-            let approved: Vec<crate::invites::Record> = invites.delivering(now).cloned().collect();
+            // Never one whose device would refuse what it is given: an invite
+            // anchored to the founder is delivered with the founder's root, and
+            // only once that is kept (`recovery-repairs` 4.1).
+            let node = network.node();
+            let approved: Vec<crate::invites::Record> = invites
+                .delivering(now)
+                .filter(|record| !awaits_root(record, node))
+                .cloned()
+                .collect();
             if open.is_empty() && approved.is_empty() {
                 continue;
             }
@@ -6825,6 +7025,29 @@ impl Service {
         let Some((record, request)) =
             record.and_then(|record| record.request.clone().map(|request| (record, request)))
         else {
+            // Approved with the founder's words, and its root never kept: its
+            // device is given nothing until it is. Approving it again with the
+            // words signs that root alone, never a second admission
+            // (`recovery-repairs` 4.3).
+            let awaiting = Self::invites_of(&network).await.ok().is_some_and(|invites| {
+                invites
+                    .named(name, crate::invites::Standing::Approved, now)
+                    .is_some_and(|record| awaits_root(record, &node))
+            });
+            if awaiting && as_founder() {
+                let founder = state.params.founder.signing_id();
+                let report = Outcome::Reported(self.report().await);
+                return self.founder_root_wanted(&label, &founder, report).await;
+            }
+            if awaiting {
+                return Outcome::refused(format!(
+                    "`{}` is approved, and its device is given the network once the founder's \
+                     root over it is signed: `peerfectly approve {} --founder`. Nothing was \
+                     signed.",
+                    crate::control::shown(name),
+                    crate::control::shown(name)
+                ));
+            }
             return Outcome::refused(format!(
                 "no request for `{}` is waiting in `{label}`",
                 crate::control::shown(name)
@@ -6844,6 +7067,18 @@ impl Service {
                 "`{}` asks to join as an admin, and only the founder governs admins: approve it \
                  with the founder's words, `peerfectly approve {} --founder`. Nothing was signed.",
                 crate::control::shown(name),
+                crate::control::shown(name)
+            ));
+        }
+        // Never the device approving: it would revoke itself in the act that
+        // admits its successor, and nothing would be left to give that one the
+        // network. Becoming an admin is what recovery is for (`recovery-repairs`
+        // 4.4; found on a PC that invited itself, 2026-11-25).
+        if taken.as_ref().is_some_and(|taken| taken.device == node.identity().device_id()) {
+            return Outcome::refused(format!(
+                "the device holding `{}` is this one: replacing it would revoke the device \
+                 approving. To make this device an admin, use `peerfectly recover {label}`. \
+                 Nothing was signed.",
                 crate::control::shown(name)
             ));
         }
@@ -12187,13 +12422,17 @@ mod tests {
         let record = Record { label: label.clone(), network: state.network };
         record.write(&paths).expect("writes");
         Service::vouch(&home, &label, &Custodied).expect("vouches");
-        let service = Service::holding(
+        // The key that vouched, as a started service holds it.
+        let (machine, _made) =
+            crate::keys::Keys::machine_key(&Custodied, home.root()).expect("the machine's key");
+        let mut service = Service::holding(
             home,
             vec![Network::new(record, paths, node)],
             Lifecycle::new(Arc::new(Recording::new()) as Arc<dyn Machine>),
             Arc::new(InProcess::new()) as Arc<dyn Connectivity>,
             Arc::new(Names::new()) as Arc<dyn Resolving>,
         );
+        service.machine = Some(machine);
         (service, founder, desk, scratch)
     }
 
@@ -12472,7 +12711,7 @@ mod tests {
 
         // What a demotion does, by its own step.
         service.destroy_signing_key(&network).await.expect("destroyed");
-        service.settled.lock().await.insert(network.label().clone());
+        service.settled.lock().await.insert(node.identity().device_id());
 
         let kept =
             crate::keys::Keys::identity(&crate::keys::PlatformKeys, &network.paths).expect("reads");
@@ -12973,6 +13212,39 @@ mod tests {
         assert!(state.devices.contains_key(&phone.device_id()), "the member is still one");
     }
 
+    /// **A closed network lets go of its files, whoever still holds it**
+    /// (`recovery-repairs` design §1): a store and a state still held, as a
+    /// delivery or a sync under way holds them, do not keep the layers file
+    /// open, and the node writes nothing to its log from then on. On Windows
+    /// the layers file held open is what stopped a recovery (os error 33).
+    #[tokio::test]
+    async fn a_closed_network_lets_go_of_its_files_while_it_is_still_held() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) = two_admins_and(false, desk, None, None).await;
+        let network = service.named(&label("casa")).await.expect("held");
+        let paths = network.paths.clone();
+        // Held as a task under way holds them.
+        let layers = crate::state::open_layers(&paths).expect("opens");
+        let state = network.node().state().await.expect("derives");
+        let node = Arc::clone(network.node());
+
+        let _lowered = service.lower(&network, Stop::Everything).await;
+        service.networks.lock().await.remove(&label("casa"));
+        Service::close_network(&network).await;
+
+        drop(
+            member_store::Layers::open(&paths.layers(), 1 << 20)
+                .expect("nothing holds the layers file once the network is closed"),
+        );
+        assert!(layers.node_count().is_err(), "the layers held are closed");
+        let before = std::fs::read(paths.roster()).expect("reads");
+        let operation = crate::state::Log::at(paths.roster()).read().expect("reads");
+        let again = operation.last().expect("an operation");
+        assert!(node.admit_without_activating(again).await.is_err(), "nothing is appended");
+        assert_eq!(std::fs::read(paths.roster()).expect("reads"), before, "the log is as it was");
+        drop(state);
+    }
+
     /// **A member phone recovers a network whose admin was stolen**: the
     /// admin is revoked, the phone's member identity too, and the phone is the
     /// network's admin under a new identity, carried at once; the founder's root
@@ -12992,10 +13264,15 @@ mod tests {
                 .collect()
         };
 
+        // Held open, as a running network holds it: on Windows this stopped the
+        // swap with os error 33 until the network was closed first.
+        let held =
+            crate::state::open_layers(&service.home().paths_for(&label("casa"))).expect("opens");
         let asked = service
             .handle(Command::Recover {
                 network: Some("casa".to_owned()),
                 revoke: vec![by_name("nas"), by_name("desk")],
+                another_name: false,
             })
             .await;
         let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
@@ -13007,6 +13284,7 @@ mod tests {
         let done =
             service.handle(Command::Signed { id: root.id.clone(), signatures: sign(&root) }).await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+        assert!(held.node_count().is_err(), "the layers held were closed, not copied open");
 
         let node = service.node().await.expect("the network, carried again");
         let now = node.identity().device_id();
@@ -13024,6 +13302,485 @@ mod tests {
                 .exists(),
             "the new identity's directory took the old one's place"
         );
+    }
+
+    /// **No operation authored here gives a name to a second device**
+    /// (`recovery-repairs` 3.1): it is neither kept nor spread, whatever path
+    /// signed it. Revoking the holder first, as a replacement does, frees the
+    /// name for the admission after it.
+    #[tokio::test]
+    async fn an_operation_giving_a_taken_name_is_neither_kept_nor_spread() {
+        use roster::sign::sign_operation;
+        use roster::types::{OperationBody, OperationCore, Role};
+
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let words = the_founders_words();
+        let node = service.node().await.expect("a network");
+        let network = node.state().await.expect("derives").network;
+        let signed = |body: OperationBody, heads: Vec<roster::id::OperationId>| {
+            let core = OperationCore::new(
+                crate::clock::signing_time(),
+                roster::types::Algorithm::Ed25519,
+                body,
+                heads,
+                words.keys().signing_id(),
+                network,
+            )
+            .expect("well-formed");
+            sign_operation(&core, words.signer()).expect("signs")
+        };
+        let other = NodeIdentity::generate().expect("generates");
+        let second = OperationBody::AddDevice(
+            other.device_spec("Phone", Role::Admin, vec![]).expect("spec"),
+        );
+        let log = std::fs::read(service.home().paths_for(&label("casa")).roster()).expect("reads");
+
+        let refused =
+            node.admit_without_activating(&signed(second.clone(), node.heads().await)).await;
+
+        assert!(
+            refused.as_ref().is_err_and(|cause| cause.to_string().contains("phone")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(service.home().paths_for(&label("casa")).roster()).expect("reads"),
+            log,
+            "nothing was kept"
+        );
+
+        let revocation = OperationBody::RevokeDevice {
+            device: phone.device_id(),
+            reason: "replaced".to_owned(),
+        };
+        node.admit_without_activating(&signed(revocation, node.heads().await))
+            .await
+            .expect("revokes");
+        node.admit_without_activating(&signed(second, node.heads().await))
+            .await
+            .expect("the name is free once its holder is revoked");
+        let state = node.state().await.expect("derives");
+        assert_eq!(state.devices.named("phone").len(), 1, "one device answers to it");
+    }
+
+    /// **A member signs at once, with no founder session; a revoked device
+    /// looks for a member within one bound** (`recovery-repairs`): the member
+    /// signs on the copy of the roster it holds, which merges what is signed
+    /// apart; the revoked one is heard only through a founder session, and
+    /// with every member off it gives up within the bound, signing nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_signs_at_once_and_a_revoked_device_looks_within_its_bound() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let words = the_founders_words();
+        let session = || Command::FounderSession {
+            network: Some("casa".to_owned()),
+            transport: roster::hex::encode(words.transport_seed().expose()),
+        };
+
+        let started = tokio::time::Instant::now();
+        let member = service.handle(session()).await;
+        assert!(matches!(member, Outcome::Done), "{member:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "a member waits for nothing");
+
+        let (revoked, _holder, _scratch) =
+            a_revoked_phone_whose_name_passed(roster::types::Role::Member).await;
+        let started = tokio::time::Instant::now();
+        let looked = revoked.handle(session()).await;
+        assert!(
+            started.elapsed() <= crate::limits::FOUNDER_REACH + Duration::from_secs(5),
+            "once for all, not per member"
+        );
+        assert!(
+            matches!(&looked, Outcome::Failed { message, .. } if message.contains("Nothing was signed")),
+            "{looked:?}"
+        );
+    }
+
+    /// An invite opened with the founder's words on the fixture's member phone,
+    /// its request arrived from `applicant` and approved: anchored to the
+    /// founder, its root not kept.
+    async fn approved_with_the_founders_words(
+        service: &Service,
+        applicant: &NodeIdentity,
+    ) -> crate::invites::Record {
+        let network = service.named(&label("casa")).await.expect("held");
+        let state = network.node().state().await.expect("derives");
+        let now = crate::state::wall_seconds();
+        let invited = crate::invites::Invited {
+            name: "pc".to_owned(),
+            role: roster::types::Role::Admin,
+            mode: roster::leaf::Mode::Full,
+            groups: Vec::new(),
+            ipv4: None,
+        };
+        let record = crate::invites::Record::issue(
+            &format!("{}@relay.example:8443", "1c".repeat(32)),
+            state.network,
+            state.params.ipv4_range(),
+            state.params.founder.signing_id(),
+            invited,
+            now,
+            86_400,
+        )
+        .expect("issues");
+        let mut invites = Service::invites_of(&network).await.expect("reads");
+        invites.add(record.clone());
+        let applicant = crate::admitting::Applicant {
+            signing: applicant.signing_key().public_key(),
+            transport: applicant.transport_key().public_key(),
+            attestation: applicant.attestation_key().public_key(),
+            name: "pc".to_owned(),
+            conflicts: Vec::new(),
+        };
+        assert!(invites.arrived(&record.invite.secret, applicant, now));
+        assert!(invites.approve(&record.invite.secret, now));
+        Service::save_invites(&network, &invites).expect("saves");
+        invites.named("pc", crate::invites::Standing::Approved, now).expect("approved").clone()
+    }
+
+    /// **A founder-anchored approval is not delivered without the founder's
+    /// root, and approving it again signs that root alone**
+    /// (`recovery-repairs` 4.1, 4.3): never dialled while the root is missing,
+    /// listed as waiting for it, and the root, once signed, is kept with it.
+    #[tokio::test]
+    async fn a_founder_anchored_approval_waits_for_the_founders_root() {
+        use roster::sign::sign_operation;
+        use roster::types::{OperationBody, OperationCore, Role};
+
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let service = Arc::new(service);
+        let words = the_founders_words();
+        let pc = NodeIdentity::generate().expect("generates");
+        let record = approved_with_the_founders_words(&service, &pc).await;
+        // Its admission, as the founder's words signed it.
+        let node = service.node().await.expect("a network");
+        let core = OperationCore::new(
+            crate::clock::signing_time(),
+            roster::types::Algorithm::Ed25519,
+            OperationBody::AddDevice(pc.device_spec("pc", Role::Admin, vec![]).expect("spec")),
+            node.heads().await,
+            words.keys().signing_id(),
+            node.state().await.expect("derives").network,
+        )
+        .expect("well-formed");
+        node.admit_without_activating(&sign_operation(&core, words.signer()).expect("signs"))
+            .await
+            .expect("admitted");
+
+        service.dial_invites().await;
+        assert!(
+            !service.delivering.lock().await.contains_key(&record.invite.secret),
+            "never dialled while the root is missing"
+        );
+        let Outcome::Pending(listed) = service.handle(Command::Pending { network: None }).await
+        else {
+            panic!("a pending list")
+        };
+        assert!(
+            listed.invites.iter().any(|line| line.name == "pc" && line.awaiting_root),
+            "{listed:?}"
+        );
+
+        let refused = service
+            .handle(Command::Approve { network: None, name: "pc".to_owned(), replace: false })
+            .await;
+        assert!(matches!(refused, Outcome::Failed { .. }), "the words are needed: {refused:?}");
+
+        let asked = service
+            .handle(Command::AsFounder(Box::new(Command::Approve {
+                network: None,
+                name: "pc".to_owned(),
+                replace: false,
+            })))
+            .await;
+        let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
+        assert_eq!(wanted.items.len(), 1, "the root alone, no second admission");
+        assert!(matches!(
+            wanted.items.first().map(|item| item.kind),
+            Some(crate::control::SigningKind::Snapshot)
+        ));
+        let signatures = wanted
+            .items
+            .iter()
+            .map(|item| words.signer().sign(&item.message).expect("signs"))
+            .collect();
+        let done = service.handle(Command::Signed { id: wanted.id, signatures }).await;
+        assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
+
+        let network = service.named(&label("casa")).await.expect("held");
+        let invites = Service::invites_of(&network).await.expect("reads");
+        let kept = invites
+            .named("pc", crate::invites::Standing::Approved, crate::state::wall_seconds())
+            .expect("still approved");
+        assert!(kept.root.is_some(), "the founder's root is kept with it");
+        assert!(!awaits_root(kept, network.node()), "and it is delivered from now on");
+    }
+
+    /// **An approval never revokes the device approving** (`recovery-repairs`
+    /// 4.4): a member that joined its own admin invite, replacing the name it
+    /// holds, is refused before anything is signed, and pointed to recovery.
+    #[tokio::test]
+    async fn an_approval_that_would_revoke_the_device_approving_is_refused() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let network = service.named(&label("casa")).await.expect("held");
+        let now = crate::state::wall_seconds();
+        let state = network.node().state().await.expect("derives");
+        // The invite names this device's own name: `phone`.
+        let record = crate::invites::Record::issue(
+            &format!("{}@relay.example:8443", "1c".repeat(32)),
+            state.network,
+            state.params.ipv4_range(),
+            state.params.founder.signing_id(),
+            crate::invites::Invited {
+                name: "phone".to_owned(),
+                role: roster::types::Role::Admin,
+                mode: roster::leaf::Mode::Full,
+                groups: Vec::new(),
+                ipv4: None,
+            },
+            now,
+            86_400,
+        )
+        .expect("issues");
+        let mut invites = Service::invites_of(&network).await.expect("reads");
+        invites.add(record.clone());
+        let itself = NodeIdentity::generate().expect("generates");
+        let applicant = crate::admitting::Applicant {
+            signing: itself.signing_key().public_key(),
+            transport: itself.transport_key().public_key(),
+            attestation: itself.attestation_key().public_key(),
+            name: "phone".to_owned(),
+            conflicts: Vec::new(),
+        };
+        assert!(invites.arrived(&record.invite.secret, applicant, now));
+        Service::save_invites(&network, &invites).expect("saves");
+        let heads = network.node().heads().await;
+
+        let refused = service
+            .handle(Command::AsFounder(Box::new(Command::Approve {
+                network: None,
+                name: "phone".to_owned(),
+                replace: true,
+            })))
+            .await;
+
+        let Outcome::Failed { message, .. } = &refused else { panic!("{refused:?}") };
+        assert!(message.contains("peerfectly recover casa"), "{message}");
+        assert_eq!(network.node().heads().await, heads, "nothing was signed");
+        assert!(
+            network.node().state().await.expect("derives").devices.contains_key(&phone.device_id()),
+            "the member keeps its membership"
+        );
+    }
+
+    /// **A destroyed key is said of the identity it belonged to, not of the
+    /// network's name** (`recovery-repairs`): a PC demoted and then recovered
+    /// under the same name holds a new identity with a key, and `status` said
+    /// it held none until the daemon restarted (2026-11-25).
+    #[tokio::test]
+    async fn a_settled_key_is_the_identitys_not_the_networks_name() {
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, desk, _scratch) = two_admins_and(false, desk, None, None).await;
+        let custody =
+            || async { service.report().await.networks.first().map(|network| network.custody) };
+        assert_ne!(custody().await, Some(crate::control::Custody::None), "this one holds its key");
+
+        // An earlier identity under the same name had its key destroyed.
+        let earlier = NodeIdentity::generate().expect("generates");
+        service.settled.lock().await.insert(earlier.device_id());
+        assert_ne!(custody().await, Some(crate::control::Custody::None), "not this identity's");
+
+        service.settled.lock().await.insert(desk.device_id());
+        assert_eq!(custody().await, Some(crate::control::Custody::None), "this identity's");
+    }
+
+    /// The fixture's phone, revoked, and its name given since to another device
+    /// with `role`: the PC of 2026-11-25, whose name had passed to the admin
+    /// identity it made for itself. Returns the service and the new holder.
+    async fn a_revoked_phone_whose_name_passed(
+        role: roster::types::Role,
+    ) -> (Service, NodeIdentity, tempfile::TempDir) {
+        use roster::sign::sign_operation;
+        use roster::types::{OperationBody, OperationCore};
+
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let words = the_founders_words();
+        let node = service.node().await.expect("a network");
+        let network = node.state().await.expect("derives").network;
+        let holder = NodeIdentity::generate().expect("generates");
+        for body in [
+            OperationBody::RevokeDevice {
+                device: phone.device_id(),
+                reason: "replaced".to_owned(),
+            },
+            OperationBody::AddDevice(holder.device_spec("phone", role, vec![]).expect("spec")),
+        ] {
+            let core = OperationCore::new(
+                crate::clock::signing_time(),
+                roster::types::Algorithm::Ed25519,
+                body,
+                node.heads().await,
+                words.keys().signing_id(),
+                network,
+            )
+            .expect("well-formed");
+            node.admit_without_activating(&sign_operation(&core, words.signer()).expect("signs"))
+                .await
+                .expect("held");
+        }
+        (service, holder, scratch)
+    }
+
+    /// The names a recovery's batch would admit devices under.
+    fn admitted_names(wanted: &crate::control::SignaturesWanted) -> Vec<String> {
+        wanted
+            .items
+            .iter()
+            .filter_map(|item| roster::types::OperationCore::decode(&item.payload).ok())
+            .filter_map(|core| match core.body {
+                roster::types::OperationBody::AddDevice(spec) => Some(spec.name),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **A name an admin holds is asked about before anything is made**
+    /// (`recovery-repairs` 3.2): nothing is signed and no key is made until the
+    /// person answers; revoked in the recovery, the name passes to this device;
+    /// declined, it is admitted under a free name, said in the batch.
+    #[tokio::test]
+    async fn a_recovery_asks_about_a_name_an_admin_holds() {
+        let (service, holder, _scratch) =
+            a_revoked_phone_whose_name_passed(roster::types::Role::Admin).await;
+
+        let asked = service
+            .handle(Command::Recover { network: None, revoke: Vec::new(), another_name: false })
+            .await;
+
+        let Outcome::NameHeld(held) = asked else { panic!("{asked:?}") };
+        assert_eq!(held.name, "phone");
+        assert_eq!(held.holder.id, crate::control::short_id(&holder.device_id()));
+        assert!(held.admin, "an admin, which the recovery can revoke");
+        assert_eq!(held.instead, "phone-2");
+        let temporary = crate::recovering::temporary(&label("casa")).expect("t");
+        assert!(!service.home().paths_for(&temporary).root().exists(), "no key was made");
+
+        let revoking = service
+            .handle(Command::Recover {
+                network: None,
+                revoke: vec![crate::control::Target::Id(held.holder.id.clone())],
+                another_name: false,
+            })
+            .await;
+        let Outcome::NeedsSignatures(wanted) = revoking else { panic!("{revoking:?}") };
+        assert_eq!(admitted_names(&wanted), vec!["phone".to_owned()], "the name passes");
+        let _ = service.handle(Command::NotSigned { id: wanted.id }).await;
+
+        let elsewhere = service
+            .handle(Command::Recover { network: None, revoke: Vec::new(), another_name: true })
+            .await;
+        let Outcome::NeedsSignatures(wanted) = elsewhere else { panic!("{elsewhere:?}") };
+        assert_eq!(admitted_names(&wanted), vec!["phone-2".to_owned()], "a free name");
+    }
+
+    /// **A name a member holds is never shared**: the recovery cannot revoke a
+    /// member, so the person is told the free name, and that is what is signed.
+    #[tokio::test]
+    async fn a_recovery_takes_a_free_name_where_a_member_holds_its_own() {
+        let (service, _holder, _scratch) =
+            a_revoked_phone_whose_name_passed(roster::types::Role::Member).await;
+
+        let asked = service
+            .handle(Command::Recover { network: None, revoke: Vec::new(), another_name: false })
+            .await;
+        let Outcome::NameHeld(held) = asked else { panic!("{asked:?}") };
+        assert!(!held.admin, "a member, which a recovery does not revoke");
+
+        let elsewhere = service
+            .handle(Command::Recover { network: None, revoke: Vec::new(), another_name: true })
+            .await;
+        let Outcome::NeedsSignatures(wanted) = elsewhere else { panic!("{elsewhere:?}") };
+        assert_eq!(admitted_names(&wanted), vec![held.instead]);
+    }
+
+    /// **A recovery stopped after its note is finished at the next start, and
+    /// carried** (`recovery-repairs` 2.2): the checkpoint travels with the
+    /// roster, so the directory that takes the network's place is vouched for
+    /// as the old one was, without the daemon vouching for anything anew.
+    #[tokio::test]
+    async fn a_recovery_stopped_after_its_note_is_finished_and_carried_at_start() {
+        use roster::sign::sign_operation;
+        use roster::types::{OperationBody, OperationCore, Role};
+
+        let desk = Arc::new(NodeIdentity::generate().expect("generates"));
+        let phone = Arc::new(NodeIdentity::generate().expect("generates"));
+        let (service, _nas, _desk, _scratch) =
+            two_admins_and(false, desk, None, Some(Arc::clone(&phone))).await;
+        let home = service.home().clone();
+        let words = the_founders_words();
+
+        // The decision: the new identity made, admitted by the founder, noted.
+        let temporary = crate::recovering::temporary(&label("casa")).expect("temporary");
+        let temp = home.paths_for(&temporary);
+        temp.create().expect("creates");
+        let new = NodeIdentity::generate().expect("generates");
+        identity::store::save(&new, &temp.identity()).expect("seals");
+        let node = service.node().await.expect("a network");
+        let network = node.state().await.expect("derives").network;
+        let admission = OperationCore::new(
+            crate::clock::signing_time(),
+            roster::types::Algorithm::Ed25519,
+            OperationBody::AddDevice(
+                new.device_spec("phone-new", Role::Admin, vec![]).expect("spec"),
+            ),
+            node.heads().await,
+            words.keys().signing_id(),
+            network,
+        )
+        .expect("well-formed");
+        node.admit_without_activating(&sign_operation(&admission, words.signer()).expect("signs"))
+            .await
+            .expect("admits");
+        let machine = service.machine.clone().expect("the machine's key");
+        crate::recovering::write_note(
+            &temp,
+            machine.as_ref(),
+            &crate::recovering::Note::new(&label("casa"), &network, &new.device_id()),
+        )
+        .expect("notes");
+        // The stop, before anything was copied.
+        let held = service.named(&label("casa")).await.expect("held");
+        Service::close_network(&held).await;
+        drop((held, node, service));
+
+        let again = Service::over_with_keys(
+            home.clone(),
+            Lifecycle::new(Arc::new(Recording::new()) as Arc<dyn Machine>),
+            Arc::new(InProcess::new()) as Arc<dyn Connectivity>,
+            Arc::new(Names::new()) as Arc<dyn Resolving>,
+            Arc::new(Custodied),
+        )
+        .expect("starts");
+
+        let (carried, refused) = carried_and_refused(&again).await;
+        assert_eq!(carried, vec!["casa".to_owned()], "refused: {refused:?}");
+        let node = again.node().await.expect("carried");
+        assert_eq!(node.identity().device_id(), new.device_id(), "under the new identity");
+        assert!(!temp.root().exists(), "the recovering directory took the old one's place");
     }
 
     /// A member recovering from one admin has room in its batch for the new
@@ -13044,8 +13801,13 @@ mod tests {
                 .collect()
         };
 
-        let asked =
-            service.handle(Command::Recover { network: None, revoke: vec![by_name("nas")] }).await;
+        let asked = service
+            .handle(Command::Recover {
+                network: None,
+                revoke: vec![by_name("nas")],
+                another_name: false,
+            })
+            .await;
         let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
         assert_eq!(
             wanted.items.len(),
@@ -13098,7 +13860,7 @@ mod tests {
 
         let done = as_the_founder(
             &service,
-            Command::Recover { network: None, revoke: vec![by_name("nas")] },
+            Command::Recover { network: None, revoke: vec![by_name("nas")], another_name: false },
         )
         .await;
         assert!(matches!(done, Outcome::Reported(_)), "{done:?}");
@@ -13125,8 +13887,13 @@ mod tests {
                 .collect()
         };
 
-        let asked =
-            service.handle(Command::Recover { network: None, revoke: vec![by_name("nas")] }).await;
+        let asked = service
+            .handle(Command::Recover {
+                network: None,
+                revoke: vec![by_name("nas")],
+                another_name: false,
+            })
+            .await;
         let Outcome::NeedsSignatures(wanted) = asked else { panic!("{asked:?}") };
         assert_eq!(wanted.items.len(), 1, "the revocation alone");
         let root = service
@@ -13158,12 +13925,16 @@ mod tests {
             vec![by_name("nas"), by_name("desk"), by_name("phone")],
             vec![by_name("nobody")],
         ] {
-            let refused = on_phone.handle(Command::Recover { network: None, revoke }).await;
+            let refused = on_phone
+                .handle(Command::Recover { network: None, revoke, another_name: false })
+                .await;
             assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
         }
 
         let (on_desk, _nas, _desk, _scratch) = two_admins_and(false, desk, None, None).await;
-        let refused = on_desk.handle(Command::Recover { network: None, revoke: Vec::new() }).await;
+        let refused = on_desk
+            .handle(Command::Recover { network: None, revoke: Vec::new(), another_name: false })
+            .await;
         assert!(matches!(refused, Outcome::Failed { .. }), "{refused:?}");
         let state = on_desk.node().await.expect("a network").state().await.expect("derives");
         assert_eq!(state.devices.len(), 3, "nothing was signed or revoked");

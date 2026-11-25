@@ -250,7 +250,13 @@ impl Home {
     /// When the directory exists and cannot be read or removed.
     pub fn discard_unfounded(&self, label: &Label) -> Result<bool> {
         let paths = self.paths_for(label);
-        if !paths.root().exists() || paths.record().exists() || crate::joins::in_progress(&paths) {
+        // A recovery's directory is finished or reported at start, never
+        // discarded as an attempt: past its note, the batch was decided.
+        if !paths.root().exists()
+            || paths.record().exists()
+            || crate::joins::in_progress(&paths)
+            || crate::recovering::carries_note(&paths)
+        {
             return Ok(false);
         }
         if !crate::state::Log::at(paths.roster()).read()?.is_empty() {
@@ -628,8 +634,9 @@ impl Home {
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             let paths = Paths::under(entry.path());
-            // A join in progress is listed as one, not as a network.
-            if crate::joins::in_progress(&paths) {
+            // A join in progress is listed as one, not as a network; a
+            // recovery's directory is finished or reported before the survey.
+            if crate::joins::in_progress(&paths) || crate::recovering::carries_note(&paths) {
                 continue;
             }
 

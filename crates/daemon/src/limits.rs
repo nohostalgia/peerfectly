@@ -210,6 +210,12 @@ pub const CROSSING_DIALS: std::time::Duration = std::time::Duration::from_secs(1
 /// the admin that approved it, until it has the network.
 pub const NEWCOMER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3 * 24 * 60 * 60);
 
+/// How long a founder act tries to reach a full member of its network before
+/// going on without one, or saying it could not: every candidate is dialled at
+/// once, so this is the whole of the wait a person sees, never one per device
+/// (`recovery-repairs`; a phone waited minutes on offline members, 2026-11-25).
+pub const FOUNDER_REACH: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[cfg(test)]
 mod tests {
     use super::*;

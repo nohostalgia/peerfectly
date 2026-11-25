@@ -46,6 +46,7 @@ fn report() -> Report {
         custody: daemon::control::Custody::KeyStore,
         key_until_settled: false,
         revoked_by: None,
+        shared_names: Vec::new(),
         owner_taken: false,
         // A network confirmed within the time it allows.
         confirmation: None,
@@ -153,6 +154,21 @@ fn report() -> Report {
         key_until_settled: false,
         // Revoked there, so a renderer has the line to draw.
         revoked_by: Some("laptop [0a1b-2c3d-4e5f-6a7b]".to_owned()),
+        // Two admins admitted one name apart, and their branches met.
+        shared_names: vec![daemon::control::SharedName {
+            name: "nas".to_owned(),
+            holders: vec![
+                daemon::control::Named {
+                    name: Some("nas".to_owned()),
+                    id: "1a2b-3c4d-5e6f-7a8b".to_owned(),
+                },
+                daemon::control::Named {
+                    name: Some("NAS".to_owned()),
+                    id: "9c0d-1e2f-3a4b-5c6d".to_owned(),
+                },
+            ],
+        }],
+
         owner_taken: false,
         // And one this device has not been able to confirm, so a renderer of
         // the report has both to draw.
@@ -293,6 +309,7 @@ fn outcomes() -> Vec<Outcome> {
                     network: "casa".to_owned(),
                     name: "sensor".to_owned(),
                     standing: "open".to_owned(),
+                    awaiting_root: false,
                     expires_at: 1_758_300_000,
                     request: None,
                     refused: Vec::new(),
@@ -301,6 +318,7 @@ fn outcomes() -> Vec<Outcome> {
                     network: "casa".to_owned(),
                     name: "tablet".to_owned(),
                     standing: "requested".to_owned(),
+                    awaiting_root: false,
                     expires_at: 1_758_200_000,
                     request: Some(daemon::control::RequestLine {
                         proposed_name: "Mario's tablet".to_owned(),
@@ -316,6 +334,17 @@ fn outcomes() -> Vec<Outcome> {
                         ],
                         admin: true,
                     }),
+                    refused: Vec::new(),
+                },
+                // Approved with the founder's words, and its root not kept:
+                // not given to its device until it is.
+                daemon::control::InviteLine {
+                    network: "casa".to_owned(),
+                    name: "pc".to_owned(),
+                    standing: "approved".to_owned(),
+                    awaiting_root: true,
+                    expires_at: 1_758_200_000,
+                    request: None,
                     refused: Vec::new(),
                 },
             ],
@@ -374,6 +403,18 @@ fn outcomes() -> Vec<Outcome> {
         // Removing a network this device is the only admin of: a question for
         // a person, asked before anything is touched.
         Outcome::OnlyAdmin { network: "casa".to_owned() },
+        // A recovery whose name another device answers to: a question, asked
+        // before any key is made or anything signed.
+        Outcome::NameHeld(daemon::control::NameHeld {
+            network: "casa".to_owned(),
+            name: "pc".to_owned(),
+            holder: daemon::control::TakenName {
+                name: "pc".to_owned(),
+                id: "185e-2b1c-90aa-7f31".to_owned(),
+            },
+            admin: true,
+            instead: "pc-2".to_owned(),
+        }),
         // Revoking an admin whose acts would be voided: a question, asked
         // before anything is signed.
         Outcome::WouldVoid {
@@ -593,7 +634,9 @@ fn administrator_table() -> Vec<(daemon::control::Command, bool)> {
         Command::Recover {
             network: casa(),
             revoke: vec![daemon::control::Target::Name("laptop".to_owned())],
+            another_name: false,
         },
+        Command::Recover { network: casa(), revoke: Vec::new(), another_name: true },
         Command::ReplaceFounder {
             network: casa(),
             founder: daemon::control::FounderPublic {

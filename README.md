@@ -93,8 +93,8 @@ is unknown: *More info → Run anyway*.
 4 or 5 on a 64-bit system among them), unpack it and run its install script:
 
 ```sh
-tar xzf peerfectly-0.6.0-linux-x86_64.tar.gz
-sudo ./peerfectly-0.6.0-linux-x86_64/install.sh
+tar xzf peerfectly-0.6.1-linux-x86_64.tar.gz
+sudo ./peerfectly-0.6.1-linux-x86_64/install.sh
 ```
 
 The script checks everything it needs before it writes anything, and tells you which packages are
@@ -109,7 +109,7 @@ built it, from which commit, on which runner. To check that a file came out of t
 release workflow and not off someone's laptop, use the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify peerfectly-0.6.0-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
+gh attestation verify peerfectly-0.6.1-linux-x86_64.tar.gz --repo nohostalgia/peerfectly
 ```
 
 That tells you where the file was built. It isn't a code signature: Windows doesn't read it, and
@@ -171,7 +171,12 @@ A device's name is how the others reach it, as `laptop.home.internal`, so it is 
 lower-case letters, digits and hyphens, at most 63 of them, with no hyphen at either end. Upper case
 is lowered, so `Laptop` and `laptop` are the same name. Anything else is refused with a name that
 would do. Without `--name`, the machine's name is used, made to fit. An admin renames a device with
-`peerfectly rename laptop studio`.
+`peerfectly rename laptop studio`. A name answers for one device: nothing signed on your devices
+gives it to a second, and two admins admitting one name apart are told by `status` which devices
+share it until one is renamed.
+
+A member becomes an admin with `peerfectly recover home` on it, typing the founder's words: it is
+admitted again as an admin under a new identity, its member identity revoked, in one act.
 
 `peerfectly` with no arguments lists every command. Reading — `status`, `peers`, `revoked`,
 `address`, `exposed`, `pending` — and turning your own networks on and off with `up` and `down`

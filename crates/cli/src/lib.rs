@@ -427,6 +427,23 @@ impl Cli<'_> {
                 && line.standing == "requested"
                 && network.as_deref().is_none_or(|wanted| line.network == wanted)
         });
+        // Approved with the founder's words, its root never kept: approving it
+        // again signs that root alone, which the batch shows before the words.
+        let rooted = list.invites.iter().any(|line| {
+            line.name == name
+                && line.awaiting_root
+                && network.as_deref().is_none_or(|wanted| line.network == wanted)
+        });
+        if waiting.is_none() && rooted {
+            println!(
+                "`{}` is approved, and its device is given the network once the founder's root \
+                 over it is signed. Only that root is signed now.",
+                daemon::control::shown(&name)
+            );
+            let asked = Command::Approve { network, name, replace: false };
+            let answer = self.ask_and_sign(asked.clone()).await;
+            return self.shown(&asked, answer);
+        }
         let Some((line, request)) =
             waiting.and_then(|line| line.request.as_ref().map(|request| (line, request)))
         else {
@@ -1427,7 +1444,27 @@ impl Cli<'_> {
             }
             founder = Some(key);
         }
+        let sent = command.clone();
         let mut outcome = self.ask(command).await?;
+        // A recovery whose name another device answers to: asked here, with the
+        // words already held for the act, and sent again with the answer, so
+        // nothing is made or signed before the person has said
+        // (`recovery-repairs` design §5).
+        let answered;
+        let expected = if let (Outcome::NameHeld(held), Command::Recover { network, revoke, .. }) =
+            (&outcome, &sent)
+        {
+            let Some(again) = recovery_name_answered(held, network.clone(), revoke.clone()) else {
+                return Ok(Outcome::Declined {
+                    message: "nothing was signed: the recovery was not made".to_owned(),
+                });
+            };
+            outcome = self.ask(again.clone()).await?;
+            answered = again;
+            &answered
+        } else {
+            expected
+        };
         // What the act is, for showing and checking: the act inside, where the
         // founder's words sign it.
         let shown_as = match expected {
@@ -1988,6 +2025,76 @@ const AS_FOUNDER_USAGE: &str =
     ipv4 or route, signs with the founder's words instead of this device's key, from any
     device holding the network: an admin, a member, or one the network revoked";
 
+/// The person's answer where a recovery would give this device a name
+/// another device answers to: the recovery to send again, or `None` where they
+/// would rather not go on.
+fn recovery_name_answered(
+    held: &daemon::control::NameHeld,
+    network: Option<String>,
+    revoke: Vec<daemon::control::Target>,
+) -> Option<daemon::control::Command> {
+    use std::io::Write as _;
+
+    println!();
+    println!(
+        "In `{}`, {} is now the name of {}: {}.",
+        held.network,
+        daemon::control::shown(&held.name),
+        daemon::control::shown(&held.holder.name),
+        held.holder.id
+    );
+    println!("Two devices answering to one name resolve for neither, so this device cannot");
+    println!("take it while that one holds it.");
+    if held.admin {
+        println!(
+            "That device is an admin: this recovery can revoke it, for good, and the name comes"
+        );
+        println!(
+            "back to this device. Otherwise this device is admitted as {}.",
+            daemon::control::shown(&held.instead)
+        );
+        print!(
+            "Revoke {} in this recovery? [yes/no, no admits this device as {}] ",
+            held.holder.id,
+            daemon::control::shown(&held.instead)
+        );
+        let _ = std::io::stdout().flush();
+        return recovery_again(held, network, revoke, said_yes());
+    }
+    println!(
+        "That device is a member, which a recovery does not revoke. This device will be admitted"
+    );
+    println!(
+        "as {}; revoke the other afterwards and rename this one if you want the name back.",
+        daemon::control::shown(&held.instead)
+    );
+    print!("Go on? [yes/no] ");
+    let _ = std::io::stdout().flush();
+    recovery_again(held, network, revoke, said_yes())
+}
+
+/// The recovery sent again once the person answered `yes` or not: an admin
+/// holding the name revoked in it, or this device under the free name; for a
+/// member holding it, the free name, or nothing at all.
+fn recovery_again(
+    held: &daemon::control::NameHeld,
+    network: Option<String>,
+    mut revoke: Vec<daemon::control::Target>,
+    yes: bool,
+) -> Option<daemon::control::Command> {
+    use daemon::control::{Command, Target};
+    match (held.admin, yes) {
+        (true, true) => {
+            revoke.push(Target::Id(held.holder.id.clone()));
+            Some(Command::Recover { network, revoke, another_name: false })
+        }
+        (true, false) | (false, true) => {
+            Some(Command::Recover { network, revoke, another_name: true })
+        }
+        (false, false) => None,
+    }
+}
+
 /// Reads `recover [<network>] [--revoke <admin>]...`.
 fn recovery_from(rest: &[String]) -> Result<daemon::control::Command, String> {
     let mut network = None;
@@ -2008,7 +2115,7 @@ fn recovery_from(rest: &[String]) -> Result<daemon::control::Command, String> {
             _ => return Err(format!("usage: {RECOVER_USAGE}")),
         }
     }
-    Ok(daemon::control::Command::Recover { network, revoke })
+    Ok(daemon::control::Command::Recover { network, revoke, another_name: false })
 }
 
 /// Reads `founder replace [<network>]`, making the new words and checking them
@@ -2411,6 +2518,10 @@ fn pending_listed(list: &daemon::control::PendingList) -> String {
                 "{name} ({network}): open {}, waiting for its device\n  peerfectly withdraw {name}\n",
                 open_for(line.expires_at)
             )),
+            ("approved", _) if line.awaiting_root => out.push_str(&format!(
+                "{name} ({network}): approved, and not given the network until the founder's \
+                 root over it is signed\n  peerfectly approve {name} --founder\n"
+            )),
             ("approved", _) => out.push_str(&format!(
                 "{name} ({network}): approved, and given the network as soon as it answers\n"
             )),
@@ -2725,6 +2836,7 @@ mod tests {
                     network: "casa".to_owned(),
                     name: "laptop".to_owned(),
                     standing: "requested".to_owned(),
+                    awaiting_root: false,
                     expires_at: 0,
                     request: Some(RequestLine {
                         proposed_name: "mario".to_owned(),
@@ -2743,6 +2855,7 @@ mod tests {
                     network: "casa".to_owned(),
                     name: "sensor".to_owned(),
                     standing: "used".to_owned(),
+                    awaiting_root: false,
                     expires_at: 0,
                     request: None,
                     refused: vec![daemon::control::RefusedLine {
@@ -3441,15 +3554,58 @@ mod custody {
             Command::Recover {
                 network: Some("casa".to_owned()),
                 revoke: vec![Target::Name("nas".to_owned()), Target::Name("desk".to_owned())],
+                another_name: false,
             }
         );
         assert_eq!(
             super::recovery_from(&[]).unwrap(),
-            Command::Recover { network: None, revoke: Vec::new() }
+            Command::Recover { network: None, revoke: Vec::new(), another_name: false }
         );
         for refused in ["casa --admin", "casa lavoro", "casa --revoke"] {
             assert!(super::recovery_from(&words(refused)).is_err(), "{refused}");
         }
+    }
+
+    /// **Where another device answers to this one's name, the answer decides
+    /// the recovery sent again** (`recovery-repairs` 3.3): an admin holding it
+    /// is revoked in it, by its short id, or this device takes the free name;
+    /// a member's is never revoked, and declining sends nothing.
+    #[test]
+    fn a_held_name_is_answered_into_the_recovery_sent_again() {
+        use daemon::control::{Command, NameHeld, TakenName, Target};
+        let held = |admin| NameHeld {
+            network: "casa".to_owned(),
+            name: "pc".to_owned(),
+            holder: TakenName { name: "pc".to_owned(), id: "185e-2b1c-90aa-7f31".to_owned() },
+            admin,
+            instead: "pc-2".to_owned(),
+        };
+        let named = vec![Target::Name("nas".to_owned())];
+        let network = Some("casa".to_owned());
+
+        assert_eq!(
+            super::recovery_again(&held(true), network.clone(), named.clone(), true),
+            Some(Command::Recover {
+                network: network.clone(),
+                revoke: vec![
+                    Target::Name("nas".to_owned()),
+                    Target::Id("185e-2b1c-90aa-7f31".to_owned())
+                ],
+                another_name: false,
+            })
+        );
+        for (admin, yes) in [(true, false), (false, true)] {
+            assert_eq!(
+                super::recovery_again(&held(admin), network.clone(), named.clone(), yes),
+                Some(Command::Recover {
+                    network: network.clone(),
+                    revoke: named.clone(),
+                    another_name: true,
+                }),
+                "admin {admin}, yes {yes}"
+            );
+        }
+        assert_eq!(super::recovery_again(&held(false), network, named, false), None);
     }
 
     /// The history says who signed each act, the founder by that name, what

@@ -107,9 +107,9 @@ unit, `install.sh` and their digests.
 the script is about to run as root. Then:
 
 ```text
-sha256sum peerfectly-0.6.0-linux-x86_64.tar.gz
-tar xzf peerfectly-0.6.0-linux-x86_64.tar.gz
-sudo ./peerfectly-0.6.0-linux-x86_64/install.sh
+sha256sum peerfectly-0.6.1-linux-x86_64.tar.gz
+tar xzf peerfectly-0.6.1-linux-x86_64.tar.gz
+sudo ./peerfectly-0.6.1-linux-x86_64/install.sh
 ```
 
 The script **checks everything before it writes anything**, and reports every missing piece at once
@@ -140,7 +140,7 @@ programs, and the networks that were up come back up.
 **Uninstalling:**
 
 ```text
-sudo ./peerfectly-0.6.0-linux-x86_64/install.sh --uninstall
+sudo ./peerfectly-0.6.1-linux-x86_64/install.sh --uninstall
 ```
 
 It stops and disables the service and removes the unit and both programs. **It keeps
@@ -178,9 +178,12 @@ admin. Deleting `/var/lib/peerfectly` by hand removes every network at once, wit
   setting one takes `--founder`; an admin's own key governs members only, and the command says so
   before anything is signed. `sudo peerfectly demote <device> --founder` makes an admin a member,
   and the demoted device destroys its signing key at once. Nothing is signed for a device that is
-  already a member or for the network's only admin. A member wanted as an admin is invited again
-  with `invite --admin` and approved with `approve <name> --replace --founder`: a member keeps no
-  key that could be made an admin's, so promoting one is not offered.
+  already a member or for the network's only admin. A member wanted as an admin runs
+  `sudo peerfectly recover <network>` with the founder's words, or is invited again with
+  `invite --admin` from another device and approved there with `approve <name> --replace
+  --founder`: a member keeps no key that could be made an admin's, so promoting one is not offered,
+  and an approval never replaces the device approving. A recovery whose name another device holds
+  asks first; two devices admitted apart under one name are named in `status` until one is renamed.
 - **Revoking a stolen admin**, `sudo peerfectly revoke <admin> <reason> --founder`, lists its acts
   still held and asks from which to void them: what it admitted leaves, what it revoked comes back,
   what it renamed has its name again. Other admins' acts stand. The devices that come back are

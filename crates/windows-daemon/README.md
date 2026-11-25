@@ -262,7 +262,10 @@ Only the founder's words act on an admin: admitting, demoting, revoking, renamin
 takes `--founder`, and an admin's own key governs members only. `peerfectly demote <device>
 --founder` makes an admin a member, and the demoted device destroys its key in the key store at
 once. Nothing is signed for a member or for the network's only admin. A member wanted as an admin
-is invited again with `--admin` and approved with `--replace --founder`. `peerfectly revoke <admin>
+runs `peerfectly recover <network>` with the founder's words, or is invited again with `--admin` from
+another device and approved there with `--replace --founder`; an approval never replaces the device
+approving. A recovery whose name another device holds asks first, and no act signed here leaves
+one name to two devices; two admitted apart are named in `status` until one is renamed. `peerfectly revoke <admin>
 <reason> --founder` lists the admin's acts still held and asks from which to void them, then the
 devices that come back, any of which it revokes again in the same act. A revoked device is told by
 the member it was talking to, by any member it dials, or at the end of the founder's act, with no
