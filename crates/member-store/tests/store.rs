@@ -262,3 +262,23 @@ fn a_state_of_no_devices_is_written_and_read() {
     assert!(read.devices.is_empty());
     store.verify(&read.devices.root()).unwrap();
 }
+
+/// Closed, the store lets go of its file at once, though a state read from it
+/// is still held: the file opens again, and the store answers that it is
+/// closed (`recovery-repairs` design §1).
+#[test]
+fn a_closed_store_lets_go_of_its_file_while_its_state_is_held() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("base.redb");
+    let store = Store::open(&path, CACHE).unwrap();
+    store.write(&state(10)).unwrap();
+    let held = store.state().unwrap().expect("a state");
+
+    store.close();
+
+    drop(Database::create(&path).expect("nothing holds the file once the store is closed"));
+    assert!(store.state().is_err(), "a closed store reads nothing");
+    assert!(store.write(&state(3)).is_err(), "a closed store writes nothing");
+    store.close();
+    drop(held);
+}

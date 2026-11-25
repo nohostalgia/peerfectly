@@ -594,6 +594,12 @@ pub struct Network {
     /// §16). It issues no invite and signs nothing as an admin there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_by: Option<String>,
+    /// The names more than one device of it answers to, each with those
+    /// devices. Such a name resolves for neither; an admin renames one
+    /// (`recovery-repairs` design §6). Two admins admitting one name apart
+    /// meet in it when their branches merge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_names: Vec<SharedName>,
     /// Whether this network was taken from somebody rather than always this
     /// person's.
     ///
@@ -1709,6 +1715,11 @@ pub enum Command {
         /// The admins to revoke, by name or short id. At most two.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         revoke: Vec<Target>,
+        /// The person's answer where another device answers to this device's
+        /// name: admit the new identity under a name no device answers to
+        /// ([`Outcome::NameHeld`]). Absent, a recovery stops to ask.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        another_name: bool,
     },
 
     /// The act inside, signed with the founder's words instead of this device's
@@ -2670,6 +2681,7 @@ impl Outcome {
             Self::NeedsKey(_) => "needs a key",
             Self::NotAllowed { .. } => "not allowed",
             Self::OnlyAdmin { .. } => "only admin",
+            Self::NameHeld(_) => "name held",
             Self::WouldVoid { .. } => "would void",
             Self::BatchReview { .. } => "batch review",
             Self::Staged { .. } => "staged",
@@ -2748,6 +2760,31 @@ pub struct TakenName {
     pub name: String,
     /// The short id of the device holding it.
     pub id: String,
+}
+
+/// A name more than one device of a network answers to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedName {
+    /// The name, in lower case, as the resolver reads it.
+    pub name: String,
+    /// The devices answering to it, each with its short id.
+    pub holders: Vec<Named>,
+}
+
+/// The device already answering to the name a recovery would give this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameHeld {
+    /// The network, by the name it is reported under.
+    pub network: String,
+    /// The name this device would be admitted under.
+    pub name: String,
+    /// The device answering to it now, with its short id.
+    pub holder: TakenName,
+    /// Whether that device is an admin, which a recovery can revoke.
+    pub admin: bool,
+    /// The name this device is admitted under instead, where the person says
+    /// so.
+    pub instead: String,
 }
 
 /// One device of a batch file, as the command line read it: what its board
@@ -2853,6 +2890,11 @@ pub struct InviteLine {
     /// `open`, `requested`, `approved`, `used`, `rejected`, `expired` or
     /// `withdrawn`.
     pub standing: String,
+    /// Approved, and not given to its device until the founder's root over the
+    /// admission is kept: approving it again with the founder's words signs
+    /// that root alone (`recovery-repairs` 4.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting_root: bool,
     /// When it stops taking a request, in seconds since the epoch.
     pub expires_at: u64,
     /// The request that arrived through it, if one has.
@@ -3052,6 +3094,17 @@ pub enum Outcome {
         message: String,
     },
 
+    /// A recovery would admit this device's new identity under a name another
+    /// live device answers to, and the person has not said what to do.
+    ///
+    /// **Nothing was signed or made.** A surface asks, and sends the recovery
+    /// again: naming the holder among the admins to revoke, where it is an
+    /// admin, so the name passes to this device; or with
+    /// `another_name`, so this device is admitted as [`NameHeld::instead`].
+    /// Two devices answering to one name resolve for neither, so a recovery
+    /// never admits a second one (`recovery-repairs` design §5).
+    NameHeld(NameHeld),
+
     /// Removing this network would leave it with no admin, and the person has
     /// not said they know that.
     ///
@@ -3235,6 +3288,7 @@ mod tests {
             custody: Custody::HeldHere,
             key_until_settled: false,
             revoked_by: None,
+            shared_names: Vec::new(),
             owner_taken: false,
             confirmation: None,
             arrived: None,
@@ -3758,6 +3812,7 @@ mod tests {
                 network: "casa".to_owned(),
                 name: "laptop".to_owned(),
                 standing: "requested".to_owned(),
+                awaiting_root: false,
                 expires_at: 1_800_000_000,
                 request: Some(RequestLine {
                     proposed_name: "Mario's laptop".to_owned(),

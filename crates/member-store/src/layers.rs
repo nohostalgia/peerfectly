@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableTable, TableDefinition};
 use roster::batch::BatchEntry;
 use roster::id::{DeviceId, KeyId, OperationId};
 use roster::members::LayerStore;
@@ -70,7 +70,7 @@ fn database(cause: impl core::fmt::Display) -> Error {
 
 /// A full member's batch layers, in redb.
 pub struct Layers {
-    db: Database,
+    db: crate::held::Held,
     tampered: AtomicBool,
     /// The tables lookups read, kept open from one write to the next.
     reading: std::sync::Mutex<Option<Arc<Reading>>>,
@@ -99,7 +99,9 @@ impl Layers {
     ///
     /// When the file cannot be opened as a database.
     pub fn open(path: &Path, cache: usize) -> Result<Arc<Self>, Error> {
-        let db = Database::builder().set_cache_size(cache).create(path).map_err(database)?;
+        let db = crate::held::Held::new(
+            Database::builder().set_cache_size(cache).create(path).map_err(database)?,
+        );
         let layers =
             Self { db, tampered: AtomicBool::new(false), reading: std::sync::Mutex::new(None) };
         let write = layers.db.begin_write().map_err(database)?;
@@ -296,6 +298,15 @@ impl Layers {
         if let Ok(mut held) = self.reading.lock() {
             *held = None;
         }
+    }
+
+    /// Lets go of the file: writes under way end first, waited for, and every
+    /// use from then on is told the store is closed. For moving a network's
+    /// files while states read from it are still held (`recovery-repairs`
+    /// design §1). Blocks until the file is let go.
+    pub fn close(&self) {
+        self.stop_reading();
+        self.db.close();
     }
 
     fn told(&self) {

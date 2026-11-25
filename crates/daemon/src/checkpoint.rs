@@ -523,6 +523,8 @@ struct Kept {
     /// start where the checkpoint names it: what a checkpoint vouches for,
     /// whatever the file holds when it is written.
     light_held: Option<Hash>,
+    /// Closed with its node: nothing is written from then on.
+    closed: bool,
 }
 
 impl Keeper {
@@ -584,6 +586,9 @@ impl Keeper {
         {
             values.light = Some(kept);
         }
+        if held.closed {
+            return Ok(false);
+        }
         let checkpoint = Checkpoint::of(&values, &held.bases, &held.light);
         if held.written.as_ref() == Some(&checkpoint) {
             held.values = Some(values);
@@ -618,6 +623,14 @@ impl Keeper {
         self.allow(|held| held.light.push(hash))
     }
 
+    /// Writes nothing from now on, and allows no base or light state to be
+    /// written: the network is closed for its files to move.
+    pub fn close(&self) {
+        if let Ok(mut held) = self.held.lock() {
+            held.closed = true;
+        }
+    }
+
     /// Says a write named beforehand has landed: what it replaced may go at the
     /// next checkpoint.
     pub fn landed(&self) {
@@ -630,6 +643,12 @@ impl Keeper {
 
     fn allow(&self, add: impl FnOnce(&mut Kept)) -> Result<()> {
         let mut held = self.held.lock().map_err(|_| self.poisoned())?;
+        if held.closed {
+            return Err(Error::State {
+                path: self.paths.checkpoint(),
+                cause: "this network was closed for its files to move".to_owned(),
+            });
+        }
         add(&mut held);
         let Some(values) = held.values.clone() else {
             // Nothing written yet in this process: what the directory held at

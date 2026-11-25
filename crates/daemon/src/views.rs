@@ -305,6 +305,27 @@ fn status_of(network: &Network) -> Block {
             ),
         );
     }
+    // A name two devices answer to resolves for neither: said until one is
+    // renamed, with the command, and never hidden (`recovery-repairs` §6).
+    for shared in &network.shared_names {
+        let holders: Vec<String> = shared
+            .holders
+            .iter()
+            .map(|holder| {
+                format!("{} [{}]", shown(holder.name.as_deref().unwrap_or("?")), holder.id)
+            })
+            .collect();
+        let first = shared.holders.first().map_or("<short id>", |holder| holder.id.as_str());
+        block.line(
+            "shared name",
+            format!(
+                "{} is the name of {}, so it resolves for neither. An admin renames one: \
+                 peerfectly rename {first} <new name>",
+                shown(&shared.name),
+                holders.join(" and "),
+            ),
+        );
+    }
 
     warnings(network, &mut block);
     block
@@ -521,6 +542,7 @@ mod tests {
             custody: crate::control::Custody::HeldHere,
             key_until_settled: false,
             revoked_by: None,
+            shared_names: Vec::new(),
             owner_taken: false,
             confirmation: None,
             arrived: None,
@@ -556,6 +578,30 @@ mod tests {
 
         moving.relay_leaving = None;
         assert!(!infrastructure(&moving).contains("old.example"), "nothing, after the end");
+    }
+
+    /// **A name two devices answer to is said in `status`, with both and the
+    /// rename**, and nothing once only one answers to it (`recovery-repairs`
+    /// 3.5).
+    #[test]
+    fn status_says_a_name_two_devices_answer_to() {
+        let mut report = two_networks();
+        assert!(!report.to_string().contains("shared name"));
+        if let Some(casa) = report.networks.first_mut() {
+            casa.shared_names = vec![crate::control::SharedName {
+                name: "pc".to_owned(),
+                holders: vec![
+                    crate::control::Named { name: Some("pc".to_owned()), id: "185e".to_owned() },
+                    crate::control::Named { name: Some("pc".to_owned()), id: "2291".to_owned() },
+                ],
+            }];
+        }
+        // Read as words: the block wraps its lines.
+        let drawn =
+            report.to_string().replace('│', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(drawn.contains("pc [185e] and pc [2291]"), "both, by id: {drawn}");
+        assert!(drawn.contains("resolves for neither"), "{drawn}");
+        assert!(drawn.contains("peerfectly rename 185e <new name>"), "{drawn}");
     }
 
     /// **An invited device that arrived after its command ended is told in

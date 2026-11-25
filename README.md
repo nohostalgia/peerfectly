@@ -171,7 +171,12 @@ A device's name is how the others reach it, as `laptop.home.internal`, so it is 
 lower-case letters, digits and hyphens, at most 63 of them, with no hyphen at either end. Upper case
 is lowered, so `Laptop` and `laptop` are the same name. Anything else is refused with a name that
 would do. Without `--name`, the machine's name is used, made to fit. An admin renames a device with
-`peerfectly rename laptop studio`.
+`peerfectly rename laptop studio`. A name answers for one device: nothing signed on your devices
+gives it to a second, and two admins admitting one name apart are told by `status` which devices
+share it until one is renamed.
+
+A member becomes an admin with `peerfectly recover home` on it, typing the founder's words: it is
+admitted again as an admin under a new identity, its member identity revoked, in one act.
 
 `peerfectly` with no arguments lists every command. Reading — `status`, `peers`, `revoked`,
 `address`, `exposed`, `pending` — and turning your own networks on and off with `up` and `down`

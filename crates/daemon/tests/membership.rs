@@ -174,8 +174,25 @@ fn the_roster_is_owned_by_one_module_and_one_choke_point() {
         );
     }
 
+    // The operations authored here are admitted one way, whether one or an
+    // act of several: through the one path that changes the roster for them.
+    for entry in ["pub async fn admit_without_activating", "pub async fn admit_act"] {
+        let body = node
+            .split_once(entry)
+            .map(|(_, rest)| {
+                rest.split(
+                    "
+    /// ",
+                )
+                .next()
+                .unwrap_or(rest)
+            })
+            .unwrap_or_else(|| panic!("{entry} admits what is authored here"));
+        assert!(body.contains("admit_checked"), "{entry} must admit through `admit_checked`");
+    }
+
     // Both mutating paths end at the choke point.
-    for path in ["async fn received_roster", "pub async fn admit_without_activating"] {
+    for path in ["async fn received_roster", "async fn admit_checked"] {
         let body = node
             .split_once(path)
             .map(|(_, rest)| {

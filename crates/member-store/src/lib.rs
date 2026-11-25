@@ -30,6 +30,7 @@
 //!
 //! [redb]: https://www.redb.org
 
+mod held;
 pub mod layers;
 
 pub use layers::Layers;
@@ -38,9 +39,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-};
+use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 use roster::id::{DeviceId, KeyId};
 use roster::leaf::DeviceLeaf;
 use roster::members::{MemberStore, Members};
@@ -112,7 +111,7 @@ fn database(cause: impl core::fmt::Display) -> Error {
 
 /// A full member's base, in redb.
 pub struct Store {
-    db: Database,
+    db: crate::held::Held,
     count: AtomicUsize,
     tampered: AtomicBool,
     /// The tables lookups read, kept open from one write to the next: opening
@@ -147,7 +146,9 @@ impl Store {
     ///
     /// When the file cannot be opened as a database.
     pub fn open(path: &Path, cache: usize) -> Result<Arc<Self>, Error> {
-        let db = Database::builder().set_cache_size(cache).create(path).map_err(database)?;
+        let db = crate::held::Held::new(
+            Database::builder().set_cache_size(cache).create(path).map_err(database)?,
+        );
         let store = Self {
             db,
             count: AtomicUsize::new(0),
@@ -723,6 +724,15 @@ impl Store {
         if let Ok(mut held) = self.reading.lock() {
             *held = None;
         }
+    }
+
+    /// Lets go of the file: writes under way end first, waited for, and every
+    /// use from then on is told the store is closed. For moving a network's
+    /// files while states read from it are still held (`recovery-repairs`
+    /// design §1). Blocks until the file is let go.
+    pub fn close(&self) {
+        self.stop_reading();
+        self.db.close();
     }
 }
 

@@ -512,7 +512,7 @@ pub fn holder_of(name: &str, state: &RosterState) -> Option<Taken> {
 ///
 /// Two devices with one name would make a name ambiguous, and a name is what a
 /// person types. The proposal is kept where it can be.
-fn unused_name(proposed: &str, state: &RosterState) -> String {
+pub fn unused_name(proposed: &str, state: &RosterState) -> String {
     let taken = |candidate: &str| !state.devices.named(candidate).is_empty();
     if !taken(proposed) {
         return proposed.to_owned();

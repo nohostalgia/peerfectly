@@ -207,3 +207,18 @@ fn collecting_keeps_what_live_roots_reach() {
     assert_eq!(layers.node_count().unwrap(), 0, "with no root in use, nothing is left");
     layers.clear().unwrap();
 }
+
+/// Closed, the layers let go of their file at once, though they are still
+/// held (`recovery-repairs` design §1).
+#[test]
+fn closed_layers_let_go_of_their_file() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("layers.redb");
+    let layers = Layers::open(&path, 4 << 20).unwrap();
+    let held = Arc::clone(&layers);
+
+    layers.close();
+
+    drop(redb::Database::create(&path).expect("nothing holds the file once they are closed"));
+    assert!(held.node_count().is_err(), "closed layers read nothing");
+}

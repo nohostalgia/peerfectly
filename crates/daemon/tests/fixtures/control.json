@@ -244,6 +244,15 @@
     ],
     [
       {
+        "Recover": {
+          "another_name": true,
+          "network": "casa"
+        }
+      },
+      true
+    ],
+    [
+      {
         "ReplaceFounder": {
           "founder": {
             "signing": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -560,6 +569,21 @@
             "relay_leaving": null,
             "revoked_by": "laptop [0a1b-2c3d-4e5f-6a7b]",
             "revoked_count": 0,
+            "shared_names": [
+              {
+                "holders": [
+                  {
+                    "id": "1a2b-3c4d-5e6f-7a8b",
+                    "name": "nas"
+                  },
+                  {
+                    "id": "9c0d-1e2f-3a4b-5c6d",
+                    "name": "NAS"
+                  }
+                ],
+                "name": "nas"
+              }
+            ],
             "standing": {
               "LastKnown": {
                 "at": {
@@ -732,6 +756,14 @@
               }
             },
             "standing": "requested"
+          },
+          {
+            "awaiting_root": true,
+            "expires_at": 1758200000,
+            "name": "pc",
+            "network": "casa",
+            "request": null,
+            "standing": "approved"
           }
         ],
         "joins": [
@@ -798,6 +830,18 @@
     },
     {
       "OnlyAdmin": {
+        "network": "casa"
+      }
+    },
+    {
+      "NameHeld": {
+        "admin": true,
+        "holder": {
+          "id": "185e-2b1c-90aa-7f31",
+          "name": "pc"
+        },
+        "instead": "pc-2",
+        "name": "pc",
         "network": "casa"
       }
     },

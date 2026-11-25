@@ -383,6 +383,71 @@ const fn label_character(character: char) -> bool {
     character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
 }
 
+/// A name another live device would share, as the operation `body` gives it
+/// over `state`: the name and the device already answering to it. A device
+/// `leaving` — revoked in the same act — is not counted.
+///
+/// Two devices answering to one name make the resolver answer for neither
+/// ([`answer`]), so an act authored here that would do it is not taken
+/// (`recovery-repairs` design §5). Admins admitting the same name apart still
+/// meet when their branches merge; that is reported, not prevented.
+#[must_use]
+pub fn shared_by(
+    state: &RosterState,
+    body: &roster::types::OperationBody,
+    leaving: impl Fn(&DeviceId) -> bool,
+) -> Option<(String, DeviceId)> {
+    let (device, name) = match body {
+        roster::types::OperationBody::AddDevice(spec) => (spec.device_id().ok()?, &spec.name),
+        roster::types::OperationBody::Rename { device, name } => (*device, name),
+        _ => return None,
+    };
+    state
+        .devices
+        .named(name)
+        .into_iter()
+        .find(|holder| holder.record.id != device && !leaving(&holder.record.id))
+        .map(|holder| (holder.record.name.clone(), holder.record.id))
+}
+
+/// The names, in ASCII lower case, that more than one member of `state`
+/// answers to: one pass over the members, asking the name index of each. For
+/// a start, or a change that cannot be followed from the devices it touched;
+/// never on a path that waits on it.
+#[must_use]
+pub fn shared_among(state: &RosterState) -> std::collections::BTreeSet<String> {
+    let mut shared = std::collections::BTreeSet::new();
+    for leaf in state.devices.values() {
+        let lower = leaf.record.name.to_ascii_lowercase();
+        if !shared.contains(&lower) && state.devices.named(&lower).len() > 1 {
+            shared.insert(lower);
+        }
+    }
+    shared
+}
+
+/// What `known`, the shared names of an earlier state, becomes in `state`,
+/// which differs from it only at `changed`: each kept while still shared, and
+/// each changed device's name added where it now is. Asks the name index of
+/// those few, never of every member.
+#[must_use]
+pub fn shared_after(
+    state: &RosterState,
+    known: &std::collections::BTreeSet<String>,
+    changed: &[DeviceId],
+) -> std::collections::BTreeSet<String> {
+    let mut shared: std::collections::BTreeSet<String> =
+        known.iter().filter(|name| state.devices.named(name).len() > 1).cloned().collect();
+    for device in changed {
+        let Some(leaf) = state.devices.get(device) else { continue };
+        let lower = leaf.record.name.to_ascii_lowercase();
+        if !shared.contains(&lower) && state.devices.named(&lower).len() > 1 {
+            shared.insert(lower);
+        }
+    }
+    shared
+}
+
 #[must_use]
 /// **Only its own tests call this.** It was public while every module in this
 /// crate was, so nothing said so; narrowing the surface is what made it visible.
@@ -607,6 +672,28 @@ mod tests {
         let state = state(vec![record(1, "nas"), record(2, "nas")]);
         assert_eq!(answer(&state, &Ipv4View::default(), "nas.example.internal"), Answer::Ambiguous);
         assert!(answer(&state, &Ipv4View::default(), "nas.example.internal").is_non_existent());
+    }
+
+    /// **A name two members answer to is found, and found gone once one is
+    /// renamed** (`recovery-repairs` 3.4): found whole at start, then followed
+    /// from the devices each change touches.
+    #[test]
+    fn a_shared_name_is_found_and_followed_through_changes() {
+        let before = state(vec![record(1, "nas"), record(2, "printer")]);
+        assert!(shared_among(&before).is_empty(), "nothing shared");
+
+        // Two branches merged: another device admitted as `NAS`.
+        let mut merged = before.clone();
+        merged.devices.insert(DeviceId::from_bytes([3; 32]), record(3, "NAS"));
+        let found = shared_after(&merged, &shared_among(&before), &[DeviceId::from_bytes([3; 32])]);
+        assert_eq!(found.into_iter().collect::<Vec<_>>(), vec!["nas".to_owned()]);
+        assert_eq!(shared_among(&merged).len(), 1, "a start finds what was already held");
+
+        // One renamed: the name is no longer shared.
+        let mut renamed = merged.clone();
+        renamed.devices.insert(DeviceId::from_bytes([3; 32]), record(3, "nas-2"));
+        let kept = shared_among(&merged);
+        assert!(shared_after(&renamed, &kept, &[DeviceId::from_bytes([3; 32])]).is_empty());
     }
 
     /// The suffix comes from the signed parameters. `DESIGN.md` §0 forbids a

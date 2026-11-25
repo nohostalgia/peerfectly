@@ -2,7 +2,7 @@
 
 What the automated suite cannot show, and the commands that show it.
 
-**Run so far**: 58 of 90. Every other result reads `not run`. That is the honest
+**Run so far**: 59 of 91. Every other result reads `not run`. That is the honest
 state, written down rather than left blank so an unverified behaviour cannot be
 mistaken for a tested one.
 
@@ -2620,3 +2620,42 @@ the phone's debug app built the same day, installed over wireless adb. Everythin
 person reported it: the phone invited the PC and the PC joined; the PC invited the phone as a light
 member and the phone joined; both reached each other; the page on port 8000 opened in the phone's
 browser.
+
+## C6. A member PC recovered on Windows, an admin invited from the phone, and founder acts on the phone
+
+From `recovery-repairs`. The PC (`home`, member) and the phone (`home`, admin), on the VPS's relay;
+on the PC, an elevated console.
+
+1. On the phone, with the founder's words, revoke the PC's two unused identities (`185e…`,
+   `2291…`) left by the 0.6.0 recovery that stopped on os error 33. On the PC, `peerfectly forget
+   home`.
+2. On the phone, an invite for `pc` with *As an admin*; on the PC, `peerfectly join <invite>
+   --admin --name pc`; on the phone, approve it with the founder's words. On the PC, `peerfectly
+   status`.
+3. On the phone, demote the PC with the founder's words. On the PC:
+
+   ```powershell
+   peerfectly recover home
+   ```
+
+   then `peerfectly status`.
+
+**Expect**: each founder act on the phone is signed at once on its copy of the roster, with the
+founder-act line shown while it runs and a *done* notice after, and no crash; the PC joins as an
+admin through the phone's invite; the recovery takes up the new identity in the same command, with
+no file held open and no restart, as an admin under one `pc`, keeping its IPv4 address; `status`
+names the signing key in the machine's key store.
+
+**Result**: run, 2026-11-25, by the person, on `peerfectly-0.6.0-windows-x64.msi` built that day from
+this branch (unsigned) and the phone's debug app built the same day, installed over USB adb.
+- Before the fixes the phone froze on *sign* and closed: a stack overflow (SIGSEGV) in the founder
+  revocation's future, polled on the app's own thread, behind a founder session that tried every
+  offline member one after another. With the core's calls on the runtime's threads and a member
+  signing at once, both revocations went through (log at 15:58, no crash), and the *done* notice
+  showed after.
+- The phone's admin invite, approved with the founder's words: the PC joined as `pc
+  [5179-eed9-9969-1fe6]`, admin, IPv4 100.92.0.1, five revoked.
+- Demoted and recovered: the PC took up `pc [6e08-4d5e-da05-c3c8]` in the same command, admin,
+  keeping 100.92.0.1. `status` then said the signing key was *none: this device is a member*: the
+  daemon's record of the destroyed key was kept by the network's name, so the new identity under
+  the same name inherited it. Fixed by keeping it by identity; to be seen again on the next build.

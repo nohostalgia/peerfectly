@@ -620,6 +620,29 @@ pub fn open_layers(paths: &Paths) -> Result<std::sync::Arc<member_store::Layers>
     Ok(layers)
 }
 
+/// Closes the base store and the layers file this process holds open for the
+/// network at `paths`, whoever still holds them: the files are let go at once,
+/// and the next to ask opens them afresh (`recovery-repairs` design §1).
+/// Blocks until writes under way have ended.
+pub fn close_stores(paths: &Paths) {
+    let store = OPEN_STORES
+        .lock()
+        .ok()
+        .and_then(|mut open| open.remove(&paths.base_store()))
+        .and_then(|held| held.upgrade());
+    if let Some(store) = store {
+        store.close();
+    }
+    let layers = OPEN_LAYERS
+        .lock()
+        .ok()
+        .and_then(|mut open| open.remove(&paths.layers()))
+        .and_then(|held| held.upgrade());
+    if let Some(layers) = layers {
+        layers.close();
+    }
+}
+
 /// Keeps the base a compacted log rests on: its root and that root's state.
 ///
 /// Written before the log is rewritten, so that a log which no longer carries

@@ -579,6 +579,7 @@ fn recovering(named: &[&str]) -> Command {
     Command::Recover {
         network: Some("home".to_owned()),
         revoke: named.iter().map(|name| Target::Name((*name).to_owned())).collect(),
+        another_name: false,
     }
 }
 

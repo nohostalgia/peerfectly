@@ -118,6 +118,13 @@ impl Fault {
 /// and never across an await.
 type Light = Arc<std::sync::Mutex<light_node::engine::Engine>>;
 
+/// The names more than one member answers to, and the state they were found
+/// in, which the next change is measured from.
+struct SharedNames {
+    names: std::collections::BTreeSet<String>,
+    state: RosterState,
+}
+
 /// The assembled node.
 pub struct Node {
     /// This device's keys.
@@ -219,7 +226,16 @@ pub struct Node {
     /// Held while the log is written: appended to, or rewritten after a
     /// compaction, so that a rewrite never drops an operation appended while it
     /// was being made.
-    log_guard: Mutex<()>,
+    /// Held while the logs are written; `true` once the node is closed
+    /// ([`Self::close`]), after which nothing is written to them.
+    log_guard: Mutex<bool>,
+    /// The names more than one member answers to, with the state they were
+    /// found in: followed from the devices each change touches, and found
+    /// whole, in the background, where a change cannot be followed
+    /// (`recovery-repairs` design §6).
+    shared_names: Arc<std::sync::Mutex<Option<SharedNames>>>,
+    /// Whether a whole pass for [`Self::shared_names`] is under way.
+    finding_shared: Arc<std::sync::atomic::AtomicBool>,
     /// What keeps this network's checkpoint current, once the service has set
     /// one. Absent in a node nobody carries.
     keeper: std::sync::OnceLock<Arc<crate::checkpoint::Keeper>>,
@@ -387,7 +403,9 @@ impl Node {
             born: tokio::time::Instant::now(),
             heard: Arc::new(std::sync::Mutex::new(Vec::new())),
             standing: Arc::new(tokio::sync::Notify::new()),
-            log_guard: Mutex::new(()),
+            log_guard: Mutex::new(false),
+            shared_names: Arc::new(std::sync::Mutex::new(None)),
+            finding_shared: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             keeper: std::sync::OnceLock::new(),
             base: std::sync::Mutex::new(None),
             base_told: std::sync::atomic::AtomicBool::new(false),
@@ -686,6 +704,76 @@ impl Node {
     #[must_use]
     pub fn keeper(&self) -> Option<&Arc<crate::checkpoint::Keeper>> {
         self.keeper.get()
+    }
+
+    /// Follows the names more than one member answers to into `state`: from
+    /// the devices that differ where the state they were found in shares its
+    /// base, and otherwise by one whole pass in the background, which the next
+    /// change follows on from.
+    fn follow_shared_names(&self, state: &RosterState) {
+        let Ok(mut held) = self.shared_names.lock() else { return };
+        let followed = held.as_ref().and_then(|known| {
+            let changed = known.state.devices.differing(&state.devices)?;
+            Some(crate::names::shared_after(state, &known.names, &changed))
+        });
+        if let Some(names) = followed {
+            *held = Some(SharedNames { names, state: state.clone() });
+            return;
+        }
+        drop(held);
+        if self.finding_shared.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let shared = Arc::clone(&self.shared_names);
+        let finding = Arc::clone(&self.finding_shared);
+        let state = state.clone();
+        let _found = tokio::task::spawn_blocking(move || {
+            let names = crate::names::shared_among(&state);
+            if let Ok(mut held) = shared.lock() {
+                *held = Some(SharedNames { names, state });
+            }
+            finding.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// The names more than one member of `state` answers to, each with the
+    /// members answering to it: what `status` says until one is renamed. Asks
+    /// the name index of the few names known to be shared, and nothing else.
+    pub fn shared_names(
+        &self,
+        state: &RosterState,
+    ) -> Vec<(String, Vec<Arc<roster::leaf::DeviceLeaf>>)> {
+        let Ok(held) = self.shared_names.lock() else { return Vec::new() };
+        let Some(known) = held.as_ref() else { return Vec::new() };
+        known
+            .names
+            .iter()
+            .filter_map(|name| {
+                let holders = state.devices.named(name);
+                (holders.len() > 1).then(|| (name.clone(), holders))
+            })
+            .collect()
+    }
+
+    /// Closes the node for good, for its network's files to be moved
+    /// (`recovery-repairs` design §1): a write to its logs under way ends
+    /// first, and from then on nothing is appended to them and no checkpoint
+    /// or base is written, whoever still holds the node. The checkpoint is
+    /// written once more first, as at shutdown, by the caller.
+    pub async fn close(&self) {
+        let mut closed = self.log_guard.lock().await;
+        *closed = true;
+        if let Some(keeper) = self.keeper.get() {
+            keeper.close();
+        }
+    }
+
+    /// What a write to a closed node's logs is told.
+    fn closed_error(&self) -> crate::Error {
+        crate::Error::State {
+            path: self.paths().map_or_else(std::path::PathBuf::new, |paths| paths.roster()),
+            cause: "this network was closed for its files to move".to_owned(),
+        }
     }
 
     /// The root the roster's base rests on, where it was compacted.
@@ -1683,7 +1771,10 @@ impl Node {
     async fn keep_pieces(&self, pieces: &[Vec<u8>]) -> crate::Result<()> {
         let Some(paths) = self.paths() else { return Ok(()) };
         let log = crate::state::Log::at(paths.pieces());
-        let _guard = self.log_guard.lock().await;
+        let closed = self.log_guard.lock().await;
+        if *closed {
+            return Err(self.closed_error());
+        }
         for piece in pieces {
             log.append(piece)?;
         }
@@ -2843,6 +2934,7 @@ impl Node {
         if let Some(previous) = &previous {
             self.tell_lost_offsets(previous, &state).await;
         }
+        self.follow_shared_names(&state);
 
         self.forget_departed(&state).await;
         self.reconsider_carrying().await;
@@ -3135,8 +3227,8 @@ impl Node {
         }
         for operation in &reception.accepted {
             let appended = {
-                let _guard = self.log_guard.lock().await;
-                self.log.append(operation)
+                let closed = self.log_guard.lock().await;
+                if *closed { Err(self.closed_error()) } else { self.log.append(operation) }
             };
             if let Err(cause) = appended {
                 self.record(Severity::Problem, "state", cause).await;
@@ -3416,11 +3508,71 @@ impl Node {
     ///
     /// When the roster refuses it.
     pub async fn admit_without_activating(&self, bytes: &[u8]) -> crate::Result<()> {
+        self.refuse_shared_names(&[bytes]).await?;
+        self.admit_checked(bytes).await
+    }
+
+    /// Admits the operations of one act authored here, in order, as
+    /// [`Self::admit_without_activating`] admits one. The name rule is asked of
+    /// the act as a whole: a device revoked anywhere in it frees its name for
+    /// an admission in it, which is what lets a recovery admit the new
+    /// identity under the old one's name before revoking the old one.
+    ///
+    /// # Errors
+    ///
+    /// When the act would leave a name to two devices, before anything is
+    /// kept; otherwise as each admission.
+    pub async fn admit_act(&self, operations: &[Vec<u8>]) -> crate::Result<()> {
+        let act: Vec<&[u8]> = operations.iter().map(Vec::as_slice).collect();
+        self.refuse_shared_names(&act).await?;
+        for bytes in act {
+            self.admit_checked(bytes).await?;
+        }
+        Ok(())
+    }
+
+    /// Refuses an act authored here that would leave a name to two live
+    /// devices: the one place every operation authored here passes before it
+    /// is kept or spread, so no path, today's or a later one, can sign one into
+    /// the network (`recovery-repairs` design §5). The surfaces ask before
+    /// this.
+    async fn refuse_shared_names(&self, act: &[&[u8]]) -> crate::Result<()> {
+        let raws: Vec<roster::sign::RawOperation<'_>> =
+            act.iter().filter_map(|bytes| roster::sign::RawOperation::decode(bytes).ok()).collect();
+        let revoked: std::collections::BTreeSet<DeviceId> = raws
+            .iter()
+            .filter_map(|raw| match &raw.core().body {
+                roster::types::OperationBody::RevokeDevice { device, .. } => Some(*device),
+                _ => None,
+            })
+            .collect();
+        let Ok(state) = self.state().await else { return Ok(()) };
+        for raw in &raws {
+            if let Some((name, holder)) =
+                crate::names::shared_by(&state, &raw.core().body, |held| revoked.contains(held))
+            {
+                return Err(crate::Error::Refused {
+                    cause: format!(
+                        "{} already answers to that name, and two devices answering to one \
+                         name resolve for neither. Nothing was kept or spread.",
+                        crate::control::Named::new(&holder, Some(name)),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Admits one operation whose names were asked about.
+    async fn admit_checked(&self, bytes: &[u8]) -> crate::Result<()> {
         // Written before it is spread. An operation a peer has and this node
         // forgets at the next restart is worse than one that was refused: it
         // takes effect, disappears, and nobody is told.
         {
-            let _guard = self.log_guard.lock().await;
+            let closed = self.log_guard.lock().await;
+            if *closed {
+                return Err(self.closed_error());
+            }
             self.log.append(bytes)?;
         }
 
