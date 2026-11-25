@@ -2,3 +2,8 @@
 # shebang makes the interpreter "not found", which reports as exit code 127 and
 # looks nothing like a line-ending problem.
 *.sh text eol=lf
+
+# The founder's word list is embedded byte for byte and checked against the
+# published list's digest: a CRLF checkout on Windows changed every line, and
+# the digest with it (CI, 2026-11-25).
+crates/identity/src/bip39-english.txt text eol=lf
